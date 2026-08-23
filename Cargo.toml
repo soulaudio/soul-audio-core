@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/soul-audio-core", "crates/soul-audio-cli", "xtask"]
+members = [
+  "crates/soul-audio-core",
+  "crates/soul-audio-cli",
+  "crates/soul-audio-firmware",
+  "xtask",
+]
 default-members = ["crates/soul-audio-core", "crates/soul-audio-cli", "xtask"]
 
 [workspace.package]

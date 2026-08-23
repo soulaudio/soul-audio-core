@@ -1,0 +1,30 @@
+[package]
+name = "soul-audio-firmware"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "STM32H743 Embassy firmware shell for soul-audio-core."
+
+# Intentionally NO `[lints] workspace = true`: Embassy macros/HAL can trip
+# host-oriented clippy lints. The firmware is gated by *building* for the
+# target, not by clippy.
+
+[[bin]]
+name = "soul-audio-firmware"
+test = false
+bench = false
+doctest = false
+
+[dependencies]
+soul-audio-core = { path = "../soul-audio-core" }
+embedded-io = { workspace = true }
+cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7"
+defmt = "1"
+defmt-rtt = "1"
+panic-probe = { version = "1", features = ["print-defmt"] }
+embassy-time = { version = "0.5.1", features = ["defmt"] }
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-stm32 = { version = "0.6.0", features = ["stm32h743zi", "memory-x", "time-driver-any", "defmt"] }
+# Embassy deps are added via `cargo add` (versions move fast) — see the plan.
