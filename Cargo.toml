@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/soul-audio-core"]
-default-members = ["crates/soul-audio-core"]
+members = ["crates/soul-audio-core", "xtask"]
+default-members = ["crates/soul-audio-core", "xtask"]
 
 [workspace.package]
 edition = "2024"

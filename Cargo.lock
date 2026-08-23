@@ -14,3 +14,7 @@ version = "0.1.0"
 dependencies = [
  "embedded-io",
 ]
+
+[[package]]
+name = "xtask"
+version = "0.0.0"
