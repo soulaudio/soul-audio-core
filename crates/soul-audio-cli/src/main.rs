@@ -8,7 +8,7 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use embedded_io_adapters::std::FromStd;
 use soul_audio_core::formats::wav::WavDecoder;

@@ -13,8 +13,8 @@ use defmt_rtt as _; // global defmt logger over RTT
 use panic_probe as _; // panic handler
 
 use embassy_executor::Spawner;
-use soul_audio_core::formats::wav::WavDecoder;
 use soul_audio_core::SliceReader;
+use soul_audio_core::formats::wav::WavDecoder;
 
 /// Placeholder audio source. Replace with a real one (SD card, flash, USB, …).
 static AUDIO: &[u8] = &[];

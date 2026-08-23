@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::{exit, Command};
+use std::process::{Command, exit};
 
 const USAGE: &str = "usage: cargo xtask <verify|ci|install-hooks>";
 
