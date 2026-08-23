@@ -1,8 +1,18 @@
 # soul-audio-core — Cross-Platform Embedded Rust Template
 
 **Date:** 2026-08-23
-**Status:** Approved design, pre-implementation
+**Status:** Implemented (scope narrowed — see note)
 **Repo root:** `D:\dev\soulaudio\soul-audio-core` (existing git repo)
+
+> **AS-BUILT NOTE (scope narrowed during execution):** the user asked for the
+> *template/scaffold only* — no real decoder logic. So **all format decoders
+> (WAV included) are stubs** returning `DecodeError::Unsupported`; there are no
+> generated audio fixtures; and the tests assert the scaffold/stub contracts
+> rather than golden PCM. Everything else below holds. Other deviations: the
+> `trybuild` compile-fail test was dropped (its `.stderr` snapshots are
+> compiler-version-fragile for a template on floating `stable`); Embassy
+> resolved to `embassy-executor 0.10` (arch feature `platform-cortex-m`) and
+> `embassy-stm32 0.6`; `cortex-m` needs `critical-section-single-core`.
 
 ## 1. Purpose
 

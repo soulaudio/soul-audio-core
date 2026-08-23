@@ -6,7 +6,17 @@
 
 **Architecture:** Single Cargo workspace (Rust 2024, resolver 3). A pure sync `no_std`/no-alloc core library defines the decode boundary over `embedded-io::Read`. Thin platform shells consume it: an Embassy STM32 firmware binary and a `std` CLI test harness. A dedicated `architecture-tests` crate plus an `xtask` runner and GitHub Actions enforce the no_std/no-alloc/layering invariants.
 
-**Tech Stack:** Rust 2024 edition, `embedded-io`, Embassy (`embassy-executor`, `embassy-stm32`, `embassy-time`), `defmt`/`defmt-rtt`/`panic-probe`, `probe-rs`, `clap`, `assert_cmd`, `trybuild`, `cargo_metadata`.
+**Tech Stack:** Rust 2024 edition, `embedded-io`, Embassy (`embassy-executor`, `embassy-stm32`, `embassy-time`), `defmt`/`defmt-rtt`/`panic-probe`, `probe-rs`, `clap`, `assert_cmd`, `cargo_metadata`.
+
+> **AS-BUILT NOTE:** scope was narrowed during execution to the
+> **template/scaffold only** — every format decoder (WAV included) is a stub
+> returning `Unsupported`, there are no generated fixtures, and tests assert the
+> scaffold/stub contracts. The `trybuild` compile-fail task was dropped (fragile
+> `.stderr` snapshots for a template on floating `stable`). Resolved deps:
+> `embassy-executor 0.10` (arch feature `platform-cortex-m`), `embassy-stm32 0.6`,
+> `cortex-m` with `critical-section-single-core`, `defmt`/`defmt-rtt`/`panic-probe`
+> at `1.x`. All gates pass: `cargo test`, `cargo check-embedded`, `cargo fw`,
+> `cargo xtask verify`.
 
 ## Global Constraints
 
