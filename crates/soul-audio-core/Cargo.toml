@@ -1,0 +1,13 @@
+[package]
+name = "soul-audio-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cross-platform, no_std, no-alloc audio decode core (WAV reference; MP3/FLAC/DSD planned)."
+
+[lints]
+workspace = true
+
+[dependencies]
+embedded-io = { workspace = true }

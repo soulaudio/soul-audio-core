@@ -1,0 +1,13 @@
+[alias]
+xtask = "run --package xtask --"
+fw = "build --package soul-audio-firmware --target thumbv7em-none-eabihf"
+fw-run = "run --package soul-audio-firmware --target thumbv7em-none-eabihf"
+check-embedded = "build --package soul-audio-core --target thumbv7em-none-eabihf --no-default-features"
+
+[target.thumbv7em-none-eabihf]
+runner = "probe-rs run --chip STM32H743ZITx"
+rustflags = [
+  "-C", "link-arg=--nmagic",
+  "-C", "link-arg=-Tlink.x",
+  "-C", "link-arg=-Tdefmt.x",
+]
