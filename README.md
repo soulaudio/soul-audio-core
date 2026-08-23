@@ -26,7 +26,19 @@ discipline, so you can drop real decoders straight into `formats/`.
 | `cargo fw` | Build the firmware for `thumbv7em-none-eabihf`. |
 | `cargo fw-run` | Flash + run on hardware via `probe-rs` (needs a board). |
 | `cargo xtask verify` | Full local gate: fmt, clippy, tests, both embedded builds. |
-| `cargo xtask install-hooks` | Install a pre-commit hook that runs `verify`. |
+
+Git hooks are managed by [lefthook](https://github.com/evilmartians/lefthook)
+via `lefthook.yml`: **pre-commit** runs fast checks (fmt + clippy) on staged
+Rust/Cargo files; **pre-push** runs the full `cargo xtask verify` (tests + both
+STM32 builds).
+
+Setup: install the lefthook binary (`go install github.com/evilmartians/lefthook@latest`,
+`npm i -D lefthook`, or `scoop`/`choco`/`brew install lefthook`), then run
+`lefthook install` once. If you use a global `core.hooksPath` dispatcher that
+already delegates to lefthook, skip `lefthook install`; the dispatcher picks up
+`lefthook.yml` automatically (pre-push may print a benign hook-sync warning, and
+commit-time pre-commit for non-JS repos can be bridged with a
+`.git/hooks/pre-commit` that runs `lefthook run --no-auto-install pre-commit`).
 
 ## How the cross-platform split works
 
@@ -45,7 +57,8 @@ discipline, so you can drop real decoders straight into `formats/`.
    `std`/`alloc` creep fails to compile (`cargo check-embedded`).
 2. **Runtime:** `architecture-tests` asserts zero allocations during core work.
 3. **Structural:** `architecture-tests` asserts the dependency layering.
-4. **Local:** `cargo xtask verify` + the pre-commit hook.
+4. **Local:** lefthook git hooks — fast pre-commit (fmt + clippy) and full
+   pre-push (`cargo xtask verify`).
 5. **Remote:** GitHub Actions (`host` + `embedded` jobs) block merges on failure.
 
 ## Target chip

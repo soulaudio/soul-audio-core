@@ -1,3 +1,6 @@
 /target
 **/*.rs.bk
 /out.pcm
+
+# Local tooling / session state (not part of the template)
+/.claude/

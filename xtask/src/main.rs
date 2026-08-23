@@ -1,19 +1,17 @@
 //! Repo automation. Run via the cargo alias: `cargo xtask <command>`.
 //!
 //! Pure Rust (no external task runner) so it behaves identically on Windows,
-//! macOS, Linux, and CI.
+//! macOS, Linux, and CI. Git hooks are managed by lefthook (`lefthook.yml`);
+//! the pre-push hook runs `cargo xtask verify`.
 
-use std::fs;
-use std::path::Path;
 use std::process::{Command, exit};
 
-const USAGE: &str = "usage: cargo xtask <verify|ci|install-hooks>";
+const USAGE: &str = "usage: cargo xtask <verify|ci>";
 
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
     let result = match cmd.as_str() {
         "verify" | "ci" => verify(),
-        "install-hooks" => install_hooks(),
         "" => {
             eprintln!("{USAGE}");
             exit(2);
@@ -45,7 +43,7 @@ fn run(args: &[&str]) -> Result<(), String> {
 }
 
 /// Full gate: format, lint, host tests, the no_std core build, and the firmware
-/// build for the STM32 target. This is what CI and the pre-commit hook run.
+/// build for the STM32 target. This is what CI and the pre-push hook run.
 fn verify() -> Result<(), String> {
     run(&["fmt", "--all", "--", "--check"])?;
     run(&["clippy", "--all-targets", "--", "-D", "warnings"])?;
@@ -68,24 +66,5 @@ fn verify() -> Result<(), String> {
         "thumbv7em-none-eabihf",
     ])?;
     println!("verify: OK");
-    Ok(())
-}
-
-/// Install a git pre-commit hook that runs `cargo xtask verify`.
-fn install_hooks() -> Result<(), String> {
-    let hook = Path::new(".git/hooks/pre-commit");
-    fs::write(
-        hook,
-        "#!/bin/sh\n# installed by `cargo xtask install-hooks`\nexec cargo xtask verify\n",
-    )
-    .map_err(|e| format!("writing {}: {e}", hook.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(hook).map_err(|e| e.to_string())?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(hook, perms).map_err(|e| e.to_string())?;
-    }
-    println!("installed .git/hooks/pre-commit");
     Ok(())
 }

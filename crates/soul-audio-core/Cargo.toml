@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Cross-platform, no_std, no-alloc audio decode core (WAV reference; MP3/FLAC/DSD planned)."
+description = "Cross-platform, no_std, no-alloc audio decode core (template; WAV/MP3/FLAC/DSD decoders stubbed)."
 
 [lints]
 workspace = true
