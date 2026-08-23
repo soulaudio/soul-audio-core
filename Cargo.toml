@@ -4,9 +4,15 @@ members = [
   "crates/soul-audio-core",
   "crates/soul-audio-cli",
   "crates/soul-audio-firmware",
+  "crates/architecture-tests",
   "xtask",
 ]
-default-members = ["crates/soul-audio-core", "crates/soul-audio-cli", "xtask"]
+default-members = [
+  "crates/soul-audio-core",
+  "crates/soul-audio-cli",
+  "crates/architecture-tests",
+  "xtask",
+]
 
 [workspace.package]
 edition = "2024"
