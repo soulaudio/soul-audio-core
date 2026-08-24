@@ -43,10 +43,12 @@ commit-time pre-commit for non-JS repos can be bridged with a
 ## How the cross-platform split works
 
 - **`soul-audio-core` is sync, `no_std`, and allocates nothing.** Decoders read
-  from any `embedded-io::Read` and write PCM into caller-provided buffers.
+  through the `Source` capability ladder (`Source` → `BufSource` → `SeekSource`,
+  owned super-traits over `embedded-io`) and write PCM into caller-provided
+  buffers.
 - On the **desktop**, `soul-audio-cli` wraps a `std::fs::File` with
   `embedded-io-adapters`; on the **STM32**, the firmware uses
-  `soul_audio_core::SliceReader` over in-flash bytes. Same core code path.
+  `soul_audio_core::SliceSource` over in-flash bytes. Same core code path.
 - Async lives only in the **firmware shell** (Embassy, for DMA/I2S); the core
   stays runtime-agnostic.
 

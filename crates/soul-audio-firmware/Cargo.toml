@@ -27,4 +27,5 @@ panic-probe = { version = "1", features = ["print-defmt"] }
 embassy-time = { version = "0.5.1", features = ["defmt"] }
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
 embassy-stm32 = { version = "0.6.0", features = ["stm32h743zi", "memory-x", "time-driver-any", "defmt"] }
+embedded-sdmmc = { version = "0.9.0", default-features = false }
 # Embassy deps are added via `cargo add` (versions move fast) — see the plan.
