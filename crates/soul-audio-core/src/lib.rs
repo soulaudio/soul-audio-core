@@ -15,6 +15,7 @@ pub mod formats;
 pub mod io;
 pub mod model;
 pub mod probe;
+pub mod resample;
 
 pub use decoder::{DecodeError, Decoder, DsdDecoder, DsdSeek};
 pub use demux::{Demuxer, FlacDemuxer, Mp3Demuxer, Packet, WavDemuxer};
@@ -23,3 +24,4 @@ pub use dsd::{DecimateAdapter, DopAdapter};
 pub use io::{BufReader, BufSource, SeekSource, SliceSource, Source};
 pub use model::{DsdMode, DsdRate, Format, SampleFormat, StreamInfo};
 pub use probe::probe;
+pub use resample::{Quality, ResampleError, Resampler};

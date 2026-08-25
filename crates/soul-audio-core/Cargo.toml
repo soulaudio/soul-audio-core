@@ -11,3 +11,8 @@ workspace = true
 
 [dependencies]
 embedded-io = { workspace = true }
+
+# Host-only: FFT for the resampler's objective DSP-quality tests (alias/SNR
+# measurement). Never compiled into the no_std library or the firmware.
+[dev-dependencies]
+rustfft = "6"
