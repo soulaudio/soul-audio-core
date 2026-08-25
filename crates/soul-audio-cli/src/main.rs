@@ -10,6 +10,10 @@
 //!
 //! The engine/deck run identically on the STM32 — only the sink and source swap.
 
+// `convert` is used by the cpal callback (playback) and by its own tests; when
+// playback is off it is exercised only by tests, so allow dead code there.
+#[cfg_attr(not(feature = "playback"), allow(dead_code))]
+mod convert;
 #[cfg(feature = "playback")]
 mod cpal_sink;
 mod driver;

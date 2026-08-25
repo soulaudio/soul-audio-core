@@ -17,8 +17,7 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use soul_audio_core::model::SampleFormat as CoreFmt;
 use soul_audio_core::{Sink, SinkError, StreamInfo};
 
-/// Canonical input bit depth the deck normalizes to (`±2^23`).
-const CANONICAL_BITS: u8 = 24;
+use crate::convert::{self, CANONICAL_BITS};
 
 /// A cpal output stream presented as a [`Sink`] consuming canonical 24-bit PCM.
 pub struct CpalSink {
@@ -49,40 +48,25 @@ impl CpalSink {
         let (prod, mut cons) = HeapRb::<i32>::new(cap).split();
         let err_fn = |e| eprintln!("cpal stream error: {e}");
 
+        // The callback pops from the ring and converts via the unit-tested
+        // `convert` functions (silence on underrun).
         let stream = match sample_format {
-            SampleFormat::F32 => {
-                // 2^(24-1) maps the canonical peak (±2^23) to ±1.0 full scale.
-                let scale = 2f32.powi(i32::from(CANONICAL_BITS) - 1);
-                device
-                    .build_output_stream(
-                        &config,
-                        move |data: &mut [f32], _| {
-                            for s in data.iter_mut() {
-                                *s = cons.try_pop().unwrap_or(0) as f32 / scale;
-                            }
-                        },
-                        err_fn,
-                        None,
-                    )
-                    .context("building f32 output stream")?
-            }
-            SampleFormat::I16 => {
-                // 24-bit → 16-bit: drop the low 8 bits.
-                let shift = i32::from(CANONICAL_BITS) - 16;
-                device
-                    .build_output_stream(
-                        &config,
-                        move |data: &mut [i16], _| {
-                            for s in data.iter_mut() {
-                                let v = cons.try_pop().unwrap_or(0) >> shift;
-                                *s = v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
-                            }
-                        },
-                        err_fn,
-                        None,
-                    )
-                    .context("building i16 output stream")?
-            }
+            SampleFormat::F32 => device
+                .build_output_stream(
+                    &config,
+                    move |data: &mut [f32], _| convert::fill_f32(|| cons.try_pop(), data),
+                    err_fn,
+                    None,
+                )
+                .context("building f32 output stream")?,
+            SampleFormat::I16 => device
+                .build_output_stream(
+                    &config,
+                    move |data: &mut [i16], _| convert::fill_i16(|| cons.try_pop(), data),
+                    err_fn,
+                    None,
+                )
+                .context("building i16 output stream")?,
             other => return Err(anyhow!("unsupported device sample format: {other:?}")),
         };
         stream.play().context("starting stream")?;

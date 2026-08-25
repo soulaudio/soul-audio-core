@@ -1,6 +1,8 @@
 //! Black-box E2E: run the built CLI binary and check its behaviour.
 
 use assert_cmd::Command;
+use rustfft::FftPlanner;
+use rustfft::num_complex::Complex;
 
 /// A minimal valid 16-bit mono WAV carrying `samples`.
 fn wav16(samples: &[i16]) -> Vec<u8> {
@@ -81,14 +83,8 @@ fn decode_wav_to_pcm() {
 
 // --- `render` end-to-end: the full engine pipeline to a file (no device) ------
 
-/// A constant-value 16-bit PCM WAV of `frames` per-channel frames.
-fn wav_const(rate: u32, channels: u16, value: i16, frames: u32) -> Vec<u8> {
-    let mut data = Vec::new();
-    for _ in 0..frames {
-        for _ in 0..channels {
-            data.extend_from_slice(&value.to_le_bytes());
-        }
-    }
+/// Wrap 16-bit PCM `data` (interleaved LE) in a WAV container.
+fn wav16_pcm(rate: u32, channels: u16, data: &[u8]) -> Vec<u8> {
     let byte_rate = rate * u32::from(channels) * 2;
     let block_align = channels * 2;
     let mut v = Vec::new();
@@ -105,8 +101,34 @@ fn wav_const(rate: u32, channels: u16, value: i16, frames: u32) -> Vec<u8> {
     v.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
     v.extend_from_slice(b"data");
     v.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    v.extend_from_slice(&data);
+    v.extend_from_slice(data);
     v
+}
+
+/// A constant-value 16-bit PCM WAV of `frames` per-channel frames.
+fn wav_const(rate: u32, channels: u16, value: i16, frames: u32) -> Vec<u8> {
+    let mut data = Vec::new();
+    for _ in 0..frames {
+        for _ in 0..channels {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    wav16_pcm(rate, channels, &data)
+}
+
+/// A sine WAV with a (possibly distinct) frequency per channel, `amp` = 16-bit
+/// peak amplitude.
+fn wav_sine(rate: u32, channels: u16, freqs: &[f64], amp: i16, frames: u32) -> Vec<u8> {
+    assert_eq!(freqs.len(), channels as usize);
+    let mut data = Vec::new();
+    for n in 0..frames {
+        for &f in freqs {
+            let t = f64::from(n) / f64::from(rate);
+            let v = (f64::from(amp) * (2.0 * std::f64::consts::PI * f * t).sin()).round() as i16;
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    wav16_pcm(rate, channels, &data)
 }
 
 /// A unique temp path (tests run in parallel).
@@ -127,6 +149,74 @@ fn read_pcm(path: &std::path::Path) -> Vec<i32> {
 /// (normalized by `2^(24-16)`).
 fn canon(v16: i16) -> i32 {
     i32::from(v16) << 8
+}
+
+/// Extract channel `ch` of the interleaved i32 PCM as f32, skipping `skip`
+/// frames (past any resampler warm-up) then taking `n`.
+fn channel_window(pcm: &[i32], channels: usize, ch: usize, skip: usize, n: usize) -> Vec<f32> {
+    pcm.iter()
+        .skip(ch)
+        .step_by(channels)
+        .skip(skip)
+        .take(n)
+        .map(|&s| s as f32)
+        .collect()
+}
+
+/// Result of a spectral analysis: the dominant tone and how clean it is.
+struct Spectrum {
+    peak_hz: f64,
+    /// Spurious-free dynamic range: the dominant tone vs the largest spurious
+    /// peak outside a guard band around it. Aliasing/imaging artifacts show up as
+    /// spurious peaks and drop this; the analysis window's own leakage is
+    /// localized near the tone and excluded by the guard band.
+    sfdr_db: f64,
+}
+
+/// Hann-windowed magnitude spectrum of `signal` → its dominant frequency and its
+/// spurious-free dynamic range.
+fn analyze(signal: &[f32], rate: u32) -> Spectrum {
+    let n = signal.len();
+    let mut buf: Vec<Complex<f32>> = signal
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| {
+            // Hann window to suppress spectral leakage.
+            let w = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / (n as f64 - 1.0)).cos();
+            Complex {
+                re: x * w as f32,
+                im: 0.0,
+            }
+        })
+        .collect();
+    FftPlanner::<f32>::new()
+        .plan_fft_forward(n)
+        .process(&mut buf);
+
+    let half = n / 2;
+    let mag: Vec<f64> = buf[..half].iter().map(|c| f64::from(c.norm())).collect();
+    // Dominant bin, skipping DC and the lowest window-leakage bins.
+    let lo = 3;
+    let peak_bin = mag
+        .iter()
+        .enumerate()
+        .skip(lo)
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(b, _)| b)
+        .unwrap();
+    let peak_hz = peak_bin as f64 * f64::from(rate) / n as f64;
+    // Largest spurious peak outside a guard band (±16 bins) around the tone —
+    // far enough that Hann leakage is well below any real artifact.
+    let guard = 16;
+    let mut spur = 0f64;
+    for (b, &m) in mag.iter().enumerate().skip(lo) {
+        if b >= peak_bin.saturating_sub(guard) && b <= peak_bin + guard {
+            continue;
+        }
+        spur = spur.max(m);
+    }
+    let sfdr_db = 20.0 * (mag[peak_bin] / spur.max(1e-12)).log10();
+    Spectrum { peak_hz, sfdr_db }
 }
 
 #[test]
@@ -263,4 +353,87 @@ fn render_rejects_incompatible_channels() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("channel"));
+}
+
+// --- signal analysis: what a human ear checks, measured automatically ---------
+
+#[test]
+fn render_preserves_tone_pitch_level_and_purity() {
+    // A 1 kHz tone resampled 44.1k → 48k must stay a 1 kHz tone. A wrong resample
+    // ratio would shift the pitch (the audible "chipmunk"/slow-tape bug an ear
+    // catches); it must also stay clean (resampler SNR) and keep its level.
+    let a = tmp("tone_a.wav");
+    let out = tmp("tone_out.pcm");
+    let amp = 16_383i16; // ~0.5 full scale
+    std::fs::write(&a, wav_sine(44_100, 2, &[1000.0, 1000.0], amp, 22_050)).unwrap();
+
+    Command::cargo_bin("soul-audio-cli")
+        .unwrap()
+        .args(["render"])
+        .arg(&a)
+        .args(["--out"])
+        .arg(&out)
+        .args(["--rate", "48000", "--channels", "2"])
+        .assert()
+        .success();
+
+    let pcm = read_pcm(&out);
+    let n = 16_384;
+    let sig = channel_window(&pcm, 2, 0, 4000, n); // skip warm-up, then a full window
+    assert_eq!(sig.len(), n, "need a full analysis window of output");
+
+    let s = analyze(&sig, 48_000);
+    assert!(
+        (s.peak_hz - 1000.0).abs() < 5.0,
+        "pitch drifted to {:.1} Hz (resample ratio wrong?)",
+        s.peak_hz
+    );
+    // Measured ~84 dB for the clean Hq resampler; 55 dB is a wide margin that
+    // still fails on real aliasing (which lands at 20–40 dB).
+    assert!(
+        s.sfdr_db > 55.0,
+        "tone not clean: {:.1} dB SFDR (aliasing/artifacts?)",
+        s.sfdr_db
+    );
+    // Level preserved end-to-end: the settled peak ≈ input amplitude, canonical.
+    let peak = sig.iter().fold(0f32, |m, &x| m.max(x.abs()));
+    let expect = f64::from(i32::from(amp) << 8);
+    assert!(
+        (f64::from(peak) - expect).abs() < expect * 0.05,
+        "level off: {peak} vs ~{expect}"
+    );
+}
+
+#[test]
+fn render_keeps_stereo_channels_distinct() {
+    // Left = 1 kHz, right = 4 kHz through a passthrough render: each channel must
+    // carry its own tone — catches a channel swap or a mono collapse.
+    let a = tmp("stereo_a.wav");
+    let out = tmp("stereo_out.pcm");
+    std::fs::write(&a, wav_sine(48_000, 2, &[1000.0, 4000.0], 16_383, 24_000)).unwrap();
+
+    Command::cargo_bin("soul-audio-cli")
+        .unwrap()
+        .args(["render"])
+        .arg(&a)
+        .args(["--out"])
+        .arg(&out)
+        .args(["--rate", "48000", "--channels", "2"])
+        .assert()
+        .success();
+
+    let pcm = read_pcm(&out);
+    let n = 16_384;
+    let left = analyze(&channel_window(&pcm, 2, 0, 2000, n), 48_000);
+    let right = analyze(&channel_window(&pcm, 2, 1, 2000, n), 48_000);
+    assert!(
+        (left.peak_hz - 1000.0).abs() < 5.0,
+        "left channel is {:.1} Hz, not 1000",
+        left.peak_hz
+    );
+    assert!(
+        (right.peak_hz - 4000.0).abs() < 5.0,
+        "right channel is {:.1} Hz, not 4000",
+        right.peak_hz
+    );
 }
