@@ -296,4 +296,57 @@ mod tests {
             Some(DecodeError::Unsupported)
         );
     }
+
+    /// Build an N-channel DSF (one 4096-byte planar block per channel); each
+    /// `chans[c]` supplies the leading bytes of channel `c`'s block.
+    fn dsf_n(freq: u32, sample_count: u64, chans: &[&[u8]]) -> Vec<u8> {
+        let channels = chans.len() as u32;
+        let audio = chans.len() * BLOCK;
+        let mut v = Vec::new();
+        v.extend_from_slice(b"DSD ");
+        v.extend_from_slice(&28u64.to_le_bytes());
+        v.extend_from_slice(&0u64.to_le_bytes());
+        v.extend_from_slice(&0u64.to_le_bytes());
+        v.extend_from_slice(b"fmt ");
+        v.extend_from_slice(&52u64.to_le_bytes());
+        v.extend_from_slice(&1u32.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&channels.to_le_bytes()); // channel type ≈ count
+        v.extend_from_slice(&channels.to_le_bytes());
+        v.extend_from_slice(&freq.to_le_bytes());
+        v.extend_from_slice(&1u32.to_le_bytes()); // bits = 1
+        v.extend_from_slice(&sample_count.to_le_bytes());
+        v.extend_from_slice(&(BLOCK as u32).to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&(audio as u64 + 12).to_le_bytes());
+        for ch in chans {
+            let mut b = vec![0u8; BLOCK];
+            b[..ch.len()].copy_from_slice(ch);
+            v.extend_from_slice(&b);
+        }
+        v
+    }
+
+    #[test]
+    fn decodes_6_channel_dsf() {
+        // 5.1 DSD: 6 planar blocks → interleaved MSB-first clustered frames.
+        // 16 samples/ch = 2 valid bytes/ch. channel c byte t = 0x10*c + t + 1.
+        let per_ch: Vec<[u8; 2]> = (0..6u8).map(|c| [0x10 * c + 1, 0x10 * c + 2]).collect();
+        let refs: Vec<&[u8]> = per_ch.iter().map(|a| a.as_slice()).collect();
+        let bytes = dsf_n(2_822_400, 16, &refs);
+
+        let mut d = DsfDecoder::new(SliceSource::new(&bytes)).unwrap();
+        assert_eq!(d.stream_info().channels, 6);
+        let mut out = [0u8; 32];
+        let n = d.read_dsd(&mut out).unwrap();
+        assert_eq!(n, 12); // 2 time indices × 6 channels
+        // Interleaved + bit-reversed (LSB→MSB): out[t*6 + c] = rev(0x10*c + t + 1).
+        for t in 0..2usize {
+            for c in 0..6usize {
+                let src = 0x10 * c as u8 + t as u8 + 1;
+                assert_eq!(out[t * 6 + c], src.reverse_bits());
+            }
+        }
+    }
 }

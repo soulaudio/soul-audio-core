@@ -17,3 +17,22 @@ binary — see `.gitattributes`.
 
 The firmware can embed a clip from here via `include_bytes!` to exercise the
 core on real hardware.
+
+## DST cross-check vector
+
+`dst-64fs44-2ch.slice.dff` — first frames of the FFmpeg FATE sample
+`dst-64fs44-2ch.dff` (DSD64 stereo, DST-compressed). Our decode of the full
+file matched FFmpeg's DST decoder bit-exact (raw DSD) and the FFmpeg binary
+end-to-end (PCM); this slice is the embedded regression gate
+(`dff.rs::dst_real_fate_slice_matches_ffmpeg`).
+
+## IMA-ADPCM vectors
+
+`ima-adpcm-mono.wav` / `ima-adpcm-stereo.wav` — ffmpeg-encoded IMA/DVI-ADPCM
+(WAV tag 0x11). Our decode matches ffmpeg's own decode bit-exactly (golden
+tests in `formats/wav.rs`).
+
+## FLAC-in-Ogg vector
+
+`flac-in-ogg.ogg` — ffmpeg-encoded FLAC in an Ogg container. `open()` decodes it
+bit-exactly vs ffmpeg (golden test in `tests/decode.rs`).

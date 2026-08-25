@@ -8,6 +8,7 @@
 //! [`DsdMode`](crate::model::DsdMode) (see [`crate::dsd`]).
 
 use crate::decoder::{DecodeError, Decoder};
+use crate::demux::ogg::OggReader;
 use crate::formats::{flac::FlacDecoder, mp3::Mp3Decoder, wav::WavDecoder};
 use crate::io::BufSource;
 use crate::model::{Format, StreamInfo};
@@ -27,6 +28,8 @@ pub enum AnyDecoder<S> {
     Flac(FlacDecoder<S>),
     /// MPEG Layer III.
     Mp3(Mp3Decoder<S>),
+    /// FLAC in an Ogg container.
+    OggFlac(FlacDecoder<OggReader<S>>),
 }
 
 impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
@@ -35,6 +38,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::Wav(d) => d.stream_info(),
             AnyDecoder::Flac(d) => d.stream_info(),
             AnyDecoder::Mp3(d) => d.stream_info(),
+            AnyDecoder::OggFlac(d) => d.stream_info(),
         }
     }
 
@@ -43,6 +47,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::Wav(d) => d.decode_into(out),
             AnyDecoder::Flac(d) => d.decode_into(out),
             AnyDecoder::Mp3(d) => d.decode_into(out),
+            AnyDecoder::OggFlac(d) => d.decode_into(out),
         }
     }
 }
@@ -58,6 +63,7 @@ pub fn open<S: BufSource>(mut src: S) -> Result<AnyDecoder<S>, DecodeError> {
         Format::Wav => WavDecoder::new(src).map(AnyDecoder::Wav),
         Format::Flac => FlacDecoder::new(src).map(AnyDecoder::Flac),
         Format::Mp3 => Mp3Decoder::new(src).map(AnyDecoder::Mp3),
+        Format::OggFlac => FlacDecoder::new(OggReader::new(src)?).map(AnyDecoder::OggFlac),
         // DSD containers need an explicit DsdMode (native / DoP / decimate);
         // they are not routed through the PCM `open`.
         Format::Dsf | Format::Dff => Err(DecodeError::Unsupported),

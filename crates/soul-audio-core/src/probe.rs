@@ -32,6 +32,15 @@ fn identify(head: &[u8]) -> Option<Format> {
             b"fLaC" => return Some(Format::Flac),
             b"DSD " => return Some(Format::Dsf),
             b"FRM8" => return Some(Format::Dff),
+            // Ogg: only FLAC-in-Ogg is supported — its BOS page body begins with
+            // the `\x7FFLAC` mapping header (within the first page).
+            b"OggS" => {
+                let window = &head[..head.len().min(64)];
+                if window.windows(5).any(|w| w == b"\x7FFLAC") {
+                    return Some(Format::OggFlac);
+                }
+                return None; // Ogg Vorbis/Opus/etc. are not supported
+            }
             _ => {}
         }
     }

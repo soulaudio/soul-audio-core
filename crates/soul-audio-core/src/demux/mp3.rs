@@ -3,18 +3,41 @@
 //! packet. MP3 *decoding* (Huffman, IMDCT, the bit reservoir) is the codec's
 //! job, deferred.
 
+use embedded_io::SeekFrom;
+
 use super::{Demuxer, Packet, read_exact, skip};
 use crate::decoder::DecodeError;
-use crate::io::Source;
+use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
 
-/// Layer III bitrate (kbps) by index — MPEG-1 and MPEG-2/2.5.
-const BITRATE_V1: [u32; 16] = [
+/// Bitrate (kbps) by index, per MPEG version + layer (index 0 = free, 15 = bad).
+const BR_V1_L1: [u32; 16] = [
+    0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0,
+];
+const BR_V1_L2: [u32; 16] = [
+    0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0,
+];
+const BR_V1_L3: [u32; 16] = [
     0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
 ];
-const BITRATE_V2: [u32; 16] = [
+const BR_V2_L1: [u32; 16] = [
+    0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0,
+];
+const BR_V2_L23: [u32; 16] = [
     0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
 ];
+
+/// Bitrate (kbps) for `(mpeg1, layer ∈ {1,2,3})` at table index `idx`.
+fn bitrate_kbps(mpeg1: bool, layer: u8, idx: usize) -> u32 {
+    let table = match (mpeg1, layer) {
+        (true, 1) => &BR_V1_L1,
+        (true, 2) => &BR_V1_L2,
+        (true, _) => &BR_V1_L3,
+        (false, 1) => &BR_V2_L1,
+        (false, _) => &BR_V2_L23,
+    };
+    table[idx]
+}
 /// Sample rate by version bits (00=2.5, 01=reserved, 10=2, 11=1) and index.
 const SRATE: [[u32; 4]; 4] = [
     [11025, 12000, 8000, 0],  // MPEG-2.5
@@ -23,13 +46,43 @@ const SRATE: [[u32; 4]; 4] = [
     [44100, 48000, 32000, 0], // MPEG-1
 ];
 
+/// Largest MPEG frame buffered for the first-frame (Xing/VBRI) scan: MPEG-1
+/// Layer III at 320 kbps / 32 kHz is 1441 bytes.
+const FRAME_MAX: usize = 1600;
+
+/// A parsed Xing/Info/VBRI VBR header (present in the first frame of most
+/// encoder output). Gives duration and a seek index.
+#[derive(Clone, Copy)]
+struct VbrTag {
+    /// Total MPEG frames in the stream (excludes the tag frame itself).
+    total_frames: u64,
+    /// Total audio bytes covered by the TOC (0 if absent).
+    total_bytes: u64,
+    /// `true` for a LAME `Info` tag (constant bit rate) → O(1) exact seek.
+    cbr: bool,
+    /// Xing 100-entry table-of-contents (byte ≈ `TOC[i]/256 × total_bytes` at
+    /// time fraction `i%`), if present.
+    toc: Option<[u8; 100]>,
+}
+
 /// MP3 container parser over a byte [`Source`].
 pub struct Mp3Demuxer<S> {
     src: S,
     info: StreamInfo,
-    spf: u32,                 // samples per frame
-    pending: Option<[u8; 4]>, // first frame header, read while parsing StreamInfo
+    spf: u32, // samples per frame
     pos_samples: u64,
+    /// Absolute byte offset of the first frame's sync (after any ID3 tag).
+    audio_start: u64,
+    /// Constant CBR frame length in bytes (the first frame's length).
+    frame_len: usize,
+    /// VBR/duration header from the first frame, if any.
+    vbr: Option<VbrTag>,
+    /// The buffered first frame (header + body), served before any seek.
+    first_frame: [u8; FRAME_MAX],
+    first_len: usize,
+    first_pending: bool,
+    /// A header already read (by the forward-scan seek), to serve next.
+    pending: Option<[u8; 4]>,
 }
 
 impl<S: Source> Mp3Demuxer<S> {
@@ -40,6 +93,7 @@ impl<S: Source> Mp3Demuxer<S> {
     pub fn new(mut src: S) -> Result<Self, DecodeError> {
         let mut head = [0u8; 4];
         read_exact(&mut src, &mut head)?;
+        let mut pos: u64 = 4;
 
         if &head[0..3] == b"ID3" {
             let mut rest = [0u8; 6];
@@ -52,23 +106,14 @@ impl<S: Source> Mp3Demuxer<S> {
             let footer = if flags & 0x10 != 0 { 10 } else { 0 };
             skip(&mut src, u64::from(size) + footer)?;
             read_exact(&mut src, &mut head)?;
+            pos += 6 + u64::from(size) + footer + 4;
         }
 
-        // Resync to the first valid frame header.
-        loop {
+        // Resync to the first valid frame header. `pos` indexes the byte just
+        // past the 4-byte `head` window, so the header starts at `pos - 4`.
+        let f = loop {
             if let Some(f) = parse_header(&head) {
-                let spf = f.spf;
-                return Ok(Self {
-                    src,
-                    info: StreamInfo {
-                        sample_rate: f.sample_rate,
-                        channels: f.channels,
-                        format: SampleFormat::Int { bits: 16 },
-                    },
-                    spf,
-                    pending: Some(head),
-                    pos_samples: 0,
-                });
+                break f;
             }
             head[0] = head[1];
             head[1] = head[2];
@@ -76,7 +121,54 @@ impl<S: Source> Mp3Demuxer<S> {
             let mut b = [0u8; 1];
             read_exact(&mut src, &mut b)?; // EOF here → Malformed (no frame)
             head[3] = b[0];
+            pos += 1;
+        };
+
+        // Buffer the whole first frame (it carries any Xing/Info/VBRI tag), so
+        // it can be both parsed and served as the first packet.
+        let mut first_frame = [0u8; FRAME_MAX];
+        let frame_len = f.len.min(FRAME_MAX);
+        first_frame[0..4].copy_from_slice(&head);
+        let mut n = 4;
+        while n < frame_len {
+            match src.read(&mut first_frame[n..frame_len]) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(_) => return Err(DecodeError::Io),
+            }
         }
+        let vbr = parse_vbr_tag(&first_frame[..n], &f);
+
+        Ok(Self {
+            src,
+            info: StreamInfo {
+                sample_rate: f.sample_rate,
+                channels: f.channels,
+                format: SampleFormat::Int { bits: 16 },
+            },
+            spf: f.spf,
+            pos_samples: 0,
+            audio_start: pos - 4,
+            frame_len: f.len,
+            vbr,
+            first_frame,
+            first_len: n,
+            first_pending: true,
+            pending: None,
+        })
+    }
+
+    /// Samples per frame (1152 for MPEG-1 Layer III, 576 for MPEG-2/2.5).
+    #[must_use]
+    pub fn samples_per_frame(&self) -> u32 {
+        self.spf
+    }
+
+    /// Total samples per channel, if a Xing/Info/VBRI header declared the frame
+    /// count. `None` for a raw stream without a VBR header.
+    #[must_use]
+    pub fn total_samples(&self) -> Option<u64> {
+        self.vbr.map(|v| v.total_frames * u64::from(self.spf))
     }
 
     /// Read the next frame header (resyncing past garbage). `Ok(None)` at EOF.
@@ -101,6 +193,82 @@ impl<S: Source> Mp3Demuxer<S> {
     }
 }
 
+impl<S: SeekSource> Mp3Demuxer<S> {
+    /// Position the stream at frame `target` (0-based). With a Xing/VBRI header
+    /// this jumps in O(1) via the TOC (VBR) or the byte-per-frame ratio (CBR) —
+    /// **approximate** (MP3 seeking is inherently so: frames vary by a padding
+    /// byte and the decoder warms up after a seek), landing on the nearest frame
+    /// boundary near `target`. Without a header it **forward-scans** (exact but
+    /// O(frames)). Clamps to the frame count. Returns the requested frame's first
+    /// sample.
+    ///
+    /// # Errors
+    /// [`DecodeError::Io`] on a seek failure; propagates read errors.
+    pub(crate) fn seek_to_frame(&mut self, target: u64) -> Result<u64, DecodeError> {
+        self.first_pending = false;
+        self.pending = None;
+
+        if let Some(v) = self.vbr {
+            let target = target.min(v.total_frames);
+            if let Some(byte_off) = self.estimate_byte(target, &v) {
+                // Fast path: jump near the target; `next_header` resyncs to the
+                // next real frame boundary on the following `next_packet`.
+                self.src
+                    .seek(SeekFrom::Start(self.audio_start + byte_off))
+                    .map_err(|_| DecodeError::Io)?;
+                self.pos_samples = target * u64::from(self.spf);
+                return Ok(self.pos_samples);
+            }
+        }
+
+        // Exact fallback: forward-scan frame headers from the start.
+        self.src
+            .seek(SeekFrom::Start(self.audio_start))
+            .map_err(|_| DecodeError::Io)?;
+        let mut idx = 0u64;
+        loop {
+            let head = match self.next_header()? {
+                Some(h) => h,
+                None => {
+                    self.pos_samples = idx * u64::from(self.spf); // clamp to end
+                    return Ok(self.pos_samples);
+                }
+            };
+            if idx == target {
+                self.pending = Some(head); // src is past the 4 header bytes
+                self.pos_samples = idx * u64::from(self.spf);
+                return Ok(self.pos_samples);
+            }
+            let f = parse_header(&head).ok_or(DecodeError::Malformed)?;
+            skip(&mut self.src, (f.len - 4) as u64)?;
+            idx += 1;
+        }
+    }
+
+    /// Estimate the byte offset (from `audio_start`) of frame `target` using the
+    /// VBR header. `None` if the header lacks the fields needed.
+    fn estimate_byte(&self, target: u64, v: &VbrTag) -> Option<u64> {
+        if v.total_frames == 0 {
+            return None;
+        }
+        if v.cbr {
+            // Constant frame length (± a padding byte, corrected by resync).
+            return Some(target * self.frame_len as u64);
+        }
+        let toc = v.toc?;
+        if v.total_bytes == 0 {
+            return None;
+        }
+        // Xing TOC: byte ≈ TOC[i]/256 × total_bytes at time fraction i%.
+        let frac = (target as f64 / v.total_frames as f64) * 100.0;
+        let i = (frac as usize).min(99);
+        let lo = f64::from(toc[i]);
+        let hi = if i < 99 { f64::from(toc[i + 1]) } else { 256.0 };
+        let interp = lo + (hi - lo) * (frac - i as f64);
+        Some((interp / 256.0 * v.total_bytes as f64) as u64)
+    }
+}
+
 impl<S: Source> Demuxer for Mp3Demuxer<S> {
     fn stream_info(&self) -> StreamInfo {
         self.info
@@ -110,6 +278,23 @@ impl<S: Source> Demuxer for Mp3Demuxer<S> {
         &mut self,
         scratch: &'a mut [u8],
     ) -> Result<Option<Packet<'a>>, DecodeError> {
+        // Serve the buffered first frame (which carried the VBR tag) before any
+        // seek has repositioned the source.
+        if self.first_pending {
+            self.first_pending = false;
+            let len = self.first_len;
+            if len > scratch.len() {
+                return Err(DecodeError::Unsupported);
+            }
+            scratch[..len].copy_from_slice(&self.first_frame[..len]);
+            let ts = self.pos_samples;
+            self.pos_samples += u64::from(self.spf);
+            return Ok(Some(Packet {
+                ts,
+                dur: self.spf,
+                data: &scratch[..len],
+            }));
+        }
         let header = match self.pending.take() {
             Some(h) => h,
             None => match self.next_header()? {
@@ -148,6 +333,82 @@ struct Frame {
     len: usize,
 }
 
+/// Read a big-endian `u32` at `off`, or `None` if out of bounds.
+fn be32(b: &[u8], off: usize) -> Option<u32> {
+    let s = b.get(off..off + 4)?;
+    Some(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+/// Parse a Xing/`Info`/VBRI header from the first frame `frame` (a Layer III
+/// frame described by `f`). Returns duration + a seek index, or `None`.
+fn parse_vbr_tag(frame: &[u8], f: &Frame) -> Option<VbrTag> {
+    if frame.len() < 4 {
+        return None;
+    }
+    let mpeg1 = (frame[1] >> 3) & 0x3 == 3;
+    let crc = if frame[1] & 1 == 0 { 2 } else { 0 }; // protection bit 0 ⇒ CRC present
+    let mono = f.channels == 1;
+    let side_info = match (mpeg1, mono) {
+        (true, true) => 17,
+        (true, false) => 32,
+        (false, true) => 9,
+        (false, false) => 17,
+    };
+
+    // Xing (VBR) / Info (CBR) at 4 + CRC + side-info.
+    let xoff = 4 + crc + side_info;
+    if let Some(magic) = frame.get(xoff..xoff + 4) {
+        if magic == b"Xing" || magic == b"Info" {
+            let cbr = magic == b"Info";
+            let flags = be32(frame, xoff + 4)?;
+            let mut p = xoff + 8;
+            let mut total_frames = 0u64;
+            let mut total_bytes = 0u64;
+            let mut toc = None;
+            if flags & 1 != 0 {
+                total_frames = u64::from(be32(frame, p)?);
+                p += 4;
+            }
+            if flags & 2 != 0 {
+                total_bytes = u64::from(be32(frame, p)?);
+                p += 4;
+            }
+            if flags & 4 != 0 {
+                if let Some(t) = frame.get(p..p + 100) {
+                    let mut arr = [0u8; 100];
+                    arr.copy_from_slice(t);
+                    toc = Some(arr);
+                }
+            }
+            if total_frames > 0 {
+                return Some(VbrTag {
+                    total_frames,
+                    total_bytes,
+                    cbr,
+                    toc,
+                });
+            }
+        }
+    }
+
+    // VBRI (Fraunhofer): fixed 32 bytes after the 4-byte header (byte 36).
+    if frame.get(36..40) == Some(b"VBRI".as_slice()) {
+        let total_bytes = u64::from(be32(frame, 36 + 10)?);
+        let total_frames = u64::from(be32(frame, 36 + 14)?);
+        if total_frames > 0 {
+            // VBRI's TOC has a variable entry size; use the header for duration
+            // and clamping (seeks fall back to the exact forward-scan).
+            return Some(VbrTag {
+                total_frames,
+                total_bytes,
+                cbr: false,
+                toc: None,
+            });
+        }
+    }
+    None
+}
+
 /// Parse+validate a 4-byte MPEG Layer III frame header. `None` if not a valid L3
 /// frame (reserved fields, free/bad bitrate, non-Layer-III, etc.).
 fn parse_header(h: &[u8; 4]) -> Option<Frame> {
@@ -155,27 +416,43 @@ fn parse_header(h: &[u8; 4]) -> Option<Frame> {
         return None;
     }
     let version = (h[1] >> 3) & 0x3; // 0=2.5, 1=reserved, 2=v2, 3=v1
-    let layer = (h[1] >> 1) & 0x3; // 1 = Layer III
+    let layer_code = (h[1] >> 1) & 0x3; // 01=III, 10=II, 11=I, 00=reserved
     let br_idx = ((h[2] >> 4) & 0xF) as usize;
     let sr_idx = ((h[2] >> 2) & 0x3) as usize;
     let padding = u32::from((h[2] >> 1) & 0x1);
     let chan_mode = (h[3] >> 6) & 0x3;
 
-    if version == 1 || layer != 1 || br_idx == 0 || br_idx == 15 || sr_idx == 3 {
+    // `br_idx == 0` is free-format (constant but table-less frame length) — it is
+    // intentionally declined (rare; measuring the length would rework the
+    // streaming read model). `br_idx == 15` is the reserved "bad" index.
+    if version == 1 || layer_code == 0 || br_idx == 0 || br_idx == 15 || sr_idx == 3 {
         return None;
     }
+    let layer = match layer_code {
+        1 => 3, // Layer III
+        2 => 2, // Layer II
+        _ => 1, // Layer I
+    };
+    let mpeg1 = version == 3;
     let sample_rate = SRATE[version as usize][sr_idx];
     if sample_rate == 0 {
         return None;
     }
-    let bitrate_kbps = if version == 3 {
-        BITRATE_V1[br_idx]
-    } else {
-        BITRATE_V2[br_idx]
+    let bitrate = bitrate_kbps(mpeg1, layer, br_idx);
+    if bitrate == 0 {
+        return None;
+    }
+    let bits = bitrate * 1000;
+    // Samples per frame and byte length differ by layer/version.
+    let (spf, len) = match layer {
+        1 => (384, ((12 * bits / sample_rate + padding) * 4) as usize),
+        2 => (1152, (144 * bits / sample_rate + padding) as usize),
+        _ => {
+            let spf = if mpeg1 { 1152 } else { 576 };
+            let coef = spf / 8; // 144 (MPEG-1) or 72 (MPEG-2/2.5)
+            (spf, (coef * bits / sample_rate + padding) as usize)
+        }
     };
-    let spf = if version == 3 { 1152 } else { 576 };
-    let coef = spf / 8; // 144 (MPEG-1) or 72 (MPEG-2/2.5)
-    let len = (coef * bitrate_kbps * 1000 / sample_rate + padding) as usize;
     let channels = if chan_mode == 3 { 1 } else { 2 };
     Some(Frame {
         sample_rate,

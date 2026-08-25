@@ -3,16 +3,29 @@
 //! codec's job, deferred; this reader surfaces stream parameters and hands the
 //! raw post-metadata bytes to the (future) codec.
 
+use embedded_io::SeekFrom;
+
 use super::{Demuxer, Packet, read_exact, skip};
 use crate::decoder::DecodeError;
-use crate::io::Source;
+use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
+
+/// Maximum SEEKTABLE points retained (no-alloc). A typical encoder writes one
+/// point per ~1–10 s; beyond this cap the extra points are ignored (seeking
+/// stays correct, just coarser). Placeholders are never stored.
+const MAX_SEEK_POINTS: usize = 512;
 
 /// FLAC container parser over a byte [`Source`].
 pub struct FlacDemuxer<S> {
     src: S,
     info: StreamInfo,
     total_samples: Option<u64>,
+    /// Absolute byte offset of the first audio frame (after the metadata chain).
+    audio_start: u64,
+    /// SEEKTABLE points `(sample_number, byte_offset_from_audio_start)`, sorted,
+    /// placeholders excluded. `seek_count` are valid.
+    seek_points: [(u64, u64); MAX_SEEK_POINTS],
+    seek_count: usize,
 }
 
 impl<S: Source> FlacDemuxer<S> {
@@ -24,11 +37,13 @@ impl<S: Source> FlacDemuxer<S> {
     pub fn new(mut src: S) -> Result<Self, DecodeError> {
         let mut magic = [0u8; 4];
         read_exact(&mut src, &mut magic)?;
+        let mut pos: u64 = 4;
 
         // Tolerate a leading ID3v2 tag (illegal but common), then expect `fLaC`.
         if &magic[0..3] == b"ID3" {
-            skip_id3v2(&mut src, magic)?;
+            pos += skip_id3v2(&mut src, magic)?;
             read_exact(&mut src, &mut magic)?;
+            pos += 4;
         }
         if &magic == b"OggS" {
             return Err(DecodeError::Unsupported); // FLAC-in-Ogg is a different demuxer
@@ -38,25 +53,51 @@ impl<S: Source> FlacDemuxer<S> {
         }
 
         let mut stream_info: Option<(StreamInfo, Option<u64>)> = None;
+        let mut seek_points = [(0u64, 0u64); MAX_SEEK_POINTS];
+        let mut seek_count = 0usize;
         loop {
             let mut h = [0u8; 4];
             read_exact(&mut src, &mut h)?;
+            pos += 4;
             let last = h[0] & 0x80 != 0;
             let btype = h[0] & 0x7F;
             let length = u32::from(h[1]) << 16 | u32::from(h[2]) << 8 | u32::from(h[3]);
 
-            if btype == 0 {
-                // STREAMINFO (34 bytes).
-                if length < 34 {
-                    return Err(DecodeError::Malformed);
+            match btype {
+                0 => {
+                    // STREAMINFO (34 bytes).
+                    if length < 34 {
+                        return Err(DecodeError::Malformed);
+                    }
+                    let mut si = [0u8; 34];
+                    read_exact(&mut src, &mut si)?;
+                    skip(&mut src, u64::from(length) - 34)?;
+                    stream_info = Some(parse_streaminfo(&si)?);
                 }
-                let mut si = [0u8; 34];
-                read_exact(&mut src, &mut si)?;
-                skip(&mut src, u64::from(length) - 34)?;
-                stream_info = Some(parse_streaminfo(&si)?);
-            } else {
-                skip(&mut src, u64::from(length))?;
+                3 => {
+                    // SEEKTABLE: length/18 points of 18 bytes each.
+                    let points = length as usize / 18;
+                    let mut pt = [0u8; 18];
+                    for _ in 0..points {
+                        read_exact(&mut src, &mut pt)?;
+                        let sample = u64::from_be_bytes([
+                            pt[0], pt[1], pt[2], pt[3], pt[4], pt[5], pt[6], pt[7],
+                        ]);
+                        // 0xFFFF..FF = placeholder point; ignore.
+                        if sample != u64::MAX && seek_count < MAX_SEEK_POINTS {
+                            let byte_off = u64::from_be_bytes([
+                                pt[8], pt[9], pt[10], pt[11], pt[12], pt[13], pt[14], pt[15],
+                            ]);
+                            seek_points[seek_count] = (sample, byte_off);
+                            seek_count += 1;
+                        }
+                    }
+                    // Skip any trailing bytes not part of a whole point.
+                    skip(&mut src, u64::from(length) - (points as u64) * 18)?;
+                }
+                _ => skip(&mut src, u64::from(length))?,
             }
+            pos += u64::from(length);
             if last {
                 break;
             }
@@ -67,6 +108,9 @@ impl<S: Source> FlacDemuxer<S> {
             src,
             info,
             total_samples,
+            audio_start: pos,
+            seek_points,
+            seek_count,
         })
     }
 
@@ -83,6 +127,36 @@ impl<S: Source> FlacDemuxer<S> {
     /// not delimited, so the codec feeds these bytes to its own bit reader.
     pub(crate) fn read_audio(&mut self, out: &mut [u8]) -> Result<usize, DecodeError> {
         self.src.read(out).map_err(|_| DecodeError::Io)
+    }
+
+    /// The best SEEKTABLE point at or before per-channel `sample`:
+    /// `(base_sample, byte_offset_from_audio_start)`. Falls back to the stream
+    /// start `(0, 0)` when there is no earlier point. Points are ascending, so a
+    /// binary search finds the greatest `sample_number <= sample`.
+    pub(crate) fn seek_point_before(&self, sample: u64) -> (u64, u64) {
+        let pts = &self.seek_points[..self.seek_count];
+        let mut best = (0u64, 0u64);
+        // partition_point: number of points with sample_number <= sample.
+        let idx = pts.partition_point(|&(s, _)| s <= sample);
+        if idx > 0 {
+            best = pts[idx - 1];
+        }
+        best
+    }
+}
+
+impl<S: SeekSource> FlacDemuxer<S> {
+    /// Reposition the source to `byte_offset` bytes past the first audio frame
+    /// (a SEEKTABLE byte offset). Gated on [`SeekSource`], so a streaming source
+    /// cannot name it.
+    ///
+    /// # Errors
+    /// [`DecodeError::Io`] if the underlying seek fails.
+    pub(crate) fn seek_audio(&mut self, byte_offset: u64) -> Result<(), DecodeError> {
+        self.src
+            .seek(SeekFrom::Start(self.audio_start + byte_offset))
+            .map_err(|_| DecodeError::Io)?;
+        Ok(())
     }
 }
 
@@ -117,7 +191,9 @@ impl<S: Source> Demuxer for FlacDemuxer<S> {
 }
 
 /// Skip a leading ID3v2 tag. `head` holds the first 4 bytes (`"ID3"` + major).
-fn skip_id3v2<S: Source>(src: &mut S, _head: [u8; 4]) -> Result<(), DecodeError> {
+/// Returns the number of bytes consumed **after** the initial 4 (i.e. the 6
+/// remaining header bytes + the tag body + any footer).
+fn skip_id3v2<S: Source>(src: &mut S, _head: [u8; 4]) -> Result<u64, DecodeError> {
     // We've read 4 of the 10-byte header; read the remaining 6.
     let mut rest = [0u8; 6];
     read_exact(src, &mut rest)?;
@@ -128,7 +204,8 @@ fn skip_id3v2<S: Source>(src: &mut S, _head: [u8; 4]) -> Result<(), DecodeError>
         | (u32::from(rest[4]) << 7)
         | u32::from(rest[5]);
     let footer = if flags & 0x10 != 0 { 10 } else { 0 };
-    skip(src, u64::from(size) + footer)
+    skip(src, u64::from(size) + footer)?;
+    Ok(6 + u64::from(size) + footer)
 }
 
 /// Parse a 34-byte STREAMINFO body.

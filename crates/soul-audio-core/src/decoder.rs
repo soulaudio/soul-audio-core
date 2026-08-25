@@ -51,6 +51,18 @@ pub trait DsdDecoder {
     fn read_dsd(&mut self, out: &mut [u8]) -> Result<usize, DecodeError>;
 }
 
+/// Convert a time in seconds to a sample/frame index at `rate` samples/second,
+/// rounding to nearest and clamping negatives to 0. Shared by the decoders'
+/// `seek_to_time` convenience methods — the `f64` lives only at this boundary,
+/// keeping the seek internals integer. `no_std`-safe (no `libm`).
+#[must_use]
+pub(crate) fn secs_to_samples(secs: f64, rate: u32) -> u64 {
+    if secs <= 0.0 {
+        return 0;
+    }
+    (secs * f64::from(rate) + 0.5) as u64
+}
+
 /// Random access for a [`DsdDecoder`]. Implemented only for seekable sources
 /// (gated on [`SeekSource`](crate::io::SeekSource) at the concrete type), so a
 /// streaming DSD source cannot name it.

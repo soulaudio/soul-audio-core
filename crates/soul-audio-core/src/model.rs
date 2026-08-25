@@ -101,6 +101,8 @@ pub enum Format {
     Dsf,
     /// DFF / DSDIFF.
     Dff,
+    /// FLAC in an Ogg container.
+    OggFlac,
 }
 
 /// Explicit DSD output mode chosen by the caller. Selects which path a native

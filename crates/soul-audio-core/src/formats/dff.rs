@@ -595,4 +595,55 @@ mod tests {
             Some(DecodeError::Unsupported)
         );
     }
+
+    /// A real DST-compressed DSDIFF slice (first frames of the FFmpeg FATE
+    /// sample `dst-64fs44-2ch.dff`, DSD64 stereo). Our full-file decode was
+    /// cross-checked **bit-exact against FFmpeg's own DST decoder** (raw DSD)
+    /// and against the FFmpeg binary end-to-end (PCM); this embeds a slice so the
+    /// external match is a permanent regression gate.
+    const DST_SLICE_DFF: &[u8] = include_bytes!("../../testdata/dst-64fs44-2ch.slice.dff");
+    const DST_SLICE_DSD_LEN: usize = 18816;
+    const DST_SLICE_DSD_HASH: u64 = 0x729d_89e7_b62e_aa6f;
+    const DST_SLICE_DSD_FIRST: [u8; 16] = [
+        0x96, 0x96, 0x69, 0x69, 0xa5, 0xa5, 0xaa, 0xaa, 0x6a, 0x6a, 0xa9, 0xa9, 0xcc, 0xcc, 0xcd,
+        0xcd,
+    ];
+
+    /// FNV-1a/64 over the decoded DSD bytes.
+    fn fnv_bytes(data: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in data {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        h
+    }
+
+    #[test]
+    fn dst_real_fate_slice_matches_ffmpeg() {
+        let mut d = DffDecoder::new(SliceSource::new(DST_SLICE_DFF)).unwrap();
+        assert_eq!(d.stream_info().channels, 2);
+        assert_eq!(
+            d.stream_info().format,
+            SampleFormat::Dsd {
+                rate: DsdRate::Dsd64
+            }
+        );
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = d.read_dsd(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(out.len(), DST_SLICE_DSD_LEN, "decoded DSD length");
+        assert_eq!(&out[..16], &DST_SLICE_DSD_FIRST, "leading DSD bytes");
+        assert_eq!(
+            fnv_bytes(&out),
+            DST_SLICE_DSD_HASH,
+            "DSD checksum vs FFmpeg"
+        );
+    }
 }

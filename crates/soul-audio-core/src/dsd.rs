@@ -13,7 +13,7 @@
 use crate::decoder::{DecodeError, Decoder, DsdDecoder};
 use crate::model::{SampleFormat, StreamInfo};
 
-use crate::decoder::DsdSeek;
+use crate::decoder::{DsdSeek, secs_to_samples};
 
 /// The two DoP marker bytes. They alternate **once per DoP frame** (not per
 /// channel) so a DoP DAC recognises the stream; every channel of a frame carries
@@ -82,6 +82,14 @@ impl<D: DsdDecoder + DsdSeek> DopAdapter<D> {
         self.ch_pos = 0; // drop any partial frame
         Ok(self.frame_index)
     }
+
+    /// Seek to `secs` seconds (convenience over [`Self::seek_to_frame`]).
+    ///
+    /// # Errors
+    /// Propagates the inner seek error.
+    pub fn seek_to_time(&mut self, secs: f64) -> Result<u64, DecodeError> {
+        self.seek_to_frame(secs_to_samples(secs, self.stream_info().sample_rate))
+    }
 }
 
 impl<D: DsdDecoder> Decoder for DopAdapter<D> {
@@ -131,9 +139,11 @@ impl<D: DsdDecoder> Decoder for DopAdapter<D> {
 /// MHz; DSD512 → 2.8224 MHz.
 const DECIMATION: u32 = 8;
 
-/// FIR length in taps (a multiple of 8): a 64-tap symmetric Blackman-windowed
-/// sinc low-pass with cutoff at the output Nyquist (`f_in / 16`).
-const TAPS: usize = 64;
+/// FIR length in taps (a multiple of 8): a 128-tap symmetric Kaiser-windowed
+/// sinc low-pass (β ≈ 8.6, ~90 dB stopband) with cutoff at the output Nyquist
+/// (`f_in / 16`). Longer + steeper than the original 64-tap Blackman design, for
+/// better anti-alias rejection of the shaped DSD noise.
+const TAPS: usize = 128;
 
 /// Byte-groups spanning the filter — one history byte (8 bits) per group.
 const GROUPS: usize = TAPS / 8;
@@ -148,15 +158,20 @@ const PCM_MIN: i32 = -(1 << 23);
 /// FIR taps, DC-normalised so the integer coefficients sum to exactly
 /// [`PCM_MAX`]: a constant all-ones DSD input (every bit → `+1`) maps to
 /// `+PCM_MAX`, all-zeros (every bit → `-1`) to `-PCM_MAX`. Symmetric (linear
-/// phase). Generated from a Blackman-windowed sinc (cutoff `f_in/16`) rounded to
-/// i32; the Nyquist (alternating-bit) response is ≈ 0, rejecting the DSD noise.
+/// phase). Generated from a Kaiser-windowed sinc (cutoff `f_in/16`, β ≈ 8.6)
+/// rounded to i32; the Nyquist (alternating-bit) response is ≈ 0, rejecting the
+/// DSD noise.
 const COEFFS: [i32; TAPS] = [
-    0, -44, -273, -764, -1439, -2035, -2100, -1081, 1527, 5962, 11956, 18542, 23990, 25951, 21863,
-    9580, -11845, -41385, -75490, -107960, -130378, -133165, -107147, -45391, 55026, 191699,
-    356375, 535444, 711441, 865394, 979612, 1040438, 1040439, 979612, 865394, 711441, 535444,
-    356375, 191699, 55026, -45391, -107147, -133165, -130378, -107960, -75490, -41385, -11845,
-    9580, 21863, 25951, 23990, 18542, 11956, 5962, 1527, -1081, -2100, -2035, -1439, -764, -273,
-    -44, 0,
+    -11, -53, -121, -207, -287, -328, -288, -130, 165, 588, 1087, 1567, 1898, 1932, 1539, 640,
+    -753, -2508, -4367, -5964, -6873, -6687, -5106, -2042, 2316, 7459, 12585, 16685, 18703, 17726,
+    13210, 5162, -5732, -18090, -29950, -39016, -43024, -40167, -29520, -11390, 12505, 39070,
+    64124, 82934, 90935, 84557, 62011, 23925, -26325, -82650, -136729, -178878, -199249, -189187,
+    -142580, -56986, 65637, 218739, 391588, 570261, 739107, 882515, 986747, 1041584, 1041585,
+    986747, 882515, 739107, 570261, 391588, 218739, 65637, -56986, -142580, -189187, -199249,
+    -178878, -136729, -82650, -26325, 23925, 62011, 84557, 90935, 82934, 64124, 39070, 12505,
+    -11390, -29520, -40167, -43024, -39016, -29950, -18090, -5732, 5162, 13210, 17726, 18703,
+    16685, 12585, 7459, 2316, -2042, -5106, -6687, -6873, -5964, -4367, -2508, -753, 640, 1539,
+    1932, 1898, 1567, 1087, 588, 165, -130, -288, -328, -287, -207, -121, -53, -11,
 ];
 
 /// Per-(group, byte) partial-sum table, à la Gesemann `dsd2pcm` / FFmpeg
@@ -197,7 +212,7 @@ const fn build_table() -> [[i32; 256]; GROUPS] {
 /// Wraps a [`DsdDecoder`] and presents it as a PCM [`Decoder`] by decimating the
 /// 1-bit stream to multi-bit PCM (plays on any DAC).
 ///
-/// Runs a 64-tap table-driven low-pass FIR per channel and decimates 8:1 (one
+/// Runs a 128-tap table-driven low-pass FIR per channel and decimates 8:1 (one
 /// 24-bit PCM sample per input byte), de-interleaving the clustered-frame byte
 /// stream into per-channel filters and re-interleaving the PCM output (`L,R,…`).
 /// Supports up to [`MAX_DECIMATE_CHANNELS`] channels; more are rejected as
@@ -240,6 +255,29 @@ impl<D: DsdDecoder> DecimateAdapter<D> {
             filled += k;
         }
         Ok(filled == need)
+    }
+}
+
+impl<D: DsdDecoder + DsdSeek> DecimateAdapter<D> {
+    /// Seek to output PCM `frame` (random access). One PCM frame = [`DECIMATION`]
+    /// DSD samples per channel; the FIR history is reset (so the first output
+    /// samples after a seek are a short filter-warm-up transient).
+    ///
+    /// # Errors
+    /// Propagates the inner [`DsdSeek::seek_to_sample`] error.
+    pub fn seek_to_frame(&mut self, frame: u64) -> Result<u64, DecodeError> {
+        let landed = self.inner.seek_to_sample(frame * u64::from(DECIMATION))?;
+        self.hist = [[0u8; GROUPS]; MAX_DECIMATE_CHANNELS];
+        self.ring_pos = GROUPS - 1;
+        Ok(landed / u64::from(DECIMATION))
+    }
+
+    /// Seek to `secs` seconds (convenience over [`Self::seek_to_frame`]).
+    ///
+    /// # Errors
+    /// Propagates the inner seek error.
+    pub fn seek_to_time(&mut self, secs: f64) -> Result<u64, DecodeError> {
+        self.seek_to_frame(secs_to_samples(secs, self.stream_info().sample_rate))
     }
 }
 
@@ -512,5 +550,24 @@ mod tests {
             dec.decode_into(&mut out).unwrap_err(),
             DecodeError::Unsupported
         );
+    }
+
+    #[test]
+    fn dop_and_decimate_seek_to_time_convert_seconds() {
+        // DoP frame rate (DSD64) = 2_822_400 / 16 = 176_400.
+        let fake = FakeDsd {
+            bytes: &[0u8; 8],
+            pos: 0,
+            rate: DsdRate::Dsd64,
+            channels: 2,
+        };
+        let mut dop = DopAdapter::new(fake);
+        // 0.0001 s × 176_400 = 17.64 → DoP frame 18.
+        assert_eq!(dop.seek_to_time(0.0001).unwrap(), 18);
+
+        // Decimated rate (DSD64, 8:1) = 2_822_400 / 8 = 352_800.
+        let mut dec = decimate(&[0u8; 8], 2, DsdRate::Dsd64);
+        // 0.0001 s × 352_800 = 35.28 → PCM frame 35.
+        assert_eq!(dec.seek_to_time(0.0001).unwrap(), 35);
     }
 }

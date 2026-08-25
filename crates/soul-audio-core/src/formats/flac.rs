@@ -10,27 +10,30 @@
 //! depth widened into `i32` (a 16-bit value stays in `[-32768, 32767]`);
 //! [`StreamInfo::format`] carries the depth. No rescaling.
 //!
-//! Frame and header CRCs are read/skipped (consumed for correct positioning) but
-//! not validated — validation is a bonus left for a follow-up.
+//! Frame CRCs are consumed for positioning and, when
+//! [`set_validate_crc`](FlacDecoder::set_validate_crc) is enabled, verified
+//! (header CRC-8 + frame CRC-16) — a mismatch fails with `Malformed`. Off by
+//! default (lenient, matching most players).
 
-use crate::decoder::{DecodeError, Decoder};
+use crate::decoder::{DecodeError, Decoder, secs_to_samples};
 use crate::demux::{Demuxer, FlacDemuxer};
-use crate::io::Source;
+use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
 
 /// Maximum decoded block size (samples per channel) the inline buffer supports.
 /// 4608 covers every standard-block-size encoder (the subset limit at ≤48 kHz);
 /// larger blocks are declined with [`DecodeError::Unsupported`].
 const MAX_BLOCK: usize = 4608;
-/// Maximum channels the inline decode buffer supports. Mono/stereo is the whole
-/// of this playback core's remit (it mirrors the DSD readers'
-/// [`MAX_DSD_CHANNELS`](crate::formats::MAX_DSD_CHANNELS)); multichannel (>2)
-/// FLAC is declined with [`DecodeError::Unsupported`]. The full `channels ×
-/// MAX_BLOCK` plane buffer must persist between `decode_into` calls (stereo
-/// decorrelation needs both channels' whole planes before any sample is
-/// emittable), so this bound also caps [`AnyDecoder`](crate::dispatch::AnyDecoder)'s
-/// footprint.
-const MAX_CHANNELS: usize = 2;
+/// Maximum channels the inline decode buffer supports (up to 7.1 surround).
+/// FLAC's inter-channel decorrelation is stereo-only, so >2 channels are always
+/// coded independently and decode with no cross-channel dependency.
+///
+/// **RAM cost:** the `channels × MAX_BLOCK × 4`-byte plane buffer must persist
+/// between `decode_into` calls, and it sizes both `FlacDecoder` and — via the
+/// `Wav`/`Flac`/`Mp3` enum — [`AnyDecoder`](crate::dispatch::AnyDecoder). At the
+/// default it is `8 × 4608 × 4 ≈ 147 KiB`; lower this const to trade channel
+/// support for footprint on RAM-constrained targets.
+const MAX_CHANNELS: usize = 8;
 /// Maximum predictor order (LPC tops out at 32).
 const MAX_ORDER: usize = 32;
 /// Raw-byte refill buffer size for the bit reader.
@@ -63,6 +66,40 @@ pub struct FlacDecoder<S> {
     block_total: usize,
     /// Interleaved emit cursor within the current block.
     emit_i: usize,
+
+    // --- optional per-frame CRC verification ---
+    /// When set, mismatched header CRC-8 / frame CRC-16 fail with `Malformed`.
+    validate_crc: bool,
+    /// Running CRC-8 over the current frame header (poly 0x07).
+    crc8: u8,
+    /// Running CRC-16 over the current frame (poly 0x8005).
+    crc16: u16,
+}
+
+/// FLAC frame-header CRC-8 (poly `x⁸+x²+x+1` = 0x07, init 0, MSB-first).
+fn crc8_update(mut crc: u8, byte: u8) -> u8 {
+    crc ^= byte;
+    for _ in 0..8 {
+        crc = if crc & 0x80 != 0 {
+            (crc << 1) ^ 0x07
+        } else {
+            crc << 1
+        };
+    }
+    crc
+}
+
+/// FLAC frame CRC-16 (poly `x¹⁶+x¹⁵+x²+1` = 0x8005, init 0, MSB-first).
+fn crc16_update(mut crc: u16, byte: u8) -> u16 {
+    crc ^= u16::from(byte) << 8;
+    for _ in 0..8 {
+        crc = if crc & 0x8000 != 0 {
+            (crc << 1) ^ 0x8005
+        } else {
+            crc << 1
+        };
+    }
+    crc
 }
 
 /// The fields of a parsed frame header the codec actually needs.
@@ -106,7 +143,18 @@ impl<S: Source> FlacDecoder<S> {
             planes: [[0; MAX_BLOCK]; MAX_CHANNELS],
             block_total: 0,
             emit_i: 0,
+            validate_crc: false,
+            crc8: 0,
+            crc16: 0,
         })
+    }
+
+    /// Enable per-frame CRC verification. When on, a header CRC-8 or frame
+    /// CRC-16 mismatch fails decoding with [`DecodeError::Malformed`] (corruption
+    /// detection). Off by default — lenient decoding plays through minor errors,
+    /// matching most players.
+    pub fn set_validate_crc(&mut self, on: bool) {
+        self.validate_crc = on;
     }
 
     // -- byte layer -----------------------------------------------------------
@@ -123,6 +171,13 @@ impl<S: Source> FlacDecoder<S> {
         }
         let b = self.bytes[self.byte_cur];
         self.byte_cur += 1;
+        if self.validate_crc {
+            // Read-ahead is < 1 byte (acc holds ≤ 7 leftover bits), so every
+            // pulled byte is frame content up to the CRC fields, which are read
+            // (and snapshotted-before) explicitly.
+            self.crc8 = crc8_update(self.crc8, b);
+            self.crc16 = crc16_update(self.crc16, b);
+        }
         Ok(b)
     }
 
@@ -227,6 +282,9 @@ impl<S: Source> FlacDecoder<S> {
             return Ok(false);
         }
 
+        // The frame is byte-aligned; start CRC accumulation from its first byte.
+        self.crc8 = 0;
+        self.crc16 = 0;
         let h = self.read_frame_header()?;
         if h.block == 0 || h.block > MAX_BLOCK {
             return Err(DecodeError::Unsupported);
@@ -254,7 +312,11 @@ impl<S: Source> FlacDecoder<S> {
         }
 
         self.align_to_byte();
-        let _crc16 = self.read_bits(16)?; // frame footer CRC-16 (read/skip)
+        let computed16 = self.crc16; // CRC-16 covers the whole frame up to here
+        let stored16 = self.read_bits(16)? as u16;
+        if self.validate_crc && computed16 != stored16 {
+            return Err(DecodeError::Malformed);
+        }
 
         self.apply_decorrelation(h.ca, h.block);
 
@@ -318,7 +380,11 @@ impl<S: Source> FlacDecoder<S> {
             _ => return Err(DecodeError::Unsupported), // 3 = reserved
         };
 
-        let _crc8 = self.read_bits(8)?; // header CRC-8 (read/skip)
+        let computed8 = self.crc8; // CRC-8 covers the header up to (not incl.) here
+        let stored8 = self.read_bits(8)? as u8;
+        if self.validate_crc && computed8 != stored8 {
+            return Err(DecodeError::Malformed);
+        }
 
         Ok(FrameHeader {
             block,
@@ -547,6 +613,69 @@ impl<S: Source> FlacDecoder<S> {
             }
             _ => {} // independent channels: nothing to undo
         }
+    }
+}
+
+impl<S: Source> FlacDecoder<S> {
+    /// Current playback position, in per-channel samples from the start (the
+    /// index of the next sample `decode_into` will return).
+    #[must_use]
+    pub fn position(&self) -> u64 {
+        let ch = self.channels as u64;
+        let unemitted = ((self.block_total - self.emit_i) as u64) / ch;
+        self.decoded_per_ch - unemitted
+    }
+}
+
+impl<S: SeekSource> FlacDecoder<S> {
+    /// Seek to per-channel `sample` (sample-accurate). Uses the SEEKTABLE to jump
+    /// near, then decodes forward to the exact sample. Returns the sample landed
+    /// on (clamped to the stream length when known).
+    ///
+    /// # Errors
+    /// [`DecodeError::Io`] on a source-seek failure; propagates decode errors
+    /// from the forward pass.
+    pub fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        let target = self.total_samples.map_or(sample, |t| sample.min(t));
+
+        // Jump to the best SEEKTABLE point at or before the target (or the start).
+        let (base_sample, byte_off) = self.demux.seek_point_before(target);
+        self.demux.seek_audio(byte_off)?;
+
+        // Full reset — drop every byte/bit/plane of the pre-seek position so no
+        // stale sample can leak into the post-seek stream.
+        self.byte_len = 0;
+        self.byte_cur = 0;
+        self.acc = 0;
+        self.acc_bits = 0;
+        self.block_total = 0;
+        self.emit_i = 0;
+        self.decoded_per_ch = base_sample;
+
+        // Decode-and-discard whole frames until the frame containing `target`.
+        loop {
+            let frame_start = self.decoded_per_ch;
+            if !self.decode_next_frame()? {
+                break; // reached end of stream (target == total): next read is 0
+            }
+            if target < self.decoded_per_ch {
+                // This frame covers `target`; position the emit cursor at it.
+                self.emit_i = ((target - frame_start) as usize) * self.channels as usize;
+                break;
+            }
+            // Otherwise discard the whole frame and continue.
+            self.emit_i = self.block_total;
+        }
+        Ok(target)
+    }
+
+    /// Seek to `secs` seconds (convenience over [`Self::seek_to`]). Returns the
+    /// per-channel sample landed on.
+    ///
+    /// # Errors
+    /// Propagates [`Self::seek_to`] errors.
+    pub fn seek_to_time(&mut self, secs: f64) -> Result<u64, DecodeError> {
+        self.seek_to(secs_to_samples(secs, self.demux.stream_info().sample_rate))
     }
 }
 
@@ -1237,5 +1366,288 @@ mod tests {
         let n = dec.decode_into(&mut out).unwrap();
         assert_eq!(n, block);
         assert!(out[..n].iter().all(|&s| s == k));
+    }
+
+    // -- seeking --------------------------------------------------------------
+
+    /// Encode one VERBATIM mono frame carrying `samples` (16-bit).
+    fn verbatim_frame(samples: &[i32]) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        write_header(&mut bw, samples.len(), 0);
+        bw.bits(0, 1); // subframe leading 0
+        bw.bits(1, 6); // VERBATIM
+        bw.bits(0, 1); // no wasted bits
+        for &s in samples {
+            bw.signed(s, 16);
+        }
+        write_footer(&mut bw);
+        bw.into_bytes()
+    }
+
+    /// A multi-frame mono FLAC of a counting ramp (`sample[i] == i`), split into
+    /// `block`-sized VERBATIM frames, optionally carrying a SEEKTABLE with one
+    /// point per frame. Returns `(bytes, ramp)`.
+    fn ramp_flac(total: usize, block: usize, with_seektable: bool) -> (Vec<u8>, Vec<i32>) {
+        let ramp: Vec<i32> = (0..total as i32).collect();
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        let mut points: Vec<(u64, u64, u16)> = Vec::new(); // (sample, byte_off, count)
+        let mut off = 0u64;
+        let mut s = 0usize;
+        while s < total {
+            let n = block.min(total - s);
+            let fr = verbatim_frame(&ramp[s..s + n]);
+            points.push((s as u64, off, n as u16));
+            off += fr.len() as u64;
+            frames.push(fr);
+            s += n;
+        }
+
+        let mut v = Vec::new();
+        v.extend_from_slice(b"fLaC");
+        v.push(if with_seektable { 0x00 } else { 0x80 }); // STREAMINFO (last iff no seektable)
+        v.extend_from_slice(&[0, 0, 34]);
+        v.extend_from_slice(&streaminfo(44_100, 1, 16, total as u64));
+        if with_seektable {
+            let body = points.len() * 18;
+            v.push(0x83); // last + SEEKTABLE (type 3)
+            v.extend_from_slice(&[(body >> 16) as u8, (body >> 8) as u8, body as u8]);
+            for (sn, bo, fs) in &points {
+                v.extend_from_slice(&sn.to_be_bytes());
+                v.extend_from_slice(&bo.to_be_bytes());
+                v.extend_from_slice(&fs.to_be_bytes());
+            }
+        }
+        for fr in &frames {
+            v.extend_from_slice(fr);
+        }
+        (v, ramp)
+    }
+
+    fn read_n(dec: &mut FlacDecoder<SliceSource<'_>>, n: usize) -> Vec<i32> {
+        let mut out = vec![0i32; n];
+        let got = dec.decode_into(&mut out).unwrap();
+        out.truncate(got);
+        out
+    }
+
+    fn drain(dec: &mut FlacDecoder<SliceSource<'_>>) -> Vec<i32> {
+        let mut all = Vec::new();
+        let mut buf = [0i32; 16];
+        loop {
+            let n = dec.decode_into(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            all.extend_from_slice(&buf[..n]);
+        }
+        all
+    }
+
+    #[test]
+    fn seek_round_trip_with_seektable() {
+        let (bytes, ramp) = ramp_flac(40, 8, true); // 5 frames
+        for &n in &[0u64, 1, 8, 15, 24, 39] {
+            let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+            assert_eq!(dec.seek_to(n).unwrap(), n);
+            let got = read_n(&mut dec, 6);
+            assert_eq!(
+                got,
+                &ramp[n as usize..(n as usize + got.len())],
+                "seek({n})"
+            );
+        }
+    }
+
+    #[test]
+    fn seek_round_trip_without_seektable() {
+        // No SEEKTABLE → decode-forward fallback from the stream start.
+        let (bytes, ramp) = ramp_flac(40, 8, false);
+        for &n in &[0u64, 3, 8, 20, 39] {
+            let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+            assert_eq!(dec.seek_to(n).unwrap(), n);
+            let got = read_n(&mut dec, 5);
+            assert_eq!(
+                got,
+                &ramp[n as usize..(n as usize + got.len())],
+                "seek({n})"
+            );
+        }
+    }
+
+    #[test]
+    fn seek_exhaustive_per_sample() {
+        let (bytes, ramp) = ramp_flac(24, 4, true);
+        for n in 0..24u64 {
+            let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+            assert_eq!(dec.seek_to(n).unwrap(), n);
+            assert_eq!(read_n(&mut dec, 1), &ramp[n as usize..n as usize + 1]);
+        }
+    }
+
+    #[test]
+    fn seek_to_zero_after_partial_matches_fresh() {
+        let (bytes, ramp) = ramp_flac(40, 8, true);
+        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let _ = read_n(&mut dec, 13); // partial decode leaves internal state
+        assert_eq!(dec.seek_to(0).unwrap(), 0);
+        assert_eq!(drain(&mut dec), ramp); // no stale samples after seek(0)
+    }
+
+    #[test]
+    fn seek_backward_and_repeated() {
+        let (bytes, ramp) = ramp_flac(48, 8, true);
+        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let _ = read_n(&mut dec, 30);
+        assert_eq!(dec.seek_to(4).unwrap(), 4); // backward
+        assert_eq!(read_n(&mut dec, 3), &ramp[4..7]);
+        dec.seek_to(40).unwrap(); // repeated seeks, only the last counts
+        dec.seek_to(12).unwrap();
+        assert_eq!(dec.seek_to(20).unwrap(), 20);
+        assert_eq!(read_n(&mut dec, 2), &ramp[20..22]);
+    }
+
+    #[test]
+    fn seek_beyond_end_reads_zero() {
+        let (bytes, _) = ramp_flac(40, 8, true);
+        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        assert_eq!(dec.seek_to(40).unwrap(), 40); // exact end → clamp
+        assert_eq!(dec.position(), 40);
+        assert_eq!(dec.decode_into(&mut [0i32; 8]).unwrap(), 0);
+        assert_eq!(dec.seek_to(10_000).unwrap(), 40); // far beyond → clamp
+        assert_eq!(dec.decode_into(&mut [0i32; 8]).unwrap(), 0);
+    }
+
+    #[test]
+    fn seek_to_time_converts_seconds() {
+        let (bytes, ramp) = ramp_flac(40, 8, true); // 44_100 Hz
+        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        // 0.0004 s × 44_100 = 17.64 → sample 18.
+        assert_eq!(dec.seek_to_time(0.0004).unwrap(), 18);
+        assert_eq!(read_n(&mut dec, 1), &ramp[18..19]);
+    }
+
+    #[test]
+    fn position_tracks_seek_and_reads() {
+        let (bytes, _) = ramp_flac(40, 8, true);
+        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        assert_eq!(dec.position(), 0);
+        dec.seek_to(17).unwrap();
+        assert_eq!(dec.position(), 17); // before any read
+        let _ = read_n(&mut dec, 5);
+        assert_eq!(dec.position(), 22); // after reading 5
+    }
+
+    // -- CRC validation -------------------------------------------------------
+
+    /// A VERBATIM mono frame with correct CRC-8 (header) and CRC-16 (frame).
+    fn frame_with_valid_crc(samples: &[i16]) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        write_header(&mut bw, samples.len(), 0);
+        bw.bits(0, 1);
+        bw.bits(1, 6); // VERBATIM
+        bw.bits(0, 1);
+        for &s in samples {
+            bw.signed(i32::from(s), 16);
+        }
+        write_footer(&mut bw);
+        let mut frame = bw.into_bytes();
+        // Header CRC-8 covers bytes[0..7] (sync..num..block16), stored at byte 7.
+        let mut c8 = 0u8;
+        for &b in &frame[0..7] {
+            c8 = crc8_update(c8, b);
+        }
+        frame[7] = c8;
+        // Frame CRC-16 covers everything but the trailing 2 CRC bytes.
+        let len = frame.len();
+        let mut c16 = 0u16;
+        for &b in &frame[0..len - 2] {
+            c16 = crc16_update(c16, b);
+        }
+        frame[len - 2..len].copy_from_slice(&c16.to_be_bytes());
+        frame
+    }
+
+    /// Offset of the frame within a `flac_file` container: fLaC(4) + block
+    /// header(4) + STREAMINFO(34).
+    const FRAME_OFF: usize = 42;
+
+    #[test]
+    fn crc_valid_frame_passes_validation() {
+        let samples = [10i16, -20, 30, -40];
+        let frame = frame_with_valid_crc(&samples);
+        let bytes = flac_file(44_100, 1, 16, samples.len() as u64, &frame);
+        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        dec.set_validate_crc(true);
+        let mut out = [0i32; 8];
+        assert_eq!(dec.decode_into(&mut out).unwrap(), 4);
+        assert_eq!(&out[..4], &[10, -20, 30, -40]);
+    }
+
+    #[test]
+    fn crc8_mismatch_is_rejected_when_validating() {
+        let samples = [10i16, -20, 30, -40];
+        let frame = frame_with_valid_crc(&samples);
+        let mut bytes = flac_file(44_100, 1, 16, samples.len() as u64, &frame);
+        bytes[FRAME_OFF + 7] ^= 0xFF; // corrupt the stored header CRC-8
+        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        dec.set_validate_crc(true);
+        assert_eq!(dec.decode_into(&mut [0i32; 8]), Err(DecodeError::Malformed));
+    }
+
+    #[test]
+    fn crc16_mismatch_is_rejected_when_validating() {
+        let samples = [10i16, -20, 30, -40];
+        let frame = frame_with_valid_crc(&samples);
+        let mut bytes = flac_file(44_100, 1, 16, samples.len() as u64, &frame);
+        bytes[FRAME_OFF + 9] ^= 0xFF; // corrupt a subframe data byte (after header)
+        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        dec.set_validate_crc(true);
+        assert_eq!(dec.decode_into(&mut [0i32; 8]), Err(DecodeError::Malformed));
+    }
+
+    #[test]
+    fn crc_off_by_default_is_lenient() {
+        let samples = [10i16, -20, 30, -40];
+        let frame = frame_with_valid_crc(&samples);
+        let mut bytes = flac_file(44_100, 1, 16, samples.len() as u64, &frame);
+        bytes[FRAME_OFF + 7] ^= 0xFF; // corrupt the stored CRC-8
+        // Default (validation off): the corrupt CRC is ignored, decode proceeds.
+        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut out = [0i32; 8];
+        assert_eq!(dec.decode_into(&mut out).unwrap(), 4);
+    }
+
+    // -- multichannel ---------------------------------------------------------
+
+    #[test]
+    fn decodes_4_independent_channels() {
+        // FLAC >2 channels are always independent (decorrelation is stereo-only).
+        // Channel assignment 3 ⇒ 4 channels. sample[ch][i] = ch*100 + i.
+        let block = 5usize;
+        let channels = 4u16;
+        let mut bw = BitWriter::new();
+        write_header(&mut bw, block, 3); // ca = 3 → 4 independent channels
+        for c in 0..channels as i32 {
+            bw.bits(0, 1); // subframe leading 0
+            bw.bits(1, 6); // VERBATIM
+            bw.bits(0, 1); // no wasted bits
+            for i in 0..block as i32 {
+                bw.signed(c * 100 + i, 16);
+            }
+        }
+        write_footer(&mut bw);
+        let bytes = flac_file(96_000, channels, 16, block as u64, &bw.into_bytes());
+
+        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        assert_eq!(dec.stream_info().channels, 4);
+        let mut out = [0i32; 32];
+        let n = dec.decode_into(&mut out).unwrap();
+        assert_eq!(n, block * channels as usize);
+        // Interleaved: frame i → [ch0, ch1, ch2, ch3].
+        for i in 0..block {
+            for c in 0..channels as usize {
+                assert_eq!(out[i * 4 + c], (c as i32) * 100 + i as i32);
+            }
+        }
     }
 }

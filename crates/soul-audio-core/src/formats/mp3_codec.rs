@@ -218,6 +218,9 @@ pub(crate) struct Mp3Codec {
     syn: [f32; (18 + 15) * (2 * 32)],
     /// Intensity-stereo positions, per channel.
     ist_pos: [[u8; 39]; 2],
+
+    /// Layer I/II sub-decoder (used only for non-Layer-III frames).
+    l12: crate::formats::mp3_l12::Layer12,
 }
 
 impl Mp3Codec {
@@ -234,7 +237,18 @@ impl Mp3Codec {
             scf: [0.0; 40],
             syn: [0.0; (18 + 15) * (2 * 32)],
             ist_pos: [[0; 39]; 2],
+            l12: crate::formats::mp3_l12::Layer12::new(),
         }
+    }
+
+    /// Reset all cross-frame state (bit reservoir + IMDCT/QMF history) to the
+    /// post-`new` condition — required after a seek, since the reservoir and
+    /// filterbank memory belong to the pre-seek position.
+    pub(crate) fn reset(&mut self) {
+        self.mdct_overlap = [[0.0; 9 * 32]; 2];
+        self.qmf_state = [0.0; 15 * 2 * 32];
+        self.reserv = 0;
+        self.l12.reset();
     }
 
     /// Assemble this frame's main data into [`Self::maindata`]: the last
@@ -1246,7 +1260,9 @@ fn dct3_9(y: &mut [f32; 9]) {
     let t4 = (s4 + s2) * 0.93969262;
     let t2 = (s8 + s2) * 0.76604444;
     s6 = (s4 - s8) * 0.17364818;
-    let s4b = s4 + s8 - s2;
+    // minimp3's `s4 += s8 - s2`: the subtraction rounds before the add, which is
+    // not the same in f32 as `(s4 + s8) - s2`. Preserve the reference grouping.
+    let s4b = s4 + (s8 - s2);
 
     let s2b = s0 - s4b * 0.5;
     y[4] = s4b + s0;
@@ -1769,8 +1785,10 @@ impl Mp3Codec {
             return None;
         }
         let hdr = Header([frame[0], frame[1], frame[2], frame[3]]);
+        // Layer bits: 1 = Layer III (handled here), 2 = Layer II, 3 = Layer I
+        // (both routed to the self-contained subband decoder).
         if hdr.layer() != 1 {
-            return None; // Layer III only
+            return self.l12.decode_frame(frame, pcm);
         }
         let nch = hdr.channels();
         let granules = hdr.granules();

@@ -36,7 +36,17 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Decode { input, out } => decode(&input, &out),
+        // `AnyDecoder` embeds the largest decoder's buffers by value (no-alloc:
+        // e.g. multichannel FLAC's sample planes are ~150 KiB). That exceeds the
+        // default main-thread stack on some platforms (Windows = 1 MiB), so run
+        // the decode on a thread with a generous stack. On embedded the decoder
+        // is placed in a static/BSS instead.
+        Cmd::Decode { input, out } => std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || decode(&input, &out))
+            .expect("spawn decode thread")
+            .join()
+            .expect("decode thread panicked"),
     }
 }
 

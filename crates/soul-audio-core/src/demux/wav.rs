@@ -12,6 +12,13 @@ use crate::model::{SampleFormat, StreamInfo};
 /// Unknown/streamed `data` size marker (also `0` is treated as unknown).
 const UNKNOWN_SIZE: u32 = 0xFFFF_FFFF;
 
+/// G.711 companding of the `data` bytes (8-bit → 16-bit PCM), if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Companding {
+    ALaw,
+    MuLaw,
+}
+
 /// RIFF/WAVE container parser over a byte [`Source`].
 pub struct WavDemuxer<S> {
     src: S,
@@ -25,6 +32,32 @@ pub struct WavDemuxer<S> {
     frames_total: Option<u64>,
     /// Frames read so far (packet timestamps).
     pos_frames: u64,
+    /// G.711 companding of the samples, if the codec is A-law/µ-law.
+    companding: Option<Companding>,
+    /// Big-endian sample data (RIFX). PCM samples must be byte-swapped on decode.
+    big_endian: bool,
+    /// `Some(samples_per_block)` for IMA-ADPCM (the `data` holds compressed blocks).
+    adpcm: Option<u16>,
+}
+
+/// Read a little- or big-endian `u32` from the first 4 bytes of `b`.
+fn read_u32(b: &[u8], be: bool) -> u32 {
+    let a = [b[0], b[1], b[2], b[3]];
+    if be {
+        u32::from_be_bytes(a)
+    } else {
+        u32::from_le_bytes(a)
+    }
+}
+
+/// Read a little- or big-endian `u16` from the first 2 bytes of `b`.
+fn read_u16(b: &[u8], be: bool) -> u16 {
+    let a = [b[0], b[1]];
+    if be {
+        u16::from_be_bytes(a)
+    } else {
+        u16::from_le_bytes(a)
+    }
 }
 
 impl<S: Source> WavDemuxer<S> {
@@ -37,38 +70,72 @@ impl<S: Source> WavDemuxer<S> {
     pub fn new(mut src: S) -> Result<Self, DecodeError> {
         let mut hdr = [0u8; 12];
         read_exact(&mut src, &mut hdr)?;
-        if &hdr[0..4] != b"RIFF" || &hdr[8..12] != b"WAVE" {
+        // RIFF/RF64/BW64 are little-endian; RIFX is the big-endian variant (all
+        // chunk sizes, `fmt ` fields, and sample data are big-endian).
+        let rf64 = matches!(&hdr[0..4], b"RF64" | b"BW64");
+        let be = &hdr[0..4] == b"RIFX";
+        let valid_magic = &hdr[0..4] == b"RIFF" || rf64 || be;
+        if !valid_magic || &hdr[8..12] != b"WAVE" {
             return Err(DecodeError::Malformed);
         }
         let mut pos: u64 = 12;
+        // The true `data` size for RF64/BW64, read from the `ds64` chunk.
+        let mut ds64_data_size: Option<u64> = None;
 
-        let mut fmt: Option<(StreamInfo, u16)> = None;
+        let mut fmt: Option<FmtInfo> = None;
         loop {
             let mut ch = [0u8; 8];
             read_exact(&mut src, &mut ch)?;
             pos += 8;
             let id = [ch[0], ch[1], ch[2], ch[3]];
-            let size = u32::from_le_bytes([ch[4], ch[5], ch[6], ch[7]]);
+            let size = read_u32(&ch[4..8], be);
             let padded = u64::from(size) + u64::from(size & 1);
 
             match &id {
+                b"ds64" => {
+                    // RF64/BW64 sizes: riffSize:u64, dataSize:u64, sampleCount:u64, …
+                    let mut d = [0u8; 24];
+                    let take = (size as usize).min(24);
+                    read_exact(&mut src, &mut d[..take])?;
+                    if take >= 16 {
+                        ds64_data_size = Some(u64::from_le_bytes([
+                            d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15],
+                        ]));
+                    }
+                    skip(&mut src, padded - take as u64)?;
+                    pos += padded;
+                }
                 b"fmt " => {
-                    fmt = Some(parse_fmt(&mut src, size)?);
+                    fmt = Some(parse_fmt(&mut src, size, be)?);
                     pos += padded;
                 }
                 b"data" => {
-                    let (info, block_align) = fmt.ok_or(DecodeError::Malformed)?;
+                    let FmtInfo {
+                        info,
+                        block_align,
+                        companding,
+                        adpcm,
+                    } = fmt.ok_or(DecodeError::Malformed)?;
                     if block_align == 0 {
                         return Err(DecodeError::Malformed);
                     }
-                    let (data_remaining, frames_total) = if size == UNKNOWN_SIZE || size == 0 {
-                        (u64::MAX, None)
+                    // In RF64/BW64 the 32-bit `data` size is 0xFFFFFFFF; the real
+                    // size comes from `ds64`.
+                    let true_size = if size == UNKNOWN_SIZE {
+                        ds64_data_size
+                    } else if size == 0 {
+                        None
                     } else {
-                        // Round the data chunk DOWN to a whole number of frames — a
-                        // trailing partial frame would otherwise corrupt post-seek
-                        // decoding (dr_wav regression).
-                        let frames = u64::from(size) / u64::from(block_align);
-                        (frames * u64::from(block_align), Some(frames))
+                        Some(u64::from(size))
+                    };
+                    let (data_remaining, frames_total) = match true_size {
+                        None => (u64::MAX, None), // unknown/streamed
+                        Some(sz) => {
+                            // Round DOWN to a whole frame — a trailing partial frame
+                            // would corrupt post-seek decoding (dr_wav regression).
+                            let frames = sz / u64::from(block_align);
+                            (frames * u64::from(block_align), Some(frames))
+                        }
                     };
                     return Ok(Self {
                         src,
@@ -78,6 +145,9 @@ impl<S: Source> WavDemuxer<S> {
                         data_remaining,
                         frames_total,
                         pos_frames: 0,
+                        companding,
+                        big_endian: be,
+                        adpcm,
                     });
                 }
                 _ => {
@@ -98,6 +168,22 @@ impl<S: Source> WavDemuxer<S> {
     #[must_use]
     pub fn frames_total(&self) -> Option<u64> {
         self.frames_total
+    }
+
+    /// G.711 companding of the samples, if the codec is A-law/µ-law.
+    pub(crate) fn companding(&self) -> Option<Companding> {
+        self.companding
+    }
+
+    /// Whether sample data is big-endian (RIFX).
+    pub(crate) fn big_endian(&self) -> bool {
+        self.big_endian
+    }
+
+    /// IMA-ADPCM samples-per-block, if the codec is IMA-ADPCM. When set, the
+    /// `data` region holds compressed blocks of [`Self::block_align`] bytes each.
+    pub(crate) fn adpcm_samples_per_block(&self) -> Option<u16> {
+        self.adpcm
     }
 
     /// Read raw PCM bytes from the `data` region into `out`, bounded by the
@@ -169,9 +255,18 @@ impl<S: Source> Demuxer for WavDemuxer<S> {
     }
 }
 
+/// Parsed `fmt ` chunk: stream parameters plus which codec decodes the `data`.
+struct FmtInfo {
+    info: StreamInfo,
+    block_align: u16,
+    companding: Option<Companding>,
+    /// `Some(samples_per_block)` for IMA-ADPCM.
+    adpcm: Option<u16>,
+}
+
 /// Parse a `fmt ` chunk body of `size` bytes (already consumed the 8-byte chunk
-/// header). Advances past the body + pad. Returns `(StreamInfo, block_align)`.
-fn parse_fmt<S: Source>(src: &mut S, size: u32) -> Result<(StreamInfo, u16), DecodeError> {
+/// header). Advances past the body + pad.
+fn parse_fmt<S: Source>(src: &mut S, size: u32, be: bool) -> Result<FmtInfo, DecodeError> {
     let mut fmt = [0u8; 40];
     let take = (size as usize).min(fmt.len());
     if take < 16 {
@@ -182,34 +277,58 @@ fn parse_fmt<S: Source>(src: &mut S, size: u32) -> Result<(StreamInfo, u16), Dec
     let consumed = take as u64;
     skip(src, u64::from(size) + u64::from(size & 1) - consumed)?;
 
-    let tag = u16::from_le_bytes([fmt[0], fmt[1]]);
-    let channels = u16::from_le_bytes([fmt[2], fmt[3]]);
-    let sample_rate = u32::from_le_bytes([fmt[4], fmt[5], fmt[6], fmt[7]]);
-    let block_align = u16::from_le_bytes([fmt[12], fmt[13]]);
-    let bits = u16::from_le_bytes([fmt[14], fmt[15]]);
+    let tag = read_u16(&fmt[0..2], be);
+    let channels = read_u16(&fmt[2..4], be);
+    let sample_rate = read_u32(&fmt[4..8], be);
+    let block_align = read_u16(&fmt[12..14], be);
+    let bits = read_u16(&fmt[14..16], be);
 
     // WAVE_FORMAT_EXTENSIBLE: the true format tag is the first u16 of the
     // SubFormat GUID at byte 24.
     let real_tag = if tag == 0xFFFE && take >= 26 {
-        u16::from_le_bytes([fmt[24], fmt[25]])
+        read_u16(&fmt[24..26], be)
     } else {
         tag
     };
 
+    // A-law/µ-law (companded) and IMA-ADPCM all decode to 16-bit PCM.
+    let mut companding = None;
+    let mut adpcm = None;
     let format = match real_tag {
         0x0001 => SampleFormat::Int { bits: bits as u8 },
         0x0003 => SampleFormat::Float { bits: bits as u8 },
+        0x0006 => {
+            companding = Some(Companding::ALaw);
+            SampleFormat::Int { bits: 16 }
+        }
+        0x0007 => {
+            companding = Some(Companding::MuLaw);
+            SampleFormat::Int { bits: 16 }
+        }
+        0x0011 => {
+            // IMA/DVI-ADPCM: samples-per-block is in the fmt extension (bytes
+            // 18..20, after the 2-byte cbSize).
+            let spb = if take >= 20 {
+                read_u16(&fmt[18..20], be)
+            } else {
+                return Err(DecodeError::Unsupported);
+            };
+            adpcm = Some(spb);
+            SampleFormat::Int { bits: 16 }
+        }
         _ => return Err(DecodeError::Unsupported),
     };
 
-    Ok((
-        StreamInfo {
+    Ok(FmtInfo {
+        info: StreamInfo {
             sample_rate,
             channels,
             format,
         },
         block_align,
-    ))
+        companding,
+        adpcm,
+    })
 }
 
 #[cfg(test)]
@@ -250,6 +369,42 @@ mod tests {
         assert_eq!(si.format, SampleFormat::Int { bits: 16 });
         assert_eq!(d.block_align(), 4);
         assert_eq!(d.frames_total(), Some(2));
+    }
+
+    #[test]
+    fn rf64_reads_64bit_data_size_from_ds64() {
+        let data = [1u8, 2, 3, 4, 5, 6, 7, 8]; // 4 frames of 16-bit mono
+        let mut v = Vec::new();
+        v.extend_from_slice(b"RF64");
+        v.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        v.extend_from_slice(b"WAVE");
+        // ds64: riffSize, dataSize, sampleCount, tableLength(=0).
+        v.extend_from_slice(b"ds64");
+        v.extend_from_slice(&28u32.to_le_bytes());
+        v.extend_from_slice(&9999u64.to_le_bytes()); // riffSize (unused)
+        v.extend_from_slice(&(data.len() as u64).to_le_bytes()); // dataSize
+        v.extend_from_slice(&(data.len() as u64 / 2).to_le_bytes()); // sampleCount
+        v.extend_from_slice(&0u32.to_le_bytes()); // tableLength
+        // fmt (16-bit mono)
+        v.extend_from_slice(b"fmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&44_100u32.to_le_bytes());
+        v.extend_from_slice(&88_200u32.to_le_bytes());
+        v.extend_from_slice(&2u16.to_le_bytes());
+        v.extend_from_slice(&16u16.to_le_bytes());
+        // data with the RF64 sentinel size.
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        v.extend_from_slice(&data);
+
+        let mut d = WavDemuxer::new(SliceSource::new(&v)).unwrap();
+        assert_eq!(d.stream_info().sample_rate, 44_100);
+        assert_eq!(d.frames_total(), Some(4)); // ds64 dataSize 8 / blockAlign 2
+        let mut scratch = [0u8; 16];
+        let pkt = d.next_packet(&mut scratch).unwrap().unwrap();
+        assert_eq!(pkt.data, &data); // bounded by the ds64 size, not 0xFFFFFFFF
     }
 
     #[test]

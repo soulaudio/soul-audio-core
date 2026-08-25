@@ -15,8 +15,11 @@ pub mod dst;
 pub mod flac;
 pub mod mp3;
 pub mod mp3_codec;
+pub mod mp3_l12;
 pub mod wav;
 
-/// Maximum DSD channels supported by the no-alloc DSD readers (stereo). The
-/// planar-transpose buffer is sized from this; multichannel DSD is a follow-up.
-pub(crate) const MAX_DSD_CHANNELS: usize = 2;
+/// Maximum DSD channels for the DSF planar reader (up to 6 — SACD's multichannel
+/// maximum). The `channels × 4096`-byte planar block-row buffer is sized from
+/// this (6 × 4096 = 24 KiB); lower it to reduce footprint. The DoP and decimation
+/// adapters carry their own (independent) 8-channel caps.
+pub(crate) const MAX_DSD_CHANNELS: usize = 6;
