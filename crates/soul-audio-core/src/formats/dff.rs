@@ -106,7 +106,7 @@ impl<S: Source> DffDecoder<S> {
                     return Self::open_dst(src, sample_rate, channels, rate, pos);
                 }
                 _ => {
-                    let padded = size + (size & 1); // FVER, ABSS, ...
+                    let padded = size.saturating_add(size & 1); // FVER, ABSS, ...
                     skip(&mut src, padded)?;
                     pos += padded;
                 }
@@ -134,7 +134,7 @@ impl<S: Source> DffDecoder<S> {
         let num_frames = u64::from(u32::from_be_bytes([fb[0], fb[1], fb[2], fb[3]]));
         let frame_rate = u16::from_be_bytes([fb[4], fb[5]]);
         pos += 6;
-        let fpad = fsize + (fsize & 1);
+        let fpad = fsize.saturating_add(fsize & 1);
         if fpad > 6 {
             skip(&mut src, fpad - 6)?;
             pos += fpad - 6;
@@ -148,7 +148,7 @@ impl<S: Source> DffDecoder<S> {
         let decoder = DstDecoder::new(usize::from(channels), samples_per_frame)?;
         let frame_bytes = decoder.frame_bytes();
 
-        let audio_total = num_frames * frame_bytes as u64;
+        let audio_total = num_frames.saturating_mul(frame_bytes as u64);
         Ok(Self {
             src,
             info: stream_info(channels, rate),
@@ -176,7 +176,7 @@ impl<S: Source> DffDecoder<S> {
                 return Ok(false);
             }
             let (id, size) = read_chunk_header(&mut self.src)?;
-            let padded = size + (size & 1);
+            let padded = size.saturating_add(size & 1);
             if &id == b"DSTF" {
                 let len = size as usize;
                 if len == 0 || len > MAX_DSTF_BYTES {
@@ -338,30 +338,33 @@ fn parse_prop<S: Source>(src: &mut S, size: u64) -> Result<(u32, u16), DecodeErr
     if &prop_type != b"SND " {
         return Err(DecodeError::Malformed);
     }
-    let mut rem = size - 4;
+    // `size` must at least cover the 4-byte propType just read.
+    let mut rem = size.checked_sub(4).ok_or(DecodeError::Malformed)?;
     let mut sample_rate = 0u32;
     let mut channels = 0u16;
 
     while rem >= 12 {
         let (id, csize) = read_chunk_header(src)?;
-        rem -= 12;
-        let padded = csize + (csize & 1);
+        rem -= 12; // safe: loop guard guarantees rem >= 12
+        // Round the (attacker-controlled) chunk size up to even, without
+        // overflowing; an implausibly large size simply skips to EOF and errors.
+        let padded = csize.saturating_add(csize & 1);
         match &id {
             b"FS  " => {
                 let mut b = [0u8; 4];
                 read_exact(src, &mut b)?;
                 sample_rate = u32::from_be_bytes(b);
-                skip(src, padded - 4)?;
+                skip(src, padded.saturating_sub(4))?;
             }
             b"CHNL" => {
                 let mut b = [0u8; 2];
                 read_exact(src, &mut b)?;
                 channels = u16::from_be_bytes(b);
-                skip(src, padded - 2)?; // channel IDs
+                skip(src, padded.saturating_sub(2))?; // channel IDs
             }
             _ => skip(src, padded)?, // CMPR, etc.
         }
-        rem -= padded;
+        rem = rem.saturating_sub(padded);
     }
     Ok((sample_rate, channels))
 }
@@ -457,6 +460,70 @@ mod tests {
         v.extend_from_slice(b"DSD "); // formType
         v.extend_from_slice(body);
         v
+    }
+
+    /// Wrap a hand-built PROP body (following `SND `) in `PROP`+`FRM8`.
+    fn frm8_prop(prop_after_snd: &[u8]) -> Vec<u8> {
+        let mut prop = Vec::new();
+        prop.extend_from_slice(b"SND ");
+        prop.extend_from_slice(prop_after_snd);
+        let mut b = Vec::new();
+        b.extend_from_slice(b"PROP");
+        b.extend_from_slice(&(prop.len() as u64).to_be_bytes());
+        b.extend_from_slice(&prop);
+        frm8(&b)
+    }
+
+    #[test]
+    fn malformed_prop_sizes_error_without_panicking() {
+        // Each of these tripped a debug arithmetic panic (underflow/overflow on an
+        // attacker-controlled chunk size) before the size fields were bounds-
+        // checked. They must now resolve to a graceful outcome, never a panic.
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+
+        // PROP smaller than the 4-byte propType it must contain (`size - 4`).
+        {
+            let mut b = Vec::new();
+            b.extend_from_slice(b"PROP");
+            b.extend_from_slice(&2u64.to_be_bytes());
+            b.extend_from_slice(b"SND ");
+            cases.push(frm8(&b));
+        }
+        // `FS ` sub-chunk claiming fewer than its 4 payload bytes (`padded - 4`).
+        {
+            let mut p = Vec::new();
+            p.extend_from_slice(b"FS  ");
+            p.extend_from_slice(&0u64.to_be_bytes());
+            p.extend_from_slice(&[0, 0, 0, 0]);
+            cases.push(frm8_prop(&p));
+        }
+        // `CHNL` sub-chunk claiming fewer than its 2 payload bytes (`padded - 2`).
+        {
+            let mut p = Vec::new();
+            p.extend_from_slice(b"CHNL");
+            p.extend_from_slice(&1u64.to_be_bytes());
+            p.extend_from_slice(&[0, 0]);
+            cases.push(frm8_prop(&p));
+        }
+        // Sub-chunk with a `u64::MAX` size (`size + (size & 1)` padded overflow).
+        {
+            let mut p = Vec::new();
+            p.extend_from_slice(b"CMPR");
+            p.extend_from_slice(&u64::MAX.to_be_bytes());
+            cases.push(frm8_prop(&p));
+        }
+        // Sub-chunk whose padded size exceeds the bytes remaining (`rem -= padded`).
+        {
+            let mut p = Vec::new();
+            p.extend_from_slice(b"CMPR");
+            p.extend_from_slice(&9_999u64.to_be_bytes());
+            cases.push(frm8_prop(&p));
+        }
+
+        for c in cases {
+            // Must return (typically Err), never panic.
+            let _ = DffDecoder::new(SliceSource::new(&c));
+        }
     }
 
     #[test]

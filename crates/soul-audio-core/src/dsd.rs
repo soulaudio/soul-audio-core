@@ -76,8 +76,10 @@ impl<D: DsdDecoder + DsdSeek> DopAdapter<D> {
     /// # Errors
     /// Propagates the inner [`DsdSeek::seek_to_sample`] error.
     pub fn seek_to_frame(&mut self, frame: u64) -> Result<u64, DecodeError> {
-        // One DoP frame carries 16 DSD bits (2 bytes) per channel.
-        let landed = self.inner.seek_to_sample(frame * 16)?;
+        // One DoP frame carries 16 DSD bits (2 bytes) per channel. Saturate the
+        // conversion: a wildly out-of-range target simply clamps to the end in the
+        // inner seek rather than overflowing.
+        let landed = self.inner.seek_to_sample(frame.saturating_mul(16))?;
         self.frame_index = landed / 16;
         self.ch_pos = 0; // drop any partial frame
         Ok(self.frame_index)
@@ -266,7 +268,9 @@ impl<D: DsdDecoder + DsdSeek> DecimateAdapter<D> {
     /// # Errors
     /// Propagates the inner [`DsdSeek::seek_to_sample`] error.
     pub fn seek_to_frame(&mut self, frame: u64) -> Result<u64, DecodeError> {
-        let landed = self.inner.seek_to_sample(frame * u64::from(DECIMATION))?;
+        let landed = self
+            .inner
+            .seek_to_sample(frame.saturating_mul(u64::from(DECIMATION)))?;
         self.hist = [[0u8; GROUPS]; MAX_DECIMATE_CHANNELS];
         self.ring_pos = GROUPS - 1;
         Ok(landed / u64::from(DECIMATION))
@@ -569,5 +573,79 @@ mod tests {
         let mut dec = decimate(&[0u8; 8], 2, DsdRate::Dsd64);
         // 0.0001 s × 352_800 = 35.28 → PCM frame 35.
         assert_eq!(dec.seek_to_time(0.0001).unwrap(), 35);
+    }
+
+    #[test]
+    fn adapter_seek_to_extreme_frame_saturates_without_overflow() {
+        // `seek_to_frame` scales the frame index (×16 for DoP, ×DECIMATION for the
+        // decimator) into a DSD sample index; an extreme target must saturate, not
+        // overflow the multiply — a debug panic the robustness sweep caught.
+        let mut dop = DopAdapter::new(FakeDsd {
+            bytes: &STEREO_FF_00,
+            pos: 0,
+            rate: DsdRate::Dsd64,
+            channels: 2,
+        });
+        assert!(dop.seek_to_frame(u64::MAX).is_ok());
+
+        let mut dec = decimate(&STEREO_FF_00, 2, DsdRate::Dsd64);
+        assert!(dec.seek_to_frame(u64::MAX).is_ok());
+    }
+
+    fn dec_decode_all(d: &mut DecimateAdapter<FakeDsd>) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut buf = [0i32; 64];
+        loop {
+            let n = d.decode_into(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    #[test]
+    fn decimate_seek_round_trip_and_reset() {
+        // Mono counting pattern: with DECIMATION = 8, one input byte yields one
+        // output frame, so frame f lives at byte f. Even targets keep the mock's
+        // DoP-granular (2-byte) seek exact.
+        static PATTERN: [u8; 256] = {
+            let mut a = [0u8; 256];
+            let mut i = 0;
+            while i < 256 {
+                a[i] = i as u8;
+                i += 1;
+            }
+            a
+        };
+        let reference = dec_decode_all(&mut decimate(&PATTERN, 1, DsdRate::Dsd64));
+
+        // After the FIR warm-up (the filter spans TAPS = GROUPS output frames) a
+        // seeked decode is bit-identical to the linear decode.
+        for f in [0u64, 8, 20, 50] {
+            let mut d = decimate(&PATTERN, 1, DsdRate::Dsd64);
+            assert_eq!(d.seek_to_frame(f).unwrap(), f);
+            let got = dec_decode_all(&mut d);
+            assert_eq!(
+                got[GROUPS..],
+                reference[f as usize + GROUPS..],
+                "decimate round-trip after warm-up, seek({f})"
+            );
+        }
+
+        // Seeking fully resets the FIR history and ring position: a decoder driven
+        // to completion then seeked back matches a fresh decoder seeked the same.
+        let mut dirty = decimate(&PATTERN, 1, DsdRate::Dsd64);
+        let _ = dec_decode_all(&mut dirty);
+        dirty.seek_to_frame(20).unwrap();
+        let after_dirty = dec_decode_all(&mut dirty);
+        let mut fresh = decimate(&PATTERN, 1, DsdRate::Dsd64);
+        fresh.seek_to_frame(20).unwrap();
+        assert_eq!(
+            after_dirty,
+            dec_decode_all(&mut fresh),
+            "seek resets FIR history"
+        );
     }
 }

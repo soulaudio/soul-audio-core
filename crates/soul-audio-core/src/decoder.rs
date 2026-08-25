@@ -74,3 +74,21 @@ pub trait DsdSeek {
     /// Returns the sample actually landed on.
     fn seek_to_sample(&mut self, sample: u64) -> Result<u64, DecodeError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secs_to_samples_clamps_and_rounds() {
+        // Non-positive (and non-finite) inputs clamp to 0 — a seek can't go before
+        // the start, and `NaN`/negative must not produce a garbage sample index.
+        assert_eq!(secs_to_samples(0.0, 44_100), 0);
+        assert_eq!(secs_to_samples(-1.0, 44_100), 0);
+        assert_eq!(secs_to_samples(f64::NAN, 44_100), 0);
+        // Exact and round-to-nearest.
+        assert_eq!(secs_to_samples(1.0, 44_100), 44_100);
+        assert_eq!(secs_to_samples(5.25, 2), 11); // 10.5 → 11 (round half up)
+        assert_eq!(secs_to_samples(5.24, 2), 10); // 10.48 → 10
+    }
+}

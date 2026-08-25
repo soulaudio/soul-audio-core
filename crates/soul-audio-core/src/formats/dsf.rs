@@ -153,19 +153,25 @@ impl<S: SeekSource> DsdSeek for DsfDecoder<S> {
     fn seek_to_sample(&mut self, s: u64) -> Result<u64, DecodeError> {
         let s = s.min(self.total_samples);
         let block = BLOCK as u64;
-        let row_r = s / (block * 8); // which block-row (32768 samples/row)
-        let byte_in = (s / 8) % block; // time-byte within the row
         let row_bytes = self.channels as u64 * block;
+        // Clamp the target row to what the `data` chunk actually holds: a header
+        // whose declared sample count exceeds its data size must not drive the row
+        // past the available bytes, or the remaining-bytes bookkeeping underflows.
+        let max_row = self.audio_total / row_bytes;
+        let row_r = (s / (block * 8)).min(max_row); // which block-row (32768 samples/row)
+        let byte_in = (s / 8) % block; // time-byte within the row
 
         // Snap the source to the block-row boundary (planar → can't land mid-row).
         self.src
             .seek(SeekFrom::Start(self.data_start + row_r * row_bytes))
             .map_err(|_| DecodeError::Io)?;
 
-        // Re-prime the streaming state as if we had read up to this row.
+        // Re-prime the streaming state as if we had read up to this row. `row_r`
+        // is bounded by the data chunk above; saturate the sample-domain figure
+        // too in case the declared count and data size disagree.
         let valid_total = self.total_samples.div_ceil(8);
         self.audio_bytes_remaining = self.audio_total - row_r * row_bytes;
-        self.valid_bytes_per_channel = valid_total - row_r * block;
+        self.valid_bytes_per_channel = valid_total.saturating_sub(row_r * block);
         self.row_len = 0;
         self.emit_i = 0;
 
@@ -250,6 +256,22 @@ mod tests {
         assert_eq!(n, 4);
         assert_eq!(&out[..4], &[0x80, 0xC0, 0x40, 0x20]);
         assert_eq!(d.read_dsd(&mut out).unwrap(), 0); // trimmed past valid bytes
+    }
+
+    #[test]
+    fn seek_with_sample_count_exceeding_data_does_not_underflow() {
+        use crate::decoder::DsdSeek;
+        // Header declares an enormous per-channel sample count, but the `data`
+        // chunk holds a single block-row. Seeking toward the declared end must
+        // clamp to the bytes that actually exist, not underflow the remaining-
+        // bytes bookkeeping (a debug-overflow panic before the row was clamped).
+        let bytes = dsf(2_822_400, 1, u64::MAX / 2, &[0x01], &[0x02]);
+        let mut d = DsfDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let landed = d.seek_to_sample(u64::MAX).unwrap();
+        assert!(landed <= u64::MAX / 2);
+        // A read after the clamped seek must also not panic.
+        let mut out = [0u8; 16];
+        let _ = d.read_dsd(&mut out);
     }
 
     #[test]

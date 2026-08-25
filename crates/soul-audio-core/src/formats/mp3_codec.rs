@@ -1735,11 +1735,17 @@ fn l3_decode(
         );
     }
 
-    if hdr.test_i_stereo() {
-        let gr1_sfc = gr[1].scalefac_compress;
-        intensity_stereo(grbuf, &mut ist_pos[1], &gr[0], hdr, gr1_sfc);
-    } else if hdr.is_ms_stereo() {
-        midside_stereo(grbuf, 0, 576);
+    // Stereo (de)coupling only applies to two-channel frames. A malformed —
+    // or merely sloppy — header can set the joint-stereo mode-extension bits on
+    // a mono frame, where `gr` holds a single granule; guard against indexing the
+    // absent second channel.
+    if nch == 2 {
+        if hdr.test_i_stereo() {
+            let gr1_sfc = gr[1].scalefac_compress;
+            intensity_stereo(grbuf, &mut ist_pos[1], &gr[0], hdr, gr1_sfc);
+        } else if hdr.is_ms_stereo() {
+            midside_stereo(grbuf, 0, 576);
+        }
     }
 
     let sr2 = hdr.my_sample_rate_idx() == 2;
@@ -2044,6 +2050,23 @@ mod tests {
         assert!(!enough);
         assert_eq!(len, 1 + 2);
         assert_eq!(&c.maindata[..3], &[0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn mono_frame_with_stereo_mode_ext_does_not_panic() {
+        // Header FF FB 90 D0: MPEG-1 Layer III, 128 kbps, 44.1 kHz, *mono* mode
+        // (0xC0) yet with the joint-stereo intensity-stereo mode-extension bit
+        // (0x10) set — inconsistent, but a corrupt (or sloppy) stream can produce
+        // it. Stereo coupling must be skipped for a single-channel frame, not
+        // index the absent second granule. Regression for an out-of-bounds panic
+        // surfaced by the malformed-input robustness sweep.
+        let mut frame = vec![0xFF, 0xFB, 0x90, 0xD0];
+        frame.resize(417, 0); // 128 kbps / 44.1 kHz frame length; zero body = silence
+        let mut c = Mp3Codec::new();
+        let mut pcm = [0i32; 1152 * 2];
+        // main_data_begin = 0 (zero side info) → first frame decodes self-contained,
+        // exercising the stereo-processing branch. Must return, not panic.
+        assert!(c.decode_frame(&frame, &mut pcm).is_some());
     }
 
     #[test]
