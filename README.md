@@ -37,9 +37,19 @@ across every format.
 # Decode any supported file to interleaved i32 LE PCM
 cargo run --release -p soul-audio-cli -- decode song.flac --out song.pcm
 
+# Render files through the full gapless engine pipeline to a PCM file, offline
+# (decode → resample → normalize → channel-map; no audio device needed)
+cargo run --release -p soul-audio-cli -- render a.flac b.mp3 --out mix.pcm --rate 48000 --channels 2
+
 # Play one or more files gaplessly on the default output device
 cargo run --release -p soul-audio-cli --features playback -- play a.flac b.mp3 c.wav
 ```
+
+`render` is the offline counterpart of `play` — the same `Engine`/`Deck` pipeline
+into a file `Sink` instead of cpal. Because it needs no hardware, it is how the
+playback pipeline is tested end-to-end in CI (`crates/soul-audio-cli/tests/e2e.rs`
+asserts gapless concatenation, resampling, and channel mapping on the rendered
+output).
 
 `play` needs the `playback` feature (pulls in cpal + a lock-free ring buffer); the
 default build omits it and prints a hint. Tracks play back-to-back with no gap

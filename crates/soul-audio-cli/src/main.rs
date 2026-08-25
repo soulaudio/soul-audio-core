@@ -1,14 +1,17 @@
 //! `soul-audio-cli` — desktop harness that drives `soul-audio-core`.
 //!
-//! `decode` streams any supported file to interleaved i32 LE PCM. `play` (built
-//! with `--features playback`) plays one or more files **gaplessly** on the
-//! default device via `soul-audio-engine`'s [`Engine`](soul_audio_engine::Engine)
-//! over a cpal [`Sink`](soul_audio_core::Sink), with tracks opened on a loader
-//! thread. The same engine/deck run on the STM32 — only the sink and source swap.
+//! - `decode` streams any supported file to interleaved i32 LE PCM.
+//! - `render` runs the full gapless engine pipeline (decode → resample →
+//!   normalize → channel-map) over one or more files into a raw i32 LE PCM file —
+//!   the same pipeline `play` uses, but to a file, so it is testable without an
+//!   audio device.
+//! - `play` (built with `--features playback`) plays files **gaplessly** on the
+//!   default device via the cpal [`Sink`](soul_audio_core::Sink).
+//!
+//! The engine/deck run identically on the STM32 — only the sink and source swap.
 
 #[cfg(feature = "playback")]
 mod cpal_sink;
-#[cfg(feature = "playback")]
 mod driver;
 mod sources;
 
@@ -37,6 +40,23 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Render one or more files gaplessly through the full engine pipeline to a
+    /// raw interleaved i32 LE PCM file at the given rate/channels. No device
+    /// needed — the offline counterpart of `play`.
+    Render {
+        /// Input file paths, rendered in order.
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+        /// Output .pcm path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Output sample rate (Hz).
+        #[arg(long, default_value_t = 48_000)]
+        rate: u32,
+        /// Output channel count.
+        #[arg(long, default_value_t = 2)]
+        channels: u16,
+    },
     /// Play one or more audio files gaplessly on the default output device
     /// (needs `--features playback`).
     Play {
@@ -53,6 +73,12 @@ fn main() -> Result<()> {
     // these live in a static/BSS instead.
     let job: Box<dyn FnOnce() -> Result<()> + Send> = match Cli::parse().cmd {
         Cmd::Decode { input, out } => Box::new(move || decode(&input, &out)),
+        Cmd::Render {
+            inputs,
+            out,
+            rate,
+            channels,
+        } => Box::new(move || driver::render(&inputs, &out, rate, channels)),
         Cmd::Play { inputs } => Box::new(move || play(&inputs)),
     };
     std::thread::Builder::new()
