@@ -35,6 +35,27 @@ fn core_only_depends_on_allowlist() {
 }
 
 #[test]
+fn engine_depends_on_core_and_stays_lean() {
+    let md = MetadataCommand::new().exec().unwrap();
+
+    // core must not depend on the engine (layering points one way).
+    let core_deps = normal_dep_names(pkg(&md, "soul-audio-core"));
+    assert!(
+        !core_deps.contains(&"soul-audio-engine".to_string()),
+        "soul-audio-core must not depend on soul-audio-engine"
+    );
+
+    // The engine sits directly on core and carries nothing else — it stays
+    // `no_std` and platform-agnostic like core.
+    let engine_deps = normal_dep_names(pkg(&md, "soul-audio-engine"));
+    assert_eq!(
+        engine_deps,
+        vec!["soul-audio-core".to_string()],
+        "soul-audio-engine should depend on soul-audio-core and nothing else"
+    );
+}
+
+#[test]
 fn shells_depend_on_core_not_the_reverse() {
     let md = MetadataCommand::new().exec().unwrap();
     let core_deps = normal_dep_names(pkg(&md, "soul-audio-core"));

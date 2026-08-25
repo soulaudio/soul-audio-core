@@ -91,6 +91,13 @@ impl<S: Source> Mp3Decoder<S> {
     pub fn total_samples(&self) -> Option<u64> {
         self.demux.total_samples()
     }
+
+    /// Total per-channel frames, if the stream declares a length (Xing/Info/VBRI).
+    /// Alias of [`total_samples`](Self::total_samples) for a uniform decoder API.
+    #[must_use]
+    pub fn total_frames(&self) -> Option<u64> {
+        self.demux.total_samples()
+    }
 }
 
 impl<S: SeekSource> Mp3Decoder<S> {

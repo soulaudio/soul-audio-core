@@ -1,10 +1,12 @@
 //! Desktop [`Sink`] backed by cpal — the default output device fed through a
 //! lock-free SPSC ring.
 //!
-//! The player thread pushes interleaved `i32` (source scale) via
-//! [`Sink::write`]; cpal's real-time callback pops from the ring and converts to
-//! the device sample format, normalized by the source bit depth. `write` blocks
-//! when the ring is full (backpressure), pacing decode to the device clock; an
+//! The [`Deck`](soul_audio_core::Deck) pushes interleaved `i32` **canonical
+//! 24-bit** PCM (`±2^23`) via [`Sink::write`]; cpal's real-time callback pops
+//! from the ring and converts to the device sample format. Because the deck
+//! already normalized every track to the same 24-bit scale, the sink is
+//! bit-depth-agnostic — it never needs to know the source depth. `write` blocks
+//! when the ring is full (backpressure), pacing the pump to the device clock; an
 //! empty ring plays silence (a soft underrun).
 
 use anyhow::{Context, Result, anyhow};
@@ -15,20 +17,22 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use soul_audio_core::model::SampleFormat as CoreFmt;
 use soul_audio_core::{Sink, SinkError, StreamInfo};
 
-/// A cpal output stream presented as a [`Sink`].
+/// Canonical input bit depth the deck normalizes to (`±2^23`).
+const CANONICAL_BITS: u8 = 24;
+
+/// A cpal output stream presented as a [`Sink`] consuming canonical 24-bit PCM.
 pub struct CpalSink {
     prod: <HeapRb<i32> as Split>::Prod,
     // Held to keep the stream alive; dropping it stops playback.
     _stream: Stream,
     rate: u32,
     channels: u16,
-    bits: u8,
 }
 
 impl CpalSink {
-    /// Open the default output device. `source_bits` is the decoded stream's bit
-    /// depth, used to normalize `i32` → the device format.
-    pub fn new(source_bits: u8) -> Result<Self> {
+    /// Open the default output device. Input is always canonical 24-bit PCM (the
+    /// deck normalizes every track to it), so no per-source bit depth is needed.
+    pub fn new() -> Result<Self> {
         let device = cpal::default_host()
             .default_output_device()
             .context("no default output device")?;
@@ -43,13 +47,12 @@ impl CpalSink {
         // ~1 second of buffering.
         let cap = rate as usize * channels as usize;
         let (prod, mut cons) = HeapRb::<i32>::new(cap).split();
-        let bits = source_bits;
         let err_fn = |e| eprintln!("cpal stream error: {e}");
 
         let stream = match sample_format {
             SampleFormat::F32 => {
-                // Full-scale divisor: 2^(bits-1) maps the source's peak to ±1.0.
-                let scale = 2f32.powi(i32::from(bits) - 1);
+                // 2^(24-1) maps the canonical peak (±2^23) to ±1.0 full scale.
+                let scale = 2f32.powi(i32::from(CANONICAL_BITS) - 1);
                 device
                     .build_output_stream(
                         &config,
@@ -64,15 +67,15 @@ impl CpalSink {
                     .context("building f32 output stream")?
             }
             SampleFormat::I16 => {
-                let shift = i32::from(bits) - 16;
+                // 24-bit → 16-bit: drop the low 8 bits.
+                let shift = i32::from(CANONICAL_BITS) - 16;
                 device
                     .build_output_stream(
                         &config,
                         move |data: &mut [i16], _| {
                             for s in data.iter_mut() {
-                                let v = cons.try_pop().unwrap_or(0);
-                                let scaled = if shift > 0 { v >> shift } else { v << (-shift) };
-                                *s = scaled.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+                                let v = cons.try_pop().unwrap_or(0) >> shift;
+                                *s = v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
                             }
                         },
                         err_fn,
@@ -88,7 +91,6 @@ impl CpalSink {
             _stream: stream,
             rate,
             channels,
-            bits,
         })
     }
 }
@@ -98,7 +100,9 @@ impl Sink for CpalSink {
         StreamInfo {
             sample_rate: self.rate,
             channels: self.channels,
-            format: CoreFmt::Int { bits: self.bits },
+            format: CoreFmt::Int {
+                bits: CANONICAL_BITS,
+            },
         }
     }
 

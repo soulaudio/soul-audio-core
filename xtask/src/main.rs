@@ -54,12 +54,20 @@ fn verify() -> Result<(), String> {
     // The checked-in resampler coefficient tables must match the generator.
     resample_tables::check()?;
     run(&["test"])?;
-    // The STM32 discipline gates: the core must build no_std for the target,
-    // and the firmware must link for it.
+    // The STM32 discipline gates: the core and engine must build no_std for the
+    // target, and the firmware must link for it.
     run(&[
         "build",
         "-p",
         "soul-audio-core",
+        "--target",
+        "thumbv7em-none-eabihf",
+        "--no-default-features",
+    ])?;
+    run(&[
+        "build",
+        "-p",
+        "soul-audio-engine",
         "--target",
         "thumbv7em-none-eabihf",
         "--no-default-features",

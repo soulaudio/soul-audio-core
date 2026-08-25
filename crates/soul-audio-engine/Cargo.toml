@@ -1,0 +1,13 @@
+[package]
+name = "soul-audio-engine"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Portable no_std playback queue engine (cursor + repeat modes + gapless preload) over soul-audio-core's Deck."
+
+[lints]
+workspace = true
+
+[dependencies]
+soul-audio-core = { path = "../soul-audio-core" }

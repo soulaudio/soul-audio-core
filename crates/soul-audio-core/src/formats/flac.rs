@@ -625,6 +625,12 @@ impl<S: Source> FlacDecoder<S> {
         let unemitted = ((self.block_total - self.emit_i) as u64) / ch;
         self.decoded_per_ch - unemitted
     }
+
+    /// Total per-channel frames from STREAMINFO, if declared (0 = unknown → `None`).
+    #[must_use]
+    pub fn total_frames(&self) -> Option<u64> {
+        self.total_samples
+    }
 }
 
 impl<S: SeekSource> FlacDecoder<S> {

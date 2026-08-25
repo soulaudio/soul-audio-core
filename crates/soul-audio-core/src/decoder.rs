@@ -46,6 +46,20 @@ pub trait Decoder {
     fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError>;
 }
 
+/// A [`Decoder`] that can also seek and report its length — the capability the
+/// playback [`Deck`](crate::deck::Deck) needs from a track. [`AnyDecoder`] with a
+/// seekable source implements it.
+pub trait SeekableDecoder: Decoder {
+    /// Seek to per-channel `sample`; returns the frame actually landed on.
+    ///
+    /// # Errors
+    /// [`DecodeError::Unsupported`] if the source cannot seek, else a decode/IO
+    /// error.
+    fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError>;
+    /// Total per-channel frames, if the stream declares a length.
+    fn total_frames(&self) -> Option<u64>;
+}
+
 /// A streaming **native DSD** decoder producing packed 1-bit samples (8 per
 /// byte) into a caller-provided buffer. Implementors allocate nothing.
 ///

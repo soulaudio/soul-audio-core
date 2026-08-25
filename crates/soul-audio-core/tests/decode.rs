@@ -76,6 +76,18 @@ fn open_decodes_flac_in_ogg_matching_ffmpeg() {
 }
 
 #[test]
+fn ogg_flac_reports_duration_but_rejects_seek() {
+    // Streaming Ogg-FLAC: the source is not seekable, so seek returns Unsupported.
+    // (This fixture's STREAMINFO declares no total, so duration is unknown — a
+    // valid streaming case; total_frames just must not panic.)
+    let ogg = include_bytes!("../testdata/flac-in-ogg.ogg");
+    let mut dec = open(SliceSource::new(ogg)).expect("open ogg-flac");
+    assert_eq!(dec.total_frames(), None);
+    assert_eq!(dec.seek_to(1000), Err(DecodeError::Unsupported));
+    assert_eq!(dec.seek_to_time(0.1), Err(DecodeError::Unsupported));
+}
+
+#[test]
 fn open_surfaces_flac_stream_info() {
     // fLaC + STREAMINFO (44.1 kHz stereo 16-bit) with no audio frames.
     let mut si = [0u8; 34];

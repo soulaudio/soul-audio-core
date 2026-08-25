@@ -7,6 +7,7 @@
 //! [`BufSource`] → [`SeekSource`]) and write PCM samples into caller-provided
 //! buffers. No allocation happens anywhere in this crate.
 
+pub mod deck;
 pub mod decoder;
 pub mod demux;
 pub mod dispatch;
@@ -18,7 +19,8 @@ pub mod probe;
 pub mod resample;
 pub mod sink;
 
-pub use decoder::{DecodeError, Decoder, DsdDecoder, DsdSeek};
+pub use deck::{Deck, DeckError, DeckState, Progress};
+pub use decoder::{DecodeError, Decoder, DsdDecoder, DsdSeek, SeekableDecoder};
 pub use demux::{Demuxer, FlacDemuxer, Mp3Demuxer, Packet, WavDemuxer};
 pub use dispatch::{AnyDecoder, open};
 pub use dsd::{DecimateAdapter, DopAdapter};
@@ -26,4 +28,4 @@ pub use io::{BufReader, BufSource, SeekSource, SliceSource, Source};
 pub use model::{DsdMode, DsdRate, Format, SampleFormat, StreamInfo};
 pub use probe::probe;
 pub use resample::{Quality, ResampleError, Resampler};
-pub use sink::{Player, PlayerError, Sink, SinkError};
+pub use sink::{Sink, SinkError};

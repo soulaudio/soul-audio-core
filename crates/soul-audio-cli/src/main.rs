@@ -1,12 +1,15 @@
 //! `soul-audio-cli` — desktop harness that drives `soul-audio-core`.
 //!
 //! `decode` streams any supported file to interleaved i32 LE PCM. `play` (built
-//! with `--features playback`) decodes → resamples to the device rate → plays via
-//! cpal, using the core [`Player`](soul_audio_core::Player) + a cpal
-//! [`Sink`](soul_audio_core::Sink). The same core path runs on the STM32.
+//! with `--features playback`) plays one or more files **gaplessly** on the
+//! default device via `soul-audio-engine`'s [`Engine`](soul_audio_engine::Engine)
+//! over a cpal [`Sink`](soul_audio_core::Sink), with tracks opened on a loader
+//! thread. The same engine/deck run on the STM32 — only the sink and source swap.
 
 #[cfg(feature = "playback")]
 mod cpal_sink;
+#[cfg(feature = "playback")]
+mod driver;
 mod sources;
 
 use std::fs::File;
@@ -34,21 +37,23 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Play an audio file on the default output device (needs `--features playback`).
+    /// Play one or more audio files gaplessly on the default output device
+    /// (needs `--features playback`).
     Play {
-        /// Input file path.
-        input: PathBuf,
+        /// Input file paths, played in order.
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
     },
 }
 
 fn main() -> Result<()> {
-    // `AnyDecoder` + `Player` embed large fixed buffers by value (no-alloc), which
-    // exceeds the default main-thread stack on some platforms (Windows = 1 MiB),
-    // so run the work on a thread with a generous stack. On embedded these live
-    // in a static/BSS instead.
+    // `AnyDecoder` + the `Deck` embed large fixed buffers by value (no-alloc),
+    // which exceeds the default main-thread stack on some platforms (Windows =
+    // 1 MiB), so run the work on a thread with a generous stack. On embedded
+    // these live in a static/BSS instead.
     let job: Box<dyn FnOnce() -> Result<()> + Send> = match Cli::parse().cmd {
         Cmd::Decode { input, out } => Box::new(move || decode(&input, &out)),
-        Cmd::Play { input } => Box::new(move || play(&input)),
+        Cmd::Play { inputs } => Box::new(move || play(&inputs)),
     };
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
@@ -88,37 +93,15 @@ fn decode(input: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Decode → resample-to-device-rate → play via cpal.
+/// Play one or more files gaplessly via the engine + cpal driver.
 #[cfg(feature = "playback")]
-fn play(input: &Path) -> Result<()> {
-    use soul_audio_core::{Player, Quality, Sink};
-
-    let file = File::open(input).with_context(|| format!("opening {}", input.display()))?;
-    let mut scratch = [0u8; 8192];
-    let source = sources::file_source(file, &mut scratch);
-    let decoder = open(source).map_err(|e| anyhow!("cannot decode {}: {e:?}", input.display()))?;
-
-    let si = decoder.stream_info();
-    let sink = cpal_sink::CpalSink::new(si.bits_per_sample())?;
-    let dev = sink.stream_info();
-    println!(
-        "playing {} — {} Hz {}ch → device {} Hz {}ch",
-        input.display(),
-        si.sample_rate,
-        si.channels,
-        dev.sample_rate,
-        dev.channels
-    );
-    let mut player =
-        Player::new(decoder, sink, Quality::Hq).map_err(|e| anyhow!("player init: {e:?}"))?;
-    player.run().map_err(|e| anyhow!("playback: {e:?}"))?;
-    println!("done");
-    Ok(())
+fn play(inputs: &[PathBuf]) -> Result<()> {
+    driver::play(inputs)
 }
 
 /// Fallback when the `playback` feature is not built.
 #[cfg(not(feature = "playback"))]
-fn play(_input: &Path) -> Result<()> {
+fn play(_inputs: &[PathBuf]) -> Result<()> {
     Err(anyhow!(
         "playback support not built — rebuild with `--features playback`"
     ))

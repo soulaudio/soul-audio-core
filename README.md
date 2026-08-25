@@ -37,15 +37,19 @@ across every format.
 # Decode any supported file to interleaved i32 LE PCM
 cargo run --release -p soul-audio-cli -- decode song.flac --out song.pcm
 
-# Play a file on the default output device (decodes + resamples to the device rate)
-cargo run --release -p soul-audio-cli --features playback -- play song.flac
+# Play one or more files gaplessly on the default output device
+cargo run --release -p soul-audio-cli --features playback -- play a.flac b.mp3 c.wav
 ```
 
 `play` needs the `playback` feature (pulls in cpal + a lock-free ring buffer); the
-default build omits it and prints a hint. It reports the conversion, e.g.:
+default build omits it and prints a hint. Tracks play back-to-back with no gap
+(the next one is decoded ahead on a loader thread), e.g.:
 
 ```
-playing song.flac — 44100 Hz 2ch → device 48000 Hz 2ch
+device: 48000 Hz 2ch (canonical 24-bit) — 3 track(s)
+▶ track 0
+▶ track 1 (gapless)
+▶ track 2 (gapless)
 done
 ```
 
@@ -118,41 +122,47 @@ loop {
   `max_rel_ratio` you passed to `new`.
 - `latency()` reports the group delay in output frames.
 
-### Play (Player + Sink)
+### Playback (Deck + Engine + Sink)
 
-The `Player` composes **decode → resample → channel-map → write** and drives it to
-end of stream. It resamples only when the decoder rate differs from the sink rate,
-and duplicates mono → stereo automatically. Output goes to any `Sink`:
+Playback is a portable mechanism plus a per-platform shell. The library gives you
+two pieces; you supply the concrete `Sink` and the track source:
+
+- **`Deck<Sink, Decoder, PRELOAD>`** — the producer-side player. Per block it does
+  **decode → resample → normalize → volume → channel-map → write**, resampling only
+  when rates differ and duplicating mono → stereo automatically. It holds `PRELOAD`
+  already-opened decoders and swaps to one at end-of-track for **gapless**
+  transitions. It normalizes every track to canonical 24-bit, so the sink is
+  bit-depth-agnostic. Transport: `load` / `preload` / `advance` / `play` / `pause` /
+  `stop` / `seek` / `set_volume`; `pump()` does one block and returns `Progress`.
+- **`soul-audio-engine`'s `Engine`** — the queue on top of a `Deck`: a cursor,
+  `Normal`/`RepeatOne`/`RepeatAll`, and `next`/`prev`/`goto`. It decides which track
+  index plays next and drives the deck's gapless preload, doing **no I/O**: it emits
+  `poll_open() -> Option<index>` and you hand the opened decoder back via
+  `provide(index, decoder)`. Opening (slow) happens on your loader thread.
+
+Both are `no_std`, no-alloc, sync — the same code runs on the STM32 and the desktop.
+Output goes to any `Sink`:
 
 ```rust
 use soul_audio_core::{Sink, SinkError, StreamInfo};
 
 pub trait Sink {
     fn stream_info(&self) -> StreamInfo;              // the device's rate/channels
-    fn write(&mut self, frames: &[i32]) -> Result<(), SinkError>; // blocking, backpressure
+    fn write(&mut self, frames: &[i32]) -> Result<(), SinkError>; // canonical 24-bit, backpressure
     fn flush(&mut self) -> Result<(), SinkError>;
 }
 ```
 
-The desktop cpal implementation lives in
-[`crates/soul-audio-cli/src/cpal_sink.rs`](crates/soul-audio-cli/src/cpal_sink.rs) —
-copy it, or implement `Sink` for your own output. Then:
-
-```rust,ignore
-use soul_audio_core::{open, Decoder, Player, Quality, SliceSource};
-
-let bytes = std::fs::read("song.flac")?;
-let decoder = open(SliceSource::new(&bytes))?;
-let bits = decoder.stream_info().bits_per_sample();
-
-let sink = MyCpalSink::new(bits)?;                // implements Sink
-let mut player = Player::new(decoder, sink, Quality::Hq)?;
-player.run()?;                                    // blocks, paced by the sink
-```
-
 `Sink::write` applies backpressure (blocks when the device buffer is full), which
-paces decoding to the device clock — the same shape works for an embedded DMA
-sink, where "block" means "wait for the next DMA buffer".
+paces the pump to the device clock — the same shape works for an embedded DMA sink,
+where "block" means "wait for the next DMA buffer". The concrete sink owns a
+lock-free SPSC ring whose consumer is the real-time callback / DMA ISR.
+
+The desktop wiring is a worked example: the cpal `Sink` is in
+[`crates/soul-audio-cli/src/cpal_sink.rs`](crates/soul-audio-cli/src/cpal_sink.rs),
+and the pump-thread + loader-thread driver over the `Engine` is in
+[`crates/soul-audio-cli/src/driver.rs`](crates/soul-audio-cli/src/driver.rs) — copy
+them, or implement `Sink` + a loader for your own platform.
 
 ### Seeking
 
@@ -195,17 +205,21 @@ let n = pcm.decode_into(&mut buf)?;               // via the Decoder trait
 ## Architecture
 
 ```
-bytes ──▶ probe ──▶ Decoder ──▶ [Resampler] ──▶ Sink ──▶ device
-         (open)     i32 PCM      to sink rate    cpal / SAI-DMA
+                          soul-audio-core (no_std)          soul-audio-engine   app / platform
+bytes ─▶ probe ─▶ Decoder ─▶ [Resampler] ─▶ normalize ─▶ Deck ──▶ Engine (queue) ──▶ Sink ─▶ device
+        (open)    i32 PCM     to sink rate    +volume    (gapless)  next/prev/repeat   cpal / SAI-DMA
 ```
 
 - **`soul-audio-core`** is sync, `no_std`, and allocates nothing. Decoders read
   through the `Source` capability ladder (`Source` → `BufSource` → `SeekSource`,
   owned super-traits over [`embedded-io`](https://crates.io/crates/embedded-io))
-  and write PCM into caller-provided buffers.
-- The **`Sink` trait** and the **`Player`** live in the core (portable); the
-  concrete sinks live in the shells because they need std / hardware — cpal on the
-  desktop, SAI/I²S DMA on the STM32.
+  and write PCM into caller-provided buffers. It holds the `Sink` trait and the
+  **`Deck`** (the gapless playback mechanism).
+- **`soul-audio-engine`** (also `no_std`) is the portable queue on top of a `Deck`:
+  cursor + repeat modes + `next`/`prev`/`goto`, driving gapless preload with no I/O.
+- The **concrete sinks and track sources** live in the shells because they need
+  std / hardware — cpal on the desktop, SAI/I²S DMA on the STM32. The `Deck` +
+  `Engine` above them are identical on both.
 - Async lives only in the firmware shell (Embassy, for DMA/I²S); the core stays
   runtime-agnostic.
 
@@ -213,8 +227,9 @@ bytes ──▶ probe ──▶ Decoder ──▶ [Resampler] ──▶ Sink ─
 
 | Crate | Role |
 |---|---|
-| `crates/soul-audio-core` | The library: decoders, resampler, `Sink`/`Player`. `#![no_std]`, no-alloc, `forbid(unsafe_code)`. |
-| `crates/soul-audio-cli` | Desktop harness: `decode` + `play` (cpal). |
+| `crates/soul-audio-core` | The library: decoders, resampler, `Sink` trait, `Deck`. `#![no_std]`, no-alloc, `forbid(unsafe_code)`. |
+| `crates/soul-audio-engine` | Portable playback queue (cursor + repeat + gapless) over a `Deck`. `#![no_std]`, depends only on core. |
+| `crates/soul-audio-cli` | Desktop harness: `decode` + gapless `play` (cpal sink + threaded driver). |
 | `crates/soul-audio-firmware` | STM32H743 + Embassy shell (`thumbv7em-none-eabihf`). |
 | `crates/architecture-tests` | Runtime no-alloc + dependency-layering invariants. |
 | `xtask` | Pure-Rust automation (`verify` / `gen-resample-tables`). |
@@ -224,7 +239,7 @@ bytes ──▶ probe ──▶ Decoder ──▶ [Resampler] ──▶ Sink ─
 
 ```sh
 cargo test                       # host tests: unit + integration + DSP + robustness
-cargo run -p soul-audio-cli --features playback -- play <file>
+cargo run -p soul-audio-cli --features playback -- play <file>...   # gapless
 cargo xtask verify               # full gate: fmt, clippy -D warnings, tests, both STM32 builds
 cargo build -p soul-audio-core --target thumbv7em-none-eabihf --no-default-features  # no_std gate
 ```

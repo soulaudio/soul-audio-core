@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 soul-audio-core = { path = "../soul-audio-core" }
+soul-audio-engine = { path = "../soul-audio-engine" }
 embedded-io = { workspace = true }
 embedded-io-adapters = { workspace = true, features = ["std"] }
 clap = { version = "4", features = ["derive"] }

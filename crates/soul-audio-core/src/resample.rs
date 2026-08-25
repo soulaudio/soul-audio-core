@@ -191,6 +191,14 @@ impl Resampler {
         wing(self.z, self.nominal_step)
     }
 
+    /// Flush the filter state (history + read cursor) — call after a discontinuity
+    /// such as a seek. The conversion ratio is preserved; the first outputs
+    /// afterward are a short warm-up transient.
+    pub fn reset(&mut self) {
+        self.read = 0.0;
+        self.hist = [[0.0; MAX_HISTORY]; MAX_CHANNELS];
+    }
+
     /// Set the conversion ratio (`out_rate / in_rate` scale) for subsequent
     /// output. `ramp` slews it smoothly across the next block; the value is
     /// clamped to the range declared at construction.

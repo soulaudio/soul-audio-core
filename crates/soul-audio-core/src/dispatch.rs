@@ -32,6 +32,59 @@ pub enum AnyDecoder<S> {
     OggFlac(FlacDecoder<OggReader<S>>),
 }
 
+impl<S: crate::io::Source> AnyDecoder<S> {
+    /// Total per-channel frames, if the stream declares a length. `None` for a
+    /// raw MP3 without a Xing/Info/VBRI header.
+    #[must_use]
+    pub fn total_frames(&self) -> Option<u64> {
+        match self {
+            AnyDecoder::Wav(d) => d.total_frames(),
+            AnyDecoder::Flac(d) => d.total_frames(),
+            AnyDecoder::Mp3(d) => d.total_frames(),
+            AnyDecoder::OggFlac(d) => d.total_frames(),
+        }
+    }
+}
+
+impl<S: crate::io::SeekSource> AnyDecoder<S> {
+    /// Seek to per-channel `sample` (frame-granular for MP3, sample-accurate for
+    /// WAV/FLAC). Returns the frame actually landed on.
+    ///
+    /// # Errors
+    /// [`DecodeError::Unsupported`] for the streaming Ogg-FLAC variant (its source
+    /// is not seekable); otherwise the underlying decoder's seek error.
+    pub fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        match self {
+            AnyDecoder::Wav(d) => d.seek_to(sample),
+            AnyDecoder::Flac(d) => d.seek_to(sample),
+            AnyDecoder::Mp3(d) => d.seek_to(sample),
+            AnyDecoder::OggFlac(_) => Err(DecodeError::Unsupported),
+        }
+    }
+
+    /// Seek to `secs` seconds (convenience over [`Self::seek_to`]).
+    ///
+    /// # Errors
+    /// As [`Self::seek_to`].
+    pub fn seek_to_time(&mut self, secs: f64) -> Result<u64, DecodeError> {
+        match self {
+            AnyDecoder::Wav(d) => d.seek_to_time(secs),
+            AnyDecoder::Flac(d) => d.seek_to_time(secs),
+            AnyDecoder::Mp3(d) => d.seek_to_time(secs),
+            AnyDecoder::OggFlac(_) => Err(DecodeError::Unsupported),
+        }
+    }
+}
+
+impl<S: crate::io::SeekSource> crate::decoder::SeekableDecoder for AnyDecoder<S> {
+    fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        AnyDecoder::seek_to(self, sample)
+    }
+    fn total_frames(&self) -> Option<u64> {
+        AnyDecoder::total_frames(self)
+    }
+}
+
 impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
     fn stream_info(&self) -> StreamInfo {
         match self {
@@ -139,6 +192,21 @@ mod tests {
             open(SliceSource::new(b"DSD \0\0\0\0")).err(),
             Some(DecodeError::Unsupported)
         );
+    }
+
+    #[test]
+    fn any_decoder_reports_total_frames_and_seeks() {
+        // 8 mono frames; total is known from the data-chunk size, and seek lands
+        // exactly (WAV is sample-accurate).
+        let wav = wav16(&[10, 20, 30, 40, 50, 60, 70, 80]);
+        let mut dec = open(SliceSource::new(&wav)).expect("open");
+        assert_eq!(dec.total_frames(), Some(8));
+        assert_eq!(dec.seek_to(4).unwrap(), 4);
+        let mut out = [0i32; 8];
+        let n = dec.decode_into(&mut out).unwrap();
+        assert_eq!(&out[..n], &[50, 60, 70, 80]);
+        // seek_to_time on a 8 kHz stream: 0.0005 s = frame 4.
+        assert_eq!(dec.seek_to_time(0.0005).unwrap(), 4);
     }
 
     #[test]

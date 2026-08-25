@@ -266,6 +266,14 @@ impl<S: SeekSource> WavDecoder<S> {
     }
 }
 
+impl<S: Source> WavDecoder<S> {
+    /// Total per-channel frames, if the `data` chunk size was known.
+    #[must_use]
+    pub fn total_frames(&self) -> Option<u64> {
+        self.demux.frames_total()
+    }
+}
+
 impl<S: Source> Decoder for WavDecoder<S> {
     fn stream_info(&self) -> StreamInfo {
         let si = self.demux.stream_info();
