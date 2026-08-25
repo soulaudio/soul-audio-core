@@ -1,84 +1,244 @@
 # soul-audio-core
 
-A cross-platform Rust **template** for an audio decode/playback library that
-runs on an STM32H743 (bare-metal, Embassy) **and** on the desktop — from one
-strict-`no_std`, no-alloc core. The decoders (WAV, MP3, FLAC, DSD) are
-**stubs**: the whole project is wired, builds, tests, and enforces the embedded
-discipline, so you can drop real decoders straight into `formats/`.
+A cross-platform, **`no_std` / no-alloc / `forbid(unsafe_code)`** audio
+**decode + resample + playback** library in Rust — one core that runs identically
+on the desktop and on an STM32H743 (bare-metal, Embassy).
 
-## Layout
+The pipeline is **decode → resample → sink**:
+
+- **Decode** WAV, FLAC, MP3 (Layers I/II/III), DSD, and FLAC-in-Ogg to interleaved
+  `i32` PCM.
+- **Resample** to any rate with a windowed-sinc converter (anti-aliased both
+  directions, Fast/HQ tiers, runtime-variable ratio).
+- **Play** through a `Sink` — a cpal output device on the desktop (an SAI/I²S DMA
+  sink on the STM32 is the next step).
+
+Every codec is validated against external references (ffmpeg, minimp3, kjmp2)
+bit-exactly where the arithmetic allows, and the whole decode + seek surface is
+fuzzed for panic/hang safety.
+
+## Supported formats
+
+| Container / codec | Details |
+|---|---|
+| **WAV** | PCM integer (8/16/24/32), IEEE float (32/64), G.711 A-law/µ-law, IMA/DVI-ADPCM, RF64/BW64 (>4 GiB), RIFX (big-endian), up to 8 channels |
+| **FLAC** | Full decode, optional CRC-8/16 verification, up to 8 channels, sample-accurate seeking, **FLAC-in-Ogg** |
+| **MP3** | MPEG-1/2/2.5 **Layers I, II, and III**, VBR (Xing/Info/VBRI), frame-granular + time seeking |
+| **DSD** | DSF and DFF/DSDIFF, DoP passthrough, decimation to PCM, DST decompression |
+
+Output is interleaved `i32` in the source's sample range (16/24/32-bit), matching
+across every format.
+
+---
+
+## Using the CLI
+
+```sh
+# Decode any supported file to interleaved i32 LE PCM
+cargo run --release -p soul-audio-cli -- decode song.flac --out song.pcm
+
+# Play a file on the default output device (decodes + resamples to the device rate)
+cargo run --release -p soul-audio-cli --features playback -- play song.flac
+```
+
+`play` needs the `playback` feature (pulls in cpal + a lock-free ring buffer); the
+default build omits it and prints a hint. It reports the conversion, e.g.:
+
+```
+playing song.flac — 44100 Hz 2ch → device 48000 Hz 2ch
+done
+```
+
+---
+
+## Using the library
+
+The crate is not on crates.io yet; depend on it by path or git:
+
+```toml
+[dependencies]
+soul-audio-core = { git = "https://…/soul-audio-core", package = "soul-audio-core" }
+```
+
+### Decode a file to PCM
+
+`open` probes the container and returns an `AnyDecoder` that streams interleaved
+`i32` into your buffer. On the desktop the simplest source is a `SliceSource` over
+the file bytes:
+
+```rust
+use soul_audio_core::{open, Decoder, SliceSource};
+
+let bytes = std::fs::read("song.flac")?;
+let mut decoder = open(SliceSource::new(&bytes))?;
+
+let info = decoder.stream_info();
+println!("{} Hz, {} channels, {} bits",
+    info.sample_rate, info.channels, info.bits_per_sample());
+
+let mut buf = [0i32; 4096];
+loop {
+    let n = decoder.decode_into(&mut buf)?;   // interleaved samples written
+    if n == 0 { break; }                       // end of stream
+    let pcm = &buf[..n];
+    // … consume `pcm` (interleaved i32, `info.channels` per frame) …
+}
+```
+
+The buffer can be any size — the decoder emits what fits and keeps the rest.
+`decode_into` never allocates. For very large files, stream the bytes instead of
+reading them all: wrap a `std::fs::File` with
+[`embedded-io-adapters`](https://crates.io/crates/embedded-io-adapters) and the
+crate's `BufReader` (see `crates/soul-audio-cli/src/sources.rs`).
+
+### Resample to another rate
+
+`Resampler` converts interleaved `i32` at a runtime-variable ratio. It uses a
+**fixed-output-block** model: you ask how many input frames it needs, hand it
+exactly that many, and it fills a fixed output block.
+
+```rust
+use soul_audio_core::{Resampler, Quality};
+
+// stereo, 44.1 kHz → 48 kHz, no runtime ratio change, 1024-frame output blocks
+let mut rs = Resampler::new(2, 44_100, 48_000, 1.0, 1024, Quality::Hq)?;
+
+let mut out = [0i32; 1024 * 2];
+loop {
+    let need = rs.input_frames_next();          // input frames for the next block
+    let input = /* fetch exactly `need` interleaved stereo frames */;
+    rs.process(input, &mut out)?;               // fills exactly 1024 output frames
+    // … consume `out` …
+}
+```
+
+- `Quality::Fast` (~90 dB, compact) or `Quality::Hq` (~120 dB) tiers.
+- `set_ratio(out_over_in, ramp)` changes the ratio at runtime (e.g. varispeed or
+  clock-drift correction), slewed to avoid artifacts, bounded by the
+  `max_rel_ratio` you passed to `new`.
+- `latency()` reports the group delay in output frames.
+
+### Play (Player + Sink)
+
+The `Player` composes **decode → resample → channel-map → write** and drives it to
+end of stream. It resamples only when the decoder rate differs from the sink rate,
+and duplicates mono → stereo automatically. Output goes to any `Sink`:
+
+```rust
+use soul_audio_core::{Sink, SinkError, StreamInfo};
+
+pub trait Sink {
+    fn stream_info(&self) -> StreamInfo;              // the device's rate/channels
+    fn write(&mut self, frames: &[i32]) -> Result<(), SinkError>; // blocking, backpressure
+    fn flush(&mut self) -> Result<(), SinkError>;
+}
+```
+
+The desktop cpal implementation lives in
+[`crates/soul-audio-cli/src/cpal_sink.rs`](crates/soul-audio-cli/src/cpal_sink.rs) —
+copy it, or implement `Sink` for your own output. Then:
+
+```rust,ignore
+use soul_audio_core::{open, Decoder, Player, Quality, SliceSource};
+
+let bytes = std::fs::read("song.flac")?;
+let decoder = open(SliceSource::new(&bytes))?;
+let bits = decoder.stream_info().bits_per_sample();
+
+let sink = MyCpalSink::new(bits)?;                // implements Sink
+let mut player = Player::new(decoder, sink, Quality::Hq)?;
+player.run()?;                                    // blocks, paced by the sink
+```
+
+`Sink::write` applies backpressure (blocks when the device buffer is full), which
+paces decoding to the device clock — the same shape works for an embedded DMA
+sink, where "block" means "wait for the next DMA buffer".
+
+### Seeking
+
+Seeking is on the concrete format decoders (not the type-erased `AnyDecoder`).
+Construct the decoder directly and call `seek_to` / `seek_to_time`:
+
+```rust,ignore
+use soul_audio_core::formats::flac::FlacDecoder;
+use soul_audio_core::SliceSource;
+
+let bytes = std::fs::read("song.flac")?;
+let mut dec = FlacDecoder::new(SliceSource::new(&bytes))?;
+let landed = dec.seek_to(1_323_000)?;            // per-channel sample index
+// dec.seek_to_time(30.0)?;                       // …or seconds
+```
+
+FLAC is sample-accurate; MP3 is frame-granular (a short warm-up transient after a
+seek, inherent to the format).
+
+### DSD
+
+DSD needs an explicit output mode (native, DoP, or decimate-to-PCM), so it is
+*not* routed through `open`. Construct `DsfDecoder` / `DffDecoder` and wrap it:
+
+```rust,ignore
+use soul_audio_core::formats::dsf::DsfDecoder;
+use soul_audio_core::{DecimateAdapter, Decoder, SliceSource};
+
+let bytes = std::fs::read("track.dsf")?;
+let dsd = DsfDecoder::new(SliceSource::new(&bytes))?;
+let mut pcm = DecimateAdapter::new(dsd);          // DSD → multi-bit PCM, plays anywhere
+let mut buf = [0i32; 4096];
+let n = pcm.decode_into(&mut buf)?;               // via the Decoder trait
+```
+
+`DopAdapter` instead wraps the 1-bit stream in DoP frames for a DoP-capable DAC.
+
+---
+
+## Architecture
+
+```
+bytes ──▶ probe ──▶ Decoder ──▶ [Resampler] ──▶ Sink ──▶ device
+         (open)     i32 PCM      to sink rate    cpal / SAI-DMA
+```
+
+- **`soul-audio-core`** is sync, `no_std`, and allocates nothing. Decoders read
+  through the `Source` capability ladder (`Source` → `BufSource` → `SeekSource`,
+  owned super-traits over [`embedded-io`](https://crates.io/crates/embedded-io))
+  and write PCM into caller-provided buffers.
+- The **`Sink` trait** and the **`Player`** live in the core (portable); the
+  concrete sinks live in the shells because they need std / hardware — cpal on the
+  desktop, SAI/I²S DMA on the STM32.
+- Async lives only in the firmware shell (Embassy, for DMA/I²S); the core stays
+  runtime-agnostic.
+
+## Project layout
 
 | Crate | Role |
 |---|---|
-| `crates/soul-audio-core` | The library. `#![no_std]`, no-alloc, `forbid(unsafe_code)`. Defines the `Decoder` boundary over `embedded-io::Read`. |
-| `crates/soul-audio-firmware` | STM32H743 + Embassy shell. Builds for `thumbv7em-none-eabihf`. |
-| `crates/soul-audio-cli` | Desktop test harness (`clap`). |
+| `crates/soul-audio-core` | The library: decoders, resampler, `Sink`/`Player`. `#![no_std]`, no-alloc, `forbid(unsafe_code)`. |
+| `crates/soul-audio-cli` | Desktop harness: `decode` + `play` (cpal). |
+| `crates/soul-audio-firmware` | STM32H743 + Embassy shell (`thumbv7em-none-eabihf`). |
 | `crates/architecture-tests` | Runtime no-alloc + dependency-layering invariants. |
-| `xtask` | Pure-Rust automation (`verify` / `ci` / `install-hooks`). |
-| `testdata/` | Committed fixtures (add your own clips + golden PCM here). |
+| `xtask` | Pure-Rust automation (`verify` / `gen-resample-tables`). |
+| `testdata/` | Committed decode/resample fixtures. |
 
-## Common commands
+## Building & developing
 
-| Command | What it does |
-|---|---|
-| `cargo test` | Host tests: integration, E2E, and architecture invariants. |
-| `cargo check-embedded` | Build the core `no_std` for STM32 — the discipline gate. |
-| `cargo fw` | Build the firmware for `thumbv7em-none-eabihf`. |
-| `cargo fw-run` | Flash + run on hardware via `probe-rs` (needs a board). |
-| `cargo xtask verify` | Full local gate: fmt, clippy, tests, both embedded builds. |
+```sh
+cargo test                       # host tests: unit + integration + DSP + robustness
+cargo run -p soul-audio-cli --features playback -- play <file>
+cargo xtask verify               # full gate: fmt, clippy -D warnings, tests, both STM32 builds
+cargo build -p soul-audio-core --target thumbv7em-none-eabihf --no-default-features  # no_std gate
+```
 
-Git hooks are managed by [lefthook](https://github.com/evilmartians/lefthook)
-via `lefthook.yml`: **pre-commit** runs fast checks (fmt + clippy) on staged
-Rust/Cargo files; **pre-push** runs the full `cargo xtask verify` (tests + both
-STM32 builds).
+Git hooks (via [lefthook](https://github.com/evilmartians/lefthook)): pre-commit
+runs fmt + clippy on staged files; pre-push runs the full `cargo xtask verify`.
+Install the lefthook binary and run `lefthook install` once.
 
-Setup: install the lefthook binary (`go install github.com/evilmartians/lefthook@latest`,
-`npm i -D lefthook`, or `scoop`/`choco`/`brew install lefthook`), then run
-`lefthook install` once. If you use a global `core.hooksPath` dispatcher that
-already delegates to lefthook, skip `lefthook install`; the dispatcher picks up
-`lefthook.yml` automatically (pre-push may print a benign hook-sync warning, and
-commit-time pre-commit for non-JS repos can be bridged with a
-`.git/hooks/pre-commit` that runs `lefthook run --no-auto-install pre-commit`).
+The STM32 build is enforced at five layers (toolchain target auto-install →
+compile-time no_std gate → runtime no-alloc proof → dependency-layering test →
+CI). See `docs/superpowers/specs/` for the design specs of each subsystem.
 
-## How the cross-platform split works
+## Credits
 
-- **`soul-audio-core` is sync, `no_std`, and allocates nothing.** Decoders read
-  through the `Source` capability ladder (`Source` → `BufSource` → `SeekSource`,
-  owned super-traits over `embedded-io`) and write PCM into caller-provided
-  buffers.
-- On the **desktop**, `soul-audio-cli` wraps a `std::fs::File` with
-  `embedded-io-adapters`; on the **STM32**, the firmware uses
-  `soul_audio_core::SliceSource` over in-flash bytes. Same core code path.
-- Async lives only in the **firmware shell** (Embassy, for DMA/I2S); the core
-  stays runtime-agnostic.
-
-## STM32-build enforcement (layered)
-
-0. `rust-toolchain.toml` auto-installs the `thumbv7em-none-eabihf` target.
-1. **Compile-time:** core built for `thumbv7em --no-default-features` — any
-   `std`/`alloc` creep fails to compile (`cargo check-embedded`).
-2. **Runtime:** `architecture-tests` asserts zero allocations during core work.
-3. **Structural:** `architecture-tests` asserts the dependency layering.
-4. **Local:** lefthook git hooks — fast pre-commit (fmt + clippy) and full
-   pre-push (`cargo xtask verify`).
-5. **Remote:** GitHub Actions (`host` + `embedded` jobs) block merges on failure.
-
-## Target chip
-
-Defaults to **STM32H743ZI** (Nucleo-H743ZI2). To change it, edit the
-`embassy-stm32` chip feature in `crates/soul-audio-firmware/Cargo.toml` and the
-`--chip` in `.cargo/config.toml`'s `probe-rs` runner.
-
-## Prerequisites
-
-- Rust (the toolchain + STM32 target install automatically from
-  `rust-toolchain.toml`).
-- For flashing: `cargo install probe-rs-tools` and an STM32H743 board.
-
-## Adding a real decoder
-
-Implement it under `crates/soul-audio-core/src/formats/` (parse in `new`,
-implement `Decoder` to stream PCM into caller buffers, no allocation). Add a
-clip + independently-generated golden PCM under `testdata/`, then extend the
-integration test in `crates/soul-audio-core/tests/decode.rs` and the CLI/E2E.
-No boundary or tooling changes needed.
+Algorithms ported from (and cross-checked against) minimp3 (MP3 Layer III), kjmp2
+(MP3 Layer I/II, Martin Fiedler), and the libsamplerate / CCRMA windowed-sinc
+resampling method. Decode goldens generated with ffmpeg.

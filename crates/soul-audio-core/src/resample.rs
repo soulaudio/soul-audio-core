@@ -75,6 +75,19 @@ pub enum ResampleError {
     BadBufferLen,
 }
 
+impl core::fmt::Display for ResampleError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            ResampleError::TooManyChannels => "unsupported channel count",
+            ResampleError::BadRate => "invalid sample rate",
+            ResampleError::RatioRangeTooWide => "conversion ratio range too wide",
+            ResampleError::BadBufferLen => "wrong process buffer length",
+        })
+    }
+}
+
+impl core::error::Error for ResampleError {}
+
 /// A streaming windowed-sinc resampler over interleaved `i32` PCM.
 pub struct Resampler {
     channels: usize,

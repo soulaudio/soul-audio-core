@@ -63,6 +63,39 @@ pub enum PlayerError {
     Sink(SinkError),
 }
 
+impl core::fmt::Display for SinkError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            SinkError::Closed => "output device closed",
+            SinkError::Unsupported => "unsupported stream configuration",
+        })
+    }
+}
+
+impl core::error::Error for SinkError {}
+
+impl core::fmt::Display for PlayerError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PlayerError::ChannelMismatch => f.write_str("incompatible channel counts"),
+            PlayerError::Resample(e) => write!(f, "resample: {e}"),
+            PlayerError::Decode(e) => write!(f, "decode: {e}"),
+            PlayerError::Sink(e) => write!(f, "sink: {e}"),
+        }
+    }
+}
+
+impl core::error::Error for PlayerError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            PlayerError::Resample(e) => Some(e),
+            PlayerError::Decode(e) => Some(e),
+            PlayerError::Sink(e) => Some(e),
+            PlayerError::ChannelMismatch => None,
+        }
+    }
+}
+
 /// How source channels map to sink channels.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ChannelMap {
@@ -260,7 +293,21 @@ mod tests {
     use super::*;
     use crate::model::SampleFormat;
     extern crate alloc;
+    use alloc::string::ToString;
     use alloc::vec::Vec;
+
+    #[test]
+    fn player_error_displays_and_chains_source() {
+        use core::error::Error;
+        let e = PlayerError::Decode(DecodeError::Malformed);
+        assert!(!e.to_string().is_empty());
+        // The source chains to the wrapped decode error's Display.
+        assert_eq!(
+            e.source().map(ToString::to_string).as_deref(),
+            Some("malformed stream")
+        );
+        assert!(PlayerError::ChannelMismatch.source().is_none());
+    }
 
     /// A decoder yielding a fixed ramp: frame `f`, channel `c` = `f*10 + c + 1`.
     /// Emits `frames` total, honoring any output-buffer size (partial fills).

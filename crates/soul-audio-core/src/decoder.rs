@@ -18,6 +18,19 @@ pub enum DecodeError {
     Io,
 }
 
+impl core::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            DecodeError::UnexpectedEof => "unexpected end of stream",
+            DecodeError::Malformed => "malformed stream",
+            DecodeError::Unsupported => "unsupported format or variant",
+            DecodeError::Io => "reader I/O error",
+        })
+    }
+}
+
+impl core::error::Error for DecodeError {}
+
 /// A streaming **PCM** decoder producing interleaved `i32` samples into a
 /// caller-provided buffer. Implementors allocate nothing.
 ///
