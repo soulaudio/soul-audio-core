@@ -18,10 +18,11 @@ ffmpeg -y -hide_banner -loglevel error -f lavfi -i "$GRAPH" -c:a pcm_s16le tone.
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a flac tone.flac
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a libmp3lame -b:a 192k tone.mp3
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a flac -f ogg tone.ogg
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a alac -movflags +faststart tone.m4a
 
 # DSD: ffmpeg cannot encode PCM->DSD, so synthesize the 1-bit stream ourselves
 # (2nd-order sigma-delta + Sony DSF container). Needs python3 + numpy.
 python3 generate_dsd.py tone.dsf
 
 echo "generated:"
-ls -la tone.wav tone.flac tone.mp3 tone.ogg tone.dsf
+ls -la tone.wav tone.flac tone.mp3 tone.ogg tone.m4a tone.dsf

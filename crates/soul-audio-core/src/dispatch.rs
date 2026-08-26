@@ -9,7 +9,7 @@
 
 use crate::decoder::{DecodeError, Decoder};
 use crate::demux::ogg::OggReader;
-use crate::formats::{flac::FlacDecoder, mp3::Mp3Decoder, wav::WavDecoder};
+use crate::formats::{alac::AlacDecoder, flac::FlacDecoder, mp3::Mp3Decoder, wav::WavDecoder};
 use crate::io::BufSource;
 use crate::model::{Format, StreamInfo};
 use crate::probe::probe;
@@ -30,6 +30,8 @@ pub enum AnyDecoder<S> {
     Mp3(Mp3Decoder<S>),
     /// FLAC in an Ogg container.
     OggFlac(FlacDecoder<OggReader<S>>),
+    /// Apple Lossless in an MP4/M4A container.
+    Alac(AlacDecoder<S>),
 }
 
 impl<S: crate::io::Source> AnyDecoder<S> {
@@ -42,6 +44,7 @@ impl<S: crate::io::Source> AnyDecoder<S> {
             AnyDecoder::Flac(d) => d.total_frames(),
             AnyDecoder::Mp3(d) => d.total_frames(),
             AnyDecoder::OggFlac(d) => d.total_frames(),
+            AnyDecoder::Alac(d) => d.total_frames(),
         }
     }
 }
@@ -59,6 +62,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::Flac(d) => d.seek_to(sample),
             AnyDecoder::Mp3(d) => d.seek_to(sample),
             AnyDecoder::OggFlac(_) => Err(DecodeError::Unsupported),
+            AnyDecoder::Alac(_) => Err(DecodeError::Unsupported),
         }
     }
 
@@ -72,6 +76,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::Flac(d) => d.seek_to_time(secs),
             AnyDecoder::Mp3(d) => d.seek_to_time(secs),
             AnyDecoder::OggFlac(_) => Err(DecodeError::Unsupported),
+            AnyDecoder::Alac(_) => Err(DecodeError::Unsupported),
         }
     }
 }
@@ -92,6 +97,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::Flac(d) => d.stream_info(),
             AnyDecoder::Mp3(d) => d.stream_info(),
             AnyDecoder::OggFlac(d) => d.stream_info(),
+            AnyDecoder::Alac(d) => d.stream_info(),
         }
     }
 
@@ -101,6 +107,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::Flac(d) => d.decode_into(out),
             AnyDecoder::Mp3(d) => d.decode_into(out),
             AnyDecoder::OggFlac(d) => d.decode_into(out),
+            AnyDecoder::Alac(d) => d.decode_into(out),
         }
     }
 }
@@ -117,6 +124,7 @@ pub fn open<S: BufSource>(mut src: S) -> Result<AnyDecoder<S>, DecodeError> {
         Format::Flac => FlacDecoder::new(src).map(AnyDecoder::Flac),
         Format::Mp3 => Mp3Decoder::new(src).map(AnyDecoder::Mp3),
         Format::OggFlac => FlacDecoder::new(OggReader::new(src)?).map(AnyDecoder::OggFlac),
+        Format::Mp4 => AlacDecoder::new(src).map(AnyDecoder::Alac),
         // DSD containers need an explicit DsdMode (native / DoP / decimate);
         // they are not routed through the PCM `open`.
         Format::Dsf | Format::Dff => Err(DecodeError::Unsupported),
@@ -214,6 +222,23 @@ mod tests {
         assert_eq!(
             open(SliceSource::new(b"XXXXYYYY")).err(),
             Some(DecodeError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn open_routes_and_decodes_alac() {
+        let bytes = include_bytes!("../testdata/alac.m4a");
+        let mut dec = open(crate::io::SliceSource::new(bytes)).expect("probe + construct");
+        assert!(matches!(dec, AnyDecoder::Alac(_)));
+        assert_eq!(dec.stream_info().sample_rate, 44_100);
+        assert_eq!(dec.total_frames(), Some(13_230));
+        let mut buf = [0i32; 16];
+        let n = dec.decode_into(&mut buf).unwrap();
+        assert!(n > 0);
+        // seek is unsupported in v1 (like Ogg-FLAC)
+        assert_eq!(
+            dec.seek_to(0).err(),
+            Some(crate::decoder::DecodeError::Unsupported)
         );
     }
 }

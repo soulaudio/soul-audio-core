@@ -295,6 +295,7 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
             "dff",
             include_bytes!("../testdata/dst-64fs44-2ch.slice.dff").to_vec(),
         ),
+        ("alac", include_bytes!("../testdata/alac.m4a").to_vec()),
     ]
 }
 
@@ -308,10 +309,11 @@ const MAGICS: &[&[u8]] = &[
     b"DSD ",
     b"FRM8",
     b"ID3\x04\x00\x00",
-    b"\xff\xfb\x90\x00", // MPEG-1 Layer III
-    b"\xff\xfd\x80\x04", // MPEG-1 Layer II
-    b"\xff\xfe\xc8\x04", // MPEG-1 Layer I
-    b"\xff\xf3\x00\x00", // MPEG-2 Layer III
+    b"\xff\xfb\x90\x00",         // MPEG-1 Layer III
+    b"\xff\xfd\x80\x04",         // MPEG-1 Layer II
+    b"\xff\xfe\xc8\x04",         // MPEG-1 Layer I
+    b"\xff\xf3\x00\x00",         // MPEG-2 Layer III
+    b"\x00\x00\x00\x18ftypM4A ", // MP4/M4A (ALAC) — 4-byte box size then `ftyp`
 ];
 
 fn run_sweep() -> Vec<Failure> {

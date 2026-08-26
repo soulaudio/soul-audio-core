@@ -448,8 +448,16 @@ fn fixture(name: &str) -> std::path::PathBuf {
 }
 
 /// Decode a fixture through the CLI and return the raw i32 LE PCM bytes.
+///
+/// The output path is unique per call (pid + monotonic counter): several
+/// tests decode the same fixture name (e.g. `tone.wav`) concurrently, and a
+/// path keyed only on `name` would let those runs race on the same temp
+/// file.
 fn decode_fixture(name: &str) -> Vec<u8> {
-    let out = tmp(&format!("fx_{name}.pcm"));
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let uid = SEQ.fetch_add(1, Ordering::Relaxed);
+    let out = tmp(&format!("fx_{name}_{}_{uid}.pcm", std::process::id()));
     Command::cargo_bin("soul-audio-cli")
         .unwrap()
         .arg("decode")
@@ -558,4 +566,42 @@ fn real_flac_plays_through_the_render_pipeline() {
     let frames = pcm.len() / 2;
     assert!((frames as i64 - 96_000).abs() < 2000, "frames {frames}");
     assert!(pcm.iter().any(|&s| s.abs() > 1000), "render is silent");
+}
+
+#[test]
+fn real_alac_decodes_losslessly_vs_wav() {
+    // ALAC is lossless — decoding tone.m4a must match tone.wav's PCM.
+    assert_eq!(
+        decode_fixture("tone.m4a"),
+        decode_fixture("tone.wav"),
+        "ALAC decode is not lossless vs the reference WAV"
+    );
+}
+
+#[test]
+fn real_alac_renders_stereo_tones() {
+    let out = tmp("alac_out.pcm");
+    Command::cargo_bin("soul-audio-cli")
+        .unwrap()
+        .args(["render"])
+        .arg(fixture("tone.m4a"))
+        .args(["--out"])
+        .arg(&out)
+        .args(["--rate", "48000", "--channels", "2"])
+        .assert()
+        .success();
+    let pcm = read_pcm(&out);
+    let n = 16_384;
+    let left = analyze(&channel_window(&pcm, 2, 0, 4000, n), 48_000);
+    let right = analyze(&channel_window(&pcm, 2, 1, 4000, n), 48_000);
+    assert!(
+        (left.peak_hz - 440.0).abs() < 6.0,
+        "ALAC left {:.1} Hz",
+        left.peak_hz
+    );
+    assert!(
+        (right.peak_hz - 659.25).abs() < 6.0,
+        "ALAC right {:.1} Hz",
+        right.peak_hz
+    );
 }

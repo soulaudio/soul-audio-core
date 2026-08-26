@@ -51,6 +51,10 @@ fn identify(head: &[u8]) -> Option<Format> {
     if head.len() >= 2 && head[0] == 0xFF && (head[1] & 0xE0) == 0xE0 {
         return Some(Format::Mp3);
     }
+    // MP4/M4A: "ftyp" box type at offset 4 (after the 4-byte box size).
+    if head.len() >= 8 && &head[4..8] == b"ftyp" {
+        return Some(Format::Mp4);
+    }
     None
 }
 
@@ -72,6 +76,18 @@ mod tests {
         assert_eq!(probe_bytes(b"FRM8\0\0\0\0").unwrap(), Format::Dff);
         assert_eq!(probe_bytes(b"ID3\x04\0\0\0").unwrap(), Format::Mp3);
         assert_eq!(probe_bytes(&[0xFF, 0xFB, 0x90, 0x00]).unwrap(), Format::Mp3);
+    }
+
+    #[test]
+    fn identifies_mp4_ftyp() {
+        // 4-byte box size (0x18) then the "ftyp" box type at offset 4 -> MP4/M4A.
+        assert_eq!(
+            probe_bytes(&[
+                0, 0, 0, 0x18, b'f', b't', b'y', b'p', b'M', b'4', b'A', b' '
+            ])
+            .unwrap(),
+            Format::Mp4
+        );
     }
 
     #[test]

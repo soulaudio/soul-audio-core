@@ -123,6 +123,11 @@ fn qa_audio() -> Result<(), String> {
         ("MP3", "tone.mp3", "lossy — a hair different is expected"),
         ("Ogg-FLAC", "tone.ogg", "should sound identical to the WAV"),
         (
+            "ALAC (.m4a)",
+            "tone.m4a",
+            "Apple Lossless — should sound identical to the WAV",
+        ),
+        (
             "DSD (DSF)",
             "tone.dsf",
             "1-bit DSD64 decimated to PCM — same chord, faint hiss OK",

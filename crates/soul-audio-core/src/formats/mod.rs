@@ -9,6 +9,7 @@
 //! - PCM formats ([`wav`], [`flac`], [`mp3`]) implement [`crate::Decoder`].
 //! - DSD containers ([`dsf`], [`dff`]) implement [`crate::DsdDecoder`].
 
+pub mod alac;
 pub mod dff;
 pub mod dsf;
 pub mod dst;

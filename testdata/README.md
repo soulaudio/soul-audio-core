@@ -17,6 +17,7 @@ right = 659.25 Hz (E5), −6 dB, with 50 ms in/out fades. So:
 | `tone.flac` | native FLAC |
 | `tone.mp3`  | MPEG Layer III |
 | `tone.ogg`  | FLAC-in-Ogg |
+| `tone.m4a`  | ALAC (Apple Lossless) in MP4/M4A |
 | `tone.dsf`  | DSD64 (Sony DSF), 0.5 s — 1-bit, decimated to PCM for playback |
 
 DSD is 1-bit at 2.8 MHz, so `tone.dsf` is deliberately shorter (0.5 s) to keep
@@ -36,10 +37,10 @@ gapless WAV→FLAC queue. This is the one check tests can't make — that it act
 ## Automated checks
 
 `crates/soul-audio-cli/tests/e2e.rs` decodes these through the CLI and asserts
-FLAC and Ogg-FLAC are **bit-exact vs `tone.wav`** (lossless), MP3 decodes to
-plausible audio, and a real FLAC renders through the full pipeline. The
+FLAC, Ogg-FLAC, and ALAC are **bit-exact vs `tone.wav`** (lossless), MP3 decodes
+to plausible audio, and a real FLAC renders through the full pipeline. The
 signal-analysis tests there additionally verify pitch/level/cleanliness and
-channel routing on rendered output.
+channel routing on rendered output (including a rendered ALAC pass).
 
 ## Regenerating
 

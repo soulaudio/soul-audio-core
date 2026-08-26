@@ -10,6 +10,7 @@ use crate::model::StreamInfo;
 
 pub mod flac;
 pub mod mp3;
+pub mod mp4;
 pub mod ogg;
 pub mod wav;
 

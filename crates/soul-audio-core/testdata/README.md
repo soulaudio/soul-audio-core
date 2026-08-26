@@ -28,6 +28,13 @@ not here — these are minimal decode-correctness vectors.
 - `flac-in-ogg.ogg` — ffmpeg-encoded FLAC in an Ogg container. `open()` decodes
   it bit-exactly vs ffmpeg (golden test in `tests/decode.rs`).
 
+## ALAC
+
+- `alac.m4a` / `alac.ref.pcm` — an ffmpeg-encoded ALAC (Apple Lossless) stream
+  in an MP4/M4A container, plus ffmpeg's own decoded PCM reference. Our ALAC
+  decoder (via `open()`'s MP4 `moov`/`mdat` parsing) matches ffmpeg's decode
+  bit-exactly (golden test in the ALAC decoder/format tests).
+
 ## MPEG audio (Layers I / II / III)
 
 - `layer1-32k-stereo.mp1` + `layer1-32k-stereo.ffref16.pcm` — Layer I and its

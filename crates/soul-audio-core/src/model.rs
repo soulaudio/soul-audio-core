@@ -103,6 +103,8 @@ pub enum Format {
     Dff,
     /// FLAC in an Ogg container.
     OggFlac,
+    /// MP4/M4A container (ALAC audio in v1).
+    Mp4,
 }
 
 /// Explicit DSD output mode chosen by the caller. Selects which path a native
