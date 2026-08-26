@@ -254,6 +254,26 @@ cargo xtask verify               # full gate: fmt, clippy -D warnings, tests, bo
 cargo build -p soul-audio-core --target thumbv7em-none-eabihf --no-default-features  # no_std gate
 ```
 
+### Testing & QA
+
+The playback pipeline is verified end-to-end **without an audio device**: the
+`render` command runs the same engine/deck path as `play` into a file, and
+`crates/soul-audio-cli/tests/e2e.rs` asserts on the rendered PCM — gapless
+concatenation, resampling (up/down), channel mapping, plus FFT signal analysis
+for pitch, level, cleanliness (SFDR) and stereo routing. Real per-format
+fixtures in `testdata/` are decoded in the same suite and checked bit-exact
+(FLAC/Ogg-FLAC vs the reference WAV). All of this runs in `cargo test`.
+
+```sh
+cargo xtask qa-audio             # by-ear QA: play every testdata/ fixture + a gapless queue
+```
+
+`qa-audio` is the one check tests can't make — that it actually *sounds* right
+through a real device. It plays the same signal in each format (WAV/FLAC/MP3/
+Ogg-FLAC, plus a DSD64 DSF decimated to PCM) with what to listen for, then a
+gapless WAV→FLAC queue. Needs the `playback` feature (pulled in automatically).
+See `testdata/README.md`.
+
 Git hooks (via [lefthook](https://github.com/evilmartians/lefthook)): pre-commit
 runs fmt + clippy on staged files; pre-push runs the full `cargo xtask verify`.
 Install the lefthook binary and run `lefthook install` once.

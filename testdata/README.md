@@ -1,38 +1,58 @@
-# testdata
+# testdata — playback fixtures
 
-Committed test fixtures live here. **Empty in the template** — decoders are
-stubs, so there is nothing to decode yet.
+Full, playable clips for **by-ear** and **render** QA of the whole pipeline
+(decode → resample → normalize → output), one per supported PCM container.
 
-When you implement a decoder, add:
+Every file carries the **same 2-second stereo signal**: left = 440 Hz (A4),
+right = 659.25 Hz (E5), −6 dB, with 50 ms in/out fades. So:
 
-- a small input clip, e.g. `sine_stereo_44100.wav` (keep it a few ms so the repo
-  and CI stay light), and
-- a golden reference, e.g. `sine_stereo_44100.pcm` — the expected decoder output
-  as interleaved little-endian `i32`.
+- each format should sound *identical* (decode correctness),
+- the sample-exact formats (WAV/FLAC) played back-to-back are one continuous
+  chord (gapless), and
+- 44.1 kHz on a 48 kHz device exercises the resampler.
 
-Generate the golden output **independently of `soul-audio-core`** (a short
-script, a trusted tool, or by construction) so the tests validate the decoder
-against an external oracle rather than against itself. Fixtures are treated as
-binary — see `.gitattributes`.
+| File | Format |
+|------|--------|
+| `tone.wav`  | RIFF/WAVE PCM (the reference) |
+| `tone.flac` | native FLAC |
+| `tone.mp3`  | MPEG Layer III |
+| `tone.ogg`  | FLAC-in-Ogg |
+| `tone.dsf`  | DSD64 (Sony DSF), 0.5 s — 1-bit, decimated to PCM for playback |
 
-The firmware can embed a clip from here via `include_bytes!` to exercise the
-core on real hardware.
+DSD is 1-bit at 2.8 MHz, so `tone.dsf` is deliberately shorter (0.5 s) to keep
+it small. The CLI decimates it to multi-bit PCM (DSD64 → 352.8 kHz) and the deck
+resamples that to the device rate, so it plays on any DAC.
 
-## DST cross-check vector
+## By-ear QA (one command)
 
-`dst-64fs44-2ch.slice.dff` — first frames of the FFmpeg FATE sample
-`dst-64fs44-2ch.dff` (DSD64 stereo, DST-compressed). Our decode of the full
-file matched FFmpeg's DST decoder bit-exact (raw DSD) and the FFmpeg binary
-end-to-end (PCM); this slice is the embedded regression gate
-(`dff.rs::dst_real_fate_slice_matches_ffmpeg`).
+```sh
+cargo xtask qa-audio
+```
 
-## IMA-ADPCM vectors
+Plays each fixture on the default output device with what to listen for, then a
+gapless WAV→FLAC queue. This is the one check tests can't make — that it actually
+*sounds* right through a real device.
 
-`ima-adpcm-mono.wav` / `ima-adpcm-stereo.wav` — ffmpeg-encoded IMA/DVI-ADPCM
-(WAV tag 0x11). Our decode matches ffmpeg's own decode bit-exactly (golden
-tests in `formats/wav.rs`).
+## Automated checks
 
-## FLAC-in-Ogg vector
+`crates/soul-audio-cli/tests/e2e.rs` decodes these through the CLI and asserts
+FLAC and Ogg-FLAC are **bit-exact vs `tone.wav`** (lossless), MP3 decodes to
+plausible audio, and a real FLAC renders through the full pipeline. The
+signal-analysis tests there additionally verify pitch/level/cleanliness and
+channel routing on rendered output.
 
-`flac-in-ogg.ogg` — ffmpeg-encoded FLAC in an Ogg container. `open()` decodes it
-bit-exactly vs ffmpeg (golden test in `tests/decode.rs`).
+## Regenerating
+
+```sh
+bash testdata/generate.sh   # needs ffmpeg (libmp3lame + flac) and python3 + numpy
+```
+
+The PCM fixtures are produced by ffmpeg (independent of `soul-audio-core`), so
+decoding them validates our from-scratch decoders against an external encoder.
+`tone.dsf` is synthesized by `generate_dsd.py` — ffmpeg cannot *encode* PCM→DSD,
+so a 2nd-order sigma-delta modulator turns the tone into a 1-bit DSD64 stream
+wrapped in a Sony DSF container (ffmpeg *can* decode it, for cross-checking).
+
+> Minimal decode-correctness **vectors** (DSD/DST slice, IMA-ADPCM, MPEG
+> Layer I/II, VBR MP3, FLAC-in-Ogg) live in
+> `crates/soul-audio-core/testdata/`, next to the codec tests that embed them.

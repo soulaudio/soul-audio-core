@@ -437,3 +437,125 @@ fn render_keeps_stereo_channels_distinct() {
         right.peak_hz
     );
 }
+
+// --- committed per-format fixtures decoded by our own decoders ----------------
+
+/// Path to a committed `testdata/` fixture (relative to the workspace).
+fn fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata")
+        .join(name)
+}
+
+/// Decode a fixture through the CLI and return the raw i32 LE PCM bytes.
+fn decode_fixture(name: &str) -> Vec<u8> {
+    let out = tmp(&format!("fx_{name}.pcm"));
+    Command::cargo_bin("soul-audio-cli")
+        .unwrap()
+        .arg("decode")
+        .arg(fixture(name))
+        .arg("--out")
+        .arg(&out)
+        .assert()
+        .success();
+    std::fs::read(&out).unwrap()
+}
+
+#[test]
+fn real_flac_decodes_losslessly_vs_wav() {
+    // The fixtures carry the same signal; our from-scratch FLAC decoder must
+    // reproduce the reference WAV bit-for-bit.
+    assert_eq!(
+        decode_fixture("tone.flac"),
+        decode_fixture("tone.wav"),
+        "FLAC decode is not lossless vs the reference WAV"
+    );
+}
+
+#[test]
+fn real_ogg_flac_decodes_losslessly_vs_wav() {
+    assert_eq!(
+        decode_fixture("tone.ogg"),
+        decode_fixture("tone.wav"),
+        "Ogg-FLAC decode is not lossless vs the reference WAV"
+    );
+}
+
+#[test]
+fn real_mp3_decodes_to_plausible_audio() {
+    let pcm = decode_fixture("tone.mp3");
+    let samples: Vec<i32> = pcm
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    // ~2 s stereo @ 44.1 kHz = 176_400 samples, ± MP3 encoder/decoder delay.
+    assert!(
+        (samples.len() as i64 - 176_400).abs() < 20_000,
+        "unexpected MP3 length: {}",
+        samples.len()
+    );
+    assert!(
+        samples.iter().any(|&s| s.abs() > 1000),
+        "MP3 decoded to silence"
+    );
+}
+
+#[test]
+fn real_dsd_decodes_decimates_and_preserves_stereo_tones() {
+    // A real DSF (DSD64) all the way through: decode 1-bit → decimate to PCM →
+    // resample to the device rate. The A4-left / E5-right tones must come back
+    // cleanly on the correct channels — this exercises the whole DSD path.
+    let out = tmp("dsd_out.pcm");
+    Command::cargo_bin("soul-audio-cli")
+        .unwrap()
+        .args(["render"])
+        .arg(fixture("tone.dsf"))
+        .args(["--out"])
+        .arg(&out)
+        .args(["--rate", "48000", "--channels", "2"])
+        .assert()
+        .success();
+
+    let pcm = read_pcm(&out);
+    let n = 16_384;
+    let left = analyze(&channel_window(&pcm, 2, 0, 4000, n), 48_000);
+    let right = analyze(&channel_window(&pcm, 2, 1, 4000, n), 48_000);
+    assert!(
+        (left.peak_hz - 440.0).abs() < 6.0,
+        "DSD left tone {:.1} Hz, not 440",
+        left.peak_hz
+    );
+    assert!(
+        (right.peak_hz - 659.25).abs() < 6.0,
+        "DSD right tone {:.1} Hz, not 659",
+        right.peak_hz
+    );
+    // Well clear of aliasing (measured ~78-83 dB; the modulator noise is shaped
+    // out of band).
+    assert!(
+        left.sfdr_db > 40.0 && right.sfdr_db > 40.0,
+        "DSD not clean: {:.0}/{:.0} dB",
+        left.sfdr_db,
+        right.sfdr_db
+    );
+}
+
+#[test]
+fn real_flac_plays_through_the_render_pipeline() {
+    // A real FLAC all the way through decode → resample → normalize → file.
+    let out = tmp("fx_flac_render.pcm");
+    Command::cargo_bin("soul-audio-cli")
+        .unwrap()
+        .args(["render"])
+        .arg(fixture("tone.flac"))
+        .args(["--out"])
+        .arg(&out)
+        .args(["--rate", "48000", "--channels", "2"])
+        .assert()
+        .success();
+    let pcm = read_pcm(&out);
+    // 2 s resampled 44.1k → 48k ≈ 96_000 frames × 2 ch.
+    let frames = pcm.len() / 2;
+    assert!((frames as i64 - 96_000).abs() < 2000, "frames {frames}");
+    assert!(pcm.iter().any(|&s| s.abs() > 1000), "render is silent");
+}
