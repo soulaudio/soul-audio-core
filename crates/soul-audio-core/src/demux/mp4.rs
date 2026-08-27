@@ -1,11 +1,13 @@
 //! Minimal, forward-streaming MP4/M4A box reader for **faststart** files
-//! (`moov` before `mdat`). It walks the box tree to the `stsd`→`alac` sample
-//! entry (extracting the ALAC magic cookie), reads `mdhd` for the duration, and
-//! stops at `mdat` with the source positioned on the audio. Structured so the
-//! sample tables (`stsz`/`stco`, for seeking) and the `mp4a` entry (for AAC)
-//! are additive.
+//! (`moov` before `mdat`). It walks the box tree to the `stsd` sample entry —
+//! `alac` (extracting the ALAC magic cookie) or `mp4a` (descending into
+//! `esds` for the AAC `AudioSpecificConfig`) — reads `mdhd` for the duration,
+//! and stops at `mdat` with the source positioned on the audio. Structured so
+//! the sample tables (`stsz`/`stco`, for seeking) are additive.
 
 use crate::decoder::DecodeError;
+use crate::demux::adts::AacConfig;
+use crate::demux::{SAMPLE_RATES, channels_for};
 use crate::io::Source;
 
 /// The 24-byte `ALACSpecificConfig` from the `stsd`→`alac` cookie (big-endian on
@@ -22,10 +24,21 @@ pub struct AlacConfig {
     pub max_frame_bytes: u32,
 }
 
+/// Which audio codec the `stsd` sample entry described — determined once in
+/// [`Mp4Reader::new`] and exposed via [`Mp4Reader::codec`] so a caller (e.g.
+/// [`crate::dispatch::open`]) can branch to the matching decoder.
+#[derive(Clone, Copy, Debug)]
+pub enum Mp4Codec {
+    /// Apple Lossless — the `stsd`→`alac` magic cookie.
+    Alac(AlacConfig),
+    /// AAC — the `stsd`→`mp4a`→`esds` `AudioSpecificConfig`.
+    Aac(AacConfig),
+}
+
 /// A parsed MP4 header positioned at `mdat` audio.
 pub struct Mp4Reader<S> {
     src: S,
-    config: AlacConfig,
+    codec: Mp4Codec,
     total_samples: u64,
     mdat_remaining: u64,
 }
@@ -86,21 +99,21 @@ impl<S: Source> Mp4Reader<S> {
     /// [`DecodeError::Unsupported`] for non-faststart / non-ALAC / missing boxes;
     /// [`DecodeError::Malformed`] on truncation.
     pub fn new(mut src: S) -> Result<Self, DecodeError> {
-        let mut config: Option<AlacConfig> = None;
+        let mut codec: Option<Mp4Codec> = None;
         let mut total_samples: u64 = 0;
         loop {
             let (len, fourcc, _) = box_header(&mut src)?;
             match &fourcc {
                 b"moov" => {
                     let (c, ts) = parse_moov(&mut src, len)?;
-                    config = Some(c);
+                    codec = Some(c);
                     total_samples = ts;
                 }
                 b"mdat" => {
-                    let config = config.ok_or(DecodeError::Unsupported)?; // moov must precede mdat
+                    let codec = codec.ok_or(DecodeError::Unsupported)?; // moov must precede mdat
                     return Ok(Self {
                         src,
-                        config,
+                        codec,
                         total_samples,
                         mdat_remaining: len,
                     });
@@ -110,8 +123,34 @@ impl<S: Source> Mp4Reader<S> {
         }
     }
 
+    /// The codec the `stsd` sample entry described (`Alac` or `Aac`).
+    pub fn codec(&self) -> Mp4Codec {
+        self.codec
+    }
+
+    /// The ALAC config, for [`crate::formats::alac::AlacDecoder`] — which
+    /// only ever constructs a reader over an ALAC `.m4a` and consumes this
+    /// directly. If the sample entry actually described AAC (`mp4a`), this
+    /// returns a zeroed placeholder rather than panicking: every field
+    /// `AlacDecoder::new` validates (`channels`, `frame_length`, `kb`, …) is
+    /// `0` there, so construction cleanly fails `Unsupported` instead of
+    /// misreading absent ALAC data as a real cookie. New code should prefer
+    /// [`Self::codec`].
     pub fn config(&self) -> &AlacConfig {
-        &self.config
+        const ZERO: AlacConfig = AlacConfig {
+            frame_length: 0,
+            bit_depth: 0,
+            pb: 0,
+            mb: 0,
+            kb: 0,
+            channels: 0,
+            sample_rate: 0,
+            max_frame_bytes: 0,
+        };
+        match &self.codec {
+            Mp4Codec::Alac(c) => c,
+            Mp4Codec::Aac(_) => &ZERO,
+        }
     }
     pub fn total_samples(&self) -> u64 {
         self.total_samples
@@ -124,19 +163,20 @@ impl<S: Source> Mp4Reader<S> {
     }
 }
 
-/// Descend `moov`→`trak`→`mdia`→(`mdhd`,`minf`→`stbl`→`stsd`). Returns the ALAC
-/// config and the total per-channel sample count.
+/// Descend `moov`→`trak`→`mdia`→(`mdhd`,`minf`→`stbl`→`stsd`). Returns the
+/// parsed codec ([`Mp4Codec::Alac`] or [`Mp4Codec::Aac`]) and the total
+/// per-channel sample count.
 ///
 /// Sibling order within `mdia` (and any other container walked here) is not
 /// spec-mandated (ISO/IEC 14496-12), so every child is visited regardless of
 /// position, and each visited box — matched or skipped — consumes exactly its
 /// declared length. See [`descend_for`] for the same invariant applied to a
 /// single "find one child" descent.
-fn parse_moov<S: Source>(src: &mut S, len: u64) -> Result<(AlacConfig, u64), DecodeError> {
+fn parse_moov<S: Source>(src: &mut S, len: u64) -> Result<(Mp4Codec, u64), DecodeError> {
     descend_for(src, len, b"trak", |src, len| {
         descend_for(src, len, b"mdia", |src, len| {
             let mut total = 0u64;
-            let mut config = None;
+            let mut codec = None;
             let mut consumed = 0u64;
             loop {
                 let remaining = len.checked_sub(consumed).ok_or(DecodeError::Malformed)?;
@@ -153,7 +193,7 @@ fn parse_moov<S: Source>(src: &mut S, len: u64) -> Result<(AlacConfig, u64), Dec
                 match &f {
                     b"mdhd" => total = parse_mdhd(src, l)?,
                     b"minf" => {
-                        config = Some(descend_for(src, l, b"stbl", |src, len| {
+                        codec = Some(descend_for(src, l, b"stbl", |src, len| {
                             descend_for(src, len, b"stsd", parse_stsd)
                         })?);
                     }
@@ -163,8 +203,8 @@ fn parse_moov<S: Source>(src: &mut S, len: u64) -> Result<(AlacConfig, u64), Dec
                     .checked_add(box_total)
                     .ok_or(DecodeError::Malformed)?;
             }
-            let config = config.ok_or(DecodeError::Unsupported)?;
-            Ok((config, total))
+            let codec = codec.ok_or(DecodeError::Unsupported)?;
+            Ok((codec, total))
         })
     })
 }
@@ -251,32 +291,242 @@ fn parse_mdhd<S: Source>(src: &mut S, len: u64) -> Result<u64, DecodeError> {
     }
 }
 
-/// `stsd`: version+flags(4) + entry_count(4), then the sample entry. For `alac`,
-/// skip 8 (entry box header) + 28 (AudioSampleEntry body) + 12 (inner `alac`
-/// FullBox header) to reach the 24-byte config.
-fn parse_stsd<S: Source>(src: &mut S, len: u64) -> Result<AlacConfig, DecodeError> {
+/// `stsd`: version+flags(4) + entry_count(4), then the sample entry. Both
+/// `alac` and `mp4a` share an 8-byte entry box header + 28-byte
+/// `AudioSampleEntry` body; what follows differs:
+/// - `alac`: a 12-byte inner `alac` `FullBox` header, then the 24-byte cookie.
+/// - `mp4a`: an `esds` box carrying the AAC `AudioSpecificConfig` (see
+///   [`parse_esds`]).
+///
+/// Any other sample entry is `Unsupported`. The entry box's declared length is
+/// checked against `stsd`'s own bound (via [`child_header`]), and each branch
+/// consumes exactly that declared length before this function drains
+/// whatever remains of `stsd`.
+fn parse_stsd<S: Source>(src: &mut S, len: u64) -> Result<Mp4Codec, DecodeError> {
     let _vf_count: [u8; 8] = read_exact(src)?;
-    let (_entry_len, fourcc, _h) = box_header(src)?;
-    if &fourcc != b"alac" {
-        return Err(DecodeError::Unsupported); // e.g. mp4a (AAC) — future
+    let remaining = len.checked_sub(8).ok_or(DecodeError::Malformed)?;
+    let (entry_len, fourcc, entry_total) = child_header(src, remaining)?;
+    let codec = if &fourcc == b"alac" {
+        // AudioSampleEntry body (28) + inner alac FullBox header (12) = 40,
+        // then the 24-byte cookie, then whatever padding remains of the entry.
+        let trailer = entry_len
+            .checked_sub(28 + 12 + 24)
+            .ok_or(DecodeError::Malformed)?;
+        skip(src, 28 + 12)?;
+        let c: [u8; 24] = read_exact(src)?;
+        skip(src, trailer)?;
+        Mp4Codec::Alac(AlacConfig {
+            frame_length: be32(&c[0..4]),
+            bit_depth: c[5],
+            pb: c[6],
+            mb: c[7],
+            kb: c[8],
+            channels: c[9],
+            max_frame_bytes: be32(&c[12..16]),
+            sample_rate: be32(&c[20..24]),
+        })
+    } else if &fourcc == b"mp4a" {
+        // Same 28-byte AudioSampleEntry body, then an esds box (instead of an
+        // inner alac box).
+        let after_preamble = entry_len.checked_sub(28).ok_or(DecodeError::Malformed)?;
+        skip(src, 28)?;
+        let (esds_len, esds_fourcc, esds_total) = child_header(src, after_preamble)?;
+        if &esds_fourcc != b"esds" {
+            return Err(DecodeError::Unsupported);
+        }
+        let asc = parse_esds(src, esds_len)?;
+        let trailer = after_preamble
+            .checked_sub(esds_total)
+            .ok_or(DecodeError::Malformed)?;
+        skip(src, trailer)?;
+        Mp4Codec::Aac(asc)
+    } else {
+        return Err(DecodeError::Unsupported); // some other sample entry
+    };
+    let after_entry = remaining
+        .checked_sub(entry_total)
+        .ok_or(DecodeError::Malformed)?;
+    skip(src, after_entry)?;
+    Ok(codec)
+}
+
+/// Read one MPEG-4 descriptor header: a 1-byte tag followed by an
+/// **expandable length** (each byte's low 7 bits shift in; the chain
+/// continues while the byte's top bit is set — capped at 4 length bytes per
+/// ISO/IEC 14496-1, so a runaway continuation chain is `Malformed` rather
+/// than looping unboundedly). Returns `(tag, content_len, header_len)`, where
+/// `header_len` (tag + length bytes) and `content_len` are both checked
+/// against `remaining` — the bytes left in the enclosing descriptor/box — so
+/// a truncated or oversized descriptor is `Malformed`, never an OOB read.
+fn descriptor_header<S: Source>(
+    src: &mut S,
+    remaining: u64,
+) -> Result<(u8, u64, u64), DecodeError> {
+    if remaining < 2 {
+        return Err(DecodeError::Malformed);
     }
-    // AudioSampleEntry body (28) + inner alac FullBox header (12) = 40, then the
-    // 24-byte config; then skip the remainder of the entry and stsd.
-    skip(src, 28 + 12)?;
-    let c: [u8; 24] = read_exact(src)?;
-    // Skip whatever remains of stsd after the config.
-    let read_so_far = 8u64 /*stsd vf+count*/ + 8 /*entry hdr*/ + 28 + 12 + 24;
-    let after = len.checked_sub(read_so_far).ok_or(DecodeError::Malformed)?;
-    skip(src, after)?;
-    Ok(AlacConfig {
-        frame_length: be32(&c[0..4]),
-        bit_depth: c[5],
-        pb: c[6],
-        mb: c[7],
-        kb: c[8],
-        channels: c[9],
-        max_frame_bytes: be32(&c[12..16]),
-        sample_rate: be32(&c[20..24]),
+    let tag: [u8; 1] = read_exact(src)?;
+    let mut header_len = 1u64;
+    let mut size: u64 = 0;
+    loop {
+        if header_len >= remaining || header_len > 4 {
+            return Err(DecodeError::Malformed);
+        }
+        let b: [u8; 1] = read_exact(src)?;
+        header_len += 1;
+        size = (size << 7) | u64::from(b[0] & 0x7F);
+        if b[0] & 0x80 == 0 {
+            break;
+        }
+    }
+    let total = header_len.checked_add(size).ok_or(DecodeError::Malformed)?;
+    if total > remaining {
+        return Err(DecodeError::Malformed);
+    }
+    Ok((tag[0], size, header_len))
+}
+
+/// `esds`: a `FullBox` (version+flags, 4 bytes, skipped) wrapping the MPEG-4
+/// descriptor chain down to the `AudioSpecificConfig` bytes:
+/// `ES_Descriptor` (tag `0x03`) → `DecoderConfigDescriptor` (tag `0x04`) →
+/// `DecoderSpecificInfo` (tag `0x05`) = the ASC. See `aac-reference.md` §2
+/// for the descriptor field layout. Every descriptor's length is
+/// bounds-checked (via [`descriptor_header`]) against the bytes left in its
+/// enclosing descriptor, so a truncated/runaway chain is `Malformed`, never a
+/// panic or OOB read. Consumes exactly `len` bytes.
+fn parse_esds<S: Source>(src: &mut S, len: u64) -> Result<AacConfig, DecodeError> {
+    let _version_flags: [u8; 4] = read_exact(src)?;
+    let mut pos = 4u64;
+
+    let box_left = len.checked_sub(pos).ok_or(DecodeError::Malformed)?;
+    let (tag, es_len, es_hdr) = descriptor_header(src, box_left)?;
+    if tag != 0x03 {
+        return Err(DecodeError::Unsupported);
+    }
+    pos = pos.checked_add(es_hdr).ok_or(DecodeError::Malformed)?;
+
+    // ES_ID(16) + flags(8: streamDependenceFlag/URL_flag/OCRstreamFlag/streamPriority(5)).
+    let mut es_left = es_len.checked_sub(3).ok_or(DecodeError::Malformed)?;
+    let es_fixed: [u8; 3] = read_exact(src)?;
+    pos += 3;
+    let flags = es_fixed[2];
+
+    if flags & 0x80 != 0 {
+        // dependsOn_ES_ID
+        es_left = es_left.checked_sub(2).ok_or(DecodeError::Malformed)?;
+        skip(src, 2)?;
+        pos += 2;
+    }
+    if flags & 0x40 != 0 {
+        // URL_flag: URLlength(8) + URL bytes
+        es_left = es_left.checked_sub(1).ok_or(DecodeError::Malformed)?;
+        let url_len: [u8; 1] = read_exact(src)?;
+        pos += 1;
+        let ul = u64::from(url_len[0]);
+        es_left = es_left.checked_sub(ul).ok_or(DecodeError::Malformed)?;
+        skip(src, ul)?;
+        pos += ul;
+    }
+    if flags & 0x20 != 0 {
+        // OCRstreamFlag
+        es_left = es_left.checked_sub(2).ok_or(DecodeError::Malformed)?;
+        skip(src, 2)?;
+        pos += 2;
+    }
+
+    let (tag, dc_len, dc_hdr) = descriptor_header(src, es_left)?;
+    if tag != 0x04 {
+        return Err(DecodeError::Unsupported);
+    }
+    pos = pos.checked_add(dc_hdr).ok_or(DecodeError::Malformed)?;
+
+    // objectTypeIndication(8) + streamType/upStream/reserved(8) +
+    // bufferSizeDB(24) + maxBitrate(32) + avgBitrate(32) = 13 fixed bytes.
+    let dc_left = dc_len.checked_sub(13).ok_or(DecodeError::Malformed)?;
+    skip(src, 13)?;
+    pos += 13;
+
+    let (tag, di_len, di_hdr) = descriptor_header(src, dc_left)?;
+    if tag != 0x05 {
+        return Err(DecodeError::Unsupported);
+    }
+    pos = pos.checked_add(di_hdr).ok_or(DecodeError::Malformed)?;
+
+    // The ASC fields this reader needs (audioObjectType[+ext],
+    // samplingFrequencyIndex[+explicit rate], channelConfiguration) fit in
+    // well under 8 bytes; a longer DecoderSpecificInfo (SBR/PS extension,
+    // GASpecificConfig tail) is read up to that cap and the remainder is
+    // skipped unparsed.
+    const ASC_CAP: usize = 8;
+    let take = (di_len as usize).min(ASC_CAP);
+    let mut asc = [0u8; ASC_CAP];
+    src.read_exact(&mut asc[..take])
+        .map_err(|_| DecodeError::Malformed)?;
+    pos = pos.checked_add(take as u64).ok_or(DecodeError::Malformed)?;
+    let config = parse_audio_specific_config(&asc[..take])?;
+
+    let remainder = len.checked_sub(pos).ok_or(DecodeError::Malformed)?;
+    skip(src, remainder)?;
+    Ok(config)
+}
+
+/// MSB-first, bounds-checked bit reader over a fixed byte slice — used only
+/// for the handful of `AudioSpecificConfig` fields [`parse_audio_specific_config`]
+/// needs. Unlike `formats::alac`'s `BitReader` (which zero-pads past-the-end
+/// reads to tolerate a truncated final audio frame), reading past the end
+/// here is `Malformed`: this is config data, not audio payload, and a value
+/// derived from an out-of-range read must not silently look valid.
+struct AscBits<'a> {
+    data: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> AscBits<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit_pos: 0 }
+    }
+
+    /// Read `n` (≤ 24) bits, MSB-first.
+    fn read(&mut self, n: u32) -> Result<u32, DecodeError> {
+        let mut v: u32 = 0;
+        for _ in 0..n {
+            let byte = self.bit_pos >> 3;
+            let bit = 7 - (self.bit_pos & 7);
+            let b = *self.data.get(byte).ok_or(DecodeError::Malformed)?;
+            v = (v << 1) | u32::from((b >> bit) & 1);
+            self.bit_pos += 1;
+        }
+        Ok(v)
+    }
+}
+
+/// Parse the `AudioSpecificConfig` fields this decoder needs:
+/// `audioObjectType` (5 bits; `== 31` escapes to `32 + 6` more bits),
+/// `samplingFrequencyIndex` (4 bits; `== 15` escapes to a 24-bit explicit
+/// rate), `channelConfiguration` (4 bits). The trailing `GASpecificConfig`
+/// bits (`frameLengthFlag`/`dependsOnCoreCoder`/`extensionFlag`) aren't
+/// needed for AAC-LC container detection and are left unread. See
+/// `aac-reference.md` §2.
+fn parse_audio_specific_config(data: &[u8]) -> Result<AacConfig, DecodeError> {
+    let mut r = AscBits::new(data);
+    let mut object_type = r.read(5)?;
+    if object_type == 31 {
+        object_type = 32 + r.read(6)?;
+    }
+    let sfi = r.read(4)?;
+    let sample_rate = if sfi == 15 {
+        r.read(24)?
+    } else {
+        *SAMPLE_RATES
+            .get(sfi as usize)
+            .ok_or(DecodeError::Malformed)?
+    };
+    let channel_config = r.read(4)?;
+    let channels = channels_for(channel_config)?;
+    Ok(AacConfig {
+        object_type: object_type as u8,
+        sample_rate,
+        channels,
     })
 }
 
@@ -286,6 +536,20 @@ mod tests {
     use crate::io::SliceSource;
 
     const ALAC: &[u8] = include_bytes!("../../testdata/alac.m4a");
+
+    #[test]
+    fn parses_mp4a_esds_asc() {
+        let m4a = include_bytes!("../../testdata/aac.m4a");
+        let r = Mp4Reader::new(crate::io::SliceSource::new(m4a)).unwrap();
+        match r.codec() {
+            Mp4Codec::Aac(c) => {
+                assert_eq!(c.object_type, 2);
+                assert_eq!(c.sample_rate, 44_100);
+                assert_eq!(c.channels, 2);
+            }
+            Mp4Codec::Alac(_) => panic!("expected AAC"),
+        }
+    }
 
     #[test]
     fn parses_cookie_and_locates_mdat() {

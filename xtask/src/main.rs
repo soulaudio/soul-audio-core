@@ -7,9 +7,11 @@
 use std::path::Path;
 use std::process::{Command, exit};
 
+mod filterbank_tables;
 mod resample_tables;
 
-const USAGE: &str = "usage: cargo xtask <verify|ci|qa-audio|gen-resample-tables>";
+const USAGE: &str =
+    "usage: cargo xtask <verify|ci|qa-audio|gen-resample-tables|gen-filterbank-tables>";
 
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
@@ -18,6 +20,8 @@ fn main() {
         "qa-audio" => qa_audio(),
         "gen-resample-tables" => resample_tables::run(),
         "check-resample-tables" => resample_tables::check(),
+        "gen-filterbank-tables" => filterbank_tables::run(),
+        "check-filterbank-tables" => filterbank_tables::check(),
         "" => {
             eprintln!("{USAGE}");
             exit(2);
@@ -53,8 +57,9 @@ fn run(args: &[&str]) -> Result<(), String> {
 fn verify() -> Result<(), String> {
     run(&["fmt", "--all", "--", "--check"])?;
     run(&["clippy", "--all-targets", "--", "-D", "warnings"])?;
-    // The checked-in resampler coefficient tables must match the generator.
+    // The checked-in generated tables must match their generators.
     resample_tables::check()?;
+    filterbank_tables::check()?;
     run(&["test"])?;
     // The STM32 discipline gates: the core and engine must build no_std for the
     // target, and the firmware must link for it.
@@ -127,6 +132,12 @@ fn qa_audio() -> Result<(), String> {
             "tone.m4a",
             "Apple Lossless — should sound identical to the WAV",
         ),
+        (
+            "AAC-LC (.m4a)",
+            "tone-aac.m4a",
+            "AAC-LC — should sound like the WAV",
+        ),
+        ("AAC (ADTS)", "tone.aac", "raw AAC stream"),
         (
             "DSD (DSF)",
             "tone.dsf",

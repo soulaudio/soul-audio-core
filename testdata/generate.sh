@@ -20,9 +20,16 @@ ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a libmp3lame -b:a 192k ton
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a flac -f ogg tone.ogg
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a alac -movflags +faststart tone.m4a
 
+# AAC-LC: two framings of the same lossy encode. `tone-aac.m4a` is deliberately
+# NOT named `tone.m4a` — that name is already the lossless ALAC fixture above
+# (same .m4a container, different codec); reusing it would collide with the
+# lossless ALAC goldens.
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a aac -b:a 192k -movflags +faststart tone-aac.m4a
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a aac -b:a 192k -f adts tone.aac
+
 # DSD: ffmpeg cannot encode PCM->DSD, so synthesize the 1-bit stream ourselves
 # (2nd-order sigma-delta + Sony DSF container). Needs python3 + numpy.
 python3 generate_dsd.py tone.dsf
 
 echo "generated:"
-ls -la tone.wav tone.flac tone.mp3 tone.ogg tone.m4a tone.dsf
+ls -la tone.wav tone.flac tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone.dsf

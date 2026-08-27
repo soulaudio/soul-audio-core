@@ -697,8 +697,16 @@ static G_POW43: [f32; 145] = [
 ];
 
 /// `x^(4/3)` requantization power (port of minimp3's `L3_pow_43`), table-based
-/// for `x < 129` and a polynomial refinement above.
-fn pow_43(mut x: i32) -> f32 {
+/// for `x < 129` and a polynomial refinement above. `pub(crate)` (rather than
+/// private) so `formats::aac::dsp` can reuse it for AAC's identical
+/// `sign(q)·|q|^(4/3)` inverse-quant power law instead of adding `libm` or
+/// duplicating the 145-entry table — a visibility-only change, the logic and
+/// tables below are untouched. Only ever meant to be called with a
+/// non-negative `x` (a magnitude) with sign applied by the caller afterward
+/// — see the call site below and `dsp::dequant_line` — since the table's
+/// low (would-be-negative-`x`) entries are vestigial from the minimp3 port
+/// and do not hold `sign(x)·|x|^(4/3)` values.
+pub(crate) fn pow_43(mut x: i32) -> f32 {
     if x < 129 {
         return G_POW43[(16 + x) as usize];
     }

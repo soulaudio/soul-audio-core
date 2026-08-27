@@ -8,6 +8,7 @@
 # Fixtures and other binaries must never be munged.
 *.wav binary
 *.m4a binary
+*.aac binary
 *.pcm binary
 *.flac binary
 *.mp3 binary

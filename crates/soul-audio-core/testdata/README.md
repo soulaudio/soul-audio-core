@@ -35,6 +35,23 @@ not here — these are minimal decode-correctness vectors.
   decoder (via `open()`'s MP4 `moov`/`mdat` parsing) matches ffmpeg's decode
   bit-exactly (golden test in the ALAC decoder/format tests).
 
+## AAC-LC
+
+- `aac.m4a` / `aac.m4a.ref.pcm` — an ffmpeg-encoded AAC-LC stream in an
+  MP4/M4A container (`esds`/`mp4a`), plus ffmpeg's own decoded PCM reference.
+- `aac.aac` / `aac.aac.ref.pcm` — the same encode, framed as a raw ADTS
+  elementary stream instead, plus its own ffmpeg PCM reference.
+
+AAC-LC is lossy, so unlike the ALAC/FLAC goldens above, our decode is checked
+against ffmpeg's own decode by **segmental SNR with a tolerance**, not
+bit-exact equality — ~55 dB vs ffmpeg (golden tests in the AAC decoder/format
+tests). Frame 0 of both streams uses PNS (perceptual noise substitution) on
+some scalefactor bands; this decoder renders those bands silent rather than
+synthesizing noise, so the golden's alignment/tolerance accounts for that first
+frame specifically (later frames don't use PNS in this encode). The workspace-
+root `tone-aac.m4a` / `tone.aac` playback fixtures (same signal, same lossy
+codec) exercise the pitch-only render path end to end.
+
 ## MPEG audio (Layers I / II / III)
 
 - `layer1-32k-stereo.mp1` + `layer1-32k-stereo.ffref16.pcm` — Layer I and its

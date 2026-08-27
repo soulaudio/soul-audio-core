@@ -649,7 +649,18 @@ impl<S: Source> AlacDecoder<S> {
     /// [`DecodeError::Unsupported`] for >2 channels or a frame length beyond the
     /// fixed buffer; container errors propagate from [`Mp4Reader`].
     pub fn new(src: S) -> Result<Self, DecodeError> {
-        let reader = Mp4Reader::new(src)?;
+        Self::from_reader(Mp4Reader::new(src)?)
+    }
+
+    /// Construct from an already-parsed [`Mp4Reader`] (its header walked to
+    /// `mdat`). Lets [`crate::dispatch::open`] build the reader once, inspect
+    /// [`Mp4Reader::codec`], and route an `alac` sample entry here without
+    /// re-reading the container. `new` is this over a fresh `Mp4Reader`.
+    ///
+    /// # Errors
+    /// As [`Self::new`]: [`DecodeError::Unsupported`] for >2 channels, an
+    /// out-of-range frame length, or a sample entry that wasn't ALAC.
+    pub fn from_reader(reader: Mp4Reader<S>) -> Result<Self, DecodeError> {
         let c = *reader.config();
         if c.channels == 0 || c.channels as usize > MAX_CHANNELS {
             return Err(DecodeError::Unsupported);

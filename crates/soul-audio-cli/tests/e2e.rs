@@ -605,3 +605,70 @@ fn real_alac_renders_stereo_tones() {
         right.peak_hz
     );
 }
+
+#[test]
+fn real_aac_m4a_renders_stereo_tones() {
+    // AAC-LC is lossy, so — unlike the ALAC/FLAC goldens above — this is a
+    // pitch-only check: no lossless-equality assertion and no tight SFDR bar,
+    // just "the right two tones come out of the right channels". `tone-aac.m4a`
+    // (not `tone.m4a`, which is already the lossless ALAC fixture) is the same
+    // 2 s A4-left/E5-right signal, AAC-LC-encoded, in an MP4/M4A container.
+    let out = tmp("aac_m4a_out.pcm");
+    Command::cargo_bin("soul-audio-cli")
+        .unwrap()
+        .args(["render"])
+        .arg(fixture("tone-aac.m4a"))
+        .args(["--out"])
+        .arg(&out)
+        .args(["--rate", "48000", "--channels", "2"])
+        .assert()
+        .success();
+    let pcm = read_pcm(&out);
+    let n = 16_384;
+    // Skip well past the AAC encoder's priming delay (~2112 samples for AAC-LC)
+    // before analyzing a steady-state window.
+    let left = analyze(&channel_window(&pcm, 2, 0, 4000, n), 48_000);
+    let right = analyze(&channel_window(&pcm, 2, 1, 4000, n), 48_000);
+    assert!(
+        (left.peak_hz - 440.0).abs() < 6.0,
+        "AAC (.m4a) left {:.1} Hz",
+        left.peak_hz
+    );
+    assert!(
+        (right.peak_hz - 659.25).abs() < 6.0,
+        "AAC (.m4a) right {:.1} Hz",
+        right.peak_hz
+    );
+}
+
+#[test]
+fn real_aac_adts_renders_stereo_tones() {
+    // Same signal and same pitch-only rationale as
+    // `real_aac_m4a_renders_stereo_tones`, but the raw ADTS elementary-stream
+    // framing (`.aac`) instead of the MP4/M4A container — exercises the other
+    // AAC demux path (`AdtsReader` vs `Mp4Reader`) end to end.
+    let out = tmp("aac_adts_out.pcm");
+    Command::cargo_bin("soul-audio-cli")
+        .unwrap()
+        .args(["render"])
+        .arg(fixture("tone.aac"))
+        .args(["--out"])
+        .arg(&out)
+        .args(["--rate", "48000", "--channels", "2"])
+        .assert()
+        .success();
+    let pcm = read_pcm(&out);
+    let n = 16_384;
+    let left = analyze(&channel_window(&pcm, 2, 0, 4000, n), 48_000);
+    let right = analyze(&channel_window(&pcm, 2, 1, 4000, n), 48_000);
+    assert!(
+        (left.peak_hz - 440.0).abs() < 6.0,
+        "AAC (ADTS) left {:.1} Hz",
+        left.peak_hz
+    );
+    assert!(
+        (right.peak_hz - 659.25).abs() < 6.0,
+        "AAC (ADTS) right {:.1} Hz",
+        right.peak_hz
+    );
+}

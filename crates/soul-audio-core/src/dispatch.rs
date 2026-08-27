@@ -8,8 +8,12 @@
 //! [`DsdMode`](crate::model::DsdMode) (see [`crate::dsd`]).
 
 use crate::decoder::{DecodeError, Decoder};
+use crate::demux::adts::AdtsReader;
+use crate::demux::mp4::{Mp4Codec, Mp4Reader};
 use crate::demux::ogg::OggReader;
-use crate::formats::{alac::AlacDecoder, flac::FlacDecoder, mp3::Mp3Decoder, wav::WavDecoder};
+use crate::formats::{
+    aac::AacDecoder, alac::AlacDecoder, flac::FlacDecoder, mp3::Mp3Decoder, wav::WavDecoder,
+};
 use crate::io::BufSource;
 use crate::model::{Format, StreamInfo};
 use crate::probe::probe;
@@ -32,6 +36,8 @@ pub enum AnyDecoder<S> {
     OggFlac(FlacDecoder<OggReader<S>>),
     /// Apple Lossless in an MP4/M4A container.
     Alac(AlacDecoder<S>),
+    /// AAC-LC in an MP4/M4A container or a raw ADTS (`.aac`) elementary stream.
+    Aac(AacDecoder<S>),
 }
 
 impl<S: crate::io::Source> AnyDecoder<S> {
@@ -45,6 +51,7 @@ impl<S: crate::io::Source> AnyDecoder<S> {
             AnyDecoder::Mp3(d) => d.total_frames(),
             AnyDecoder::OggFlac(d) => d.total_frames(),
             AnyDecoder::Alac(d) => d.total_frames(),
+            AnyDecoder::Aac(d) => d.total_frames(),
         }
     }
 }
@@ -63,6 +70,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::Mp3(d) => d.seek_to(sample),
             AnyDecoder::OggFlac(_) => Err(DecodeError::Unsupported),
             AnyDecoder::Alac(_) => Err(DecodeError::Unsupported),
+            AnyDecoder::Aac(_) => Err(DecodeError::Unsupported),
         }
     }
 
@@ -77,6 +85,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::Mp3(d) => d.seek_to_time(secs),
             AnyDecoder::OggFlac(_) => Err(DecodeError::Unsupported),
             AnyDecoder::Alac(_) => Err(DecodeError::Unsupported),
+            AnyDecoder::Aac(_) => Err(DecodeError::Unsupported),
         }
     }
 }
@@ -98,6 +107,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::Mp3(d) => d.stream_info(),
             AnyDecoder::OggFlac(d) => d.stream_info(),
             AnyDecoder::Alac(d) => d.stream_info(),
+            AnyDecoder::Aac(d) => d.stream_info(),
         }
     }
 
@@ -108,6 +118,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::Mp3(d) => d.decode_into(out),
             AnyDecoder::OggFlac(d) => d.decode_into(out),
             AnyDecoder::Alac(d) => d.decode_into(out),
+            AnyDecoder::Aac(d) => d.decode_into(out),
         }
     }
 }
@@ -124,7 +135,20 @@ pub fn open<S: BufSource>(mut src: S) -> Result<AnyDecoder<S>, DecodeError> {
         Format::Flac => FlacDecoder::new(src).map(AnyDecoder::Flac),
         Format::Mp3 => Mp3Decoder::new(src).map(AnyDecoder::Mp3),
         Format::OggFlac => FlacDecoder::new(OggReader::new(src)?).map(AnyDecoder::OggFlac),
-        Format::Mp4 => AlacDecoder::new(src).map(AnyDecoder::Alac),
+        // One MP4 container carries either codec; the `stsd` sample entry
+        // decides. Parse the header once, then branch on it: `alac`→ALAC,
+        // `mp4a`(AAC-LC)→AAC.
+        Format::Mp4 => {
+            let reader = Mp4Reader::new(src)?;
+            match reader.codec() {
+                Mp4Codec::Alac(_) => AlacDecoder::from_reader(reader).map(AnyDecoder::Alac),
+                Mp4Codec::Aac(_) => AacDecoder::new_mp4(reader).map(AnyDecoder::Aac),
+            }
+        }
+        // Raw ADTS (`.aac`) AAC-LC elementary stream.
+        Format::Adts => AdtsReader::new(src)
+            .and_then(AacDecoder::new_adts)
+            .map(AnyDecoder::Aac),
         // DSD containers need an explicit DsdMode (native / DoP / decimate);
         // they are not routed through the PCM `open`.
         Format::Dsf | Format::Dff => Err(DecodeError::Unsupported),

@@ -48,6 +48,14 @@ fn identify(head: &[u8]) -> Option<Format> {
     if head.len() >= 3 && &head[0..3] == b"ID3" {
         return Some(Format::Mp3);
     }
+    // ADTS (raw .aac elementary stream): syncword 0xFFF + layer == 00 —
+    // checked *before* the MP3 raw-sync fallback below, whose looser 3-bit
+    // tail mask (0xE0) would otherwise also match every ADTS header (an ADTS
+    // top nibble of 0xF0 satisfies MP3's 0xE0 mask too); the layer field is
+    // what actually disambiguates the two, so it must be checked first here.
+    if head.len() >= 2 && head[0] == 0xFF && (head[1] & 0xF0) == 0xF0 && (head[1] & 0x06) == 0 {
+        return Some(Format::Adts);
+    }
     if head.len() >= 2 && head[0] == 0xFF && (head[1] & 0xE0) == 0xE0 {
         return Some(Format::Mp3);
     }
@@ -76,6 +84,13 @@ mod tests {
         assert_eq!(probe_bytes(b"FRM8\0\0\0\0").unwrap(), Format::Dff);
         assert_eq!(probe_bytes(b"ID3\x04\0\0\0").unwrap(), Format::Mp3);
         assert_eq!(probe_bytes(&[0xFF, 0xFB, 0x90, 0x00]).unwrap(), Format::Mp3);
+        // A real ADTS header (layer == 00) must probe as Adts, not Mp3 — its
+        // top nibble (0xF1 & 0xF0 == 0xF0) would otherwise satisfy the MP3
+        // raw-sync fallback's looser 0xE0 mask too.
+        assert_eq!(
+            probe_bytes(&[0xFF, 0xF1, 0x50, 0x80, 0x2C, 0xDF, 0xFC]).unwrap(),
+            Format::Adts
+        );
     }
 
     #[test]

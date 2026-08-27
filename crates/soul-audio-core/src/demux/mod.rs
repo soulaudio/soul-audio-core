@@ -8,6 +8,7 @@ use crate::decoder::DecodeError;
 use crate::io::Source;
 use crate::model::StreamInfo;
 
+pub mod adts;
 pub mod flac;
 pub mod mp3;
 pub mod mp4;
@@ -67,4 +68,26 @@ pub(crate) fn skip<S: Source>(src: &mut S, mut n: u64) -> Result<(), DecodeError
         n -= want as u64;
     }
     Ok(())
+}
+
+/// MPEG-4 `samplingFrequencyIndex` (0..=12) → Hz. Shared by the ADTS reader,
+/// the MP4 `esds`/`AudioSpecificConfig` parser, and the AAC codec's
+/// `resolve_sfi` (index 13/14 reserved; MP4's index-15 explicit-rate escape is
+/// handled inline by the ASC parser, not through this table).
+pub(crate) const SAMPLE_RATES: [u32; 13] = [
+    96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000,
+    7_350,
+];
+
+/// `channel_configuration`/`channelConfiguration` (0..=7) → channel count, per
+/// the AAC layout table (1:SCE 2:CPE 3:SCE+CPE 4:SCE+CPE+SCE 5:SCE+CPE+CPE
+/// 6:+LFE 7:7.1). `0` ("from `program_config_element`") isn't representable
+/// without parsing a PCE, so — like any value this table doesn't cover — it is
+/// [`DecodeError::Unsupported`]. Shared by the ADTS and MP4 demuxers.
+pub(crate) fn channels_for(cc: u32) -> Result<u8, DecodeError> {
+    match cc {
+        1..=6 => Ok(cc as u8),
+        7 => Ok(8), // 7.1 (SCE+CPE+CPE+CPE+LFE)
+        _ => Err(DecodeError::Unsupported),
+    }
 }

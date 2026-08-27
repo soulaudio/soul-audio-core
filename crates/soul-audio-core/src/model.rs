@@ -105,6 +105,8 @@ pub enum Format {
     OggFlac,
     /// MP4/M4A container (ALAC audio in v1).
     Mp4,
+    /// Raw ADTS (`.aac`) elementary stream (AAC-LC).
+    Adts,
 }
 
 /// Explicit DSD output mode chosen by the caller. Selects which path a native
