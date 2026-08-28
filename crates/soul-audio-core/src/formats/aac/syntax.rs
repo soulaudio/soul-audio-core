@@ -27,6 +27,27 @@ const ID_PCE: u32 = 5;
 const ID_FIL: u32 = 6;
 const ID_END: u32 = 7;
 
+/// `extension_type` values in a `fill_element` `extension_payload` carrying
+/// SBR side data (`sbr-reference.md` §1 / faad2 `sbr_syntax.h`). Every other
+/// `extension_type` is length-skipped exactly as before.
+const EXT_SBR_DATA: u32 = 13;
+const EXT_SBR_DATA_CRC: u32 = 14;
+
+/// Where the SBR extension payload sits inside the current `raw_data_block`,
+/// recorded by [`decode_fil`] and consumed by [`super::decode_rdb`] once the
+/// LC core PCM the SBR drive needs is ready. `start_bit`/`end_bit` are absolute
+/// bit offsets into the `raw_data_block` bytes (after the 4-bit
+/// `extension_type`); `crc` marks `EXT_SBR_DATA_CRC`; `id_cpe` is whether the
+/// element preceding this fill element was a CPE (vs SCE), which selects the
+/// SBR channel count.
+#[derive(Clone, Copy)]
+pub(crate) struct SbrLoc {
+    pub(crate) start_bit: usize,
+    pub(crate) end_bit: usize,
+    pub(crate) crc: bool,
+    pub(crate) id_cpe: bool,
+}
+
 /// `window_sequence` values (§4).
 pub(crate) const ONLY_LONG: u8 = 0;
 pub(crate) const LONG_START: u8 = 1;
@@ -255,6 +276,11 @@ pub(crate) struct DecodedFrame {
     /// Per `(group, sfb)`, only populated (and only meaningful) when
     /// `ms_mask_present == 1`.
     pub(crate) ms_used: [[bool; MAX_SFB]; MAX_WINDOWS],
+    /// SBR side data location, if a `fill_element` in this block carried
+    /// `EXT_SBR_DATA`/`EXT_SBR_DATA_CRC` (HE-AAC). `None` for pure AAC-LC — the
+    /// LC-only path stays byte-identical. [`super::decode_rdb`] runs the SBR
+    /// drive from this location after the LC core PCM is reconstructed.
+    pub(crate) sbr: Option<SbrLoc>,
 }
 
 impl Default for DecodedFrame {
@@ -264,6 +290,7 @@ impl Default for DecodedFrame {
             n_channels: 0,
             ms_mask_present: 0,
             ms_used: [[false; MAX_SFB]; MAX_WINDOWS],
+            sbr: None,
         }
     }
 }
@@ -661,13 +688,41 @@ fn decode_dse(r: &mut BitReader) -> Result<(), DecodeError> {
     Ok(())
 }
 
-fn decode_fil(r: &mut BitReader) -> Result<(), DecodeError> {
+/// `fill_element` (§3): `count` bytes of `extension_payload`. Inspects the
+/// leading 4-bit `extension_type`; for `EXT_SBR_DATA`/`EXT_SBR_DATA_CRC` it
+/// records the SBR payload's bit span on `frame.sbr` (for `super::decode_rdb`
+/// to drive after the LC IMDCT), and always skips the whole `count·8` bits so
+/// the element loop stays byte-accurate — every other extension type is
+/// length-skipped exactly as before (LC-only path unchanged). `id_cpe` is the
+/// preceding audio element's type (CPE vs SCE), which the SBR decode needs.
+fn decode_fil(
+    r: &mut BitReader,
+    frame: &mut DecodedFrame,
+    id_cpe: bool,
+) -> Result<(), DecodeError> {
     let mut count = r.read(4);
     if count == 15 {
         let esc = r.read(8);
         count = count + esc - 1;
     }
-    skip_bits(r, count as usize * 8);
+    let payload_bits = count as usize * 8;
+    if payload_bits >= 4 {
+        // extension_type is the first 4 bits of the payload.
+        let ext_type = r.read(4);
+        let remaining = payload_bits - 4;
+        if ext_type == EXT_SBR_DATA || ext_type == EXT_SBR_DATA_CRC {
+            let start_bit = r.bit_pos();
+            frame.sbr = Some(SbrLoc {
+                start_bit,
+                end_bit: start_bit + remaining,
+                crc: ext_type == EXT_SBR_DATA_CRC,
+                id_cpe,
+            });
+        }
+        skip_bits(r, remaining);
+    } else {
+        skip_bits(r, payload_bits);
+    }
     Ok(())
 }
 
@@ -728,6 +783,7 @@ fn decode_element(
     sfi: u8,
     frame: &mut DecodedFrame,
     next_ch: &mut usize,
+    last_id_cpe: &mut Option<bool>,
 ) -> Result<(), DecodeError> {
     match id {
         ID_SCE | ID_LFE => {
@@ -740,6 +796,7 @@ fn decode_element(
             }
             let ch = *next_ch;
             *next_ch += 1;
+            *last_id_cpe = Some(false); // preceding-element type for a following SBR fill
             frame.channels[ch] = Ics::default();
             decode_ics(r, &mut frame.channels[ch], sfi, false)
         }
@@ -770,12 +827,13 @@ fn decode_element(
             decode_ics(r, &mut frame.channels[0], sfi, common_window)?;
             decode_ics(r, &mut frame.channels[1], sfi, common_window)?;
             *next_ch = 2;
+            *last_id_cpe = Some(true); // preceding-element type for a following SBR fill
             Ok(())
         }
         ID_CCE => Err(DecodeError::Unsupported), // coupling — not used by LC
         ID_DSE => decode_dse(r),
         ID_PCE => decode_pce(r),
-        ID_FIL => decode_fil(r),
+        ID_FIL => decode_fil(r, frame, last_id_cpe.unwrap_or(false)),
         _ => Err(DecodeError::Malformed), // id_syn_ele is 3 bits; every value 0..=7 is handled above
     }
 }
@@ -805,6 +863,7 @@ pub(crate) fn decode_raw_data_block(
 
     let mut frame = DecodedFrame::default();
     let mut next_ch: usize = 0;
+    let mut last_id_cpe: Option<bool> = None;
     let mut elements = 0usize;
     loop {
         elements += 1;
@@ -815,7 +874,7 @@ pub(crate) fn decode_raw_data_block(
         if id == ID_END {
             break;
         }
-        decode_element(r, id, sfi, &mut frame, &mut next_ch)?;
+        decode_element(r, id, sfi, &mut frame, &mut next_ch, &mut last_id_cpe)?;
     }
     frame.n_channels = next_ch as u8;
     r.byte_align();
@@ -959,6 +1018,8 @@ mod tests {
             object_type: 2,
             sample_rate: 44_100,
             channels: 2,
+            sbr_signalled: false,
+            ext_sample_rate: None,
         };
 
         // Fully empty input: BitReader zero-pads every read, so this must

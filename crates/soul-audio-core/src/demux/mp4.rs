@@ -500,33 +500,76 @@ impl<'a> AscBits<'a> {
     }
 }
 
-/// Parse the `AudioSpecificConfig` fields this decoder needs:
-/// `audioObjectType` (5 bits; `== 31` escapes to `32 + 6` more bits),
-/// `samplingFrequencyIndex` (4 bits; `== 15` escapes to a 24-bit explicit
-/// rate), `channelConfiguration` (4 bits). The trailing `GASpecificConfig`
-/// bits (`frameLengthFlag`/`dependsOnCoreCoder`/`extensionFlag`) aren't
-/// needed for AAC-LC container detection and are left unread. See
-/// `aac-reference.md` §2.
+/// Read `audioObjectType` (5 bits; `== 31` escapes to `32 + read(6)`), per the
+/// `GetAudioObjectType()` primitive shared by the top-level and (for explicit
+/// SBR) the core object-type reads.
+fn read_object_type(r: &mut AscBits) -> Result<u32, DecodeError> {
+    let ot = r.read(5)?;
+    if ot == 31 {
+        Ok(32 + r.read(6)?)
+    } else {
+        Ok(ot)
+    }
+}
+
+/// Read `samplingFrequencyIndex` (4 bits; `== 15` escapes to a 24-bit explicit
+/// rate) → Hz.
+fn read_sample_rate(r: &mut AscBits) -> Result<u32, DecodeError> {
+    let sfi = r.read(4)?;
+    if sfi == 15 {
+        r.read(24)
+    } else {
+        SAMPLE_RATES
+            .get(sfi as usize)
+            .copied()
+            .ok_or(DecodeError::Malformed)
+    }
+}
+
+/// Parse the `AudioSpecificConfig` fields this decoder needs
+/// (`aac-reference.md` §2 / ISO/IEC 14496-3 Table 1.15). Handles both:
+///
+/// * **Plain AAC-LC** (`audioObjectType == 2`): `samplingFrequencyIndex` +
+///   `channelConfiguration`; SBR (if any) is discovered implicitly at decode.
+/// * **Explicit hierarchical HE-AAC** (`audioObjectType == 5` SBR or `29` PS):
+///   the top AOT is followed by the *core* `samplingFrequencyIndex`,
+///   `channelConfiguration`, then `extensionSamplingFrequencyIndex` (the SBR
+///   output rate) and the *core* `audioObjectType` (LC). Confirmed against
+///   FFmpeg `ff_mpeg4audio_get_config`: `object_type` becomes the core AOT,
+///   `sample_rate` the core rate, `ext_sample_rate` the output rate.
+///
+/// The trailing `GASpecificConfig` / backward-compatible `0x2B7` sync-extension
+/// signalling isn't parsed (the explicit AOT-5 form above covers the shipped
+/// fixtures; implicit ADTS-style discovery via the fill element still works for
+/// anything else).
 fn parse_audio_specific_config(data: &[u8]) -> Result<AacConfig, DecodeError> {
     let mut r = AscBits::new(data);
-    let mut object_type = r.read(5)?;
-    if object_type == 31 {
-        object_type = 32 + r.read(6)?;
+    let aot = read_object_type(&mut r)?;
+
+    if aot == 5 || aot == 29 {
+        // Explicit hierarchical SBR (5) / PS (29): core rate, channels, then
+        // the extension (output) rate and the core object type.
+        let core_rate = read_sample_rate(&mut r)?;
+        let channels = channels_for(r.read(4)?)?;
+        let ext_rate = read_sample_rate(&mut r)?;
+        let core_aot = read_object_type(&mut r)?;
+        return Ok(AacConfig {
+            object_type: core_aot as u8,
+            sample_rate: core_rate,
+            channels,
+            sbr_signalled: true,
+            ext_sample_rate: Some(ext_rate),
+        });
     }
-    let sfi = r.read(4)?;
-    let sample_rate = if sfi == 15 {
-        r.read(24)?
-    } else {
-        *SAMPLE_RATES
-            .get(sfi as usize)
-            .ok_or(DecodeError::Malformed)?
-    };
-    let channel_config = r.read(4)?;
-    let channels = channels_for(channel_config)?;
+
+    let sample_rate = read_sample_rate(&mut r)?;
+    let channels = channels_for(r.read(4)?)?;
     Ok(AacConfig {
-        object_type: object_type as u8,
+        object_type: aot as u8,
         sample_rate,
         channels,
+        sbr_signalled: false,
+        ext_sample_rate: None,
     })
 }
 
@@ -546,9 +589,42 @@ mod tests {
                 assert_eq!(c.object_type, 2);
                 assert_eq!(c.sample_rate, 44_100);
                 assert_eq!(c.channels, 2);
+                assert!(!c.sbr_signalled); // plain LC, no explicit SBR
+                assert_eq!(c.ext_sample_rate, None);
             }
             Mp4Codec::Alac(_) => panic!("expected AAC"),
         }
+    }
+
+    #[test]
+    fn parses_explicit_he_aac_asc() {
+        // HE-AAC (`sbr.m4a`): the esds ASC is `2b 92 08 00` = audioObjectType 5
+        // (SBR), core samplingFrequencyIndex 7 (22050), channelConfiguration 2,
+        // extensionSamplingFrequencyIndex 4 (44100), core audioObjectType 2 (LC).
+        let m4a = include_bytes!("../../testdata/sbr.m4a");
+        let r = Mp4Reader::new(crate::io::SliceSource::new(m4a)).unwrap();
+        match r.codec() {
+            Mp4Codec::Aac(c) => {
+                assert_eq!(c.object_type, 2, "core AOT is LC");
+                assert_eq!(c.sample_rate, 22_050, "core rate");
+                assert_eq!(c.channels, 2);
+                assert!(c.sbr_signalled, "explicit SBR must be flagged");
+                assert_eq!(c.ext_sample_rate, Some(44_100), "SBR output rate");
+            }
+            Mp4Codec::Alac(_) => panic!("expected AAC"),
+        }
+    }
+
+    /// The explicit ASC parser must decode `2b 92 08 00` exactly (unit-level,
+    /// independent of the container walk).
+    #[test]
+    fn explicit_sbr_asc_bits() {
+        let c = parse_audio_specific_config(&[0x2b, 0x92, 0x08, 0x00]).unwrap();
+        assert_eq!(c.object_type, 2);
+        assert_eq!(c.sample_rate, 22_050);
+        assert_eq!(c.channels, 2);
+        assert!(c.sbr_signalled);
+        assert_eq!(c.ext_sample_rate, Some(44_100));
     }
 
     #[test]

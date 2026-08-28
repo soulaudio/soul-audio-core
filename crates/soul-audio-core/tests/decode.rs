@@ -108,18 +108,32 @@ fn open_surfaces_flac_stream_info() {
 }
 
 /// Decode a full stream through the public `open` API and return interleaved PCM.
+///
+/// Runs on a generous stack: an `AnyDecoder` is large by value (no-alloc), and
+/// the HE-AAC (SBR) decoder in particular carries ~250 KiB of QMF/HF state plus
+/// per-frame DSP scratch — more than the default test-thread stack. This mirrors
+/// the CLI's own big-stack loader thread (see `soul-audio-cli` / MEMORY.md).
 fn decode_all(bytes: &[u8]) -> Vec<i32> {
-    let mut dec = open(SliceSource::new(bytes)).expect("probe + construct");
-    let mut out = Vec::new();
-    let mut buf = [0i32; 4096];
-    loop {
-        let n = dec.decode_into(&mut buf).unwrap();
-        if n == 0 {
-            break;
-        }
-        out.extend_from_slice(&buf[..n]);
-    }
-    out
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn_scoped(scope, || {
+                let mut dec = open(SliceSource::new(bytes)).expect("probe + construct");
+                let mut out = Vec::new();
+                let mut buf = [0i32; 4096];
+                loop {
+                    let n = dec.decode_into(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                }
+                out
+            })
+            .expect("spawn decode thread")
+            .join()
+            .expect("decode thread panicked")
+    })
 }
 
 fn fnv1a(samples: &[i32]) -> u64 {
@@ -238,6 +252,82 @@ fn open_decodes_aac_adts_matching_ffmpeg_within_tolerance() {
     assert!(
         snr > 45.0,
         "AAC/ADTS decode SNR vs ffmpeg too low: {snr:.1} dB (offset {off} frames)"
+    );
+}
+
+/// HE-AAC (AAC-LC + SBR) conformance vs ffmpeg for both signalling paths
+/// (`sbr.m4a` = explicit HE-AAC in MP4, `sbr.aac` = implicit SBR in raw ADTS).
+///
+/// This is the regression gate for the SBR HF-reconstruction fidelity fix: both
+/// QMF banks must use FFmpeg's/faad2's **exact absolute-phase convention**
+/// (analysis `cos/sin(π·(k+½)·(2n−0.5)/64)`; synthesis `−cos/−sin(π·(k+½)·
+/// (2n+1)/128)`), derived from faad2's `dct4_kernel` form. An earlier
+/// self-consistent-but-wrong pair (analysis `2n−96.5`, synthesis `+(2n−63)`)
+/// round-trips and matches FFmpeg on the low-band passthrough, but SBR HF
+/// generation copies `X_low[p]` up to band `k`, and the ISO patch is only
+/// correct in FFmpeg's convention — so a mismatched convention decorrelates the
+/// high band (and, downstream, the noise/sine added in that domain). Matching
+/// both banks to FFmpeg makes the whole HE-AAC decode near-bit-exact vs ffmpeg:
+/// measured segmental SNR jumps from ~11.8 dB (old convention) to ~104 dB.
+///
+/// The 90 dB bar (≈14 dB below the ~104 dB measured) is deterministic IEEE-754
+/// f32 QMF math against the s16le reference; it is far above the ~25-40 dB a
+/// conformant HE-AAC decode needs, and decisively distinguishes the fix from any
+/// per-band phase regression (which drops SNR by tens of dB).
+#[test]
+fn open_decodes_he_aac_sbr_matching_ffmpeg() {
+    for (label, data, refpcm) in [
+        (
+            "sbr.m4a",
+            include_bytes!("../testdata/sbr.m4a").as_slice(),
+            load_s16le(include_bytes!("../testdata/sbr.m4a.ref.pcm")),
+        ),
+        (
+            "sbr.aac",
+            include_bytes!("../testdata/sbr.aac").as_slice(),
+            load_s16le(include_bytes!("../testdata/sbr.aac.ref.pcm")),
+        ),
+    ] {
+        // (Up-front rate/channel reporting is covered by `formats::aac`'s own
+        // tests; here the SNR vs the 2x-rate ffmpeg reference implicitly gates
+        // that SBR activated — a non-SBR 22050 decode scores near-zero against
+        // the 44100 reference.)
+        open(SliceSource::new(data)).expect("probe + construct HE-AAC");
+        let ours = decode_all(data);
+        let (off, snr) = best_align_segsnr(&ours, &refpcm, 2);
+        assert!(
+            snr > 90.0,
+            "{label}: HE-AAC SBR SNR vs ffmpeg too low: {snr:.2} dB (offset {off} frames) \
+             — the QMF phase-convention fix should keep this near-bit-exact"
+        );
+    }
+}
+
+/// Structural sanity for the SBR decode, independent of ffmpeg (a backstop the
+/// conformance gate above can't provide if the reference PCM were ever wrong):
+/// the output must be at the **2× SBR rate** (per-channel length within a frame
+/// of ffmpeg's 2× reference), non-silent, entirely within the i16 range, and not
+/// pinned to full-scale (a clipped/garbage decode).
+#[test]
+fn sbr_output_is_2x_and_non_silent() {
+    let aac = include_bytes!("../testdata/sbr.aac");
+    let ours = decode_all(aac); // interleaved i32, 2 channels
+    let refr = load_s16le(include_bytes!("../testdata/sbr.aac.ref.pcm"));
+    let ours_per_ch = ours.len() / 2;
+    let ref_per_ch = refr.len() / 2;
+    assert!(
+        (ours_per_ch as i64 - ref_per_ch as i64).abs() <= 4096,
+        "SBR output length {ours_per_ch}/ch not ~2× (ffmpeg ref {ref_per_ch}/ch)"
+    );
+    let rms = (ours.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / ours.len() as f64).sqrt();
+    assert!(rms > 1.0, "SBR output silent (rms {rms:.2})");
+    assert!(
+        ours.iter().all(|&s| (-32768..=32767).contains(&s)),
+        "SBR output outside i16 range"
+    );
+    assert!(
+        !ours.iter().all(|&s| s.abs() >= 32767),
+        "SBR output fully clipped (garbage)"
     );
 }
 

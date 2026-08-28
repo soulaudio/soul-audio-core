@@ -14,12 +14,23 @@ use crate::io::Source;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AacConfig {
     /// MPEG-4 audio object type (LC = 2 = `profile + 1`, per the ADTS 2-bit
-    /// `profile` field).
+    /// `profile` field). For explicit HE-AAC (ASC AOT 5/29) this is the *core*
+    /// object type (LC), with SBR/PS carried separately in the fields below.
     pub object_type: u8,
-    /// PCM frame rate in Hz, from `sampling_frequency_index`.
+    /// **Core** PCM frame rate in Hz, from `sampling_frequency_index` — the rate
+    /// the AAC-LC core decodes at (SBR output is `2×` this).
     pub sample_rate: u32,
     /// Channel count, from the 3-bit `channel_configuration`.
     pub channels: u8,
+    /// Explicit SBR signalling: `true` when the MP4 ASC advertised HE-AAC
+    /// (`audioObjectType == 5`/`29`). ADTS discovers SBR *implicitly* (via the
+    /// fill element at decode time), so it leaves this `false`. When set, the
+    /// decoder reports the 2× output rate from the first frame.
+    pub sbr_signalled: bool,
+    /// Explicit SBR output (extension) sample rate from the ASC, if signalled
+    /// (`extensionSamplingFrequencyIndex`). Usually `2×sample_rate`; `None` for
+    /// implicit/ADTS (the decoder then falls back to `2×core`).
+    pub ext_sample_rate: Option<u32>,
 }
 
 /// One parsed ADTS header: [`AacConfig`] plus the framing needed to locate
@@ -75,6 +86,10 @@ fn parse_header(h: &[u8; 7]) -> Result<AdtsHeader, DecodeError> {
             object_type,
             sample_rate,
             channels,
+            // ADTS carries no explicit SBR signalling; SBR (if any) is
+            // discovered implicitly from the fill element at decode time.
+            sbr_signalled: false,
+            ext_sample_rate: None,
         },
         header_len,
         frame_len,

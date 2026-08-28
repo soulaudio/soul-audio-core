@@ -52,6 +52,30 @@ frame specifically (later frames don't use PNS in this encode). The workspace-
 root `tone-aac.m4a` / `tone.aac` playback fixtures (same signal, same lossy
 codec) exercise the pitch-only render path end to end.
 
+## AAC SBR (HE-AAC)
+
+- `sbr.m4a` / `sbr.m4a.ref.pcm` — a **HE-AAC (AAC-LC + SBR)** stream in an
+  MP4/M4A container, plus ffmpeg's own decoded PCM reference.
+- `sbr.aac` / `sbr.aac.ref.pcm` — the same content framed as raw ADTS, plus its
+  reference.
+
+**Self-encoded** (unlike a downloaded conformance vector) via the Windows
+MediaFoundation encoder, which — unlike ffmpeg's native `aac` encoder — emits
+SBR: `ffmpeg -i <src>.wav -c:a aac_mf -b:a 24k sbr.m4a` (and `-f adts` →
+`sbr.aac`). The source is a **broadband** 200 Hz→16 kHz log chirp + shaped noise
+(seed 1), deliberately *not* the low-frequency LC tone, so there is real energy
+above the SBR crossover for SBR's high-band reconstruction to act on.
+
+The two fixtures cover **both SBR signalling paths**: `sbr.m4a`'s `esds`
+advertises `profile=HE-AAC` (explicit, AudioObjectType 5), while `sbr.aac`'s
+ADTS header carries an AAC-LC profile at the **22050 Hz** core rate
+(`sampling_frequency_index=7`) and SBR is discovered **implicitly** from the
+fill element at decode time — both decode to **44100 Hz** output (2× the core),
+the structural signature of active SBR. HE-AAC is lossy (SBR reconstruction is
+LPC-predicted, not exact), so the golden is a **segmental-SNR tolerance** vs
+ffmpeg's own decode (calibrated from the measured value), backed by a structural
+sanity gate (2× output length, non-silent, finite).
+
 ## MPEG audio (Layers I / II / III)
 
 - `layer1-32k-stereo.mp1` + `layer1-32k-stereo.ffref16.pcm` — Layer I and its

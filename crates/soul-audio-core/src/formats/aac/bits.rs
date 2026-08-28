@@ -21,6 +21,16 @@ impl<'a> BitReader<'a> {
         Self { data, bit_pos: 0 }
     }
 
+    /// Construct a reader positioned at absolute bit offset `bit_pos`. Used to
+    /// re-open an SBR fill-element payload at the exact bit where the syntax
+    /// parser found it, once the LC core PCM the SBR drive needs is ready
+    /// (`formats::aac::decode_rdb`). Reads past the end of `data` are still
+    /// zero-padded, so an out-of-range `bit_pos` degrades to zero reads rather
+    /// than panicking.
+    pub(crate) fn new_at(data: &'a [u8], bit_pos: usize) -> Self {
+        Self { data, bit_pos }
+    }
+
     #[inline]
     fn byte(&self, i: usize) -> u64 {
         self.data.get(i).copied().map_or(0, u64::from)

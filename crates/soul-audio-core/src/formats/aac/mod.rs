@@ -17,6 +17,7 @@ pub(crate) mod bits;
 pub(super) mod dsp;
 pub(crate) mod filterbank;
 mod huffman;
+pub(crate) mod sbr;
 mod syntax;
 mod tables;
 
@@ -28,10 +29,11 @@ use crate::model::{SampleFormat, StreamInfo};
 
 use filterbank::Filterbank;
 
-/// One AAC-LC frame is 1024 samples/channel; stereo interleaved is 2048. The
-/// carry buffer holds one decoded frame with headroom (the task brief's
-/// `[i32; 2048*2]`), so `decode_into` can hand back partial frames across calls.
-const PCM_CAP: usize = 2048 * 2;
+/// One AAC-LC frame is 1024 samples/channel; an SBR frame is **2048**
+/// samples/channel (2× rate, `sbr-reference.md` §0). The carry buffer holds one
+/// decoded stereo SBR frame with headroom (`2048 · 2 ch · 2`), so `decode_into`
+/// can hand back partial frames across calls whether or not SBR is active.
+const PCM_CAP: usize = 2048 * 2 * 2;
 
 /// Input byte buffer: one whole `raw_data_block` must fit. ADTS's 13-bit
 /// `aac_frame_length` caps a frame at 8191 bytes (payload a little less), and a
@@ -78,13 +80,17 @@ fn round_i16(s: f32) -> i32 {
 ///
 /// Never panics: `decode_raw_data_block` bounds-checks every field, and every
 /// DSP stage independently re-clamps its indices (see `dsp`/`filterbank`).
+#[allow(clippy::too_many_arguments)]
 fn decode_rdb(
     rdb: &[u8],
     config: AacConfig,
     sfi: u8,
     fb: &mut Filterbank,
+    sbr: &mut sbr::SbrState,
+    sbr_out: &mut sbr::SbrOutput,
+    output_rate: u32,
     pcm: &mut [i32],
-) -> Result<(usize, usize), DecodeError> {
+) -> Result<(usize, usize, bool), DecodeError> {
     let mut r = bits::BitReader::new(rdb);
     let mut frame = syntax::decode_raw_data_block(&mut r, config)?;
     // `decode_raw_data_block` byte-aligns before returning, so this is the exact
@@ -94,7 +100,7 @@ fn decode_rdb(
     if n == 0 {
         // A block carrying only DSE/FIL/PCE (no audio element) — no samples, but
         // real bytes were consumed, so the MP4 window still advances.
-        return Ok((0, consumed));
+        return Ok((0, consumed, false));
     }
 
     for ch in 0..n {
@@ -117,9 +123,38 @@ fn decode_rdb(
         dsp::apply_tns(&mut frame.channels[ch], sfi);
     }
 
+    // LC core PCM for both channels (the SBR analysis QMF's input).
     let mut outs = [[0f32; 1024]; 2];
     for (ch, out) in outs.iter_mut().enumerate().take(n) {
         fb.imdct_and_overlap(ch, &frame.channels[ch], out);
+    }
+
+    // SBR (HE-AAC): a fill element in this block carried EXT_SBR_DATA. Run the
+    // §10 drive over the core PCM; when it produces output, emit **2048**
+    // interleaved samples/channel (2× rate) instead of 1024. The LC-only path
+    // below is byte-identical when no SBR fill element was present.
+    if let Some(loc) = frame.sbr {
+        let applied = sbr::decode_fill_sbr(
+            rdb,
+            loc.start_bit,
+            loc.end_bit,
+            loc.crc,
+            loc.id_cpe,
+            sbr,
+            &outs,
+            n,
+            output_rate,
+            sbr_out,
+        )?;
+        if applied {
+            let frames = 2048usize;
+            for i in 0..frames {
+                for ch in 0..n {
+                    pcm[i * n + ch] = round_i16(sbr_out.pcm[ch][i] * OUTPUT_GAIN);
+                }
+            }
+            return Ok((frames * n, consumed, true));
+        }
     }
 
     let frames = 1024usize;
@@ -128,7 +163,7 @@ fn decode_rdb(
             pcm[i * n + ch] = round_i16(outs[ch][i] * OUTPUT_GAIN);
         }
     }
-    Ok((frames * n, consumed))
+    Ok((frames * n, consumed, false))
 }
 
 /// The frame-source seam: yields the next access unit's `raw_data_block` bytes
@@ -158,6 +193,17 @@ pub struct AacDecoder<S> {
     mp4_used: usize,
     mp4_mdat_remaining: u64,
     total_samples: Option<u64>,
+    /// SBR (HE-AAC) decode state — always present, starts inactive (pure
+    /// upsample-only, `kx=32 M=0`). Costs nothing on an LC-only stream: the
+    /// drive only runs when a fill element carries `EXT_SBR_DATA`.
+    sbr: sbr::SbrState,
+    /// 2×-rate PCM scratch the SBR drive fills (reused each frame).
+    sbr_out: sbr::SbrOutput,
+    /// SBR operating/output rate (= 2×core, or the explicit `ext_sample_rate`).
+    output_rate: u32,
+    /// `true` once SBR output has been produced (explicit ASC signal, or the
+    /// first `EXT_SBR_DATA` frame) — flips `stream_info().sample_rate` to 2×.
+    sbr_confirmed: bool,
     /// Decoded interleaved PCM awaiting hand-off, `[pcm_pos, pcm_len)`.
     pcm: [i32; PCM_CAP],
     pcm_len: usize,
@@ -210,6 +256,13 @@ impl<S: Source> AacDecoder<S> {
         // Validate the sample rate up front (also the `sfi` the DSP stages need)
         // so a bad ASC/header fails at construction, not mid-decode.
         let sfi = tables::resolve_sfi(config.sample_rate)?;
+        // SBR output rate: the explicit ASC extension rate if signalled, else
+        // 2×core (the dual-rate default). Reported by `stream_info` only once
+        // SBR is confirmed (up front for explicit ASC, after the first
+        // EXT_SBR_DATA frame for implicit ADTS).
+        let output_rate = config
+            .ext_sample_rate
+            .unwrap_or_else(|| config.sample_rate.saturating_mul(2));
         Ok(Self {
             src,
             config,
@@ -221,6 +274,10 @@ impl<S: Source> AacDecoder<S> {
             mp4_used: 0,
             mp4_mdat_remaining: mdat_remaining,
             total_samples,
+            sbr: sbr::SbrState::default(),
+            sbr_out: sbr::SbrOutput::default(),
+            output_rate,
+            sbr_confirmed: config.sbr_signalled,
             pcm: [0; PCM_CAP],
             pcm_len: 0,
             pcm_pos: 0,
@@ -298,14 +355,20 @@ impl<S: Source> AacDecoder<S> {
         if self.mp4_filled == 0 {
             return Ok(None); // mdat drained
         }
-        let (samples, consumed) = decode_rdb(
+        let (samples, consumed, sbr_applied) = decode_rdb(
             &self.inbuf[..self.mp4_filled],
             self.config,
             self.sfi,
             &mut self.fb,
+            &mut self.sbr,
+            &mut self.sbr_out,
+            self.output_rate,
             &mut self.pcm,
         )?;
         self.mp4_used = consumed;
+        if sbr_applied {
+            self.sbr_confirmed = true;
+        }
         Ok(Some(samples))
     }
 
@@ -321,13 +384,19 @@ impl<S: Source> AacDecoder<S> {
                 None => return Ok(None),
             }
         };
-        let (samples, _consumed) = decode_rdb(
+        let (samples, _consumed, sbr_applied) = decode_rdb(
             &self.inbuf[..len],
             self.config,
             self.sfi,
             &mut self.fb,
+            &mut self.sbr,
+            &mut self.sbr_out,
+            self.output_rate,
             &mut self.pcm,
         )?;
+        if sbr_applied {
+            self.sbr_confirmed = true;
+        }
         Ok(Some(samples))
     }
 }
@@ -335,7 +404,15 @@ impl<S: Source> AacDecoder<S> {
 impl<S: Source> Decoder for AacDecoder<S> {
     fn stream_info(&self) -> StreamInfo {
         StreamInfo {
-            sample_rate: self.config.sample_rate,
+            // SBR doubles the output rate (dual-rate HE-AAC). Report 2× once
+            // SBR is confirmed — up front for an explicit ASC signal, or after
+            // the first EXT_SBR_DATA frame for implicit ADTS; the core rate
+            // otherwise (pure AAC-LC, byte-identical to before).
+            sample_rate: if self.sbr_confirmed {
+                self.output_rate
+            } else {
+                self.config.sample_rate
+            },
             channels: self.channels,
             format: SampleFormat::Int { bits: 16 },
         }
@@ -359,5 +436,161 @@ impl<S: Source> Decoder for AacDecoder<S> {
             written += n;
         }
         Ok(written)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::demux::adts::AdtsReader;
+    use crate::io::SliceSource;
+
+    /// Decode a whole stream through `AacDecoder` on a generous stack (the SBR
+    /// state + per-frame DSP scratch are large — see MEMORY.md / the CLI's own
+    /// big-stack loader), returning the interleaved PCM and final stream rate.
+    fn decode_all_adts(bytes: &'static [u8]) -> (Vec<i32>, u32, u16) {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let reader = AdtsReader::new(SliceSource::new(bytes)).expect("adts header");
+                let mut dec = AacDecoder::new_adts(reader).expect("aac decoder");
+                let mut out = Vec::new();
+                let mut buf = [0i32; 4096];
+                loop {
+                    let n = dec.decode_into(&mut buf).expect("decode");
+                    if n == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                }
+                let info = dec.stream_info();
+                (out, info.sample_rate, info.channels)
+            })
+            .expect("spawn")
+            .join()
+            .expect("join")
+    }
+
+    /// Decode a whole stream through the public `open` dispatch on a big stack.
+    fn decode_all_open(bytes: &'static [u8]) -> (Vec<i32>, u32, u16) {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let mut dec =
+                    crate::dispatch::open(SliceSource::new(bytes)).expect("probe + construct");
+                let rate_up_front = dec.stream_info().sample_rate;
+                let mut out = Vec::new();
+                let mut buf = [0i32; 4096];
+                loop {
+                    let n = dec.decode_into(&mut buf).expect("decode");
+                    if n == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                }
+                let info = dec.stream_info();
+                assert_eq!(
+                    rate_up_front, info.sample_rate,
+                    "explicit-SBR rate must be reported up front, not only after decode"
+                );
+                (out, info.sample_rate, info.channels)
+            })
+            .expect("spawn")
+            .join()
+            .expect("join")
+    }
+
+    /// Explicit HE-AAC in MP4 (`sbr.m4a`): the ASC advertises SBR (AOT 5), so
+    /// the decoder reports the 2× output rate (44100) *up front* — before any
+    /// frame is decoded — and produces 2048 samples/channel of non-silent audio.
+    #[test]
+    fn sbr_m4a_explicit_decodes_2x_non_silent() {
+        let m4a = include_bytes!("../../../testdata/sbr.m4a");
+        let (pcm, rate, channels) = decode_all_open(m4a);
+        assert_eq!(channels, 2);
+        assert_eq!(rate, 44_100, "explicit SBR core 22050 → output 44100");
+        assert!(!pcm.is_empty());
+        assert_eq!(
+            pcm.len() % (2048 * 2),
+            0,
+            "output length {} is not a whole number of 2048/ch stereo frames",
+            pcm.len()
+        );
+        assert!(
+            pcm.iter().any(|&s| s != 0),
+            "explicit SBR output all-silent"
+        );
+    }
+
+    /// Smoke test (task brief): the HE-AAC ADTS fixture decodes end-to-end with
+    /// no panic, SBR activates (output rate doubles to 2×core = 44100), every
+    /// frame yields 2048 samples/channel, and the reconstructed audio is
+    /// non-silent and finite. Structural only — Task 12 calibrates SNR.
+    #[test]
+    fn sbr_adts_smoke_decodes_2x_non_silent() {
+        let aac = include_bytes!("../../../testdata/sbr.aac");
+        let (pcm, rate, channels) = decode_all_adts(aac);
+
+        // SBR discovered implicitly from the fill element → 2× output rate.
+        assert_eq!(channels, 2, "sbr.aac is stereo (CPE)");
+        assert_eq!(rate, 44_100, "SBR must double the 22050 core to 44100");
+
+        // Each SBR frame is 2048 samples/channel = 4096 interleaved (stereo);
+        // the whole decode is a whole number of such frames.
+        assert!(!pcm.is_empty(), "no audio decoded");
+        assert_eq!(
+            pcm.len() % (2048 * 2),
+            0,
+            "output length {} is not a whole number of 2048/ch stereo frames",
+            pcm.len()
+        );
+        let frames = pcm.len() / (2048 * 2);
+        assert!(frames >= 10, "decoded only {frames} SBR frames, want >= 10");
+
+        // Non-silent + finite (i32 samples in the i16 output range, no NaN —
+        // `round_i16` maps NaN to 0 and saturates, so any out-of-range value
+        // would be a real bug).
+        let mut any_nonzero = false;
+        let mut peak = 0i32;
+        for &s in &pcm {
+            assert!(
+                (-32768..=32767).contains(&s),
+                "sample {s} outside i16 range (NaN/overflow leaked through)"
+            );
+            if s != 0 {
+                any_nonzero = true;
+            }
+            peak = peak.max(s.abs());
+        }
+        assert!(any_nonzero, "SBR decode produced all-silent output");
+        assert!(
+            peak > 8,
+            "SBR decode output implausibly quiet (peak {peak})"
+        );
+    }
+
+    /// Backward-compatibility: a pure AAC-LC ADTS stream (no `EXT_SBR_DATA`
+    /// fill element) decodes exactly as before — SBR never activates, the rate
+    /// stays the core rate (NOT doubled), and every frame stays 1024
+    /// samples/channel. This is the "SBR is purely additive; the LC-only path
+    /// stays byte-identical" invariant: `decode_fil` now inspects the extension
+    /// type, but consumes the same `count·8` bits as before for a non-SBR
+    /// extension and leaves `frame.sbr == None`, so the shared LC `decode_rdb`
+    /// path is unchanged. (The semantic byte-for-byte match vs ffmpeg is the
+    /// `tests/decode.rs` segmental-SNR gate; this pins the structural shape.)
+    #[test]
+    fn lc_only_adts_stays_unchanged_no_spurious_sbr() {
+        let aac = include_bytes!("../../../testdata/aac.aac");
+        let (pcm, rate, channels) = decode_all_adts(aac);
+        assert_eq!(channels, 2);
+        // If SBR had spuriously activated, the rate would double to 88200 and
+        // the length would be 2048/ch/frame.
+        assert_eq!(rate, 44_100, "LC stream must NOT double its rate (no SBR)");
+        assert_eq!(
+            pcm.len(),
+            47_104,
+            "LC decode length changed — 23 frames × 1024/ch × 2ch expected"
+        );
+        assert!(pcm.iter().any(|&s| s != 0), "LC decode was all-silent");
     }
 }

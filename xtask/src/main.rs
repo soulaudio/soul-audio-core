@@ -9,9 +9,9 @@ use std::process::{Command, exit};
 
 mod filterbank_tables;
 mod resample_tables;
+mod sbr_tables;
 
-const USAGE: &str =
-    "usage: cargo xtask <verify|ci|qa-audio|gen-resample-tables|gen-filterbank-tables>";
+const USAGE: &str = "usage: cargo xtask <verify|ci|qa-audio|gen-resample-tables|gen-filterbank-tables|gen-sbr-tables>";
 
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
@@ -22,6 +22,8 @@ fn main() {
         "check-resample-tables" => resample_tables::check(),
         "gen-filterbank-tables" => filterbank_tables::run(),
         "check-filterbank-tables" => filterbank_tables::check(),
+        "gen-sbr-tables" => sbr_tables::run(),
+        "check-sbr-tables" => sbr_tables::check(),
         "" => {
             eprintln!("{USAGE}");
             exit(2);
@@ -60,6 +62,7 @@ fn verify() -> Result<(), String> {
     // The checked-in generated tables must match their generators.
     resample_tables::check()?;
     filterbank_tables::check()?;
+    sbr_tables::check()?;
     run(&["test"])?;
     // The STM32 discipline gates: the core and engine must build no_std for the
     // target, and the firmware must link for it.
