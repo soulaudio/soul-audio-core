@@ -3,11 +3,13 @@
 //! CRC field and `bs_header_flag`, dispatches the header (`header::
 //! sbr_header`) and — on a header change/reset — rebuilds the frequency tables
 //! and re-inits the per-channel DSP state, then runs the §10 per-channel drive
-//! ([`super::drive`], which decodes `sbr_data` and synthesises 2×-rate PCM),
-//! then walks the trailing `bs_extension` loop of length-prefixed
-//! `bs_extension_id`-tagged sub-extensions, length-skipping each in Phase 2
-//! (Phase 3 dispatches `EXTENSION_ID_PS` to `ps::parse_frame` from this same
-//! loop).
+//! ([`super::drive`], which decodes `sbr_data`, parses the trailing
+//! `bs_extension` structure via [`parse_extensions`], and synthesises 2×-rate
+//! PCM). The conformant `bs_extension` parse ([`parse_extensions`]) reads the
+//! `bs_extended_data` gate and its length-prefixed sub-extensions, dispatching
+//! `EXTENSION_ID_PS` to `PsDecoder::parse_frame` (Phase 3 PS). It runs inside
+//! `drive` — before the QMF-domain synthesis (R3) — because PS's per-frame
+//! parameters must be decoded before `apply` consumes the QMF matrix.
 //!
 //! # The no-panic clamp
 //!
@@ -22,8 +24,7 @@
 //!
 //! `sbr_extension_data` is reached from `syntax::decode_fil` (which records the
 //! SBR payload's bit span) via `super::decode_fill_sbr` once the LC core PCM is
-//! ready. `EXTENSION_ID_PS` (the PS seam) carries its own targeted
-//! `dead_code` allow, still unused in Phase 2.
+//! ready. `EXTENSION_ID_PS` (the PS seam) is dispatched by [`parse_extensions`].
 
 use super::header::sbr_header;
 use super::{SbrOutput, SbrState};
@@ -31,10 +32,9 @@ use crate::decoder::DecodeError;
 use crate::formats::aac::bits::BitReader;
 
 /// `bs_extension_id` value reserved for Parametric Stereo (`sbr-reference.md`
-/// §1 / design-spec §2.4). Phase 2 (this crate today) length-skips every
-/// `bs_extension_id` uniformly, this one included; Phase 3 dispatches it to
-/// `ps::parse_frame` from the loop in [`sbr_extension_data`] instead.
-#[allow(dead_code)] // Phase-3 (PS) seam: dispatched by ps::parse_frame, unused in Phase 2
+/// §1 / design-spec §2.4). [`parse_extensions`] dispatches it to
+/// `PsDecoder::parse_frame`, trusting the returned bit count to advance the
+/// conformant `sbr_extension_data` loop.
 const EXTENSION_ID_PS: u32 = 2;
 
 /// Which element preceded this fill element — selects the SBR channel count
@@ -152,44 +152,88 @@ pub(super) fn sbr_extension_data(
         false
     };
 
-    // Trailing `bs_extension` loop (§1 / design-spec §2.4): zero or more
-    // length-prefixed `bs_extension_id`-tagged sub-extensions. Phase 2
-    // length-skips every one (including `EXTENSION_ID_PS`); Phase 3
-    // dispatches `EXTENSION_ID_PS` to `ps::parse_frame` here instead,
-    // trusting its returned bit count for this loop's own bookkeeping.
-    // Each iteration consumes >=10 clamped bits (id + length) before it can
-    // loop again, so the loop always makes forward progress or bails.
-    // A clamped-read failure here just stops extension parsing: the §10 drive
-    // above already produced this frame's output (`applied`), and the outer
-    // `decode_fil` consumes the whole fill element by its byte count, so the
-    // exact trailing-bit position no longer gates the result — `break`, don't
-    // discard the decoded frame.
-    while end_bit.saturating_sub(payload.bits.bit_pos()) >= 8 {
-        let _bs_extension_id = match clamped_read(&mut payload.bits, end_bit, 2) {
-            Some(v) => v,
-            None => break,
-        };
-        let ext_len_bytes = match clamped_read(&mut payload.bits, end_bit, 8) {
-            Some(v) => v,
-            None => break,
-        };
-        if clamped_skip(&mut payload.bits, end_bit, ext_len_bytes as usize * 8).is_none() {
-            break;
-        }
-    }
-
-    // Advance to `end_bit`. Normally the loop leaves <8 padding bits, but a
-    // malformed sub-extension whose declared length overran the clamp `break`s
-    // with `bit_pos` still short of `end_bit` (the failed `clamped_skip` didn't
-    // advance) — so `pad` can be >= 8. `clamped_skip` handles either case,
-    // landing exactly on `end_bit`; no assertion (malformed input must never
-    // panic — the §3.3 firmware invariant).
+    // The trailing `bs_extension` loop (§1 / design-spec §2.4) has already run
+    // inside [`super::drive`] via [`parse_extensions`] — placed there (R2/R3) so
+    // PS's per-frame parameters are decoded *before* the QMF-domain synthesis
+    // that consumes them. All that remains here is to advance to `end_bit`:
+    // `parse_extensions` conformantly consumes the `bs_extended_data` gate and
+    // its sub-extensions, leaving the trailing fill/pad bits, and a malformed
+    // sub-extension may `break` with `bit_pos` still short of `end_bit`.
+    // `clamped_skip` handles either case, landing exactly on `end_bit`; no
+    // assertion (malformed input must never panic — the §3.3 firmware invariant).
     let pad = end_bit.saturating_sub(payload.bits.bit_pos());
     let _ = clamped_skip(&mut payload.bits, end_bit, pad);
 
     // `applied` is true whenever SBR was active this frame (2048 samples/channel
     // written to `out`); false for the pure-LC pass-through (no header yet).
     Ok(applied)
+}
+
+/// Parse the conformant trailing `bs_extension` structure (`ps-reference.md`
+/// §1), dispatching a Parametric Stereo payload to `state.ps`. Called from
+/// [`super::drive`] after `parse_sbr_data` and before the per-channel synthesis
+/// (R2/R3), so PS's parameters for this frame are decoded before `apply`
+/// consumes the QMF matrix.
+///
+/// Structure: `bs_extended_data` (1-bit gate); if set, `cnt = read(4)` (+
+/// `read(8)` when `cnt == 15`) gives the extension byte count. `nr_bits_left =
+/// 8·cnt` (clamped to the payload) then drives
+/// `while nr_bits_left > 7 { id = read(2); nr_bits_left -= 2; … }`, dispatching
+/// `EXTENSION_ID_PS` to `PsDecoder::parse_frame` and subtracting its returned
+/// bit count. Every read goes through [`clamped_read`]; any overrun or a PS
+/// parse error stops the loop (never panics — the firmware no-panic invariant).
+/// Residual fill/pad bits are consumed by `sbr_extension_data`'s pad-to-`end_bit`.
+///
+/// The non-PS path is untouched: a `0` gate reads one bit and returns; an
+/// unknown `bs_extension_id` breaks. Neither activates `state.ps`, and because
+/// this only advances `payload.bits` (never read by synthesis) the SBR output
+/// stays bit-identical.
+pub(super) fn parse_extensions(payload: &mut SbrPayload, state: &mut SbrState) {
+    let end_bit = payload.end_bit;
+    let bits = &mut payload.bits;
+
+    // `bs_extended_data` gate (0 ⇒ no extension).
+    let Some(gate) = clamped_read(bits, end_bit, 1) else {
+        return;
+    };
+    if gate != 1 {
+        return;
+    }
+
+    // `cnt` extension byte count ([NOPANIC]: every read clamped to `end_bit`).
+    let Some(mut cnt) = clamped_read(bits, end_bit, 4) else {
+        return;
+    };
+    if cnt == 15 {
+        let Some(extra) = clamped_read(bits, end_bit, 8) else {
+            return;
+        };
+        cnt += extra;
+    }
+
+    // `nr_bits_left = 8·cnt`, clamped to what the payload actually holds.
+    let remaining = end_bit.saturating_sub(bits.bit_pos());
+    let mut nr_bits_left = (8 * cnt as usize).min(remaining) as i64;
+
+    while nr_bits_left > 7 {
+        let Some(id) = clamped_read(bits, end_bit, 2) else {
+            break;
+        };
+        nr_bits_left -= 2;
+        match id {
+            EXTENSION_ID_PS => {
+                // Bound the PS parse to the remaining sub-extension budget.
+                let ext_end = end_bit.min(bits.bit_pos() + nr_bits_left.max(0) as usize);
+                match state.ps.parse_frame(bits, ext_end) {
+                    Ok(used) => nr_bits_left -= used as i64,
+                    Err(_) => break,
+                }
+            }
+            // No other `bs_extension_id` is defined at this level; stop (the
+            // pad-to-`end_bit` consumes whatever remains).
+            _ => break,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -239,26 +283,64 @@ mod tests {
     }
 
     #[test]
-    fn bs_extension_loop_length_skips_bogus_sub_extension() {
-        // bit0: bs_header_flag=0
-        // bits1-2: bs_extension_id=0b10 (=2, EXTENSION_ID_PS — Phase 2 skips
-        //          it like any other id)
-        // bits3-10: an 8-bit byte length = 1 (skip one byte)
-        // bits11-18: 8 bits of arbitrary sub-extension payload to skip
-        // end_bit=19 lands exactly on the skip's end, so a correct
-        // length-skip must leave bit_pos == end_bit, not overrun it.
-        let buf = [0x40u8, 0x3F, 0xE0];
+    fn parse_extensions_dispatches_ps_and_activates() {
+        // The conformant `bs_extension` structure carrying a PS payload (R2):
+        //   bs_extended_data = 1            (1 bit, gate)
+        //   cnt              = 2            (4 bits -> nr_bits_left = 16)
+        //   bs_extension_id  = 2  (PS)      (2 bits)
+        //   ps_data(): enable_ps_header=1, enable_iid=0, enable_icc=0,
+        //             enable_ext=0, frame_class=0, num_env_idx=0  (7 bits)
+        // MSB-first: 1 0010 10 1000000  =  0x95 0x00.  A header was seen, so
+        // `ps_data_available` (is_active) flips true; 14 bits are consumed
+        // (gate 1 + cnt 4 + id 2 + ps_data 7), leaving nr_bits_left == 7.
+        let buf = [0x95u8, 0x00, 0x00, 0x00];
         let mut p = SbrPayload {
             crc: false,
             bits: BitReader::new(&buf),
-            end_bit: 19,
+            end_bit: 32,
         };
         let mut st = SbrState::default();
-        let core = [[0f32; 1024]; 2];
-        let mut out = SbrOutput::default();
-        let r =
-            sbr_extension_data(&mut p, IdAac::Sce, &mut st, &core, 1, 44_100, &mut out).unwrap();
-        assert_eq!(r, false);
-        assert_eq!(p.bits.bit_pos(), 19);
+        assert!(!st.ps.is_active());
+        parse_extensions(&mut p, &mut st);
+        assert!(
+            st.ps.is_active(),
+            "EXTENSION_ID_PS must be dispatched to ps::parse_frame"
+        );
+        assert_eq!(p.bits.bit_pos(), 14);
+    }
+
+    #[test]
+    fn parse_extensions_no_gate_is_inert() {
+        // bs_extended_data = 0: no extension present. `parse_extensions` reads
+        // exactly the gate bit and returns; PS stays inactive (the non-PS path
+        // is untouched — the SBR conformance golden relies on this).
+        let buf = [0x00u8, 0x00];
+        let mut p = SbrPayload {
+            crc: false,
+            bits: BitReader::new(&buf),
+            end_bit: 16,
+        };
+        let mut st = SbrState::default();
+        parse_extensions(&mut p, &mut st);
+        assert!(!st.ps.is_active());
+        assert_eq!(p.bits.bit_pos(), 1);
+    }
+
+    #[test]
+    fn parse_extensions_unknown_id_breaks_without_panic() {
+        // bs_extended_data = 1, cnt = 1 (nr_bits_left = 8), bs_extension_id = 0
+        // (not PS): the loop breaks on the unknown id. No PS activation, no
+        // panic, and no read past `end_bit`.
+        // MSB-first: 1 0001 00 ...  = 0x88.
+        let buf = [0x88u8, 0x00];
+        let mut p = SbrPayload {
+            crc: false,
+            bits: BitReader::new(&buf),
+            end_bit: 16,
+        };
+        let mut st = SbrState::default();
+        parse_extensions(&mut p, &mut st);
+        assert!(!st.ps.is_active());
+        assert!(p.bits.bit_pos() <= 16);
     }
 }

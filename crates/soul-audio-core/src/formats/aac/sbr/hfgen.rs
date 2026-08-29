@@ -51,13 +51,22 @@ use super::qmf::{Cpx, MAX_SLOTS, N_ANA, N_SYN, T_HFADJ};
 use crate::decoder::DecodeError;
 
 /// §8.3 patch table: `n_patches` consecutive-low-band-to-high-band copies,
-/// `n_patches <= 5`. `num_subbands[p]`/`start_subband[p]` are faad2's
+/// `n_patches <= 6`. `num_subbands[p]`/`start_subband[p]` are faad2's
 /// `patchNoSubbands`/`patchStartSubband`.
+///
+/// The cap is **6**, not 5: 14496-3 sp04 p205 sets the *requirement* at 5, but
+/// FFmpeg's `sbr_hf_calc_npatches` places its `num_patches > 5` reject at the
+/// TOP of the loop body (before a patch is recorded), so a *final* count of
+/// exactly 6 is legal-in-practice — its own comment notes "the Coding
+/// Technologies decoder check stream has a final count of 6 patches". Real
+/// HE-AAC streams (linear freq scale, wide M) hit this; capping at 5 silently
+/// discards the top patch, zeroing the highest QMF bands. Arrays are sized 6
+/// to match FFmpeg's `patch_num_subbands[6]`/`patch_start_subband[6]`.
 #[derive(Clone, Copy, Default)]
 pub(super) struct Patches {
     pub n_patches: usize,
-    pub num_subbands: [u8; 5],
-    pub start_subband: [u8; 5],
+    pub num_subbands: [u8; 6],
+    pub start_subband: [u8; 6],
 }
 
 impl Patches {
@@ -72,13 +81,13 @@ impl Patches {
     /// `num_subbands` entries (a patch is only ever recorded once
     /// `patchNoSubbands>0`, per §8.3) are automatically strictly
     /// increasing, so no separate sort step is needed. Returns `(borders,
-    /// len)`, `len = n_patches+1 <= 6`.
-    pub fn borders(&self, kx: u8) -> ([u8; 6], usize) {
-        let mut b = [0u8; 6];
+    /// len)`, `len = n_patches+1 <= 7` (6 patches → 7 borders).
+    pub fn borders(&self, kx: u8) -> ([u8; 7], usize) {
+        let mut b = [0u8; 7];
         b[0] = kx;
         let mut acc: u32 = kx as u32;
         let mut n = 1usize;
-        for i in 0..self.n_patches.min(5) {
+        for i in 0..self.n_patches.min(6) {
             acc += self.num_subbands[i] as u32;
             if n >= b.len() {
                 break;
@@ -108,8 +117,11 @@ fn goal_sb(output_rate: u32) -> Result<u32, DecodeError> {
 /// bands to source low bands by walking `f_master` backward from a `goalSb`
 /// anchor, each iteration carving off the largest patch that keeps the
 /// "odd" alignment consistent with `k0`; stops when the running border `sb`
-/// reaches `kx+M`. Drops a too-small (`<3` subbands) final patch, then caps
-/// at 5. `output_rate` = 2×core (for `goalSb`).
+/// reaches `kx+M`. Drops a too-small (`<3` subbands) final patch. The patch
+/// count is capped at **6** exactly as FFmpeg does it: the `n_patches > 5`
+/// reject sits at the top of the loop body, BEFORE a patch is recorded, so a
+/// final count of 6 is kept (the Coding-Technologies check stream) while a 7th
+/// patch returns `Err`. `output_rate` = 2×core (for `goalSb`).
 pub(super) fn patch_construction(
     ft: &FreqTables,
     output_rate: u32,
@@ -151,14 +163,12 @@ pub(super) fn patch_construction(
     let mut msb = k0;
     let mut usb = kx;
     let mut n_patches = 0usize;
-    // Scratch with headroom beyond the final 5-cap: the loop can (in
-    // principle, for a pathological table) record a patch before the
-    // trailing "drop tiny last" / "min(.,5)" trim reduces it back down.
-    // Real spec-conformant headers never exceed a handful of patches
-    // (usb strictly advances through <=n_master distinct f_master values
-    // before reaching kx+M), so this is defense-in-depth, not a case the
-    // brief's own worked test exercises.
-    const SCRATCH: usize = 8;
+    // Scratch sized to FFmpeg's `patch_num_subbands[6]`/`patch_start_subband[6]`.
+    // The in-loop `n_patches > 5` guard below runs BEFORE every record, so a
+    // patch is only ever written at index `n_patches <= 5` (a 6th patch, index
+    // 5, is the last write; a 7th is rejected before its write) — index 6 is
+    // never touched. Real spec-conformant headers reach at most 6 patches.
+    const SCRATCH: usize = 6;
     let mut num_subbands = [0i32; SCRATCH];
     let mut start_subband = [0i32; SCRATCH];
 
@@ -189,9 +199,18 @@ pub(super) fn patch_construction(
             }
         }
 
-        if n_patches >= SCRATCH {
+        // FFmpeg `sbr_hf_calc_npatches`: the `num_patches > 5` reject sits
+        // HERE, at the top of the loop body BEFORE the patch is recorded, so a
+        // final count of exactly 6 is kept (14496-3 sp04 p205 caps the
+        // *requirement* at 5, but the Coding-Technologies check stream legally
+        // reaches 6) while a 7th patch — `n_patches` already 6 — returns `Err`.
+        // Because this runs before every write, a patch is only recorded at
+        // index `n_patches <= 5`, so `num_subbands`/`start_subband` (len 6) are
+        // never indexed out of bounds.
+        if n_patches > 5 {
             return Err(DecodeError::Malformed);
         }
+        debug_assert!(n_patches < SCRATCH);
         let no_sub = (sb - usb).max(0);
         let start_sub = k0 - odd - no_sub;
         num_subbands[n_patches] = no_sub;
@@ -218,7 +237,11 @@ pub(super) fn patch_construction(
     if n_patches > 1 && num_subbands[n_patches - 1] < 3 {
         n_patches -= 1;
     }
-    n_patches = n_patches.min(5);
+    // No final `min` cap here: FFmpeg has none, and the in-loop `n_patches > 5`
+    // reject already bounds this to <= 6 (a 7th patch returns `Err` above). A
+    // `.min(5)` here is the original bug — it silently discarded a legitimate
+    // 6th patch. `n_patches` is now provably <= 6, so every index into the
+    // len-6 `Patches` arrays below (and the len-7 `borders`) is in bounds.
 
     let mut patches = Patches {
         n_patches,
@@ -444,7 +467,7 @@ pub(super) fn hf_generation(
     let last = grid.t_env[num_env] as usize * 2;
 
     let mut k = kx;
-    for i in 0..patches.n_patches.min(5) {
+    for i in 0..patches.n_patches.min(6) {
         let num_sb = patches.num_subbands[i] as usize;
         let start_sb = patches.start_subband[i] as usize;
         for x in 0..num_sb {
@@ -528,7 +551,7 @@ mod tests {
         };
         let ft = derive(&h, 44100).unwrap();
         let p = patch_construction(&ft, 44100).unwrap();
-        assert!(p.n_patches >= 1 && p.n_patches <= 5);
+        assert!(p.n_patches >= 1 && p.n_patches <= 6);
         let mut total = 0u32;
         for i in 0..p.n_patches {
             assert!(p.start_subband[i] as usize + p.num_subbands[i] as usize <= 64);
@@ -544,6 +567,70 @@ mod tests {
         assert_eq!(&p.start_subband[..2], &[5, 2]);
         let (borders, len) = p.borders(ft.kx);
         assert_eq!(&borders[..len], &[17, 26, 37]);
+    }
+
+    #[test]
+    fn patch_construction_six_patches_coding_technologies() {
+        // Regression for the "capped at 5" bug (was: `n_patches.min(5)` silently
+        // discarded a legitimate 6th patch, zeroing the top QMF bands → a broken
+        // high band above the crossover). This is ps-local.m4a's derived SBR
+        // config: k0=8, kx=8, M=35 (so k2=43), a *linear* master table
+        // (bs_freq_scale=0, bs_alter_scale=1 ⇒ dk=2). The real fixture is
+        // license-restricted / gitignored, so the derived tables are built
+        // directly here (as `hf_generation_zero_bw_is_straight_copy` does),
+        // keeping this CI-safe and fixture-free.
+        //
+        // Hand-traced against FFmpeg `sbr_hf_calc_npatches` — whose `num_patches
+        // > 5` reject sits BEFORE the record, so a final count of exactly 6 is
+        // kept: the six patches are num_subbands=[5,6,6,6,6,6], giving absolute
+        // borders [8,13,19,25,31,37,43] that fully cover k0..k2 = 8..43. Against
+        // the old `.min(5)` code this yields only 5 patches / borders
+        // [8,13,19,25,31,37], dropping the top patch — so `n_patches == 6` is the
+        // discriminating assertion.
+        let mut ft = FreqTables {
+            k0: 8,
+            kx: 8,
+            m: 35,
+            n_master: 18,
+            ..FreqTables::default()
+        };
+        ft.f_master[..19].copy_from_slice(&[
+            8, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39, 41, 43,
+        ]);
+        // goal_sb = round(2_048_000/44_100) = 46 ≥ kx+M(43) ⇒ k starts at n_master.
+        let p = patch_construction(&ft, 44100).unwrap();
+        assert_eq!(p.n_patches, 6, "6th (top) patch must not be dropped");
+        assert_eq!(&p.num_subbands[..6], &[5, 6, 6, 6, 6, 6]);
+        assert_eq!(&p.start_subband[..6], &[2, 1, 1, 1, 1, 1]);
+        let (borders, len) = p.borders(ft.kx);
+        assert_eq!(len, 7);
+        assert_eq!(&borders[..len], &[8, 13, 19, 25, 31, 37, 43]);
+        // Patches cover exactly M high bands (kx..kx+M).
+        let total: u32 = p.num_subbands[..p.n_patches]
+            .iter()
+            .map(|&s| u32::from(s))
+            .sum();
+        assert_eq!(total, u32::from(ft.m));
+    }
+
+    #[test]
+    fn patch_construction_seventh_patch_is_err_not_panic() {
+        // Bound: a config that would need a 7th patch must return `Err` (mirroring
+        // FFmpeg's `num_patches > 5` reject) — never a panic, an OOB write into
+        // the len-6 arrays, or a 7-patch result. Same linear master as above,
+        // extended to k2=49 (M=41): six 6-ish-wide patches reach 43, and a
+        // seventh would be needed to cover 43..49, which the guard rejects.
+        let mut ft = FreqTables {
+            k0: 8,
+            kx: 8,
+            m: 41,
+            n_master: 21,
+            ..FreqTables::default()
+        };
+        ft.f_master[..22].copy_from_slice(&[
+            8, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39, 41, 43, 45, 47, 49,
+        ]);
+        assert!(patch_construction(&ft, 44100).is_err());
     }
 
     #[test]
@@ -602,8 +689,8 @@ mod tests {
 
         let patches = Patches {
             n_patches: 1,
-            num_subbands: [3, 0, 0, 0, 0],
-            start_subband: [0, 0, 0, 0, 0],
+            num_subbands: [3, 0, 0, 0, 0, 0],
+            start_subband: [0, 0, 0, 0, 0, 0],
         };
 
         let mut t_env = [0u8; 6];

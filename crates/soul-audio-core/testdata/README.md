@@ -76,6 +76,48 @@ LPC-predicted, not exact), so the golden is a **segmental-SNR tolerance** vs
 ffmpeg's own decode (calibrated from the measured value), backed by a structural
 sanity gate (2× output length, non-silent, finite).
 
+## AAC Parametric Stereo (HE-AACv2, PS) — local-only fixture
+
+- `ps-local.m4a` / `ps-local.ref.pcm` — a **HE-AACv2 (AAC-LC + SBR + Parametric
+  Stereo)** conformance clip and ffmpeg's own s16le stereo decode of it.
+
+Unlike every other fixture in this file, these are **license-restricted**
+(sourced from the Coding Technologies aacPlus DecoderCheck suite) and
+**gitignored — never committed** (see the root `.gitignore`,
+`/crates/soul-audio-core/testdata/ps-local.*`). They exist only in local dev
+checkouts and are used purely for local, human-triggered verification: the
+`tests/decode.rs` PS conformance tests (`ps_local_matches_ffmpeg_per_channel`,
+per-channel segmental SNR vs ffmpeg; `ps_local_output_is_stereo_and_channels_differ`,
+a structural stereo gate) read them at runtime via `std::fs::read` and skip
+(no-op pass) when the files are absent — the case for CI and every clean
+checkout. There is no local encoder that produces HE-AACv2/PS (unlike the
+self-encoded SBR fixtures above, MediaFoundation's `aac_mf` does not emit PS),
+so this fixture cannot be regenerated or replaced and must never be sourced
+into the repo.
+
+**Measured conformance** (local, at the shared priming offset of 384
+per-channel frames): per-channel segmental SNR **L = 33.55 dB, R = 34.53 dB**
+vs the ffmpeg reference — high fidelity, because SBR is already near-bit-exact
+here and PS layers table-driven f32 DSP (hybrid filterbank → decorrelation →
+2×2 complex mixing) on top. `ps_local_matches_ffmpeg_per_channel` de-interleaves
+L/R and scores **each channel independently** at that shared offset, requiring
+**both** to clear `PS_SNR_BAR = 28 dB` (a ~5.5 dB margin below the lower channel,
+the same calibrate-from-measured discipline as the AAC-LC 55.3→45 dB and SBR
+~104→90 dB gates). The structural gate observes stereo width
+`RMS(L−R)/RMS(L) ≈ 0.80` (ffmpeg ref ≈ 0.808), which a mono-duplicated /
+PS-silently-disabled regression would collapse to ~0.
+
+**Committed, CI-enforced PS coverage** instead comes from the per-unit
+synthetic-input DSP tests — the hybrid filterbank, decorrelation, and the Type
+A/Type B mixing matrices + IPD/OPD phase rotation (incl. the NEGATE_IPD_MASK
+sign path), all checked against faad2/FFmpeg reference closed forms — plus the
+robustness sweep (`tests/robustness.rs`): its bit-flips/truncations over the
+committed `sbr.*` fixtures' SBR `bs_extension` region drive the PS
+`parse_extensions`/`parse_frame` `[NOPANIC]` fields to `Err`/disable-PS, never
+a panic/OOB/hang. The local `ps-local.m4a`, when present, is additionally seeded
+into that sweep as a genuine valid-baseline PS input (never committed —
+`std::fs::read`, never `include_bytes!`).
+
 ## MPEG audio (Layers I / II / III)
 
 - `layer1-32k-stereo.mp1` + `layer1-32k-stereo.ffref16.pcm` — Layer I and its

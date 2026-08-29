@@ -147,11 +147,14 @@ pub fn run<K: Sink>(sink: K, paths: &[PathBuf]) -> Result<()> {
 
     thread::scope(move |scope| -> Result<()> {
         // Loader thread: serve open requests until the pump drops `req_tx`. A
-        // generous stack — an `AnyDecoder` is ~150 KiB by value (no-alloc) and is
-        // built and moved here, which overflows the default Windows 1 MiB stack.
+        // generous stack — an `AnyDecoder` is large by value (no-alloc): the
+        // HE-AAC (SBR + Parametric Stereo) variant carries hundreds of KiB of
+        // QMF/HF/hybrid state and is built and moved here, which overflows the
+        // default Windows 1 MiB stack (and a debug build overflows a smaller
+        // one). 16 MiB matches `soul-audio-core`'s own decode-test threads.
         thread::Builder::new()
             .name("loader".into())
-            .stack_size(8 * 1024 * 1024)
+            .stack_size(16 * 1024 * 1024)
             .spawn_scoped(scope, move || {
                 for i in req_rx {
                     let opened = open_track(&paths[i]).map(|d| (i, d));

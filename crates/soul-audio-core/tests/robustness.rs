@@ -259,8 +259,24 @@ fn check(failures: &mut Vec<Failure>, seed: &'static str, mutation: String, byte
 }
 
 /// Valid seed corpus: real fixtures spanning every container + codec.
+///
+/// The HE-AACv2 Parametric Stereo `parse_extensions`/`parse_frame` `[NOPANIC]`
+/// path is reachable only inside an SBR-active frame (PS lives in the trailing
+/// `bs_extension` structure of the SBR fill-element payload). The committed
+/// `sbr-m4a`/`sbr-adts` seeds carry exactly that region, so the sweep's
+/// truncations and bit-flips over it drive `bs_extended_data`/`cnt`/
+/// `bs_extension_id` and — whenever a mutation routes into `EXTENSION_ID_PS` —
+/// every §8 PS field (`iid_mode`/`icc_mode`/`frame_class`/`num_env`/
+/// `border_position`/Huffman deltas/`ps_extension_size`) to `Err`/disable-PS,
+/// never a panic/OOB/hang. A committed, *valid-baseline* PS bitstream is not
+/// added: reaching `parse_frame` from the public API needs a working SBR header
+/// and data, and injecting a conformant PS sub-extension at the
+/// (non-byte-aligned) `bs_extended_data` offset inside compressed SBR data is
+/// impractical without decoder instrumentation. The gitignored `ps-local.*`
+/// fixture, when present, is added below as a genuine valid-baseline PS seed
+/// (local-only, never committed — `std::fs::read`, never `include_bytes!`).
 fn seeds() -> Vec<(&'static str, Vec<u8>)> {
-    vec![
+    let mut v: Vec<(&'static str, Vec<u8>)> = vec![
         ("wav-min", minimal_wav()),
         ("flac-min", minimal_flac()),
         (
@@ -300,10 +316,25 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
         ("aac-adts", include_bytes!("../testdata/aac.aac").to_vec()),
         // HE-AAC (SBR): mutating the fill-element SBR payload exercises the
         // sbr_header/grid/envelope-Huffman bounds checks → Err/upsample-only
-        // fallback, never a panic/OOB (the §3.3 firmware invariant).
+        // fallback, never a panic/OOB (the §3.3 firmware invariant). The same
+        // region carries the trailing `bs_extension` structure, so these seeds
+        // also drive the PS `parse_extensions`/`parse_frame` `[NOPANIC]` path
+        // (see the `seeds()` doc-comment).
         ("sbr-m4a", include_bytes!("../testdata/sbr.m4a").to_vec()),
         ("sbr-adts", include_bytes!("../testdata/sbr.aac").to_vec()),
-    ]
+    ];
+
+    // Genuine valid-baseline PS fuzz, local-only: the license-restricted
+    // `ps-local.m4a` is gitignored and NEVER committed / NEVER `include_bytes!`d,
+    // so read it at runtime and add it only when present (a no-op on CI / any
+    // clean checkout). Its mutations perturb real, in-range PS fields, driving
+    // the §8 `[NOPANIC]` checks from a working HE-AACv2 baseline.
+    let dir = env!("CARGO_MANIFEST_DIR");
+    if let Ok(b) = std::fs::read(format!("{dir}/testdata/ps-local.m4a")) {
+        v.push(("ps-local", b));
+    }
+
+    v
 }
 
 /// Container magics — random bodies behind these drive parsers past sync.

@@ -85,8 +85,13 @@ fn main() -> Result<()> {
         } => Box::new(move || driver::render(&inputs, &out, rate, channels)),
         Cmd::Play { inputs } => Box::new(move || play(&inputs)),
     };
+    // Generous stack: the worker owns the engine/deck, which embed an
+    // `AnyDecoder` by value (no-alloc). Its HE-AAC (SBR + Parametric Stereo)
+    // variant is by far the largest — hundreds of KiB of QMF/HF/hybrid state —
+    // so a debug build's frames overflow a smaller stack. 16 MiB matches
+    // `soul-audio-core`'s own decode-test loader thread.
     std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
+        .stack_size(16 * 1024 * 1024)
         .spawn(job)
         .expect("spawn worker thread")
         .join()

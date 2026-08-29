@@ -107,6 +107,12 @@ pub(super) struct SbrState {
     pub(super) active: bool,
     tables: Option<Tables>,
     ch: [SbrChannel; 2],
+    /// Parametric Stereo decoder (HE-AACv2, Phase 3). Always present; a
+    /// `Default` `PsDecoder` is inactive (no header seen), so an SBR-only or
+    /// LC-only stream never touches it. Fed by the SBR extension loop
+    /// ([`bitstream::parse_extensions`]) behind `EXTENSION_ID_PS`; consumed by
+    /// [`drive`] to upmix a mono core to stereo in the QMF domain (§8).
+    pub(super) ps: crate::formats::aac::ps::PsDecoder,
 }
 
 impl Default for SbrState {
@@ -118,6 +124,7 @@ impl Default for SbrState {
             active: false,
             tables: None,
             ch: [SbrChannel::default(), SbrChannel::default()],
+            ps: crate::formats::aac::ps::PsDecoder::default(),
         }
     }
 }
@@ -205,6 +212,11 @@ pub(super) fn decode_fill_sbr(
 pub(super) struct SbrOutput {
     pub(super) pcm: [[f32; 2048]; 2],
     pub(super) written: usize,
+    /// Channels actually produced this frame: the input `n_ch` for the plain
+    /// SBR path, or `2` when Parametric Stereo upmixed a mono core (R6). Set
+    /// by [`drive`] every active frame; `decode_rdb` reads it for the
+    /// interleave stride and the `AacDecoder` 1->2 channel promotion.
+    pub(super) channels: usize,
 }
 
 impl Default for SbrOutput {
@@ -212,6 +224,9 @@ impl Default for SbrOutput {
         Self {
             pcm: [[0.0; 2048]; 2],
             written: 0,
+            // Overwritten by `drive` before it is read on any active frame;
+            // 2 is the safe fallback (matches the PCM buffer's channel width).
+            channels: 2,
         }
     }
 }
@@ -457,6 +472,47 @@ fn assemble_upsample(
 /// bad frame never shortens the output). Private to the `sbr` module — the
 /// `bitstream` child calls it via `super::drive`; the AAC pipeline enters
 /// through [`decode_fill_sbr`] instead.
+/// One channel's §7-§10 QMF reconstruction: analysis QMF of the core PCM into
+/// the low-band buffer (carrying the 8-slot LPC lookback), then full HF
+/// reconstruction ([`run_channel_hf`]) or the upsample-only fallback, producing
+/// this frame's 32 assembled output slots. Factored out of [`drive`] so the
+/// plain per-channel loop and the PS mono path share one implementation
+/// (bit-identical to the pre-PS inline form).
+fn channel_x_out(
+    cs: &mut SbrChannel,
+    parsed: &Option<(bool, [ChParse; 2], [EnvLinear; 2])>,
+    tables: Option<Tables>,
+    header: Option<SbrHeader>,
+    ch: usize,
+    core_pcm: &[f32; 1024],
+) -> [[Cpx; N_SYN]; TIME_SLOTS_RATE] {
+    // (A) Analysis QMF of the LC core PCM → fresh 32 slots, placed into the
+    // low-band buffer at [T_HFGEN, 40); slots [0,8) carry the previous frame's
+    // last 8 analysis slots (§7.1 / §7.4 / §8 LPC lookback).
+    let mut fresh = [[Cpx::default(); N_ANA]; TIME_SLOTS_RATE];
+    qmf_analysis(core_pcm, &mut cs.qmf_ana, &mut fresh);
+    cs.x_low.copy_within(TIME_SLOTS_RATE..MAX_SLOTS, 0);
+    cs.x_low[T_HFGEN..MAX_SLOTS].copy_from_slice(&fresh);
+
+    let mut x_out = [[Cpx::default(); N_SYN]; TIME_SLOTS_RATE];
+    let full_ok = match (parsed, tables, header) {
+        (Some((_coupling, cp, env_lin)), Some(t), Some(hdr)) => run_channel_hf(
+            cs,
+            &cp[ch],
+            &env_lin[ch],
+            &t.ft,
+            &t.patches,
+            &hdr,
+            &mut x_out,
+        ),
+        _ => false,
+    };
+    if !full_ok {
+        assemble_upsample(&cs.x_low, &mut x_out);
+    }
+    x_out
+}
+
 fn drive(
     payload: &mut SbrPayload,
     id_aac: IdAac,
@@ -490,38 +546,47 @@ fn drive(
         _ => None,
     };
 
-    for ch in 0..n_ch {
-        let cs = &mut state.ch[ch];
+    // R3: parse the trailing `bs_extension` loop NOW — after `sbr_data`, before
+    // synthesis — so PS's per-frame parameters are decoded before `apply`
+    // consumes the QMF matrix. This only advances `payload.bits` (synthesis
+    // never reads it), so the non-PS path stays bit-identical.
+    bitstream::parse_extensions(payload, state);
 
-        // (A) Analysis QMF of the LC core PCM → fresh 32 slots, placed into the
-        // low-band buffer at [T_HFGEN, 40); slots [0,8) carry the previous
-        // frame's last 8 analysis slots (§7.1 / §7.4 / §8 LPC lookback).
-        let mut fresh = [[Cpx::default(); N_ANA]; TIME_SLOTS_RATE];
-        qmf_analysis(&core_pcm[ch], &mut cs.qmf_ana, &mut fresh);
-        cs.x_low.copy_within(TIME_SLOTS_RATE..MAX_SLOTS, 0);
-        cs.x_low[T_HFGEN..MAX_SLOTS].copy_from_slice(&fresh);
-
-        let mut x_out = [[Cpx::default(); N_SYN]; TIME_SLOTS_RATE];
-
-        let full_ok = match (&parsed, tables, header) {
-            (Some((_coupling, cp, env_lin)), Some(t), Some(hdr)) => run_channel_hf(
-                cs,
-                &cp[ch],
-                &env_lin[ch],
-                &t.ft,
-                &t.patches,
-                &hdr,
-                &mut x_out,
-            ),
-            _ => false,
-        };
-
-        if !full_ok {
-            assemble_upsample(&cs.x_low, &mut x_out);
+    // PS path: a mono HE-AACv2 core with an active PS header. Reconstruct ch0's
+    // mono QMF matrix, upmix it to a stereo pair, then synthesize each through
+    // its own persistent synthesis-QMF state (R4: ch[0] = left, ch[1] = right).
+    if n_ch == 1 && state.ps.is_active() {
+        let x_out = channel_x_out(&mut state.ch[0], &parsed, tables, header, 0, &core_pcm[0]);
+        let mut xl = [[Cpx::default(); N_SYN]; TIME_SLOTS_RATE];
+        let mut xr = [[Cpx::default(); N_SYN]; TIME_SLOTS_RATE];
+        if state.ps.apply(&x_out, &mut xl, &mut xr).is_ok() {
+            let (c0, c1) = state.ch.split_at_mut(1);
+            qmf_synthesis(&xl, &mut c0[0].qmf_syn, &mut out.pcm[0]);
+            qmf_synthesis(&xr, &mut c1[0].qmf_syn, &mut out.pcm[1]);
+            out.channels = 2; // R6: mono core promoted to stereo.
+        } else {
+            // PS failed on a malformed frame: fall back to mono passthrough.
+            qmf_synthesis(&x_out, &mut state.ch[0].qmf_syn, &mut out.pcm[0]);
+            out.channels = 1;
         }
-
-        // (C) Synthesis QMF → 2048 real samples for this channel (§7.2).
-        qmf_synthesis(&x_out, &mut cs.qmf_syn, &mut out.pcm[ch]);
+    } else {
+        // Plain SBR (LC+SBR, or a stereo core): the existing per-channel loop,
+        // unchanged and bit-identical. `ch` indexes `state.ch`, `core_pcm` and
+        // `out.pcm` in lockstep, so a range loop is clearer than zipping them.
+        #[allow(clippy::needless_range_loop)]
+        for ch in 0..n_ch {
+            let x_out = channel_x_out(
+                &mut state.ch[ch],
+                &parsed,
+                tables,
+                header,
+                ch,
+                &core_pcm[ch],
+            );
+            // (C) Synthesis QMF → 2048 real samples for this channel (§7.2).
+            qmf_synthesis(&x_out, &mut state.ch[ch].qmf_syn, &mut out.pcm[ch]);
+        }
+        out.channels = n_ch;
     }
 
     out.written = 2048;

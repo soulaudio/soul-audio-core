@@ -107,13 +107,19 @@ fn open_surfaces_flac_stream_info() {
     assert_eq!(dec.decode_into(&mut [0i32; 4]), Ok(0));
 }
 
-/// Decode a full stream through the public `open` API and return interleaved PCM.
+/// Decode a full stream through the public `open` API and return interleaved
+/// PCM together with the decoder's final reported channel count.
 ///
 /// Runs on a generous stack: an `AnyDecoder` is large by value (no-alloc), and
 /// the HE-AAC (SBR) decoder in particular carries ~250 KiB of QMF/HF state plus
 /// per-frame DSP scratch — more than the default test-thread stack. This mirrors
 /// the CLI's own big-stack loader thread (see `soul-audio-cli` / MEMORY.md).
-fn decode_all(bytes: &[u8]) -> Vec<i32> {
+///
+/// The channel count is read *after* draining the stream so it reflects any
+/// mid-stream promotion — HE-AACv2 Parametric Stereo starts on a mono core and
+/// promotes `stream_info().channels` 1→2 once the first PS frame's `apply` runs
+/// (reconciliation R6).
+fn decode_all_with_channels(bytes: &[u8]) -> (Vec<i32>, u16) {
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
@@ -128,12 +134,18 @@ fn decode_all(bytes: &[u8]) -> Vec<i32> {
                     }
                     out.extend_from_slice(&buf[..n]);
                 }
-                out
+                let channels = dec.stream_info().channels;
+                (out, channels)
             })
             .expect("spawn decode thread")
             .join()
             .expect("decode thread panicked")
     })
+}
+
+/// Decode a full stream through the public `open` API and return interleaved PCM.
+fn decode_all(bytes: &[u8]) -> Vec<i32> {
+    decode_all_with_channels(bytes).0
 }
 
 fn fnv1a(samples: &[i32]) -> u64 {
@@ -432,6 +444,160 @@ fn open_decodes_layer1_conformance_vector() {
     assert!(
         maxdiff <= 128,
         "within tolerance of ffmpeg (maxdiff={maxdiff})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AAC Parametric Stereo (HE-AACv2, Phase 3) — local-only conformance scaffold
+// (Task 0). The fixture is license-restricted (Coding Technologies aacPlus
+// DecoderCheck) and gitignored, so it is NEVER committed and NEVER embedded
+// via `include_bytes!` (that would fail the build on a clean checkout). It is
+// read at runtime with `std::fs::read`; absence (CI / any clean checkout) is
+// a no-op skip, not a failure. See `testdata/README.md` for provenance and
+// `.superpowers/sdd/ps-reference.md` §8 for the seam this exercises.
+// ---------------------------------------------------------------------------
+
+/// Load the gitignored local PS fixture at test runtime. `None` (→ the caller
+/// skips) when either file is absent — the CI / clean-checkout case. NEVER
+/// `include_bytes!` (the files are not committed).
+fn ps_local_fixture() -> Option<(Vec<u8>, Vec<i32>)> {
+    let dir = env!("CARGO_MANIFEST_DIR");
+    let m4a = std::fs::read(format!("{dir}/testdata/ps-local.m4a")).ok()?;
+    let refpcm = std::fs::read(format!("{dir}/testdata/ps-local.ref.pcm")).ok()?;
+    Some((m4a, load_s16le(&refpcm))) // load_s16le already exists in this file
+}
+
+/// De-interleave channel `ch` of `channels`-interleaved PCM into a mono vec.
+fn deinterleave(pcm: &[i32], channels: usize, ch: usize) -> Vec<i32> {
+    pcm.iter().skip(ch).step_by(channels).copied().collect()
+}
+
+/// Segmental SNR (dB) of `ours[off..]` against `refr` over their overlap:
+/// `10·log10( Σ ref² / Σ (ref − ours)² )`. Both are mono (single-channel)
+/// here; `off` is the per-channel priming offset already found on the
+/// interleaved pair, applied identically to each channel.
+fn seg_snr_at(ours: &[i32], refr: &[i32], off: usize) -> f64 {
+    if off >= ours.len() {
+        return f64::NEG_INFINITY;
+    }
+    let overlap = (ours.len() - off).min(refr.len());
+    let mut sig = 0f64;
+    let mut err = 0f64;
+    for i in 0..overlap {
+        let r = refr[i] as f64;
+        let o = ours[off + i] as f64;
+        sig += r * r;
+        let d = r - o;
+        err += d * d;
+    }
+    if err <= 0.0 {
+        f64::INFINITY
+    } else {
+        10.0 * (sig / err).log10()
+    }
+}
+
+/// Per-channel segmental-SNR bar for the local HE-AACv2/PS conformance gate.
+///
+/// Measured against the ffmpeg reference (`ps-local.ref.pcm`) at the shared
+/// priming offset of 384 per-channel frames, the two channels score **L =
+/// 33.55 dB, R = 34.53 dB** — SBR is already near-bit-exact vs ffmpeg here and
+/// PS layers table-driven f32 DSP (hybrid filterbank → decorrelation → 2×2
+/// complex mixing) on top, so the fidelity stays high. The bar sits **~5.5 dB
+/// below** the lower-scoring channel (33.55), the same calibrate-from-measured
+/// discipline as the AAC-LC gate (55.3 → 45 dB) and the SBR gate (~104 → 90 dB):
+/// comfortably clears a conformant decode yet still drops tens of dB — failing
+/// the gate — under any per-channel PS regression (a wrong mixing matrix,
+/// dropped decorrelation, or a mono-collapsed channel).
+const PS_SNR_BAR: f64 = 28.0;
+
+/// Local-only HE-AACv2/PS conformance: each channel of our decode matches
+/// ffmpeg's own stereo decode (`ps-local.ref.pcm`, s16le) within tolerance.
+///
+/// Skip-if-absent: the fixture is license-restricted and gitignored (never
+/// committed / never `include_bytes!`d), so this is a no-op pass on CI and any
+/// clean checkout, and a real gate in a local dev checkout.
+///
+/// One shared priming offset is found on the interleaved pair, then L and R are
+/// de-interleaved and scored **independently** at that offset — a one-channel
+/// bug (e.g. a mono-collapsed right channel) cannot average out against a good
+/// channel, because *both* must clear `PS_SNR_BAR` on their own.
+#[test]
+fn ps_local_matches_ffmpeg_per_channel() {
+    let Some((data, refr)) = ps_local_fixture() else {
+        eprintln!("skip: ps-local.* fixture absent (license-restricted, local-only)");
+        return;
+    };
+    let (ours, channels) = decode_all_with_channels(&data); // interleaved i32
+    // The mono core is promoted to stereo once the first PS frame's `apply`
+    // runs (reconciliation R6).
+    assert_eq!(
+        channels, 2,
+        "PS must promote the decoded stream to 2 channels (R6)"
+    );
+    // One shared priming offset (a property of the mono core + envelope
+    // timeline), found on the interleaved pair.
+    let (off, _combined) = best_align_segsnr(&ours, &refr, 2);
+    for ch in 0..2 {
+        let o = deinterleave(&ours, 2, ch);
+        let r = deinterleave(&refr, 2, ch);
+        let snr = seg_snr_at(&o, &r, off);
+        assert!(
+            snr > PS_SNR_BAR,
+            "PS ch{ch} segmental SNR vs ffmpeg too low: {snr:.2} dB \
+             (bar {PS_SNR_BAR} dB, shared offset {off} frames)"
+        );
+    }
+}
+
+/// Local-only structural stereo gate for the PS decode, independent of the
+/// per-sample ffmpeg match above (a backstop if the reference PCM were ever
+/// wrong): the output must report 2 channels, be ~2× the SBR rate (per-channel
+/// length within a frame of ffmpeg's 2× reference), non-silent, within the i16
+/// range, and — the discriminating check — the two channels must **genuinely
+/// differ**. `RMS(L−R)/RMS(L)` measured ≈ 0.80 (ffmpeg ref ≈ 0.808); a
+/// mono-duplicated / PS-silently-disabled decode would pass every other check
+/// but collapse this ratio to ~0. Skip-if-absent (see above).
+#[test]
+fn ps_local_output_is_stereo_and_channels_differ() {
+    let Some((data, refr)) = ps_local_fixture() else {
+        eprintln!("skip: ps-local.* fixture absent");
+        return;
+    };
+    let (ours, channels) = decode_all_with_channels(&data);
+    assert_eq!(channels, 2, "PS output must be stereo");
+
+    let ours_per_ch = ours.len() / 2;
+    let ref_per_ch = refr.len() / 2;
+    assert!(
+        (ours_per_ch as i64 - ref_per_ch as i64).abs() <= 4096,
+        "PS output length {ours_per_ch}/ch not within a frame of ffmpeg ref {ref_per_ch}/ch"
+    );
+
+    let rms = (ours.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / ours.len() as f64).sqrt();
+    assert!(rms > 1.0, "PS output silent (rms {rms:.2})");
+    assert!(
+        ours.iter().all(|&s| (-32768..=32767).contains(&s)),
+        "PS output outside i16 range"
+    );
+
+    // The stereo image must be real, not mono duplicated across both channels.
+    let l = deinterleave(&ours, 2, 0);
+    let r = deinterleave(&ours, 2, 1);
+    let n = l.len().min(r.len());
+    let rms_l = (l[..n].iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / n as f64).sqrt();
+    let rms_diff = (l[..n]
+        .iter()
+        .zip(&r[..n])
+        .map(|(&a, &b)| ((a - b) as f64).powi(2))
+        .sum::<f64>()
+        / n as f64)
+        .sqrt();
+    let width = if rms_l > 0.0 { rms_diff / rms_l } else { 0.0 };
+    assert!(
+        width > 0.01,
+        "PS channels barely differ: RMS(L-R)/RMS(L) = {width:.3} (measured ≈0.80) \
+         — a mono-duplicated / PS-silently-disabled regression"
     );
 }
 

@@ -17,6 +17,7 @@ pub(crate) mod bits;
 pub(super) mod dsp;
 pub(crate) mod filterbank;
 mod huffman;
+pub(crate) mod ps;
 pub(crate) mod sbr;
 mod syntax;
 mod tables;
@@ -29,11 +30,16 @@ use crate::model::{SampleFormat, StreamInfo};
 
 use filterbank::Filterbank;
 
-/// One AAC-LC frame is 1024 samples/channel; an SBR frame is **2048**
-/// samples/channel (2× rate, `sbr-reference.md` §0). The carry buffer holds one
-/// decoded stereo SBR frame with headroom (`2048 · 2 ch · 2`), so `decode_into`
-/// can hand back partial frames across calls whether or not SBR is active.
-const PCM_CAP: usize = 2048 * 2 * 2;
+/// One AAC-LC frame is 1024 samples/channel; an SBR (or SBR+PS) frame is
+/// **2048** samples/channel (2× rate, `sbr-reference.md` §0). The carry buffer
+/// holds exactly one decoded stereo frame — `2048 · 2 ch` interleaved i32, the
+/// largest a single `decode_rdb` can produce (SBR/PS 2×-rate stereo; the LC
+/// path is half that) — which `decode_into` drains across calls. Sized to one
+/// frame (not two): `decode_rdb` overwrites `pcm` per frame and never
+/// accumulates, so a second frame's headroom was pure slack. Keeping
+/// `AacDecoder` compact matters because it is the largest [`AnyDecoder`]
+/// variant, embedded by value on the (default-stack) construction path.
+const PCM_CAP: usize = 2048 * 2;
 
 /// Input byte buffer: one whole `raw_data_block` must fit. ADTS's 13-bit
 /// `aac_frame_length` caps a frame at 8191 bytes (payload a little less), and a
@@ -147,13 +153,21 @@ fn decode_rdb(
             sbr_out,
         )?;
         if applied {
+            // R6: Parametric Stereo may have upmixed a mono core to stereo, so
+            // interleave by the channel count SBR actually produced
+            // (`sbr_out.channels`), not the core element count `n`. The caller
+            // reads `sbr_out.channels` after this returns to promote
+            // `AacDecoder.channels` 1->2 (mirroring the `sbr_confirmed` rate
+            // promotion). This 2x-rate stereo write of 2048·2 samples is the
+            // largest a frame produces and exactly fills `PCM_CAP` (= 2048·2).
+            let out_ch = sbr_out.channels.clamp(1, 2);
             let frames = 2048usize;
             for i in 0..frames {
-                for ch in 0..n {
-                    pcm[i * n + ch] = round_i16(sbr_out.pcm[ch][i] * OUTPUT_GAIN);
+                for ch in 0..out_ch {
+                    pcm[i * out_ch + ch] = round_i16(sbr_out.pcm[ch][i] * OUTPUT_GAIN);
                 }
             }
-            return Ok((frames * n, consumed, true));
+            return Ok((frames * out_ch, consumed, true));
         }
     }
 
@@ -368,6 +382,7 @@ impl<S: Source> AacDecoder<S> {
         self.mp4_used = consumed;
         if sbr_applied {
             self.sbr_confirmed = true;
+            self.promote_channels_if_ps();
         }
         Ok(Some(samples))
     }
@@ -396,8 +411,20 @@ impl<S: Source> AacDecoder<S> {
         )?;
         if sbr_applied {
             self.sbr_confirmed = true;
+            self.promote_channels_if_ps();
         }
         Ok(Some(samples))
+    }
+
+    /// Promote the reported channel count 1->2 the first time Parametric Stereo
+    /// upmixes a mono core to stereo (R6), mirroring the `sbr_confirmed`
+    /// sample-rate promotion. `SbrOutput.channels` is set to 2 by the SBR drive
+    /// whenever PS ran; from then on `stream_info().channels` reports 2 and
+    /// `decode_rdb` interleaves every frame as stereo.
+    fn promote_channels_if_ps(&mut self) {
+        if self.sbr_out.channels == 2 && self.channels < 2 {
+            self.channels = 2;
+        }
     }
 }
 

@@ -4,3 +4,7 @@
 
 # Local tooling / session state (not part of the template)
 /.claude/
+
+# HE-AACv2/PS conformance fixture — license-restricted (Coding Technologies
+# DecoderCheck package), used for LOCAL PS dev verification only, NEVER committed.
+/crates/soul-audio-core/testdata/ps-local.*
