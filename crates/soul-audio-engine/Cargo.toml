@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Portable no_std playback queue engine (cursor + repeat modes + gapless preload) over soul-audio-core's Deck."
+description = "Portable no_std playback engine: drives soul-audio-core's Deck from a pluggable Sequencer policy (LinearSequencer built in) with gapless preload."
 
 [lints]
 workspace = true

@@ -34,7 +34,7 @@ use soul_audio_core::{
     AnyDecoder, DecimateAdapter, Deck, DecodeError, Decoder, Format, Progress, Quality,
     SeekableDecoder, Sink, SinkError, StreamInfo, open, probe,
 };
-use soul_audio_engine::{Engine, Provided};
+use soul_audio_engine::{Engine, LinearSequencer, Provided};
 
 #[cfg(feature = "playback")]
 use crate::cpal_sink::CpalSink;
@@ -138,8 +138,9 @@ pub fn run<K: Sink>(sink: K, paths: &[PathBuf]) -> Result<()> {
     );
 
     let deck = Deck::<K, OwnedDecoder, PRELOAD>::new(sink, Quality::Hq);
-    let mut engine = Engine::new(deck);
-    engine.set_queue(paths.len(), 0);
+    let mut engine = Engine::new(deck, LinearSequencer::new());
+    engine.sequencer_mut().set_queue(paths.len(), 0);
+    engine.rearm();
 
     // pump → loader: "open track i"; loader → pump: the opened decoder (or error).
     let (req_tx, req_rx) = mpsc::channel::<usize>();
@@ -190,7 +191,7 @@ pub fn run<K: Sink>(sink: K, paths: &[PathBuf]) -> Result<()> {
                 Progress::Ended => break,
                 // A preloaded track took over at a gapless boundary.
                 Progress::TrackChanged => {
-                    println!("▶ track {} (gapless)", engine.cursor().unwrap_or(0));
+                    println!("▶ track {} (gapless)", engine.current().unwrap_or(0));
                 }
                 // Waiting for the first/next decoder to arrive — yield briefly.
                 Progress::Idle => thread::sleep(Duration::from_millis(3)),
