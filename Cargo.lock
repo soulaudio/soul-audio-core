@@ -1758,6 +1758,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "soul-audio-queue"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.8.0",
+ "serde",
+ "soul-audio-core",
+ "soul-audio-engine",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

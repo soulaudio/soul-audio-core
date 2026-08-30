@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "crates/soul-audio-core",
   "crates/soul-audio-engine",
+  "crates/soul-audio-queue",
   "crates/soul-audio-cli",
   "crates/soul-audio-firmware",
   "crates/architecture-tests",
@@ -11,6 +12,7 @@ members = [
 default-members = [
   "crates/soul-audio-core",
   "crates/soul-audio-engine",
+  "crates/soul-audio-queue",
   "crates/soul-audio-cli",
   "crates/architecture-tests",
   "xtask",

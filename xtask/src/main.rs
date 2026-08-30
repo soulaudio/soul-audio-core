@@ -68,8 +68,8 @@ fn verify() -> Result<(), String> {
     sbr_tables::check()?;
     ps_tables::check()?;
     run(&["test"])?;
-    // The STM32 discipline gates: the core and engine must build no_std for the
-    // target, and the firmware must link for it.
+    // The STM32 discipline gates: the core, engine, and queue must build no_std
+    // for the target, and the firmware must link for it.
     run(&[
         "build",
         "-p",
@@ -82,6 +82,14 @@ fn verify() -> Result<(), String> {
         "build",
         "-p",
         "soul-audio-engine",
+        "--target",
+        "thumbv7em-none-eabihf",
+        "--no-default-features",
+    ])?;
+    run(&[
+        "build",
+        "-p",
+        "soul-audio-queue",
         "--target",
         "thumbv7em-none-eabihf",
         "--no-default-features",
