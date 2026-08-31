@@ -7,11 +7,13 @@
 //! device sink works, and this crate stays free of `cpal` (Plan 4 injects it).
 #![forbid(unsafe_code)]
 
+pub mod driver;
 pub mod library;
 pub mod types;
 
 #[cfg(test)]
 pub(crate) mod testutil;
 
+pub use driver::{ServicePlayer, apply_command, project_queue, project_tick};
 pub use library::{Library, Track};
 pub use types::{Command, Event, PlayState, QueueState, RepeatMode, Tick, TrackView};

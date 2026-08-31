@@ -1,8 +1,6 @@
 //! Headless test doubles: a no-op sink and a constant-sample decoder, so the
 //! whole player stack runs in unit tests without an audio device or real files.
 
-#![allow(dead_code)]
-
 use soul_audio_core::{
     DecodeError, Decoder, SampleFormat, SeekableDecoder, Sink, SinkError, StreamInfo,
 };
