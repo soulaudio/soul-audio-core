@@ -26,7 +26,6 @@ pub fn file_source(file: File, buf: &mut [u8]) -> BufReader<'_, FromStd<File>> {
 /// Buffered, **forward-only** source over a TCP stream. `TcpStream` is not
 /// `Seek`, so this is a `Source`/`BufSource` but *not* a `SeekSource` — the type
 /// system forbids seeking a live stream.
-#[allow(dead_code)] // demonstrated by the conformance test; wired when a stream input lands
 pub fn tcp_source(stream: TcpStream, buf: &mut [u8]) -> BufReader<'_, FromStd<TcpStream>> {
     BufReader::new(FromStd::new(stream), buf)
 }

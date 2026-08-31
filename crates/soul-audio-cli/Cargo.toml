@@ -12,22 +12,13 @@ workspace = true
 [dependencies]
 soul-audio-core = { path = "../soul-audio-core" }
 soul-audio-engine = { path = "../soul-audio-engine" }
-embedded-io = { workspace = true }
-embedded-io-adapters = { workspace = true, features = ["std"] }
+soul-audio-desktop = { path = "../soul-audio-desktop" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 
 [features]
 default = []
-playback = ["dep:cpal", "dep:ringbuf"]
-
-[dependencies.cpal]
-version = "0.15"
-optional = true
-
-[dependencies.ringbuf]
-version = "0.4"
-optional = true
+playback = ["soul-audio-desktop/playback"]
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -60,7 +60,11 @@ fn shells_depend_on_core_not_the_reverse() {
     let md = MetadataCommand::new().exec().unwrap();
     let core_deps = normal_dep_names(pkg(&md, "soul-audio-core"));
 
-    for shell in ["soul-audio-cli", "soul-audio-firmware"] {
+    for shell in [
+        "soul-audio-cli",
+        "soul-audio-desktop",
+        "soul-audio-firmware",
+    ] {
         assert!(
             !core_deps.contains(&shell.to_string()),
             "soul-audio-core must not depend on {shell}"

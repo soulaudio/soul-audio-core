@@ -17,7 +17,7 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use soul_audio_core::model::SampleFormat as CoreFmt;
 use soul_audio_core::{Sink, SinkError, StreamInfo};
 
-use crate::convert::{self, CANONICAL_BITS};
+use soul_audio_core::convert::{self, CANONICAL_BITS};
 
 /// A cpal output stream presented as a [`Sink`] consuming canonical 24-bit PCM.
 pub struct CpalSink {

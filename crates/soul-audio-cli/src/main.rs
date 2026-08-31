@@ -10,14 +10,7 @@
 //!
 //! The engine/deck run identically on the STM32 — only the sink and source swap.
 
-// `convert` is used by the cpal callback (playback) and by its own tests; when
-// playback is off it is exercised only by tests, so allow dead code there.
-#[cfg_attr(not(feature = "playback"), allow(dead_code))]
-mod convert;
-#[cfg(feature = "playback")]
-mod cpal_sink;
 mod driver;
-mod sources;
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -103,7 +96,7 @@ fn decode(input: &Path, out: &Path) -> Result<()> {
     // A file is a full-ladder source (Source + BufSource + SeekSource). The same
     // core path runs on the STM32 over a `SliceSource` / SD-card source.
     let mut scratch = [0u8; 8192];
-    let source = sources::file_source(file, &mut scratch);
+    let source = soul_audio_desktop::file_source(file, &mut scratch);
 
     let mut decoder =
         open(source).map_err(|e| anyhow!("cannot decode {}: {e:?}", input.display()))?;
