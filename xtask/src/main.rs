@@ -97,6 +97,14 @@ fn verify() -> Result<(), String> {
     run(&[
         "build",
         "-p",
+        "soul-audio-control",
+        "--target",
+        "thumbv7em-none-eabihf",
+        "--no-default-features",
+    ])?;
+    run(&[
+        "build",
+        "-p",
         "soul-audio-firmware",
         "--target",
         "thumbv7em-none-eabihf",

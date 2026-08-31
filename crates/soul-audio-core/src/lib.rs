@@ -7,6 +7,7 @@
 //! [`BufSource`] → [`SeekSource`]) and write PCM samples into caller-provided
 //! buffers. No allocation happens anywhere in this crate.
 
+pub mod convert;
 pub mod deck;
 pub mod decoder;
 pub mod demux;

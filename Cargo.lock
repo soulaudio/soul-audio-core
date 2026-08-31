@@ -1726,6 +1726,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "soul-audio-control"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.8.0",
+ "soul-audio-core",
+ "soul-audio-engine",
+ "soul-audio-queue",
+]
+
+[[package]]
 name = "soul-audio-core"
 version = "0.1.0"
 dependencies = [

@@ -15,6 +15,7 @@ mod buf;
 mod context;
 mod queue;
 mod shuffle;
+mod slice;
 mod snapshot;
 
 #[cfg(feature = "alloc")]
@@ -23,6 +24,7 @@ pub use buf::{Full, QueueBuf};
 pub use context::Context;
 pub use queue::TwoLevelQueue;
 pub use shuffle::{shuffle_index, unshuffle_index};
+pub use slice::SliceContext;
 pub use snapshot::RestoreError;
 #[cfg(feature = "alloc")]
 pub use snapshot::Snapshot;
