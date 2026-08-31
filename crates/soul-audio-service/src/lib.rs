@@ -7,9 +7,11 @@
 //! device sink works, and this crate stays free of `cpal` (Plan 4 injects it).
 #![forbid(unsafe_code)]
 
+pub mod library;
 pub mod types;
 
 #[cfg(test)]
 pub(crate) mod testutil;
 
+pub use library::{Library, Track};
 pub use types::{Command, Event, PlayState, QueueState, RepeatMode, Tick, TrackView};
