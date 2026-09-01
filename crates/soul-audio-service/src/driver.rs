@@ -143,9 +143,16 @@ mod tests {
 
     /// A player over NullSink/ConstDecoder with a 1-second prev threshold.
     fn player() -> ServicePlayer<NullSink, ConstDecoder> {
+        player_with_threshold(u64::from(RATE))
+    }
+
+    /// A player over NullSink/ConstDecoder with a custom prev threshold, so a
+    /// short ConstDecoder track can deterministically outrun (or stay under)
+    /// it — the 1 s default is unreachable on a 4000-frame track.
+    fn player_with_threshold(prev_restart_frames: u64) -> ServicePlayer<NullSink, ConstDecoder> {
         let deck = Deck::new(NullSink::new(RATE, 2), Quality::Hq);
         let engine = Engine::new(deck, queue_for(Vec::new()));
-        Player::new(engine, u64::from(RATE)) // prev_restart_frames = 1 s
+        Player::new(engine, prev_restart_frames)
     }
 
     /// Run the open/pump loop `cycles` times, feeding a ConstDecoder for each
@@ -241,9 +248,11 @@ mod tests {
 
     #[test]
     fn prev_restarts_when_past_threshold_else_steps_back() {
-        // threshold = 1 s = RATE frames. Advance to track 1, play >1 s of it, then
-        // Prev restarts track 1 (seek 0). With <1 s elapsed, Prev steps to track 0.
-        let mut p = player();
+        // Use a small threshold (FRAMES/4 = 1000 frames) so the 4000-frame
+        // ConstDecoder track can both outrun it (restart branch) and sit under
+        // it (step-back branch). Advance to track 1 and play past the threshold,
+        // then Prev must restart track 1 (seek 0, cursor stays).
+        let mut p = player_with_threshold(FRAMES / 4);
         apply_command(
             &mut p,
             Command::PlayContext {
@@ -257,12 +266,25 @@ mod tests {
         apply_command(&mut p, Command::Next, 0).unwrap();
         drive(&mut p, 2);
         assert_eq!(p.current(), Some(1), "on track 1");
-        // Not enough elapsed → steps back to track 0.
-        if p.position_frames() <= u64::from(RATE) {
-            apply_command(&mut p, Command::Prev, 0).unwrap();
-            drive(&mut p, 2);
-            assert_eq!(p.current(), Some(0), "prev stepped back");
-        }
+        // Advance enough pumps (BLOCK=256 frames each) to exceed FRAMES/4.
+        drive(&mut p, 4);
+        assert!(
+            p.position_frames() > FRAMES / 4,
+            "past threshold: pos {} > {}",
+            p.position_frames(),
+            FRAMES / 4
+        );
+        // Past threshold → Prev restarts track 1 (seek 0, cursor stays).
+        apply_command(&mut p, Command::Prev, 0).unwrap();
+        assert_eq!(
+            p.current(),
+            Some(1),
+            "prev past threshold restarts on track 1"
+        );
+        assert_eq!(p.position_frames(), 0, "restart resets position");
+        // Now at the track start (under threshold) → Prev steps back to track 0.
+        apply_command(&mut p, Command::Prev, 0).unwrap();
+        assert_eq!(p.current(), Some(0), "prev under threshold steps back");
     }
 
     #[test]
