@@ -152,7 +152,9 @@ fn pump_thread<K, Mk, Ev>(
             match cmd_rx.try_recv() {
                 Ok(cmd) => {
                     if let Command::SetVolume(v) = cmd {
-                        volume = v;
+                        // Clamp at intake so projected `Tick.volume` matches what
+                        // `Deck::set_volume` actually applies (0.0..=1.0).
+                        volume = v.clamp(0.0, 1.0);
                     }
                     seed = seed.wrapping_add(SEED_STEP);
                     if let Err(e) = apply_command(&mut player, cmd, seed) {
@@ -204,8 +206,13 @@ fn pump_thread<K, Mk, Ev>(
             last_tick = Instant::now();
         }
 
-        // 5. Shutdown / idle pacing.
-        if disconnected && !player.is_active() {
+        // 5. Shutdown / idle pacing. The command channel disconnects only when
+        //    the AudioPlayer handle is dropped — that IS the shutdown signal.
+        //    Exit immediately rather than waiting for `!is_active()`: an active
+        //    track would otherwise extend the join in `Drop` by the whole
+        //    remaining playback (real-time-paced under CpalSink), and Repeat
+        //    modes never become inactive, so the join would block forever.
+        if disconnected {
             break;
         }
         if matches!(progress, Progress::Idle) {
@@ -293,6 +300,62 @@ mod tests {
         assert!(saw_playing, "never observed track 0 playing");
 
         drop(player); // clean shutdown (joins threads)
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn drop_returns_promptly_even_while_repeat_all_plays() {
+        let dir = std::env::temp_dir().join(format!("sas_actor_drop_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let lib = fixture_library(&dir);
+
+        let (ev_tx, ev_rx) = mpsc::channel::<Event>();
+        let player = AudioPlayer::spawn(
+            || Ok(NullSink::new(48_000, 2)),
+            Arc::clone(&lib),
+            move |ev| {
+                let _ = ev_tx.send(ev);
+            },
+        );
+
+        // Repeat::All means the player never becomes inactive on its own;
+        // dropping the handle must still shut the pump down promptly.
+        // (Regression: the old shutdown condition also required `!is_active()`
+        // so `Drop`'s join blocked forever while repeat playback was active.)
+        player.send(Command::SetRepeat(crate::types::RepeatMode::All));
+        player.send(Command::PlayContext {
+            ids: vec![0, 1],
+            start: 0,
+        });
+
+        // Wait until a Tick shows track 0 playing (loader round-trip done).
+        let mut saw_playing = false;
+        let deadline = Duration::from_secs(5);
+        loop {
+            match ev_rx.recv_timeout(deadline) {
+                Ok(Event::Tick(t)) => {
+                    if t.now_playing_id == Some(0) && t.state == crate::types::PlayState::Playing {
+                        saw_playing = true;
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(saw_playing, "never observed track 0 playing");
+
+        // Drop on a helper thread: the join must return promptly, not block
+        // on Repeat::All playback that would otherwise never end.
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let dropper = std::thread::spawn(move || {
+            drop(player);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "drop(player) blocked: pump thread did not exit while repeat playback was active"
+        );
+        let _ = dropper.join();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
