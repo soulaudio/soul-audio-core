@@ -63,6 +63,7 @@ fn shells_depend_on_core_not_the_reverse() {
     for shell in [
         "soul-audio-cli",
         "soul-audio-desktop",
+        "soul-audio-service",
         "soul-audio-firmware",
     ] {
         assert!(
