@@ -20,10 +20,10 @@ use soul_audio_core::{
 /// across threads.
 pub type Src = FromStd<IoBufReader<File>>;
 
-/// A playable owned decoder: multi-bit PCM (WAV/FLAC/MP3/Ogg-FLAC) or DSD
-/// (DSF/DFF) decimated to PCM. DSD is decimated in-decoder (DSD64 → 352.8 kHz
-/// 24-bit) and the deck then resamples it to the device rate like any other
-/// source.
+/// A playable owned decoder: multi-bit PCM (WAV/FLAC/MP3/Ogg-FLAC/AAC/ALAC)
+/// or DSD (DSF/DFF) decimated to PCM. DSD is decimated in-decoder (DSD64 →
+/// 352.8 kHz 24-bit) and the deck then resamples it to the device rate like
+/// any other source.
 ///
 /// The PCM variant is `AnyDecoder` (~150 KiB by value, FLAC-dominated) — much
 /// larger than the DSD variants — but the deck holds decoders by value on a
