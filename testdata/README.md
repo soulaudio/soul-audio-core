@@ -21,6 +21,7 @@ right = 659.25 Hz (E5), −6 dB, with 50 ms in/out fades. So:
 | `tone-aac.m4a` | AAC-LC in MP4/M4A |
 | `tone.aac`  | AAC-LC, raw ADTS elementary stream |
 | `tone.dsf`  | DSD64 (Sony DSF), 0.5 s — 1-bit, decimated to PCM for playback |
+| `tagged.flac` | native FLAC with ID3-style tags (title/artist/album) — used by the library-scan `Some(tag)` test |
 
 DSD is 1-bit at 2.8 MHz, so `tone.dsf` is deliberately shorter (0.5 s) to keep
 it small. The CLI decimates it to multi-bit PCM (DSD64 → 352.8 kHz) and the deck
