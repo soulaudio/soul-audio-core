@@ -66,8 +66,10 @@ impl SeekableDecoder for OwnedDecoder {
     fn total_frames(&self) -> Option<u64> {
         match self {
             OwnedDecoder::Pcm(d) => d.total_frames(),
-            // The DSD length isn't surfaced through the decimator; streaming.
-            OwnedDecoder::Dsf(_) | OwnedDecoder::Dff(_) => None,
+            // DSD: the decimator reports the decimated PCM frame count from the
+            // container's declared DSD sample count (`None` if not declared).
+            OwnedDecoder::Dsf(d) => d.total_frames(),
+            OwnedDecoder::Dff(d) => d.total_frames(),
         }
     }
 }

@@ -5,6 +5,11 @@
 # Local tooling / session state (not part of the template)
 /.claude/
 
+# Plan 4 desktop app (app/ — isolated from the root cargo workspace)
+/app/node_modules/
+/app/dist/
+/app/src-tauri/target/
+/app/src-tauri/gen/schemas/
 # HE-AACv2/PS conformance fixture — license-restricted (Coding Technologies
 # DecoderCheck package), used for LOCAL PS dev verification only, NEVER committed.
 /crates/soul-audio-core/testdata/ps-local.*

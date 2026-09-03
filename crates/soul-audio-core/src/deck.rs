@@ -308,6 +308,10 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         if let Some(r) = track.resampler.as_mut() {
             r.reset();
         }
+        // The `track` borrow of `self.current` ends above; drop the sink's
+        // already-buffered pre-seek audio so the landing point is heard promptly
+        // instead of after the old buffer drains.
+        self.sink.discard().map_err(DeckError::Sink)?;
         Ok(landed)
     }
 
@@ -693,6 +697,56 @@ mod tests {
         deck.stop();
         assert_eq!(deck.state(), DeckState::Stopped);
         assert_eq!(deck.pump().unwrap(), Progress::Idle);
+    }
+
+    #[test]
+    fn seek_discards_buffered_sink_audio() {
+        // A seek is a playback discontinuity: the deck must tell the sink to drop
+        // its already-buffered pre-seek audio, else that audio plays out before
+        // the new position is heard (an audible seek lag). This asserts the
+        // deck→sink `discard` wiring; the ring-clear itself lives in the concrete
+        // desktop sink.
+        struct DiscardSink {
+            rate: u32,
+            ch: usize,
+            discards: usize,
+        }
+        impl Sink for DiscardSink {
+            fn stream_info(&self) -> StreamInfo {
+                StreamInfo {
+                    sample_rate: self.rate,
+                    channels: self.ch as u16,
+                    format: SampleFormat::Int { bits: 24 },
+                }
+            }
+            fn write(&mut self, _frames: &[i32]) -> Result<(), SinkError> {
+                Ok(())
+            }
+            fn flush(&mut self) -> Result<(), SinkError> {
+                Ok(())
+            }
+            fn discard(&mut self) -> Result<(), SinkError> {
+                self.discards += 1;
+                Ok(())
+            }
+        }
+
+        let sink = DiscardSink {
+            rate: 48_000,
+            ch: 1,
+            discards: 0,
+        };
+        let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
+        deck.load(const_dec(48_000, 1, 100, 10_000)).unwrap();
+        deck.pump().unwrap(); // buffer some audio first
+        assert_eq!(deck.sink().discards, 0, "no discard before seeking");
+        assert_eq!(deck.seek(5000).unwrap(), 5000);
+        assert_eq!(deck.position_frames(), 5000);
+        assert_eq!(
+            deck.sink().discards,
+            1,
+            "seek must discard the buffered pre-seek audio exactly once"
+        );
     }
 
     #[test]

@@ -1,0 +1,52 @@
+[workspace]
+members = ["."]
+resolver = "3"
+
+[package]
+name = "soul-player"
+version = "0.1.0"
+edition = "2024"
+description = "Soul Audio desktop player shell (Tauri 2) over soul-audio-service."
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+# Plan 3 backend + the one place cpal enters the graph:
+soul-audio-core = { path = "../../crates/soul-audio-core" }
+soul-audio-service = { path = "../../crates/soul-audio-service", features = ["specta"] }
+soul-audio-desktop = { path = "../../crates/soul-audio-desktop", features = ["playback"] }
+tauri-specta = { version = "=2.0.0-rc.25", features = ["typescript"] }
+specta-typescript = "0.0.12"
+specta = "=2.0.0-rc.25"
+tauri-plugin-dialog = "2"
+
+[profile.release]
+# Shrink the packaged binary; keeps dev builds untouched.
+strip = true
+
+# DSD playback needs real-time decode. Unoptimized, the DSD decimator's 128-tap
+# FIR at 2.82 MHz runs ~0.18x real-time, so `npm run tauri dev` (a debug build)
+# underruns and DSD "doesn't play". Optimize the audio crates AND this app crate
+# (the deck/decoder generics monomorphize here with the concrete CpalSink), which
+# lifts debug decode to multiples of real-time. Tauri/webview stay at opt 0 so
+# the dev build stays fast to compile. (Release already optimizes everything.)
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package.soul-audio-core]
+opt-level = 2
+[profile.dev.package.soul-audio-desktop]
+opt-level = 2
+[profile.dev.package.soul-audio-service]
+opt-level = 2
+[profile.dev.package.soul-audio-engine]
+opt-level = 2
+[profile.dev.package.soul-audio-control]
+opt-level = 2
+[profile.dev.package.soul-audio-queue]
+opt-level = 2

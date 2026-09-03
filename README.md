@@ -239,12 +239,16 @@ bytes ─▶ probe ─▶ Decoder ─▶ [Resampler] ─▶ normalize ─▶ Dec
 |---|---|
 | `crates/soul-audio-core` | The library: decoders, resampler, `Sink` trait, `Deck`. `#![no_std]`, no-alloc, `forbid(unsafe_code)`. |
 | `crates/soul-audio-engine` | Portable playback queue (cursor + repeat + gapless) over a `Deck`. `#![no_std]`, depends only on core. |
+| `crates/soul-audio-queue` | Two-level queue: source context + Up-Next/history, shuffle/repeat (`#![no_std]`; `alloc` feature). |
+| `crates/soul-audio-control` | Portable no_std `Player` facade (transport intents, prev-3s rule) over engine + queue. |
+| `crates/soul-audio-desktop` | Desktop building blocks: owned file decoder + cpal `CpalSink` (behind the `playback` feature). |
+| `crates/soul-audio-service` | Headless backend service: app Command/Event DTOs, lofty library scan, `AudioPlayer` actor. Sink-generic, device-free. |
 | `crates/soul-audio-cli` | Desktop harness: `decode` + gapless `play` (cpal sink + threaded driver). |
 | `crates/soul-audio-firmware` | STM32H743 + Embassy shell (`thumbv7em-none-eabihf`). |
 | `crates/architecture-tests` | Runtime no-alloc + dependency-layering invariants. |
 | `xtask` | Pure-Rust automation (`verify` / `gen-resample-tables`). |
 | `testdata/` | Committed decode/resample fixtures. |
-
+| `app/` | **Desktop player UI** (Tauri 2 + Svelte 5) over `soul-audio-service` — isolated from the root workspace (see [`app/README.md`](app/README.md)). |
 ## Building & developing
 
 ```sh

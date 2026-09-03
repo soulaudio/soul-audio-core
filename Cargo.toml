@@ -9,6 +9,7 @@ members = [
   "crates/soul-audio-service",
   "crates/soul-audio-cli",
   "crates/soul-audio-firmware",
+  "crates/soul-audio-tags",
   "crates/architecture-tests",
   "xtask",
 ]
@@ -20,6 +21,7 @@ default-members = [
   "crates/soul-audio-desktop",
   "crates/soul-audio-service",
   "crates/soul-audio-cli",
+  "crates/soul-audio-tags",
   "crates/architecture-tests",
   "xtask",
 ]

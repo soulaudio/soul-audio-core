@@ -147,6 +147,10 @@ impl<S: Source> DsdDecoder for DsfDecoder<S> {
         }
         Ok(w)
     }
+
+    fn total_samples(&self) -> Option<u64> {
+        Some(self.total_samples)
+    }
 }
 
 impl<S: SeekSource> DsdSeek for DsfDecoder<S> {

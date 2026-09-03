@@ -153,6 +153,14 @@ const GROUPS: usize = TAPS / 8;
 /// Maximum channels the decimator supports (fixed per-channel history state).
 const MAX_DECIMATE_CHANNELS: usize = 8;
 
+/// DSD "digital silence" seed for the FIR history. A DSD `0` bit is −1 and `1`
+/// is +1, so an all-zero byte is full-scale NEGATIVE, not silence — seeding the
+/// history with it makes the filter start at a large negative DC and the first
+/// output samples pop. `0xAA` (alternating bits) is a Nyquist-rate pattern the
+/// low-pass filter attenuates to ≈0, i.e. true silence, so playback and
+/// post-seek output start cleanly.
+const DSD_SILENCE: u8 = 0xAA;
+
 /// 24-bit signed PCM full-scale bounds; FIR overshoot is saturated into range.
 const PCM_MAX: i32 = (1 << 23) - 1;
 const PCM_MIN: i32 = -(1 << 23);
@@ -237,7 +245,7 @@ impl<D: DsdDecoder> DecimateAdapter<D> {
         Self {
             inner,
             channels,
-            hist: [[0u8; GROUPS]; MAX_DECIMATE_CHANNELS],
+            hist: [[DSD_SILENCE; GROUPS]; MAX_DECIMATE_CHANNELS],
             ring_pos: GROUPS - 1, // first frame advances to slot 0
             frame: [0u8; MAX_DECIMATE_CHANNELS],
         }
@@ -258,6 +266,17 @@ impl<D: DsdDecoder> DecimateAdapter<D> {
         }
         Ok(filled == need)
     }
+
+    /// Total output PCM frames, if the inner DSD decoder declares its length.
+    /// One PCM frame = [`DECIMATION`] input DSD samples per channel, so this is
+    /// the inner per-channel sample count divided by the ratio. `None` for a
+    /// length-unknown source. Lets the deck report a DSD track's duration.
+    #[must_use]
+    pub fn total_frames(&self) -> Option<u64> {
+        self.inner
+            .total_samples()
+            .map(|s| s / u64::from(DECIMATION))
+    }
 }
 
 impl<D: DsdDecoder + DsdSeek> DecimateAdapter<D> {
@@ -271,7 +290,7 @@ impl<D: DsdDecoder + DsdSeek> DecimateAdapter<D> {
         let landed = self
             .inner
             .seek_to_sample(frame.saturating_mul(u64::from(DECIMATION)))?;
-        self.hist = [[0u8; GROUPS]; MAX_DECIMATE_CHANNELS];
+        self.hist = [[DSD_SILENCE; GROUPS]; MAX_DECIMATE_CHANNELS];
         self.ring_pos = GROUPS - 1;
         Ok(landed / u64::from(DECIMATION))
     }
@@ -370,6 +389,80 @@ mod tests {
             self.pos = ((s / 16) * 2 * u64::from(self.channels)) as usize;
             Ok(s)
         }
+    }
+
+    #[test]
+    fn decimate_total_frames_is_decimated_sample_count() {
+        // A DSD decoder that declares its per-channel sample count -> the
+        // decimator reports total_samples / DECIMATION as the PCM duration.
+        // This is what gives a DSF track its now-playing length.
+        struct Sized(Option<u64>);
+        impl DsdDecoder for Sized {
+            fn stream_info(&self) -> StreamInfo {
+                StreamInfo {
+                    sample_rate: 44_100,
+                    channels: 2,
+                    format: SampleFormat::Dsd {
+                        rate: DsdRate::Dsd64,
+                    },
+                }
+            }
+            fn read_dsd(&mut self, _out: &mut [u8]) -> Result<usize, DecodeError> {
+                Ok(0)
+            }
+            fn total_samples(&self) -> Option<u64> {
+                self.0
+            }
+        }
+        // 5_644_800 DSD samples / DECIMATION(8) = 705_600 PCM frames.
+        assert_eq!(
+            DecimateAdapter::new(Sized(Some(5_644_800))).total_frames(),
+            Some(705_600)
+        );
+        // A length-unknown source stays None.
+        assert_eq!(DecimateAdapter::new(Sized(None)).total_frames(), None);
+    }
+
+    #[test]
+    fn decimate_silence_starts_near_zero_no_startup_pop() {
+        // A DSD stream of 0xAA (alternating bits) is silence — the low-pass FIR
+        // attenuates that Nyquist pattern to ~0. With the history seeded to
+        // silence, output starts near 0. The old zero-seed (0x00 = eight -1
+        // bits = full-scale negative) made the FIRST sample a large negative DC:
+        // an audible startup/seek pop.
+        struct Silence;
+        impl DsdDecoder for Silence {
+            fn stream_info(&self) -> StreamInfo {
+                StreamInfo {
+                    sample_rate: 44_100,
+                    channels: 2,
+                    format: SampleFormat::Dsd {
+                        rate: DsdRate::Dsd64,
+                    },
+                }
+            }
+            fn read_dsd(&mut self, out: &mut [u8]) -> Result<usize, DecodeError> {
+                out.fill(0xAA);
+                Ok(out.len())
+            }
+        }
+        let mut a = DecimateAdapter::new(Silence);
+        let mut out = [0i32; 64];
+        let n = a.decode_into(&mut out).unwrap();
+        assert!(n > 0);
+        // Near silence throughout, and critically the FIRST sample doesn't pop.
+        // (Pre-fix, out[0] was ~ -0.6 * 2^23.) Threshold is a small fraction of
+        // 24-bit full scale (2^23 = 8_388_608).
+        let peak = out[..n].iter().map(|x| x.unsigned_abs()).max().unwrap();
+        assert!(
+            peak < 100_000,
+            "silence should decode near 0, got peak {peak}"
+        );
+        assert!(
+            out[0].unsigned_abs() < 100_000,
+            "first sample must not pop, got {}",
+            out[0]
+        );
     }
 
     #[test]

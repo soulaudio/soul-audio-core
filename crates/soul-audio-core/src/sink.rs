@@ -51,6 +51,21 @@ pub trait Sink {
     /// # Errors
     /// [`SinkError`] if the device is gone.
     fn flush(&mut self) -> Result<(), SinkError>;
+
+    /// Discard any buffered-but-unplayed audio so frames written *after* this
+    /// call are heard promptly. Called on a seek (a playback discontinuity):
+    /// without it the producer's already-queued pre-seek PCM plays out before
+    /// the new position, which is audible as a lag between the scrub and the
+    /// sound. Unlike [`flush`](Sink::flush), which *waits for* the buffer to
+    /// play out, this *throws it away*.
+    ///
+    /// Default: a no-op — an unbuffered or test sink has nothing to drop.
+    ///
+    /// # Errors
+    /// [`SinkError`] if the device is gone.
+    fn discard(&mut self) -> Result<(), SinkError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

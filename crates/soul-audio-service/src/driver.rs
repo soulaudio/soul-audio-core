@@ -40,7 +40,7 @@ pub fn apply_command<K: Sink, D: SeekableDecoder>(
 ) -> Result<(), DeckError> {
     match cmd {
         Command::PlayContext { ids, start } => {
-            player.set_source(SliceContext::new(ids), start);
+            player.set_source(SliceContext::new(ids), start as usize);
             Ok(())
         }
         Command::TogglePlay => {
@@ -89,7 +89,7 @@ pub fn apply_command<K: Sink, D: SeekableDecoder>(
             player.set_repeat(mode.into());
             Ok(())
         }
-        Command::Goto(i) => player.goto(i),
+        Command::Goto(i) => player.goto(i as usize),
     }
 }
 
@@ -124,8 +124,8 @@ pub fn project_queue<K: Sink, D: SeekableDecoder>(player: &ServicePlayer<K, D>) 
     let q = player.sequencer();
     QueueState {
         up_next_ids: q.upnext_iter().collect(),
-        context_pos: q.pos(),
-        context_len: q.source_len(),
+        context_pos: q.pos() as u32,
+        context_len: q.source_len() as u32,
     }
 }
 

@@ -1,0 +1,51 @@
+/* Global theme: clean neutral with prefers-color-scheme support. Components
+   use --bg / --fg / --fg-dim / --accent / --border tokens. */
+:root {
+  --accent: #79d188;
+  --bg: #181a1f;
+  --fg: #e8eaed;
+  --fg-dim: #9aa0a6;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --accent: #2f9e44;
+    --bg: #f6f7f9;
+    --fg: #1d2127;
+    --fg-dim: #6b7280;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--fg) 20%, transparent);
+  border-radius: 5px;
+  border: 2px solid var(--bg);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--fg) 35%, transparent);
+}

@@ -76,6 +76,14 @@ pub trait DsdDecoder {
     ///
     /// Returns the number of bytes written; `Ok(0)` means end of stream.
     fn read_dsd(&mut self, out: &mut [u8]) -> Result<usize, DecodeError>;
+
+    /// Total per-channel DSD sample count, if the container declares it (DSF
+    /// stores it in its `fmt ` chunk). `None` for a length-unknown/streaming
+    /// source. A PCM adapter divides this by its decimation ratio to report the
+    /// track's PCM duration. Default `None` so streaming decoders opt out.
+    fn total_samples(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Convert a time in seconds to a sample/frame index at `rate` samples/second,
