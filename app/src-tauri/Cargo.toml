@@ -8,6 +8,19 @@ version = "0.1.0"
 edition = "2024"
 description = "Soul Audio desktop player shell (Tauri 2) over soul-audio-service."
 
+[lib]
+name = "soul_player"
+path = "src/lib.rs"
+
+[[bin]]
+name = "soul-player"
+path = "src/main.rs"
+
+[features]
+# Exposes the test-only `load_folder_path` command (bypasses the native folder
+# dialog for WebDriver/e2e). Off in release.
+e2e = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -24,6 +37,13 @@ tauri-specta = { version = "=2.0.0-rc.25", features = ["typescript"] }
 specta-typescript = "0.0.12"
 specta = "=2.0.0-rc.25"
 tauri-plugin-dialog = "2"
+
+[dev-dependencies]
+# The mock runtime for Rust product-e2e (Tier 1). Dev-only: `cargo build
+# --release` never compiles dev-deps, so the `test` feature can't leak into a
+# shipped binary.
+tauri = { version = "2", features = ["test"] }
+tempfile = "3"
 
 [profile.release]
 # Shrink the packaged binary; keeps dev builds untouched.

@@ -10,6 +10,11 @@
 /app/dist/
 /app/src-tauri/target/
 /app/src-tauri/gen/schemas/
+/app/.vitest/
+# Task 6: local-only WebDriver UI smoke (app/e2e/) — the suite itself is
+# committed (incl. package-lock.json); its installed deps and build output
+# are not.
+/app/e2e/node_modules/
 # HE-AACv2/PS conformance fixture — license-restricted (Coding Technologies
 # DecoderCheck package), used for LOCAL PS dev verification only, NEVER committed.
 /crates/soul-audio-core/testdata/ps-local.*

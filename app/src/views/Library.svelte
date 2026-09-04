@@ -57,7 +57,7 @@
       {#each player.library as track, i (track.id)}
         {@const playingThis = player.nowPlayingId === track.id}
         {@const art = artCache.get(albumKey(track))}
-        <li class:current={playingThis} use:inView={track}>
+        <li class:current={playingThis} use:inView={track} data-testid="track-row">
           <button
             type="button"
             class="rowbtn"

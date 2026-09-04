@@ -13,17 +13,27 @@ use crate::commands;
 /// builder (see main.rs). Events are emitted manually from `actor.rs` over a
 /// plain `"player"` channel using the specta-registered `Event` type.
 pub fn builder() -> Builder<Wry> {
+    // The actor emits the service `Event` enum on the "player" channel;
+    // register it (plus its Tick/QueueState payloads transitively) so the
+    // generated bindings carry the event types for the frontend.
+    #[cfg(not(feature = "e2e"))]
+    let commands = collect_commands![
+        commands::library_views,
+        commands::open_folder,
+        commands::send_command,
+        commands::track_art,
+    ];
+    #[cfg(feature = "e2e")]
+    let commands = collect_commands![
+        commands::library_views,
+        commands::open_folder,
+        commands::send_command,
+        commands::track_art,
+        commands::load_folder_path,
+    ];
     Builder::<Wry>::new()
-        // The actor emits the service `Event` enum on the "player" channel;
-        // register it (plus its Tick/QueueState payloads transitively) so the
-        // generated bindings carry the event types for the frontend.
         .typ::<soul_audio_service::Event>()
-        .commands(collect_commands![
-            commands::library_views,
-            commands::open_folder,
-            commands::send_command,
-            commands::track_art,
-        ])
+        .commands(commands)
 }
 
 /// Regenerate `app/src/lib/bindings.ts` from the current command signatures.

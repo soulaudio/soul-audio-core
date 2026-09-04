@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use soul_audio_core::Sink;
 use soul_audio_desktop::sink::CpalSink;
 use soul_audio_service::{AudioPlayer, Event, Library};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 
 use crate::offline::NullSink;
 
@@ -20,6 +20,12 @@ use crate::offline::NullSink;
 pub struct PlayerState {
     player: Mutex<Option<AudioPlayer>>,
     library: Mutex<Option<Arc<Library>>>,
+}
+
+impl Default for PlayerState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PlayerState {
@@ -57,11 +63,14 @@ impl PlayerState {
 
     /// Lazily build the actor (over `CpalSink`, or `NullSink` in offline mode),
     /// then run `f` with a guard for sending commands.
-    fn with_actor<R>(
+    ///
+    /// Generic over `R: Runtime` so Tier-1 tests can drive this with
+    /// `App<MockRuntime>`'s handle, not just the real `Wry` runtime.
+    fn with_actor<R: Runtime, T>(
         &self,
-        app: &AppHandle,
-        f: impl FnOnce(&AudioPlayer) -> R,
-    ) -> Result<R, String> {
+        app: &AppHandle<R>,
+        f: impl FnOnce(&AudioPlayer) -> T,
+    ) -> Result<T, String> {
         let mut guard = self.player.lock().expect("player mutex");
         if guard.is_none() {
             let lib = self
@@ -73,7 +82,7 @@ impl PlayerState {
     }
 
     /// Fire a command at the actor (no-op if no folder opened yet).
-    pub fn send_command(&self, app: &AppHandle, cmd: soul_audio_service::Command) {
+    pub fn send_command<R: Runtime>(&self, app: &AppHandle<R>, cmd: soul_audio_service::Command) {
         let _ = self.with_actor(app, |p| p.send(cmd));
     }
 }
@@ -82,15 +91,15 @@ impl PlayerState {
 /// `SOUL_PLAYER_OFFLINE=1` (device-free smoke runs). The sink factory runs ON
 /// the pump thread (the Plan 3 design), and every service `Event` is re-emitted
 /// to the frontend as a single `"player"` channel.
-fn build_actor(app: AppHandle, lib: Arc<Library>) -> AudioPlayer {
+fn build_actor<R: Runtime>(app: AppHandle<R>, lib: Arc<Library>) -> AudioPlayer {
     if std::env::var_os("SOUL_PLAYER_OFFLINE").is_some() {
         return build_actor_with(app, lib, offline_sink);
     }
     build_actor_with(app, lib, CpalSink::new)
 }
 
-fn build_actor_with<K: Sink + 'static>(
-    app: AppHandle,
+fn build_actor_with<R: Runtime, K: Sink + 'static>(
+    app: AppHandle<R>,
     lib: Arc<Library>,
     make_sink: fn() -> anyhow::Result<K>,
 ) -> AudioPlayer {

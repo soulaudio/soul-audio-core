@@ -2,44 +2,64 @@
 //! library views, and transport/queue command dispatch.
 #![forbid(unsafe_code)]
 
+use std::path::Path;
 use std::sync::Arc;
 
 use soul_audio_service::{Command, Library, TrackView};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Runtime, State};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::actor::PlayerState;
 
-/// Ask the user for a folder, scan it into a `Library`, hand it to the actor,
-/// and start playing it from the first track.
+/// Scan `dir` into a `Library`, hand it to the actor, and start playing from
+/// track 0. The pure half of `open_folder` — no dialog — so tests and the e2e
+/// command can drive it with a fixture directory.
+///
+/// Generic over `R: Runtime` (not hardcoded to the real `Wry` runtime) so
+/// Tier-1 tests can call it directly with `App<MockRuntime>`'s handle.
+pub fn load_folder<R: Runtime>(
+    state: &PlayerState,
+    app: &AppHandle<R>,
+    dir: &Path,
+) -> Result<Vec<TrackView>, String> {
+    let lib = Arc::new(Library::scan(dir).map_err(|e| format!("scan failed: {e:#}"))?);
+    let views = lib.views();
+    if views.is_empty() {
+        return Err("no supported audio files in that folder".to_string());
+    }
+    state.set_library(lib);
+    let ids: Vec<u32> = views.iter().map(|v| v.id).collect();
+    state.send_command(app, Command::PlayContext { ids, start: 0 });
+    Ok(views)
+}
+
+/// Ask the user for a folder (native dialog), then load it.
 #[tauri::command]
 #[specta::specta]
 pub fn open_folder(
     state: State<'_, PlayerState>,
     app: AppHandle,
 ) -> Result<Vec<TrackView>, String> {
-    // Native folder picker (blocks on the dialog thread).
     let picked = app
         .dialog()
         .file()
         .blocking_pick_folder()
         .ok_or_else(|| "no folder selected".to_string())?;
     let dir = picked.into_path().map_err(|e| e.to_string())?;
+    load_folder(&state, &app, &dir)
+}
 
-    // Scan off the UI thread is the caller's job per the service docs; a
-    // folder scan of a music library is fast enough here for the MVP.
-    let lib = Arc::new(Library::scan(&dir).map_err(|e| format!("scan failed: {e:#}"))?);
-    let views = lib.views();
-    if views.is_empty() {
-        return Err("no supported audio files in that folder".to_string());
-    }
-
-    state.set_library(lib);
-    // Open the folder = play its whole context from track 0.
-    let ids: Vec<u32> = views.iter().map(|v| v.id).collect();
-    state.send_command(&app, Command::PlayContext { ids, start: 0 });
-
-    Ok(views)
+/// Test-only: load a folder by path, bypassing the native dialog. Enabled by the
+/// `e2e` cargo feature (off in release); used by the WebDriver smoke suite.
+#[cfg(feature = "e2e")]
+#[tauri::command]
+#[specta::specta]
+pub fn load_folder_path(
+    state: State<'_, PlayerState>,
+    app: AppHandle,
+    dir: String,
+) -> Result<Vec<TrackView>, String> {
+    load_folder(&state, &app, Path::new(&dir))
 }
 
 /// The current library's views (used to render the list without re-scanning).

@@ -6,10 +6,7 @@ import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 export const commands = {
 	/**  The current library's views (used to render the list without re-scanning). */
 	libraryViews: () => __TAURI_INVOKE<TrackView[]>("library_views"),
-	/**
-	 *  Ask the user for a folder, scan it into a `Library`, hand it to the actor,
-	 *  and start playing it from the first track.
-	 */
+	/**  Ask the user for a folder (native dialog), then load it. */
 	openFolder: () => typedError<TrackView[], string>(__TAURI_INVOKE("open_folder")),
 	/**  Fire one transport/queue command at the actor (fire-and-forget semantics). */
 	sendCommand: (cmd: Command) => typedError<null, string>(__TAURI_INVOKE("send_command", { cmd })),
@@ -87,8 +84,11 @@ export type TrackView = {
 	album: string | null,
 	duration_secs: number | null,
 	/**
-	 *  Whether the file carries embedded cover art. The UI uses this to
-	 *  decide whether to request the art bytes (a separate command).
+	 *  Whether the file carries *embedded* cover art only. The UI still
+	 *  requests cover art for every visible row regardless of this flag,
+	 *  because *external* cover art (e.g. `Scans/Front.jpg`, resolved
+	 *  separately by the `track_art` command) is not reflected here — a
+	 *  track with `has_art: false` can still have art.
 	 */
 	has_art: boolean,
 };

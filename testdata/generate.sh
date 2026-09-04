@@ -31,9 +31,22 @@ ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a aac -b:a 192k -f adts to
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -t 0.2 -c:a flac \
   -metadata title="Soul Test Track" -metadata artist="Test Artist" -metadata album="Test Album" tagged.flac
 
+# Opus (48 kHz internal): exercises the last-Ogg-page-granule duration path.
+# There is otherwise NO .opus fixture (tone.ogg is FLAC-in-Ogg).
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a libopus -b:a 96k tone.opus
+
+# FLAC with an embedded cover picture: exercises embedded-art extraction. A tiny
+# solid-red 16x16 PNG is attached as the front cover.
+ffmpeg -y -hide_banner -loglevel error -f lavfi -i color=c=red:s=16x16:d=1 -frames:v 1 _cover.png
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -i _cover.png -t 0.2 \
+  -map 0:a -map 1:v -c:a flac -c:v copy -disposition:v:0 attached_pic \
+  -metadata title="Arted Track" arted.flac
+rm -f _cover.png
+
 # DSD: ffmpeg cannot encode PCM->DSD, so synthesize the 1-bit stream ourselves
 # (2nd-order sigma-delta + Sony DSF container). Needs python3 + numpy.
-python3 generate_dsd.py tone.dsf
+python3 generate_dsd.py tone.dsf                 # DSD64
+python3 generate_dsd.py tone-dsd128.dsf 5644800  # DSD128
 
 echo "generated:"
-ls -la tone.wav tone.flac tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone.dsf tagged.flac
+ls -la tone.wav tone.flac tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone.dsf tagged.flac tone.opus arted.flac tone-dsd128.dsf

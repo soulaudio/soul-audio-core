@@ -16,7 +16,8 @@ import sys
 
 import numpy as np
 
-RATE = 2_822_400  # DSD64
+DSD64 = 2_822_400
+# main() reads the rate from argv[2] (Hz) if given, else DSD64.
 DUR = 0.5  # seconds — DSD is 1-bit at 2.8 MHz, so keep it short
 FREQS = (440.0, 659.25)  # L, R
 AMP = 0.4  # headroom for sigma-delta stability
@@ -44,8 +45,9 @@ def sigma_delta_2nd(x: np.ndarray) -> np.ndarray:
 
 def main() -> None:
     out = sys.argv[1] if len(sys.argv) > 1 else "tone.dsf"
-    n = int(DUR * RATE)
-    t = np.arange(n) / RATE
+    rate = int(sys.argv[2]) if len(sys.argv) > 2 else DSD64
+    n = int(DUR * rate)
+    t = np.arange(n) / rate
 
     # One byte per 8 samples; DSF packs LSB-first.
     ch_bytes = []
@@ -76,7 +78,7 @@ def main() -> None:
         + struct.pack("<I", 0)  # format id: 0 = DSD raw
         + struct.pack("<I", 2)  # channel type: 2 = stereo (L/R)
         + struct.pack("<I", channels)
-        + struct.pack("<I", RATE)
+        + struct.pack("<I", rate)
         + struct.pack("<I", 1)  # bits per sample
         + struct.pack("<Q", n)  # sample count per channel
         + struct.pack("<I", BLOCK)
@@ -89,7 +91,8 @@ def main() -> None:
         fh.write(dsd_chunk)
         fh.write(fmt_chunk)
         fh.write(data_chunk)
-    print(f"wrote {out}: {total} bytes, {channels}ch DSD64, {DUR}s")
+    label = f"DSD{64 * rate // DSD64}" if rate % DSD64 == 0 else f"{rate}Hz"
+    print(f"wrote {out}: {total} bytes, {channels}ch {label}, {DUR}s")
 
 
 if __name__ == "__main__":

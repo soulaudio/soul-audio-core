@@ -104,7 +104,7 @@
       {/if}
     </div>
     <div class="track-info">
-      <span class="np-title">{current?.title ?? "No track"}</span>
+      <span class="np-title" data-testid="now-playing-title">{current?.title ?? "No track"}</span>
       <span class="np-sub">{current?.artist ?? "–"}</span>
     </div>
   </div>

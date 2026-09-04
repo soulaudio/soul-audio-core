@@ -10,10 +10,13 @@ import {
 } from "./bindings";
 
 /** Open a folder: scan + start playing. Resolves the library views, or null
- *  when the user cancels the dialog. */
+ *  when the user cancels the dialog (the backend's "no folder selected"
+ *  sentinel — see `open_folder` in `commands.rs`). Any other backend error
+ *  (scan failure, empty folder, …) still throws so the UI can surface it. */
 export async function openFolder(): Promise<TrackView[] | null> {
 	const r = await commands.openFolder();
 	if (r.status === "error") {
+		if (r.error === "no folder selected") return null;
 		throw new Error(r.error);
 	}
 	return r.data;

@@ -127,8 +127,11 @@ pub struct TrackView {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub duration_secs: f64,
-    /// Whether the file carries embedded cover art. The UI uses this to
-    /// decide whether to request the art bytes (a separate command).
+    /// Whether the file carries *embedded* cover art only. The UI still
+    /// requests cover art for every visible row regardless of this flag,
+    /// because *external* cover art (e.g. `Scans/Front.jpg`, resolved
+    /// separately by the `track_art` command) is not reflected here — a
+    /// track with `has_art: false` can still have art.
     pub has_art: bool,
 }
 
