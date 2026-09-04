@@ -18,6 +18,7 @@ mod base64;
 mod dsf;
 mod id3v2;
 mod locate;
+mod mp3;
 mod mp4;
 mod ogg;
 #[cfg(feature = "alloc")]

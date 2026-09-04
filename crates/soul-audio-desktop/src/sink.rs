@@ -10,7 +10,7 @@
 //! empty ring plays silence (a soft underrun).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -30,6 +30,11 @@ pub struct CpalSink {
     /// `false` (the ack). The producer waits for the ack, so post-seek audio it
     /// writes next is never caught by the clear.
     flush: Arc<AtomicBool>,
+    /// Target output volume (`f32::to_bits`, default `1.0`), read and ramped
+    /// toward per-sample by the real-time callback so changes are heard
+    /// immediately (applied to already-buffered samples as they play) instead of
+    /// lagging by the ring's ~200 ms depth.
+    volume: Arc<AtomicU32>,
     // Held to keep the stream alive; dropping it stops playback.
     _stream: Stream,
     rate: u32,
@@ -62,6 +67,7 @@ impl CpalSink {
         let err_fn = |e| eprintln!("cpal stream error: {e}");
 
         let flush = Arc::new(AtomicBool::new(false));
+        let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
 
         // On a seek, `discard` requests a ring clear via `flush`. The callback
         // honors it here: clear the buffered pre-seek audio, THEN release the ack
@@ -69,44 +75,68 @@ impl CpalSink {
         // clear to the producer's Acquire-load in `discard`, so the producer only
         // resumes writing (post-seek audio) once the clear has happened.
         let cb_flush = Arc::clone(&flush);
+        let cb_volume = Arc::clone(&volume);
 
-        // The callback pops from the ring and converts via the unit-tested
-        // `convert` functions (silence on underrun).
+        // The callback pops from the ring, applies a smoothed gain (so a volume
+        // change is heard on already-buffered samples — instantly, not after the
+        // ring drains — without an audible click), and converts via the
+        // unit-tested `convert` functions (silence on underrun).
         let stream = match sample_format {
-            SampleFormat::F32 => device
-                .build_output_stream(
-                    &config,
-                    move |data: &mut [f32], _| {
-                        if cb_flush.load(Ordering::Acquire) {
-                            cons.clear();
-                            cb_flush.store(false, Ordering::Release);
-                        }
-                        convert::fill_f32(|| cons.try_pop(), data);
-                    },
-                    err_fn,
-                    None,
-                )
-                .context("building f32 output stream")?,
-            SampleFormat::I16 => device
-                .build_output_stream(
-                    &config,
-                    move |data: &mut [i16], _| {
-                        if cb_flush.load(Ordering::Acquire) {
-                            cons.clear();
-                            cb_flush.store(false, Ordering::Release);
-                        }
-                        convert::fill_i16(|| cons.try_pop(), data);
-                    },
-                    err_fn,
-                    None,
-                )
-                .context("building i16 output stream")?,
+            SampleFormat::F32 => {
+                let mut cur_gain = 1.0f32;
+                device
+                    .build_output_stream(
+                        &config,
+                        move |data: &mut [f32], _| {
+                            if cb_flush.load(Ordering::Acquire) {
+                                cons.clear();
+                                cb_flush.store(false, Ordering::Release);
+                            }
+                            convert::fill_f32(
+                                || {
+                                    let target = f32::from_bits(cb_volume.load(Ordering::Relaxed));
+                                    cur_gain += (target - cur_gain) * 0.01;
+                                    cons.try_pop().map(|s| (s as f32 * cur_gain) as i32)
+                                },
+                                data,
+                            );
+                        },
+                        err_fn,
+                        None,
+                    )
+                    .context("building f32 output stream")?
+            }
+            SampleFormat::I16 => {
+                let mut cur_gain = 1.0f32;
+                device
+                    .build_output_stream(
+                        &config,
+                        move |data: &mut [i16], _| {
+                            if cb_flush.load(Ordering::Acquire) {
+                                cons.clear();
+                                cb_flush.store(false, Ordering::Release);
+                            }
+                            convert::fill_i16(
+                                || {
+                                    let target = f32::from_bits(cb_volume.load(Ordering::Relaxed));
+                                    cur_gain += (target - cur_gain) * 0.01;
+                                    cons.try_pop().map(|s| (s as f32 * cur_gain) as i32)
+                                },
+                                data,
+                            );
+                        },
+                        err_fn,
+                        None,
+                    )
+                    .context("building i16 output stream")?
+            }
             other => return Err(anyhow!("unsupported device sample format: {other:?}")),
         };
         stream.play().context("starting stream")?;
         Ok(Self {
             prod,
             flush,
+            volume,
             _stream: stream,
             rate,
             channels,
@@ -158,5 +188,10 @@ impl Sink for CpalSink {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         Ok(())
+    }
+
+    fn set_volume(&mut self, volume: f32) {
+        self.volume
+            .store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 }

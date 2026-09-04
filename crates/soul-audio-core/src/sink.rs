@@ -66,6 +66,13 @@ pub trait Sink {
     fn discard(&mut self) -> Result<(), SinkError> {
         Ok(())
     }
+
+    /// Set output volume 0.0..=1.0. A sink that applies gain at its output stage
+    /// (e.g. a device callback) overrides this so changes are heard immediately;
+    /// the default is a no-op for sinks without an output-side gain.
+    fn set_volume(&mut self, volume: f32) {
+        let _ = volume;
+    }
 }
 
 #[cfg(test)]

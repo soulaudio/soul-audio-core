@@ -14,15 +14,31 @@
 //! `buf.len()` bytes into the caller's buffer, discarding (not buffering)
 //! anything beyond that bound, so an oversized packet is truncated rather
 //! than requiring unbounded memory.
+//!
+//! **Duration**: `total_frames` comes from the granule position of the
+//! *last* page — the total decoded sample count at end of stream — rather
+//! than from walking every page in between. [`last_page_granule`] finds it
+//! with a bounded backward scan of just the file's tail; see its doc comment
+//! and [`read_ogg`]'s for the Opus-vs-Vorbis granule/sample-rate handling.
 
+use crate::locate::read_full;
 use crate::util::{discard, read_exact};
 use crate::vorbis;
 use crate::{StreamFacts, TagError, TagSink};
+use embedded_io::SeekFrom;
 use soul_audio_core::SeekSource;
 #[cfg(test)]
 use soul_audio_core::SliceSource;
 
 const MAX_SEGMENTS: usize = 255;
+
+/// How much of the file's tail to pull into a stack buffer when scanning
+/// backward for the last page's granule (see [`last_page_granule`]). An Ogg
+/// page tops out around 65307 bytes (255 lacing segments, each up to 255
+/// bytes), so 64 KiB comfortably covers even a maximal final page while
+/// staying a bounded, stack-sized read rather than an unbounded whole-file
+/// scan.
+const GRANULE_SCAN_WINDOW: usize = 65536;
 
 /// Walks Ogg pages read from `src`, handing out packet bytes one packet at a
 /// time via [`read_packet`](Self::read_packet). Holds only the current
@@ -185,66 +201,140 @@ impl<'w, 's, S: SeekSource> embedded_io::Read for PacketReader<'w, 's, S> {
     }
 }
 
+/// Scan `buf` (the tail of an Ogg file — see [`last_page_granule`])
+/// backward for the last `OggS` capture pattern whose granule position is a
+/// real end-of-packet marker rather than `u64::MAX` ("no packet finished on
+/// this page" — e.g. a continued packet still spanning into a page that
+/// never arrived within the scan window). Never panics: bails out (`None`)
+/// once the search runs off the front of `buf` without finding one.
+fn granule_from_tail(buf: &[u8]) -> Option<u64> {
+    if buf.len() < 14 {
+        return None;
+    }
+    let mut idx = buf.len() - 14;
+    loop {
+        if &buf[idx..idx + 4] == b"OggS" {
+            let granule = u64::from_le_bytes(buf[idx + 6..idx + 14].try_into().unwrap());
+            if granule != u64::MAX {
+                return Some(granule);
+            }
+        }
+        if idx == 0 {
+            return None;
+        }
+        idx -= 1;
+    }
+}
+
+/// Find the last page's granule position by seeking to the end of `src` and
+/// reading only its final [`GRANULE_SCAN_WINDOW`] bytes (or the whole file,
+/// if shorter) into a stack buffer — bounded, never an unbounded whole-file
+/// scan. Leaves `src`'s cursor wherever that read ended; callers that need
+/// the cursor elsewhere afterward must reposition it themselves. Returns
+/// `None` on any I/O failure or if no page with a real granule is found,
+/// rather than erroring — a missing/malformed trailer shouldn't fail the
+/// whole read, it should just leave `total_frames` unknown.
+fn last_page_granule<S: SeekSource>(src: &mut S) -> Option<u64> {
+    let len = src.seek(SeekFrom::End(0)).ok()?;
+    let window = len.min(GRANULE_SCAN_WINDOW as u64) as usize;
+    if window < 14 {
+        return None;
+    }
+    src.seek(SeekFrom::Start(len - window as u64)).ok()?;
+    let mut buf = [0u8; GRANULE_SCAN_WINDOW];
+    let n = read_full(src, &mut buf[..window]).ok()?;
+    granule_from_tail(&buf[..n])
+}
+
 /// Read stream facts + tags from an Ogg (Opus or Vorbis) container: the
 /// first packet identifies the codec (`OpusHead` or `\x01vorbis`) and
 /// carries sample rate / channel count; the second packet is the comment
 /// header (`OpusTags` or `\x03vorbis` followed by a Vorbis comment vector),
 /// streamed via [`PacketReader`] into [`vorbis::read_comment_vector`].
-/// `total_frames` is not computed (would require scanning to the last page)
-/// and is always `None`.
+///
+/// `total_frames` comes from the *last* Ogg page's granule position (the
+/// total decoded sample count at end of stream), found via a bounded
+/// backward scan of the file's tail ([`last_page_granule`]) rather than
+/// walking every page. For Opus, the granule is always in 48 kHz samples
+/// regardless of the codec's own `input_rate` — so `sample_rate` is reported
+/// as `48_000` (not the OpusHead `input_rate`) and `total_frames` is the
+/// granule minus `pre_skip` (the leading samples the decoder discards), so
+/// `total_frames / sample_rate` is a correct duration. For Vorbis, the
+/// granule is already in the identification header's sample rate, so
+/// `total_frames` is the granule as-is. If no granule can be found (e.g. a
+/// truncated or unusually-laid-out file), `total_frames` is left `None`
+/// rather than erroring.
 pub fn read_ogg<S: SeekSource>(
     src: &mut S,
     scratch: &mut [u8],
     sink: &mut impl TagSink,
 ) -> Result<StreamFacts, TagError> {
     let mut facts = StreamFacts::default();
-    let mut walker = PageWalker::new(src);
+    let mut pre_skip: u16 = 0;
+    let codec;
+    {
+        let mut walker = PageWalker::new(src);
 
-    // --- Packet 1: codec identification header (small, read in one shot). ---
-    let mut id_buf = [0u8; 32];
-    let id_len = walker.read_packet(&mut id_buf)?;
-    let id = &id_buf[..id_len];
+        // --- Packet 1: codec identification header (small, read in one shot). ---
+        let mut id_buf = [0u8; 32];
+        let id_len = walker.read_packet(&mut id_buf)?;
+        let id = &id_buf[..id_len];
 
-    let codec = if id.starts_with(b"OpusHead") {
-        // OpusHead: magic(8) version(1) channels(1) pre-skip(2) input
-        // sample rate(4, LE) output gain(2) channel mapping family(1).
-        if id.len() >= 16 {
-            facts.channels = Some(u16::from(id[9]));
-            facts.sample_rate = Some(u32::from_le_bytes([id[12], id[13], id[14], id[15]]));
+        codec = if id.starts_with(b"OpusHead") {
+            // OpusHead: magic(8) version(1) channels(1) pre-skip(2, LE)
+            // input sample rate(4, LE) output gain(2) channel mapping
+            // family(1).
+            if id.len() >= 16 {
+                facts.channels = Some(u16::from(id[9]));
+                pre_skip = u16::from_le_bytes([id[10], id[11]]);
+                // Opus always decodes at 48 kHz, independent of the
+                // declared input rate — report that (not `input_rate`) so
+                // `total_frames / sample_rate` below is a correct duration.
+                facts.sample_rate = Some(48_000);
+            }
+            Codec::Opus
+        } else if id.starts_with(b"\x01vorbis") {
+            // Vorbis identification header: magic(7) version(4) channels(1)
+            // sample rate(4, LE) ...
+            if id.len() >= 16 {
+                facts.channels = Some(u16::from(id[11]));
+                facts.sample_rate = Some(u32::from_le_bytes([id[12], id[13], id[14], id[15]]));
+            }
+            Codec::Vorbis
+        } else {
+            return Err(TagError::Unsupported);
+        };
+
+        // --- Packet 2: comment header. Streamed via `PacketReader` (see its doc
+        // comment for why) rather than materialized into a buffer first.
+        let mut packet = PacketReader::new(&mut walker);
+        let magic: &[u8] = match codec {
+            Codec::Opus => b"OpusTags",
+            Codec::Vorbis => b"\x03vorbis",
+        };
+        let mut magic_buf = [0u8; 8];
+        read_exact(&mut packet, &mut magic_buf[..magic.len()])?;
+        if &magic_buf[..magic.len()] != magic {
+            return Err(TagError::Malformed);
         }
-        Codec::Opus
-    } else if id.starts_with(b"\x01vorbis") {
-        // Vorbis identification header: magic(7) version(4) channels(1)
-        // sample rate(4, LE) ...
-        if id.len() >= 16 {
-            facts.channels = Some(u16::from(id[11]));
-            facts.sample_rate = Some(u32::from_le_bytes([id[12], id[13], id[14], id[15]]));
-        }
-        Codec::Vorbis
-    } else {
-        return Err(TagError::Unsupported);
-    };
 
-    // --- Packet 2: comment header. Streamed via `PacketReader` (see its doc
-    // comment for why) rather than materialized into a buffer first.
-    let mut packet = PacketReader::new(&mut walker);
-    let magic: &[u8] = match codec {
-        Codec::Opus => b"OpusTags",
-        Codec::Vorbis => b"\x03vorbis",
-    };
-    let mut magic_buf = [0u8; 8];
-    read_exact(&mut packet, &mut magic_buf[..magic.len()])?;
-    if &magic_buf[..magic.len()] != magic {
-        return Err(TagError::Malformed);
+        // No externally-declared total length to bound the comment vector by
+        // (unlike FLAC's METADATA_BLOCK header) — the packet's own lacing-based
+        // framing already bounds it: `PacketReader` reports `Ok(0)` at the real
+        // end, which surfaces as `TagError::Malformed` via `read_exact` if a
+        // declared field length overruns it. `u32::MAX` just means "trust the
+        // stream framing" instead of imposing a second, redundant bound.
+        vorbis::read_comment_vector(&mut packet, u32::MAX, scratch, sink)?;
+        // `walker`/`packet` (and the reborrow of `src` they hold) end here,
+        // freeing `src` for the direct seek below.
     }
 
-    // No externally-declared total length to bound the comment vector by
-    // (unlike FLAC's METADATA_BLOCK header) — the packet's own lacing-based
-    // framing already bounds it: `PacketReader` reports `Ok(0)` at the real
-    // end, which surfaces as `TagError::Malformed` via `read_exact` if a
-    // declared field length overruns it. `u32::MAX` just means "trust the
-    // stream framing" instead of imposing a second, redundant bound.
-    vorbis::read_comment_vector(&mut packet, u32::MAX, scratch, sink)?;
+    if let Some(granule) = last_page_granule(src) {
+        facts.total_frames = Some(match codec {
+            Codec::Opus => granule.saturating_sub(u64::from(pre_skip)),
+            Codec::Vorbis => granule,
+        });
+    }
 
     Ok(facts)
 }
@@ -292,11 +382,15 @@ mod tests {
     }
 
     fn opus_head(sample_rate: u32, channels: u8) -> Vec<u8> {
+        opus_head_with_pre_skip(sample_rate, channels, 0)
+    }
+
+    fn opus_head_with_pre_skip(sample_rate: u32, channels: u8, pre_skip: u16) -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(b"OpusHead");
         v.push(1); // version
         v.push(channels);
-        v.extend_from_slice(&0u16.to_le_bytes()); // pre-skip
+        v.extend_from_slice(&pre_skip.to_le_bytes());
         v.extend_from_slice(&sample_rate.to_le_bytes());
         v.extend_from_slice(&0i16.to_le_bytes()); // output gain
         v.push(0); // channel mapping family 0
@@ -605,5 +699,75 @@ mod tests {
             read_ogg(&mut src, &mut scratch, &mut c).unwrap_err(),
             TagError::Malformed
         );
+    }
+
+    #[test]
+    fn opus_total_frames_from_last_page_granule_minus_pre_skip() {
+        let pre_skip: u16 = 312; // libopus's usual default
+        let granule: u64 = 960_000; // 20 s of 48 kHz samples
+        let mut bytes = Vec::new();
+        bytes.extend(ogg_page(
+            0x02,
+            0,
+            21,
+            0,
+            &opus_head_with_pre_skip(48_000, 2, pre_skip),
+        )); // BOS
+        bytes.extend(ogg_page(0x00, 0, 21, 1, &opus_tags(&["TITLE=Long Track"])));
+        // Final (EOS) page: the real end-of-stream granule.
+        bytes.extend(ogg_page(0x04, granule, 21, 2, &[0u8; 8]));
+
+        let mut src = SliceSource::new(&bytes);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        let facts = read_ogg(&mut src, &mut scratch, &mut c).unwrap();
+
+        assert_eq!(facts.sample_rate, Some(48_000));
+        assert_eq!(facts.total_frames, Some(granule - u64::from(pre_skip)));
+    }
+
+    #[test]
+    fn opus_total_frames_skips_trailing_page_with_no_finished_packet() {
+        // A granule of `u64::MAX` means "no packet finished on this page"
+        // (e.g. a packet still spanning into a page beyond the scan
+        // window). The backward scan must keep looking for an earlier page
+        // with a real granule instead of reporting a bogus
+        // `u64::MAX - pre_skip`.
+        let real_granule: u64 = 480_000;
+        let mut bytes = Vec::new();
+        bytes.extend(ogg_page(0x02, 0, 22, 0, &opus_head(48_000, 1)));
+        bytes.extend(ogg_page(0x00, 0, 22, 1, &opus_tags(&["TITLE=Track"])));
+        bytes.extend(ogg_page(0x00, real_granule, 22, 2, &[0u8; 8]));
+        bytes.extend(ogg_page(0x04, u64::MAX, 22, 3, &[0u8; 8]));
+
+        let mut src = SliceSource::new(&bytes);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        let facts = read_ogg(&mut src, &mut scratch, &mut c).unwrap();
+
+        assert_eq!(facts.total_frames, Some(real_granule));
+    }
+
+    #[test]
+    fn vorbis_total_frames_from_last_page_granule() {
+        let granule: u64 = 132_300; // 3 s @ 44.1 kHz
+        let mut bytes = Vec::new();
+        bytes.extend(ogg_page(0x02, 0, 23, 0, &vorbis_id_header(44_100, 2)));
+        bytes.extend(ogg_page(
+            0x00,
+            0,
+            23,
+            1,
+            &vorbis_comment_header(&["TITLE=Song"]),
+        ));
+        bytes.extend(ogg_page(0x04, granule, 23, 2, &[0u8; 8]));
+
+        let mut src = SliceSource::new(&bytes);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        let facts = read_ogg(&mut src, &mut scratch, &mut c).unwrap();
+
+        assert_eq!(facts.sample_rate, Some(44_100));
+        assert_eq!(facts.total_frames, Some(granule));
     }
 }

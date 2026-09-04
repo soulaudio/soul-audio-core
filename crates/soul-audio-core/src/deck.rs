@@ -1,7 +1,9 @@
 //! The playback **deck** — the producer-side player mechanism.
 //!
 //! A [`Deck`] plays a [`SeekableDecoder`] into a [`Sink`], resampling to the sink
-//! rate, normalizing to a canonical scale, and applying a ramped volume. It holds
+//! rate and normalizing to a canonical scale. Volume is applied downstream, at
+//! the [`Sink`]'s output stage (see [`Sink::set_volume`]), so changes are heard
+//! immediately instead of lagging by the sink's output buffer depth. It holds
 //! a **preload** buffer (`PRELOAD` slots) of already-opened decoders so the next
 //! track is primed for a **gapless** swap. It is `no_std`, no-alloc, and sync:
 //! [`pump`](Deck::pump) does one block of work each call and is driven by the
@@ -125,9 +127,6 @@ pub struct Deck<K, D, const PRELOAD: usize> {
     preloads: [Option<Track<D>>; PRELOAD],
     preload_len: usize,
     state: DeckState,
-    /// Target volume 0.0..=1.0 and the ramped value chasing it.
-    volume: f32,
-    cur_vol: f32,
     in_buf: [i32; IN_FIFO * MAX_CH],
     rs_buf: [i32; BLOCK * MAX_CH],
     out_buf: [i32; BLOCK * MAX_CH],
@@ -146,8 +145,6 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             preloads: core::array::from_fn(|_| None),
             preload_len: 0,
             state: DeckState::Stopped,
-            volume: 1.0,
-            cur_vol: 1.0,
             in_buf: [0; IN_FIFO * MAX_CH],
             rs_buf: [0; BLOCK * MAX_CH],
             out_buf: [0; BLOCK * MAX_CH],
@@ -287,9 +284,10 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         self.state = DeckState::Stopped;
     }
 
-    /// Set the target volume (0.0..=1.0); applied with a short ramp.
+    /// Forward the target volume to the sink (0.0..=1.0), where it is applied at
+    /// the output stage so the change is heard immediately.
     pub fn set_volume(&mut self, volume: f32) {
-        self.volume = volume.clamp(0.0, 1.0);
+        self.sink.set_volume(volume.clamp(0.0, 1.0));
     }
 
     /// Seek the current track to per-channel `frame`.
@@ -389,15 +387,12 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         } else {
             self.block_plain()?
         };
-        // Normalize + volume + channel-map rs_buf → out_buf, then write.
+        // Normalize + channel-map rs_buf → out_buf, then write. Volume is applied
+        // downstream at the sink's output stage (see `Sink::set_volume`).
         let track = self.current.as_ref().unwrap();
         let src_ch = track.channels;
-        let norm = track.norm;
-        let (v0, v1) = (self.cur_vol, self.volume);
+        let g = track.norm;
         for f in 0..out_frames {
-            let t = (f as f32 + 1.0) / out_frames as f32;
-            let vol = v0 + (v1 - v0) * t;
-            let g = norm * vol;
             for oc in 0..sink_ch {
                 let sc = match track.map {
                     Map::Passthrough => oc,
@@ -410,7 +405,6 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
                     r.clamp(-CANONICAL_MAX - 1.0, CANONICAL_MAX) as i32;
             }
         }
-        self.cur_vol = self.volume;
         self.sink
             .write(&self.out_buf[..out_frames * sink_ch])
             .map_err(DeckError::Sink)?;
@@ -539,6 +533,7 @@ mod tests {
         rate: u32,
         ch: usize,
         written: Vec<i32>,
+        last_volume: Option<f32>,
     }
     impl Sink for MockSink {
         fn stream_info(&self) -> StreamInfo {
@@ -554,6 +549,9 @@ mod tests {
         }
         fn flush(&mut self) -> Result<(), SinkError> {
             Ok(())
+        }
+        fn set_volume(&mut self, volume: f32) {
+            self.last_volume = Some(volume);
         }
     }
 
@@ -588,6 +586,7 @@ mod tests {
             rate: 48_000,
             ch: 1,
             written: Vec::new(),
+            last_volume: None,
         };
         let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
         deck.load(const_dec(48_000, 1, 100, 1000)).unwrap();
@@ -598,25 +597,44 @@ mod tests {
     }
 
     #[test]
-    fn volume_scales_and_gapless_preload_swaps() {
+    fn gapless_preload_swaps() {
+        // Volume is no longer applied in the deck (it's forwarded to the sink's
+        // output stage — see `set_volume_forwards_to_sink`), so this only tests
+        // the gapless preload swap itself: full-scale normalized output.
         let sink = MockSink {
             rate: 48_000,
             ch: 1,
             written: Vec::new(),
+            last_volume: None,
         };
         let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
-        deck.set_volume(0.5);
-        deck.load(const_dec(48_000, 1, 100, 500)).unwrap(); // A → 25600*0.5 = 12800
+        deck.load(const_dec(48_000, 1, 100, 500)).unwrap(); // A → 25600
         assert_eq!(deck.free_preload_slots(), 1);
-        deck.preload(const_dec(48_000, 1, 60, 500)).unwrap(); // B → 15360*0.5 = 7680
+        deck.preload(const_dec(48_000, 1, 60, 500)).unwrap(); // B → 15360
         assert_eq!(deck.free_preload_slots(), 0);
         let swaps = run(&mut deck);
         assert_eq!(swaps, 1, "one gapless swap");
         let out = &deck.sink.written;
         assert_eq!(out.len(), 1000, "both tracks, no gap");
-        // Volume ramps 1.0→0.5 over the first block; check the settled regions.
-        assert_eq!(out[300], 12_800, "A at half volume");
-        assert_eq!(out[900], 7_680, "B at half volume");
+        assert_eq!(out[300], 25_600, "A at full scale");
+        assert_eq!(out[900], 15_360, "B at full scale");
+    }
+
+    #[test]
+    fn set_volume_forwards_to_sink() {
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 1,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, ConstDecoder, 1> = Deck::new(sink, Quality::Fast);
+        deck.set_volume(0.5);
+        assert_eq!(deck.sink().last_volume, Some(0.5));
+        deck.set_volume(1.5);
+        assert_eq!(deck.sink().last_volume, Some(1.0), "clamped to 1.0");
+        deck.set_volume(-0.5);
+        assert_eq!(deck.sink().last_volume, Some(0.0), "clamped to 0.0");
     }
 
     #[test]
@@ -625,6 +643,7 @@ mod tests {
             rate: 48_000,
             ch: 1,
             written: Vec::new(),
+            last_volume: None,
         };
         let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
         deck.load(const_dec(48_000, 1, 100, 10_000)).unwrap();
@@ -650,6 +669,7 @@ mod tests {
             rate: 48_000,
             ch: 2,
             written: Vec::new(),
+            last_volume: None,
         };
         let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
         deck.load(const_dec(48_000, 1, 100, 300)).unwrap();
@@ -664,6 +684,7 @@ mod tests {
             rate: 48_000,
             ch: 1,
             written: Vec::new(),
+            last_volume: None,
         };
         let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Hq);
         deck.load(const_dec(44_100, 1, 100, 4000)).unwrap();
@@ -684,6 +705,7 @@ mod tests {
             rate: 48_000,
             ch: 1,
             written: Vec::new(),
+            last_volume: None,
         };
         let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
         deck.load(const_dec(48_000, 1, 100, 10_000)).unwrap();
@@ -758,6 +780,7 @@ mod tests {
             rate: 48_000,
             ch: 9,
             written: Vec::new(),
+            last_volume: None,
         };
         let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
         assert_eq!(
@@ -774,6 +797,7 @@ mod tests {
             rate: 48_000,
             ch: 2,
             written: Vec::new(),
+            last_volume: None,
         };
         let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
         deck.load(const_dec(48_000, 2, 100, 500)).unwrap(); // stereo → OK

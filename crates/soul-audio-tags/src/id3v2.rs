@@ -6,7 +6,8 @@
 //! bare MP3 (tag at offset 0) and for a tag embedded in another container (a
 //! WAV `id3 ` chunk, a DSF header) once the caller has seeked the source to the
 //! tag. `read_mp3` is the MP3 container walk: it reads a leading ID3v2 tag (if
-//! any) and returns `StreamFacts`.
+//! any), then hands off to [`crate::mp3::read_facts`] for the Xing/Info/VBRI
+//! (or CBR-estimate) `StreamFacts` scan.
 //!
 //! Known, deliberate deferrals (none exercised by required tests):
 //! - The global unsynchronisation scheme (header flag bit 7) is not
@@ -16,8 +17,6 @@
 //!   interpreted; such a frame's body would be parsed as raw text/binary,
 //!   which is wrong but *safe* (bounded reads, no panics). These flags are
 //!   essentially unused in the wild.
-//! - MP3 Xing/duration parsing (`StreamFacts`) is a follow-up refinement, as
-//!   noted in the task spec; `read_mp3` returns `StreamFacts::default()`.
 
 use crate::locate;
 use crate::util::{read_exact, utf8_prefix};
@@ -559,10 +558,10 @@ pub fn read_id3v2<S: SeekSource>(
     Ok(())
 }
 
-/// Read the MP3 container: an optional leading ID3v2 tag, then (for now)
-/// just report empty stream facts. MP3 duration via Xing/VBRI is a
-/// documented follow-up refinement — `total_frames` stays `None` rather than
-/// being guessed at.
+/// Read the MP3 container: an optional leading ID3v2 tag, then the first
+/// MPEG audio frame's header (+ Xing/Info/VBRI tag, if present) for
+/// `StreamFacts` — a cheap header scan, not a decode. See
+/// [`crate::mp3::read_facts`] for the frame/duration parsing itself.
 pub fn read_mp3<S: SeekSource>(
     src: &mut S,
     scratch: &mut [u8],
@@ -574,7 +573,7 @@ pub fn read_mp3<S: SeekSource>(
     if n == 3 && &magic == b"ID3" {
         read_id3v2(src, scratch, sink)?;
     }
-    Ok(StreamFacts::default())
+    Ok(crate::mp3::read_facts(src))
 }
 
 #[cfg(test)]

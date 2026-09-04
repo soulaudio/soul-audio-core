@@ -1,6 +1,7 @@
 <script lang="ts">
   import { openFolder } from "../lib/ipc";
   import { player, playFrom, enqueue, playNext } from "../lib/store.svelte";
+  import { artCache, albumKey, inView } from "../lib/art-cache.svelte";
   import type { TrackView } from "../lib/bindings";
 
   let error = $state<string | null>(null);
@@ -55,13 +56,21 @@
     <ol class="tracks">
       {#each player.library as track, i (track.id)}
         {@const playingThis = player.nowPlayingId === track.id}
-        <li class:current={playingThis}>
+        {@const art = artCache.get(albumKey(track))}
+        <li class:current={playingThis} use:inView={track}>
           <button
             type="button"
             class="rowbtn"
             onclick={() => playFrom(i)}
             aria-current={playingThis ? "true" : undefined}
           >
+            <span class="art">
+              {#if art}
+                <img src={art} alt="" />
+              {:else}
+                <span class="art-placeholder" aria-hidden="true">♪</span>
+              {/if}
+            </span>
             <span class="idx">{playingThis ? "▶" : i + 1}</span>
             <span class="meta">
               <span class="title">{track.title ?? "Untitled"}</span>
@@ -190,6 +199,27 @@
   }
   .tracks li.current .rowbtn .idx {
     color: var(--accent);
+  }
+  .art {
+    flex: 0 0 auto;
+    width: 36px;
+    height: 36px;
+    border-radius: 4px;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: color-mix(in srgb, var(--fg) 8%, transparent);
+  }
+  .art img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .art-placeholder {
+    color: var(--fg-dim);
+    font-size: 0.9rem;
   }
   .idx {
     width: 1.6rem;
