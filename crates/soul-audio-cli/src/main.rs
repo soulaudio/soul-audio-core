@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use soul_audio_core::{Decoder, open};
+use soul_audio_core::formats::vorbis::VorbisDecoder;
+use soul_audio_core::{DecodeError, Decoder, Format, open, probe};
 
 #[derive(Parser)]
 #[command(name = "soul-audio-cli", about = "soul-audio-core desktop harness")]
@@ -79,12 +80,16 @@ fn main() -> Result<()> {
         Cmd::Play { inputs } => Box::new(move || play(&inputs)),
     };
     // Generous stack: the worker owns the engine/deck, which embed an
-    // `AnyDecoder` by value (no-alloc). Its HE-AAC (SBR + Parametric Stereo)
-    // variant is by far the largest — hundreds of KiB of QMF/HF/hybrid state —
-    // so a debug build's frames overflow a smaller stack. 16 MiB matches
-    // `soul-audio-core`'s own decode-test loader thread.
+    // `OwnedDecoder` by value (no-alloc) — and moves it through several call
+    // frames (`Engine::provide` → `Deck::load`/`preload` → `Track::new`) that,
+    // unoptimized (debug build), each keep their own copy rather than eliding
+    // the move. The desktop-profile `Vorbis` variant is by far the largest
+    // (~350 KiB: a 4-channel, 8192-sample-block DSP scratch — see
+    // `soul_audio_desktop::OwnedDecoder`'s doc comment) — several such copies
+    // overflowed a 16 MiB stack (the previous size, sized for `AnyDecoder`'s
+    // ~180 KiB HE-AAC variant); 64 MiB leaves a comfortable margin.
     std::thread::Builder::new()
-        .stack_size(16 * 1024 * 1024)
+        .stack_size(64 * 1024 * 1024)
         .spawn(job)
         .expect("spawn worker thread")
         .join()
@@ -96,28 +101,49 @@ fn decode(input: &Path, out: &Path) -> Result<()> {
     // A file is a full-ladder source (Source + BufSource + SeekSource). The same
     // core path runs on the STM32 over a `SliceSource` / SD-card source.
     let mut scratch = [0u8; 8192];
-    let source = soul_audio_desktop::file_source(file, &mut scratch);
-
-    let mut decoder =
-        open(source).map_err(|e| anyhow!("cannot decode {}: {e:?}", input.display()))?;
+    let mut source = soul_audio_desktop::file_source(file, &mut scratch);
 
     // Stream interleaved i32 LE PCM into `out`.
     let mut w =
         BufWriter::new(File::create(out).with_context(|| format!("creating {}", out.display()))?);
+
+    // Vorbis needs a caller-provided arena (`VorbisDecoder<S, A>`), so it is
+    // not an `AnyDecoder` variant `open` can build — special-cased here,
+    // mirroring `soul_audio_desktop::open_track`'s DSF/DFF/Vorbis split.
+    // `probe` consumes nothing (it peeks the buffered prefix), so falling
+    // through to `open`'s own internal probe for every other outcome —
+    // including a probe failure — reproduces the exact original dispatch and
+    // error message for every non-Vorbis input, unchanged.
+    if probe(&mut source) == Ok(Format::Vorbis) {
+        let mut decoder = VorbisDecoder::new(source, soul_audio_desktop::vorbis_arena())
+            .map_err(|e| anyhow!("cannot decode {}: {e:?}", input.display()))?;
+        stream_pcm(&mut decoder, &mut w)
+            .map_err(|e| anyhow!("cannot decode {}: {e:?}", input.display()))?;
+    } else {
+        let mut decoder =
+            open(source).map_err(|e| anyhow!("cannot decode {}: {e:?}", input.display()))?;
+        stream_pcm(&mut decoder, &mut w)
+            .map_err(|e| anyhow!("cannot decode {}: {e:?}", input.display()))?;
+    }
+    w.flush()?;
+    println!("decoded {} → {}", input.display(), out.display());
+    Ok(())
+}
+
+/// Stream `decoder`'s full remaining output as interleaved i32 LE PCM into
+/// `w`. Shared by every branch of [`decode`] so the two decoder types
+/// (`AnyDecoder` vs the arena-backed `VorbisDecoder`) drain identically.
+fn stream_pcm(decoder: &mut dyn Decoder, w: &mut BufWriter<File>) -> Result<(), DecodeError> {
     let mut buf = [0i32; 1024];
     loop {
-        let n = decoder
-            .decode_into(&mut buf)
-            .map_err(|e| anyhow!("cannot decode {}: {e:?}", input.display()))?;
+        let n = decoder.decode_into(&mut buf)?;
         if n == 0 {
             break;
         }
         for &s in &buf[..n] {
-            w.write_all(&s.to_le_bytes())?;
+            w.write_all(&s.to_le_bytes()).map_err(|_| DecodeError::Io)?;
         }
     }
-    w.flush()?;
-    println!("decoded {} → {}", input.display(), out.display());
     Ok(())
 }
 

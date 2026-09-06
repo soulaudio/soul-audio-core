@@ -63,14 +63,16 @@ pub fn run<K: Sink>(sink: K, paths: &[PathBuf]) -> Result<()> {
 
     thread::scope(move |scope| -> Result<()> {
         // Loader thread: serve open requests until the pump drops `req_tx`. A
-        // generous stack — an `AnyDecoder` is large by value (no-alloc): the
-        // HE-AAC (SBR + Parametric Stereo) variant carries hundreds of KiB of
-        // QMF/HF/hybrid state and is built and moved here, which overflows the
-        // default Windows 1 MiB stack (and a debug build overflows a smaller
-        // one). 16 MiB matches `soul-audio-core`'s own decode-test threads.
+        // generous stack — `OwnedDecoder` is large by value (no-alloc) and is
+        // built and moved here (and again into the `(i, d)` tuple / `Result`
+        // sent to the pump). The desktop-profile Vorbis variant is the
+        // largest (~350 KiB — see `OwnedDecoder`'s doc comment), and a debug
+        // build's unoptimized moves keep several such copies live across the
+        // call chain; 64 MiB (up from 16, which overflowed once Vorbis raised
+        // the channel cap from 2 to 4) leaves a comfortable margin.
         thread::Builder::new()
             .name("loader".into())
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn_scoped(scope, move || {
                 for i in req_rx {
                     let opened = open_track(&paths[i]).map(|d| (i, d));

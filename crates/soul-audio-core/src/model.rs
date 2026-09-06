@@ -107,6 +107,12 @@ pub enum Format {
     Mp4,
     /// Raw ADTS (`.aac`) elementary stream (AAC-LC).
     Adts,
+    /// Vorbis I audio in an Ogg container. **Consumer-dispatched**, not an
+    /// [`AnyDecoder`](crate::dispatch::AnyDecoder) variant: `open()` declines
+    /// it with [`crate::DecodeError::Unsupported`] (see
+    /// `formats::vorbis::VorbisDecoder`, which needs a caller-provided arena
+    /// that `open()`'s by-value decoders don't carry).
+    Vorbis,
 }
 
 /// Explicit DSD output mode chosen by the caller. Selects which path a native

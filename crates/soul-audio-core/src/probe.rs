@@ -32,14 +32,19 @@ fn identify(head: &[u8]) -> Option<Format> {
             b"fLaC" => return Some(Format::Flac),
             b"DSD " => return Some(Format::Dsf),
             b"FRM8" => return Some(Format::Dff),
-            // Ogg: only FLAC-in-Ogg is supported — its BOS page body begins with
-            // the `\x7FFLAC` mapping header (within the first page).
+            // Ogg: FLAC-in-Ogg and Vorbis are recognized — their BOS page
+            // body begins with the `\x7FFLAC` mapping header or the Vorbis
+            // identification header's `\x01vorbis` prefix, respectively
+            // (both within the first page).
             b"OggS" => {
                 let window = &head[..head.len().min(64)];
                 if window.windows(5).any(|w| w == b"\x7FFLAC") {
                     return Some(Format::OggFlac);
                 }
-                return None; // Ogg Vorbis/Opus/etc. are not supported
+                if window.windows(7).any(|w| w == b"\x01vorbis") {
+                    return Some(Format::Vorbis);
+                }
+                return None; // Ogg Opus/etc. are not supported
             }
             _ => {}
         }
@@ -91,6 +96,56 @@ mod tests {
             probe_bytes(&[0xFF, 0xF1, 0x50, 0x80, 0x2C, 0xDF, 0xFC]).unwrap(),
             Format::Adts
         );
+    }
+
+    /// Build a minimal, probe-realistic Ogg BOS page: a 27-byte page header +
+    /// a 1-entry lacing table + `body`. Not a fully valid page (checksum is
+    /// unchecked, like every Ogg reader in this crate) — just enough for
+    /// [`identify`]'s byte-window sniff, which never parses page structure.
+    fn ogg_bos_page(body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"OggS");
+        v.push(0); // version
+        v.push(0x02); // BOS
+        v.extend_from_slice(&0u64.to_le_bytes()); // granule
+        v.extend_from_slice(&1u32.to_le_bytes()); // serial
+        v.extend_from_slice(&0u32.to_le_bytes()); // sequence
+        v.extend_from_slice(&[0, 0, 0, 0]); // checksum (unchecked)
+        v.push(1); // one lacing entry
+        v.push(body.len() as u8);
+        v.extend_from_slice(body);
+        v
+    }
+
+    #[test]
+    fn identifies_ogg_vorbis() {
+        // A realistic id-header packet prefix: packet_type=1, then the
+        // literal "vorbis" magic (both byte-aligned, so no bit-packing needed
+        // to construct this fixture) — the rest of the fixed header's exact
+        // contents don't matter to `identify`, which only sniffs the prefix.
+        let mut packet = vec![1u8];
+        packet.extend_from_slice(b"vorbis");
+        packet.extend_from_slice(&[0u8; 23]); // pad to a realistic 30-byte packet
+        let bytes = ogg_bos_page(&packet);
+        assert_eq!(probe_bytes(&bytes).unwrap(), Format::Vorbis);
+    }
+
+    #[test]
+    fn identifies_ogg_flac_still_works_alongside_vorbis() {
+        // Guards against the new Vorbis check accidentally shadowing the
+        // pre-existing FLAC-in-Ogg detection.
+        let mut packet = b"\x7FFLAC".to_vec();
+        packet.extend_from_slice(&[0u8; 46]); // pad to a realistic mapping-header size
+        let bytes = ogg_bos_page(&packet);
+        assert_eq!(probe_bytes(&bytes).unwrap(), Format::OggFlac);
+    }
+
+    #[test]
+    fn ogg_without_a_known_mapping_is_still_unsupported() {
+        // Opus (or anything else) in Ogg: neither magic matches, so this
+        // must stay `Unsupported`, not silently become `Vorbis`/`OggFlac`.
+        let bytes = ogg_bos_page(&[0u8; 40]);
+        assert_eq!(probe_bytes(&bytes).unwrap_err(), DecodeError::Unsupported);
     }
 
     #[test]

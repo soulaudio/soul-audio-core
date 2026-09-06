@@ -672,3 +672,39 @@ fn real_aac_adts_renders_stereo_tones() {
         right.peak_hz
     );
 }
+
+#[test]
+fn real_vorbis_renders_stereo_tones() {
+    // Vorbis is lossy (like AAC above), so this is the same pitch-only golden:
+    // no lossless-equality assertion, just "the right two tones come out of
+    // the right channels" through the full render pipeline (decode →
+    // resample → normalize → file). `tone-vorbis.ogg` is the workspace-root
+    // fixture (Task 5) — the same 2 s A4-left/E5-right signal, libvorbis
+    // `-q:a 5`-encoded, in an Ogg container. Vorbis is dispatched by the
+    // desktop `open_track` special case (not `AnyDecoder`), so this also
+    // exercises that dispatch end to end.
+    let out = tmp("vorbis_out.pcm");
+    Command::cargo_bin("soul-audio-cli")
+        .unwrap()
+        .args(["render"])
+        .arg(fixture("tone-vorbis.ogg"))
+        .args(["--out"])
+        .arg(&out)
+        .args(["--rate", "48000", "--channels", "2"])
+        .assert()
+        .success();
+    let pcm = read_pcm(&out);
+    let n = 16_384;
+    let left = analyze(&channel_window(&pcm, 2, 0, 4000, n), 48_000);
+    let right = analyze(&channel_window(&pcm, 2, 1, 4000, n), 48_000);
+    assert!(
+        (left.peak_hz - 440.0).abs() < 6.0,
+        "Vorbis left {:.1} Hz",
+        left.peak_hz
+    );
+    assert!(
+        (right.peak_hz - 659.25).abs() < 6.0,
+        "Vorbis right {:.1} Hz",
+        right.peak_hz
+    );
+}

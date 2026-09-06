@@ -18,6 +18,7 @@ pub mod flac;
 pub mod mp3;
 pub mod mp3_codec;
 pub mod mp3_l12;
+pub mod vorbis;
 pub mod wav;
 
 /// Maximum DSD channels for the DSF planar reader (up to 6 — SACD's multichannel

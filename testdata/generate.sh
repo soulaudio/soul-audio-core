@@ -27,6 +27,11 @@ ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a alac -movflags +faststar
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a aac -b:a 192k -movflags +faststart tone-aac.m4a
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a aac -b:a 192k -f adts tone.aac
 
+# Vorbis (libvorbis, quality 5 ~ 160 kbps): the from-scratch Vorbis I decoder's
+# stereo golden (CLI `real_vorbis_renders_stereo_tones`, `xtask qa-audio`).
+# NOT `tone.ogg` — that name is already the FLAC-in-Ogg fixture above.
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a libvorbis -q:a 5 tone-vorbis.ogg
+
 # Tagged FLAC (title/artist/album): used by the library-scan Some(tag) test.
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -t 0.2 -c:a flac \
   -metadata title="Soul Test Track" -metadata artist="Test Artist" -metadata album="Test Album" tagged.flac
@@ -49,4 +54,4 @@ python3 generate_dsd.py tone.dsf                 # DSD64
 python3 generate_dsd.py tone-dsd128.dsf 5644800  # DSD128
 
 echo "generated:"
-ls -la tone.wav tone.flac tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone.dsf tagged.flac tone.opus arted.flac tone-dsd128.dsf
+ls -la tone.wav tone.flac tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus arted.flac tone-dsd128.dsf

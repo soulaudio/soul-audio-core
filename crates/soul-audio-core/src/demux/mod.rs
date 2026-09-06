@@ -13,6 +13,7 @@ pub mod flac;
 pub mod mp3;
 pub mod mp4;
 pub mod ogg;
+pub mod ogg_packets;
 pub mod wav;
 
 pub use flac::FlacDemuxer;

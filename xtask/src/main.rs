@@ -11,8 +11,9 @@ mod filterbank_tables;
 mod ps_tables;
 mod resample_tables;
 mod sbr_tables;
+mod vorbis_tables;
 
-const USAGE: &str = "usage: cargo xtask <verify|ci|qa-audio|gen-resample-tables|gen-filterbank-tables|gen-sbr-tables|gen-ps-tables>";
+const USAGE: &str = "usage: cargo xtask <verify|ci|qa-audio|gen-resample-tables|gen-filterbank-tables|gen-sbr-tables|gen-ps-tables|gen-vorbis-tables>";
 
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
@@ -27,6 +28,8 @@ fn main() {
         "check-sbr-tables" => sbr_tables::check(),
         "gen-ps-tables" => ps_tables::run(),
         "check-ps-tables" => ps_tables::check(),
+        "gen-vorbis-tables" => vorbis_tables::run(),
+        "check-vorbis-tables" => vorbis_tables::check(),
         "" => {
             eprintln!("{USAGE}");
             exit(2);
@@ -67,7 +70,20 @@ fn verify() -> Result<(), String> {
     filterbank_tables::check()?;
     sbr_tables::check()?;
     ps_tables::check()?;
+    vorbis_tables::check()?;
     run(&["test"])?;
+    // The Vorbis embedded profile (design spec "Profiles" / Task 11) is a
+    // separate const configuration (stereo + 4096 max block) from the default
+    // desktop build `test` just exercised — run its host tests too, so the
+    // profile-cap rejection path (`new_rejects_blocksize_over_the_profile_cap`)
+    // and every other Vorbis test actually execute under it, not just compile.
+    run(&[
+        "test",
+        "-p",
+        "soul-audio-core",
+        "--features",
+        "vorbis-embedded-profile",
+    ])?;
     // The STM32 discipline gates: the core, engine, and queue must build no_std
     // for the target, and the firmware must link for it.
     run(&[
@@ -77,6 +93,20 @@ fn verify() -> Result<(), String> {
         "--target",
         "thumbv7em-none-eabihf",
         "--no-default-features",
+    ])?;
+    // The arena-generic Vorbis codec must also cross-build under the embedded
+    // profile (smaller channel/blocksize caps) — the const configuration a
+    // future firmware build (issue #32) will actually use once it wires an
+    // arena.
+    run(&[
+        "build",
+        "-p",
+        "soul-audio-core",
+        "--target",
+        "thumbv7em-none-eabihf",
+        "--no-default-features",
+        "--features",
+        "vorbis-embedded-profile",
     ])?;
     run(&[
         "build",
@@ -169,6 +199,11 @@ fn qa_audio() -> Result<(), String> {
             "AAC-LC — should sound like the WAV",
         ),
         ("AAC (ADTS)", "tone.aac", "raw AAC stream"),
+        (
+            "Vorbis (.ogg)",
+            "tone-vorbis.ogg",
+            "libvorbis — should sound like the WAV (Vorbis is dispatched by soul-audio-desktop, not AnyDecoder)",
+        ),
         (
             "DSD (DSF)",
             "tone.dsf",

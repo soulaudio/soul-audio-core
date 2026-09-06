@@ -152,6 +152,13 @@ pub fn open<S: BufSource>(mut src: S) -> Result<AnyDecoder<S>, DecodeError> {
         // DSD containers need an explicit DsdMode (native / DoP / decimate);
         // they are not routed through the PCM `open`.
         Format::Dsf | Format::Dff => Err(DecodeError::Unsupported),
+        // Vorbis needs a caller-provided arena (`VorbisDecoder<S, A>`), and
+        // `AnyDecoder`'s by-value variants don't carry a storage type-param —
+        // threading one through here would ripple into `Deck`/`Engine` for
+        // every other format. Vorbis is consumer-dispatched instead: build
+        // `VorbisDecoder` directly (design spec, "Dispatch: per-platform, NOT
+        // in `AnyDecoder`").
+        Format::Vorbis => Err(DecodeError::Unsupported),
     }
 }
 
@@ -239,6 +246,31 @@ mod tests {
         assert_eq!(&out[..n], &[50, 60, 70, 80]);
         // seek_to_time on a 8 kHz stream: 0.0005 s = frame 4.
         assert_eq!(dec.seek_to_time(0.0005).unwrap(), 4);
+    }
+
+    #[test]
+    fn open_rejects_vorbis_not_being_an_anydecoder_variant() {
+        // Vorbis is consumer-dispatched (needs a caller-provided arena that
+        // `AnyDecoder`'s by-value variants don't carry) — `open()` must
+        // decline it cleanly, not panic or silently misdetect it.
+        let mut packet = vec![1u8];
+        packet.extend_from_slice(b"vorbis");
+        packet.extend_from_slice(&[0u8; 23]);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"OggS");
+        bytes.push(0);
+        bytes.push(0x02);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes.push(1);
+        bytes.push(packet.len() as u8);
+        bytes.extend_from_slice(&packet);
+        assert_eq!(
+            open(SliceSource::new(&bytes)).err(),
+            Some(DecodeError::Unsupported)
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Integration tests exercising the public decode API end-to-end.
 
-use soul_audio_core::{DecodeError, Decoder, SliceSource, open};
+use soul_audio_core::formats::vorbis::VorbisDecoder;
+use soul_audio_core::{DecodeError, Decoder, SeekableDecoder, SliceSource, open};
 
 /// A minimal valid 16-bit mono WAV carrying `samples`.
 fn wav16(samples: &[i16]) -> Vec<u8> {
@@ -601,6 +602,595 @@ fn ps_local_output_is_stereo_and_channels_differ() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Vorbis conformance vs ffmpeg (Task 7). Vorbis is LOSSY, but this golden decodes
+// the SAME stream ffmpeg's own decoder does, so — unlike a cross-encoder compare —
+// a spec-correct IMDCT/window/overlap tracks ffmpeg to near float precision and
+// should score very high. A MONO, all-long-block fixture isolates the IMDCT +
+// floor + residue (no coupling / type-2 residue — those get their golden later).
+// ---------------------------------------------------------------------------
+
+/// Decode a whole Vorbis stream through the public consumer-dispatch path
+/// (`VorbisDecoder::new` — Vorbis is not routed through `open`, needing a
+/// caller-provided arena) on a generous stack: the decoder carries large fixed
+/// DSP scratch (spectrum/residue/overlap) by value (no-alloc), more than the
+/// default test-thread stack. Mirrors the crate's big-stack loader pattern.
+fn decode_vorbis_all(bytes: &'static [u8]) -> Vec<i32> {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let storage = vec![0u8; 128 * 1024];
+            let mut dec =
+                VorbisDecoder::new(SliceSource::new(bytes), storage).expect("open mono vorbis");
+            let mut out = Vec::new();
+            let mut buf = [0i32; 4096];
+            loop {
+                let n = dec.decode_into(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            out
+        })
+        .expect("spawn decode thread")
+        .join()
+        .expect("decode thread panicked")
+}
+
+/// Goertzel single-bin power detector: cheap enough for a unit test, and
+/// precise enough to tell "440 Hz dominates" from "659.25 Hz dominates"
+/// without pulling in an FFT crate. Returns an unnormalized power value —
+/// only meaningful compared against another call over a same-length signal.
+fn goertzel_power(samples: &[i32], sample_rate: f64, target_hz: f64) -> f64 {
+    let n = samples.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let k = (0.5 + (n as f64) * target_hz / sample_rate).floor();
+    let w = 2.0 * std::f64::consts::PI * k / n as f64;
+    let coeff = 2.0 * w.cos();
+    let (mut q1, mut q2) = (0.0f64, 0.0f64);
+    for &s in samples {
+        let q0 = coeff * q1 - q2 + f64::from(s);
+        q2 = q1;
+        q1 = q0;
+    }
+    q1 * q1 + q2 * q2 - q1 * q2 * coeff
+}
+
+/// The first end-to-end correct-PCM milestone: our from-scratch Vorbis decode of
+/// a mono libvorbis fixture matches ffmpeg's own decode (`tone-vorbis-mono.ref.pcm`,
+/// s16le) to high fidelity. Both decode the SAME encoded stream, so the residual
+/// is only IMDCT/window float rounding; the bar is set well above a merely
+/// "conformant" decode (see the assertion) and a scaling/window/overlap bug would
+/// drop it by tens of dB. The first audio packet emits zero samples (it primes the
+/// overlap), so `best_align_segsnr` slides over that priming start offset.
+///
+/// Measured segmental SNR = 107.7 dB at a 0-frame offset (both decoders share the
+/// same libvorbis IMDCT absolute scale, so the streams align at the front and the
+/// residual is pure f32 rounding); the bar is 60 dB — far above a merely conformant
+/// decode, and the `n/2`-too-small IMDCT-normalization bug this milestone fixed
+/// scored 0.0 dB, so any regression of that class drops straight through the bar.
+#[test]
+fn open_decodes_vorbis_mono_matching_ffmpeg() {
+    let ogg = include_bytes!("../testdata/tone-vorbis-mono.ogg");
+    let refr = load_s16le(include_bytes!("../testdata/tone-vorbis-mono.ref.pcm"));
+    let ours = decode_vorbis_all(ogg);
+    let (off, snr) = best_align_segsnr(&ours, &refr, 1);
+    assert!(
+        snr > 60.0,
+        "Vorbis mono decode SNR vs ffmpeg too low: {snr:.1} dB (offset {off} frames)"
+    );
+}
+
+/// Task 8: block switching (short blocks, long↔short transitions, priming).
+/// `tone-vorbis-blocks.ogg` is a 440 Hz tone plus a sharp 3 kHz click every
+/// 0.25 s, encoded so libvorbis emits short blocks for the transients — a
+/// standalone structural check
+/// (`formats::vorbis::tests::block_switching_fixture_contains_both_block_sizes`)
+/// confirms 81 long + 46 short blocks actually appear (bs0=256, bs1=2048), so
+/// this golden exercises long→short, short→long, and sustained short↔short
+/// runs, not just the short→long case Task 7's mono fixture happened to hit.
+///
+/// Measured segmental SNR = 107.9 dB at a 0-frame offset — the same
+/// near-bit-exact class as the Task-7 mono golden (both decoders share the
+/// libvorbis IMDCT absolute scale). The bar is 60 dB, matching Task 7's: a
+/// wrong left/right half-size selection at a transition, a wrong emitted
+/// sample count/offset across a size change, or corrupted overlap state would
+/// each show up as an audible-click-class error dropping this by tens of dB,
+/// not a rounding-level residual.
+#[test]
+fn open_decodes_vorbis_block_switching_matching_ffmpeg() {
+    let ogg = include_bytes!("../testdata/tone-vorbis-blocks.ogg");
+    let refr = load_s16le(include_bytes!("../testdata/tone-vorbis-blocks.ref.pcm"));
+    let ours = decode_vorbis_all(ogg);
+    let (off, snr) = best_align_segsnr(&ours, &refr, 1);
+    assert!(
+        snr > 60.0,
+        "Vorbis block-switching decode SNR vs ffmpeg too low: {snr:.1} dB (offset {off} frames)"
+    );
+}
+
+/// Task 9: stereo channel coupling (§4.3.5 inverse coupling) + residue type 2
+/// (§8.6.5 concat/de-interleave). `tone-vorbis-stereo.ogg` encodes the
+/// workspace's stereo `testdata/tone.wav` (A4 = 440 Hz on the LEFT channel,
+/// E5 = 659.25 Hz on the RIGHT) — distinct per-channel content specifically so
+/// a channel-swap or mispairing bug in the inverse-coupling or type-2
+/// de-interleave code (`residue.rs`) is caught, not averaged away by a
+/// symmetric metric. The structural test
+/// `formats::vorbis::tests::stereo_fixture_setup_declares_coupling_and_residue_type2`
+/// confirms libvorbis actually chose channel coupling + residue type 2 for
+/// this encode, so this golden genuinely exercises that code path.
+///
+/// Measured segmental SNR = 107.2 dB at a 0-frame offset — the same
+/// near-bit-exact class as the Task 7/8 mono goldens (both decoders share the
+/// libvorbis IMDCT absolute scale; coupling/type-2 were already spec-correct
+/// from Task 6, so this fixture only had to prove it, not fix it). The bar is
+/// 60 dB, matching Task 7/8's: a channel-swap or mispaired coupling step
+/// would decorrelate the two channels entirely (comparing 440 Hz content
+/// against 659 Hz content position-wise), dropping this by tens of dB, not a
+/// rounding-level residual.
+///
+/// The channel-distinctness checks below measured: RMS(L−R) ≈ 16195 (bar
+/// 100), and a ~10¹⁰× dominant/non-dominant Goertzel power ratio on both
+/// channels (bar 4×) — L is overwhelmingly 440 Hz, R overwhelmingly 659.25
+/// Hz, so the two channels are not swapped.
+#[test]
+fn open_decodes_vorbis_stereo_coupling_matching_ffmpeg() {
+    let ogg = include_bytes!("../testdata/tone-vorbis-stereo.ogg");
+    let refr = load_s16le(include_bytes!("../testdata/tone-vorbis-stereo.ref.pcm"));
+    let ours = decode_vorbis_all(ogg);
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 60.0,
+        "Vorbis stereo coupling decode SNR vs ffmpeg too low: {snr:.1} dB (offset {off} frames)"
+    );
+
+    // Channel-distinctness: a coupling channel-swap or mispairing bug can
+    // leave the combined interleaved SNR misleadingly high if, say, it
+    // symmetrically garbles both channels alike — so directly assert L and R
+    // are NOT near-identical, and that each is dominated by its own expected
+    // tone (440 Hz left, 659.25 Hz right). This is the check the Task-6
+    // review specifically asked this golden to provide.
+    let l = deinterleave(&ours, 2, 0);
+    let r = deinterleave(&ours, 2, 1);
+    let n = l.len().min(r.len());
+    assert!(n > 1000, "decoded too few stereo samples ({n})");
+
+    let diff_rms = (l[..n]
+        .iter()
+        .zip(&r[..n])
+        .map(|(&a, &b)| f64::from(a - b).powi(2))
+        .sum::<f64>()
+        / n as f64)
+        .sqrt();
+    assert!(
+        diff_rms > 100.0,
+        "decoded L/R channels are nearly identical (RMS diff {diff_rms:.1}) \
+         — suggests a coupling channel-swap collapsed the stereo image"
+    );
+
+    let sample_rate = f64::from(vorbis_sample_rate(ogg));
+    let l_440 = goertzel_power(&l, sample_rate, 440.0);
+    let l_659 = goertzel_power(&l, sample_rate, 659.25);
+    let r_440 = goertzel_power(&r, sample_rate, 440.0);
+    let r_659 = goertzel_power(&r, sample_rate, 659.25);
+    assert!(
+        l_440 > l_659 * 4.0,
+        "left channel not dominated by its expected 440 Hz tone \
+         (power440={l_440:.3e}, power659={l_659:.3e}) — possible coupling channel-swap"
+    );
+    assert!(
+        r_659 > r_440 * 4.0,
+        "right channel not dominated by its expected 659.25 Hz tone \
+         (power659={r_659:.3e}, power440={r_440:.3e}) — possible coupling channel-swap"
+    );
+}
+
+/// The Task-3 carry-forward: `total_frames()` seeks to EOF to read the end
+/// granule, which historically invalidated the Ogg reader position — corrupting a
+/// subsequent decode. This asserts they coexist: querying the duration first must
+/// NOT change the decoded output (same SNR + sample count as decoding straight
+/// away).
+#[test]
+fn vorbis_total_frames_then_decode_is_uncorrupted() {
+    let ogg: &'static [u8] = include_bytes!("../testdata/tone-vorbis-mono.ogg");
+    let refr = load_s16le(include_bytes!("../testdata/tone-vorbis-mono.ref.pcm"));
+    let (total, ours) = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let storage = vec![0u8; 128 * 1024];
+            let mut dec =
+                VorbisDecoder::new(SliceSource::new(ogg), storage).expect("open mono vorbis");
+            // Query duration BEFORE decoding a single packet — the destructive path.
+            let total = dec.total_frames();
+            let mut out = Vec::new();
+            let mut buf = [0i32; 4096];
+            loop {
+                let n = dec.decode_into(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            (total, out)
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+
+    // The stream declares its total per-channel sample count via the last page's
+    // granule (2 s at 44.1 kHz).
+    assert_eq!(total, Some(88_200));
+    // Decoding after the total_frames() seek must still match ffmpeg (the reader
+    // position was restored, not corrupted).
+    let (_off, snr) = best_align_segsnr(&ours, &refr, 1);
+    assert!(
+        snr > 60.0,
+        "decode after total_frames() was corrupted: {snr:.1} dB"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 10: granule end-trim + Ogg-granule seeking.
+// ---------------------------------------------------------------------------
+
+/// Task 10 (granule end-trim, Task-7 carry-forward): the **last** Ogg page's
+/// granule specifies the EXACT total per-channel sample count (spec §4.3.8).
+/// Before this fix the final block's `(prev_bs+bs)/4` emission formula could
+/// run past that exact count (the Task-7 review's flagged concern — the SNR
+/// goldens above tolerate a too-long tail because `best_align_segsnr` only
+/// requires the overlap to cover half of `refr`, silently ignoring any excess
+/// tail in `ours`). This asserts the FULL decoded length matches the
+/// granule-declared total exactly — and, since all three fixtures happen to
+/// encode precisely 2.0 s at 44.1 kHz, also matches ffmpeg's own reference PCM
+/// length exactly — for all three real fixtures (mono, block-switching,
+/// stereo coupling), so the fix is proven across short-block, block-switching,
+/// and multi-channel decode paths alike.
+#[test]
+fn vorbis_full_decode_length_matches_the_granule_exactly() {
+    let cases: [(&str, &[u8], &[u8]); 3] = [
+        (
+            "mono",
+            include_bytes!("../testdata/tone-vorbis-mono.ogg"),
+            include_bytes!("../testdata/tone-vorbis-mono.ref.pcm"),
+        ),
+        (
+            "block-switching",
+            include_bytes!("../testdata/tone-vorbis-blocks.ogg"),
+            include_bytes!("../testdata/tone-vorbis-blocks.ref.pcm"),
+        ),
+        (
+            "stereo",
+            include_bytes!("../testdata/tone-vorbis-stereo.ogg"),
+            include_bytes!("../testdata/tone-vorbis-stereo.ref.pcm"),
+        ),
+    ];
+    for (label, ogg, refpcm) in cases {
+        let refr = load_s16le(refpcm);
+        let ours = decode_vorbis_all(ogg);
+        let (total, channels) = vorbis_total_frames_and_channels(ogg);
+        let total = total.unwrap_or_else(|| panic!("{label}: stream declares no length"));
+        assert_eq!(
+            ours.len(),
+            total as usize * usize::from(channels),
+            "{label}: decoded length must match the granule-declared total exactly"
+        );
+        assert_eq!(
+            ours.len(),
+            refr.len(),
+            "{label}: decoded length must match ffmpeg's reference length exactly"
+        );
+    }
+}
+
+/// The declared sample rate of a Vorbis stream, on the same big-stack thread
+/// pattern every other real-file Vorbis test in this file uses. Lets a golden
+/// read the fixture's actual rate for its frequency-domain checks (e.g. the
+/// stereo-coupling golden's Goertzel bins) instead of assuming 44.1 kHz.
+fn vorbis_sample_rate(bytes: &'static [u8]) -> u32 {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let storage = vec![0u8; 128 * 1024];
+            let dec = VorbisDecoder::new(SliceSource::new(bytes), storage).expect("open vorbis");
+            dec.stream_info().sample_rate
+        })
+        .expect("spawn decode thread")
+        .join()
+        .expect("decode thread panicked")
+}
+
+/// `(total_frames, channels)` for a Vorbis stream, on the same big-stack
+/// thread pattern every other real-file Vorbis test in this file uses.
+fn vorbis_total_frames_and_channels(bytes: &'static [u8]) -> (Option<u64>, u16) {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let storage = vec![0u8; 128 * 1024];
+            let dec = VorbisDecoder::new(SliceSource::new(bytes), storage).expect("open vorbis");
+            (dec.total_frames(), dec.stream_info().channels)
+        })
+        .expect("spawn decode thread")
+        .join()
+        .expect("decode thread panicked")
+}
+
+/// Open a Vorbis stream, seek to per-channel `sample`, then decode up to
+/// `want` per-channel frames worth of interleaved samples. Returns
+/// `(landed, pcm, channels)`. Same big-stack thread pattern as
+/// [`decode_vorbis_all`] (the decoder is large by value, no-alloc DSP scratch).
+fn vorbis_seek_and_decode(
+    bytes: &'static [u8],
+    seek_sample: u64,
+    want_frames: usize,
+) -> (u64, Vec<i32>, u16) {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let storage = vec![0u8; 128 * 1024];
+            let mut dec =
+                VorbisDecoder::new(SliceSource::new(bytes), storage).expect("open vorbis");
+            let channels = dec.stream_info().channels;
+            let landed = dec.seek_to(seek_sample).expect("seek_to");
+            let mut out = Vec::new();
+            let mut buf = [0i32; 4096];
+            while out.len() < want_frames * usize::from(channels) {
+                let n = dec.decode_into(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            out.truncate(want_frames * usize::from(channels));
+            (landed, out, channels)
+        })
+        .expect("spawn decode thread")
+        .join()
+        .expect("decode thread panicked")
+}
+
+/// Slide `needle` (interleaved, `channels` per frame) over `haystack` at every
+/// per-channel frame offset and return the `(offset_frames, snr_db)` of the
+/// best-matching alignment — the same segmental-SNR metric as
+/// [`best_align_segsnr`], but searching the WHOLE of `haystack` (not just a
+/// bounded priming window), since [`OggPackets::seek_to_granule`] bisection is
+/// page-granular (design spec: "land NEAR the target sample" — see
+/// `soul_audio_core::formats::vorbis`'s module docs and the `seek_to` doc
+/// comment): the true post-seek resume position can be anywhere at or before
+/// the landed page's granule, not necessarily at the seek target itself. Only
+/// the first `cap` samples of the overlap are scored per candidate offset (a
+/// severe corruption or misalignment shows up well within a few hundred
+/// samples), keeping an exhaustive whole-file search cheap.
+fn best_full_match(haystack: &[i32], needle: &[i32], channels: usize, cap: usize) -> (usize, f64) {
+    let mut best = (0usize, f64::NEG_INFINITY);
+    let frames = haystack.len() / channels;
+    let needle_frames = needle.len() / channels;
+    for off_frames in 0..=frames.saturating_sub(needle_frames.min(frames)) {
+        let off = off_frames * channels;
+        let n = needle.len().min(haystack.len() - off).min(cap * channels);
+        if n == 0 {
+            continue;
+        }
+        let mut sig = 0f64;
+        let mut err = 0f64;
+        for i in 0..n {
+            let h = haystack[off + i] as f64;
+            let d = needle[i] as f64;
+            sig += h * h;
+            let e = h - d;
+            err += e * e;
+        }
+        let snr = if err <= 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (sig / err).log10()
+        };
+        if snr > best.1 {
+            best = (off_frames, snr);
+        }
+    }
+    best
+}
+
+/// Task 10 seek round-trip: seeking mid-stream and decoding must reproduce
+/// audio a full from-start decode ALSO contains, somewhere — proving the
+/// re-primed overlap state reconstructs genuinely correct, correctly-overlapped
+/// PCM (not silence or garbage) — while the reported landed position stays a
+/// sane, bounded estimate (never before the target, never past the stream's
+/// end).
+///
+/// `tone-vorbis-mono.ogg` has only 4 Ogg pages (2 header + 2 audio, each audio
+/// page bundling dozens of packets) — Ogg-granule bisection is fundamentally
+/// page-granular (design spec: "land NEAR the target sample"), and this
+/// decoder's re-prime discards only the ONE packet immediately at the landed
+/// page's start (not the whole page — see [`VorbisDecoder::seek_to`]'s doc
+/// comment), so for a page bundling many packets the audio that actually
+/// resumes can start well BEFORE the landed granule, even though `landed`
+/// itself is always `>= target`. That tradeoff is deliberate: the alternative
+/// (discarding an entire multi-packet page to make the reported position
+/// exact) would emit NO audio at all for any seek landing on the stream's
+/// final page — worse for a real player than an imprecise-but-honest position
+/// alongside real, correctly-decoded trailing audio.
+///
+/// Measured: seeking to 1.5 s (66 150) lands on the file's last page
+/// (`landed = 88 200`, the exact end — this fixture's last two audio pages
+/// bracket both 44 608..66 150 and 66 150..88 200 onto the same final page),
+/// while the actually-resumed audio best-matches the full decode at
+/// **segmental SNR = ∞ (bit-exact)** starting at full-decode sample ≈ 45 632 —
+/// close to the landed page's start (44 608), confirming the re-primed audio
+/// is correct, not merely plausible, even though `landed` overstates how far
+/// into the file playback actually resumes for this coarse fixture.
+#[test]
+fn vorbis_seek_round_trip_matches_the_full_decode_somewhere() {
+    let ogg: &'static [u8] = include_bytes!("../testdata/tone-vorbis-mono.ogg");
+    let full = decode_vorbis_all(ogg);
+
+    let target = 66_150u64; // 1.5 s into the 2.0 s mono fixture
+    let want_frames = 4096usize;
+    let (landed, seek_pcm, channels) = vorbis_seek_and_decode(ogg, target, want_frames);
+    assert_eq!(channels, 1);
+
+    // The landed position must be a real, bounded estimate: never before the
+    // target (seek_to_granule's own "first page whose granule >= target"
+    // contract), and never past the stream's declared end.
+    assert!(
+        landed >= target,
+        "landed {landed} must be >= target {target}"
+    );
+    let (total, _) = vorbis_total_frames_and_channels(ogg);
+    assert!(
+        landed <= total.unwrap(),
+        "landed {landed} must not exceed the stream's total {total:?}"
+    );
+
+    // The post-seek audio must match the full decode's content SOMEWHERE —
+    // proving re-priming reconstructs correct PCM. Skip roughly the first
+    // block's worth of samples (the documented "one block of overlap warm-up"
+    // — `synthesize`'s first post-reprime emission still depends on exactly
+    // where the discarded packet's context began) before scoring.
+    let warmup = 2048usize; // > one long block's per-channel emission
+    let scored = &seek_pcm[warmup.min(seek_pcm.len())..];
+    let (off, snr) = best_full_match(&full, scored, usize::from(channels), 4096);
+    assert!(
+        snr > 60.0,
+        "seek(66150) decode doesn't match the full decode anywhere well: \
+         best {snr:.1} dB at offset {off} frames (landed={landed})"
+    );
+}
+
+/// Seeking to 0 must reproduce a fresh decode of the whole stream exactly —
+/// the special-cased "back to start" path ([`VorbisDecoder::seek_to`]'s
+/// `target == 0` branch) rewinds past the three header packets and resets the
+/// overlap state, so there is no approximation here (unlike a nonzero seek).
+#[test]
+fn vorbis_seek_to_zero_matches_a_fresh_decode() {
+    let ogg: &'static [u8] = include_bytes!("../testdata/tone-vorbis-mono.ogg");
+    let fresh = decode_vorbis_all(ogg);
+
+    let (landed, seek_pcm, _channels) = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let storage = vec![0u8; 128 * 1024];
+            let mut dec =
+                VorbisDecoder::new(SliceSource::new(ogg), storage).expect("open mono vorbis");
+            // Decode partway first, so seek_to(0) has real state to undo.
+            let mut probe = [0i32; 4096];
+            let _ = dec.decode_into(&mut probe).unwrap();
+            let landed = dec.seek_to(0).expect("seek_to(0)");
+            let mut out = Vec::new();
+            let mut buf = [0i32; 4096];
+            loop {
+                let n = dec.decode_into(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            (landed, out, dec.stream_info().channels)
+        })
+        .expect("spawn decode thread")
+        .join()
+        .expect("decode thread panicked");
+
+    assert_eq!(landed, 0);
+    assert_eq!(
+        seek_pcm, fresh,
+        "seek_to(0) must reproduce a fresh decode bit-for-bit"
+    );
+}
+
+/// Seeking beyond the stream's end must clamp to the declared total (never
+/// panic, never error) — [`OggPackets::seek_to_granule`]'s own "closest
+/// available position" contract, reused as-is by [`VorbisDecoder::seek_to`].
+#[test]
+fn vorbis_seek_beyond_end_clamps_without_panicking() {
+    let ogg: &'static [u8] = include_bytes!("../testdata/tone-vorbis-mono.ogg");
+    let (total, _) = vorbis_total_frames_and_channels(ogg);
+    let total = total.expect("mono fixture declares a length");
+
+    let (landed, tail, _channels) = vorbis_seek_and_decode(ogg, total * 100, 4096);
+    assert_eq!(landed, total);
+    // Whatever trails after landing at/near the end must stay within the
+    // exact declared total (Task 10's granule end-trim applies here too).
+    assert!(tail.len() as u64 <= total);
+}
+
+/// Task 10 review fix: seeking to a non-trivial mid-file target, then
+/// decoding ALL the way to true EOF, must land the decode EXACTLY on the
+/// granule-declared total — not merely "close enough" (the SNR-based
+/// `vorbis_seek_round_trip_matches_the_full_decode_somewhere` above only
+/// proves the resumed audio is CORRECT content, not that it stops at the
+/// right sample). `decode_into`'s end-trim compares an ABSOLUTE ceiling
+/// (`OggPackets::last_page_granule`, file-wide) against `samples_emitted`;
+/// `seek_to` used to always reset that counter to `0`, undercounting the
+/// true absolute position by the landed page's ENTIRE sample span (not "at
+/// most one block" as a since-corrected doc comment claimed) whenever a seek
+/// landed past the very first page. With the ceiling still absolute but the
+/// counter reset to 0, `ceiling - samples_emitted` stayed far too large for
+/// the whole rest of the decode, so the end-trim clamp never fired and
+/// decode ran to the raw end of the last page's data — reproducing the
+/// original Task-7 final-block overshoot, just reached by seeking instead of
+/// a from-start decode.
+///
+/// The mono fixture's target (66 150, 1.5 s into the 2.0 s file) is chosen
+/// specifically because it lands [`OggPackets::seek_to_granule`] on the
+/// file's OWN LAST page (see the round-trip test above: `landed = 88 200`,
+/// the exact end) — exactly the broken path, where the end-trim ceiling and
+/// the seek-landed page are the SAME page.
+#[test]
+fn vorbis_seek_then_decode_to_eof_length_matches_the_granule_exactly() {
+    let ogg: &'static [u8] = include_bytes!("../testdata/tone-vorbis-mono.ogg");
+    let full = decode_vorbis_all(ogg);
+    let (total, channels) = vorbis_total_frames_and_channels(ogg);
+    let total = total.expect("mono fixture declares a length");
+    assert_eq!(channels, 1);
+
+    let target = 66_150u64; // 1.5 s into the 2.0 s mono fixture — lands on the last page.
+    // `want_frames` generously covers "the rest of the stream": the loop
+    // inside `vorbis_seek_and_decode` still stops the instant `decode_into`
+    // reports a clean end of stream, so this decodes to true EOF exactly,
+    // never an artificially truncated prefix.
+    let (landed, tail, ch) =
+        vorbis_seek_and_decode(ogg, target, total as usize + usize::from(channels) * 4096);
+    assert_eq!(ch, 1);
+    assert_eq!(
+        landed, total,
+        "this target must land exactly on the stream's own last page"
+    );
+
+    // Locate where this post-seek tail begins within a full from-start
+    // decode (same alignment search the round-trip test above uses — Ogg
+    // granule-position seeking is page-granular in WHERE real audio resumes,
+    // spec/design: "land NEAR the target sample"). As in that test, skip
+    // roughly the first block's worth of samples before scoring: the very
+    // first post-reprime block still carries window-edge warm-up artifacts
+    // that would otherwise drag down the alignment search — but this skip
+    // only trims the FRONT of `tail`, so its END (what this test actually
+    // checks) is untouched.
+    let warmup = 2048usize.min(tail.len() / usize::from(ch));
+    let scored = &tail[warmup * usize::from(ch)..];
+    let (off, snr) = best_full_match(&full, scored, usize::from(ch), 4096);
+    assert!(
+        snr > 60.0,
+        "seek({target}) + decode-to-EOF tail doesn't align with the full decode: \
+         best {snr:.1} dB at offset {off} frames"
+    );
+    // Assert the tail's END lines up with the granule-declared total EXACTLY
+    // — the discriminating check the round-trip test's SNR-only comparison
+    // does not make: it catches the tail running EITHER short OR long of
+    // `total`, in particular the review's overshoot-past-`total` bug.
+    let scored_frames = scored.len() / usize::from(ch);
+    assert_eq!(
+        off + scored_frames,
+        total as usize,
+        "seek({target}) + decode-to-EOF must end EXACTLY at the granule-declared total \
+         (aligned at offset {off}, {scored_frames} scored frames) — overshooting past it \
+         reproduces the Task-7 final-block bug via seeking instead of a from-start decode"
+    );
+}
+
 #[test]
 fn open_surfaces_mp3_stream_info() {
     // MPEG-1 Layer III, 128 kbps, 44.1 kHz, stereo. A synthetic all-zero frame
@@ -619,4 +1209,51 @@ fn open_surfaces_mp3_stream_info() {
     let n = dec.decode_into(&mut out).unwrap();
     assert_eq!(n, 8);
     assert!(out.iter().all(|&s| s == 0), "silent frame decodes to zeros");
+}
+
+/// Decode-time-vs-real-time ratio for the workspace-root `tone-vorbis.ogg`
+/// fixture (Task 11 — the fast-Huffman follow-up decision). `Codebook::decode_scalar`
+/// is an O(entries·max_len) linear scan (deferred since Task 4: no fast-Huffman
+/// acceleration table), and the residue hot loop calls it heavily — this is the
+/// number that decides whether that matters yet. Measured `--release` at
+/// ~0.40x real-time (2 s of audio decodes in ~0.8 s): comfortably faster than
+/// real-time, same "the deck buffers ahead" territory as DSD's ~0.18x, so
+/// fast-Huffman stays a nice-to-have, not implemented here. `#[ignore]`d — a
+/// perf number, not a correctness gate; run explicitly with
+/// `cargo test --release -p soul-audio-core --test decode \
+/// vorbis_decode_speed_benchmark -- --ignored --nocapture` to re-check it
+/// after a DSP change.
+#[test]
+#[ignore]
+fn vorbis_decode_speed_benchmark() {
+    let ogg: &'static [u8] = include_bytes!("../../../testdata/tone-vorbis.ogg");
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let storage = vec![0u8; 128 * 1024];
+            let mut dec = VorbisDecoder::new(SliceSource::new(ogg), storage).expect("open vorbis");
+            let channels = usize::from(dec.stream_info().channels);
+            let rate = f64::from(dec.stream_info().sample_rate);
+            let mut buf = [0i32; 4096];
+            let start = std::time::Instant::now();
+            let mut total = 0usize;
+            loop {
+                let n = dec.decode_into(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            let elapsed = start.elapsed();
+            let frames = total / channels;
+            let real_time_secs = frames as f64 / rate;
+            println!(
+                "decoded {frames} frames ({real_time_secs:.3}s of audio) in {:.6}s -> ratio {:.5}x real-time",
+                elapsed.as_secs_f64(),
+                elapsed.as_secs_f64() / real_time_secs
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
