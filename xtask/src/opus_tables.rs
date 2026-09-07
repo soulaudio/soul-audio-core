@@ -32,13 +32,14 @@
 //! `E_MEANS`, `PRED_COEF`, `BETA_COEF`, `BETA_INTRA`, `E_PROB_MODEL`,
 //! `SMALL_ENERGY_ICDF`, and the `LAPLACE_*` scalars.
 //!
-//! # MDCT twiddles deferred
-//! The FFT/MDCT twiddle factors (libopus `mdct_twiddles960` /
-//! `fft_twiddles48000_960`) are intentionally NOT emitted here: CELT MDCT
-//! synthesis lands in a later task that picks the transform algorithm (the
-//! project's Vorbis precedent is a naïve direct transform first, then an FFT),
-//! and the twiddle layout depends on that choice. Only the overlap window
-//! (needed by any algorithm) is generated now.
+//! # MDCT FFT config (issue #38)
+//! The CELT inverse-MDCT fast transform is libopus's mixed-radix kiss-FFT. Its
+//! per-size config — stage factors, the bit-reversal permutation, and the
+//! forward twiddles `exp(-j2πk/N4)` — is generated host-side here (ported from
+//! `celt/kiss_fft.c` `kf_factor`/`compute_bitrev_table`/`compute_twiddles`) for
+//! each `N4 ∈ {60,120,240,480}`, so the no_std core runs the butterflies over
+//! `const` tables with no runtime trig. The overlap window (`MDCT_WINDOW`) is
+//! still generated for the pre/post-rotation + TDAC overlap-add.
 
 use std::f64::consts::PI;
 use std::fmt::Write as _;
@@ -56,6 +57,15 @@ const FINE_OFFSET: i32 = 21;
 const QTHETA_OFFSET: i32 = 4;
 const QTHETA_OFFSET_TWOPHASE: i32 = 16;
 const MAX_PSEUDO: i32 = 40;
+
+/// libopus `celt/_kiss_fft_guts.h` `MAXFACTORS` — upper bound on FFT radix
+/// stages. Our CELT MDCT sizes (`N4 ∈ {60,120,240,480}`) need at most 5.
+const MAXFACTORS: usize = 8;
+
+/// The four CELT inverse-MDCT FFT sizes (`N4 = N/4` for the 2.5/5/10/20 ms
+/// frames; short blocks always use 60). Each is `2^k·15 = 2^k·3·5`, exactly the
+/// mixed-radix sizes libopus kiss-FFT factors as radix 4/2/3/5.
+const FFT_SIZES: [usize; 4] = [60, 120, 240, 480];
 
 /// libopus `celt/modes.c` `eband5ms` — CELT energy-band boundaries for a 2.5 ms
 /// frame, in units of MDCT bins of the 120-bin short block (22 boundaries → 21
@@ -458,6 +468,111 @@ fn compute_window() -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
+// CELT inverse-MDCT FFT config (libopus celt/kiss_fft.c). Ported here so the
+// mixed-radix bit-reversal + twiddle tables are generated host-side; the no_std
+// core reads the emitted `const`s and runs the butterflies with no runtime trig.
+// The `check` re-derivation guards them exactly like the pulse cache above.
+// ---------------------------------------------------------------------------
+
+/// libopus `celt/kiss_fft.c` `kf_factor` — factor `nfft` into the radix stages
+/// the mixed-radix FFT executes, with libopus's exact policy: greedily take
+/// radix-4, fall back through 2/3/5.., and defer a lone radix-2 so it lands on a
+/// size-4 sub-transform (the specialised `kf_bfly2`). Stages are then reversed
+/// (outer→inner) and each stage's remaining size `m` filled in. Returns the flat
+/// `[p0, m0, p1, m1, …]` the runtime `opus_fft_impl` iterates.
+fn kf_factor(nfft: i32) -> Vec<i16> {
+    let mut fac = vec![0i16; 2 * MAXFACTORS];
+    let mut p = 4i32;
+    let mut stages = 0usize;
+    let mut n = nfft;
+    loop {
+        while n % p != 0 {
+            match p {
+                4 => p = 2,
+                2 => p = 3,
+                _ => p += 2,
+            }
+            if p > 32000 || p * p > n {
+                p = n;
+            }
+        }
+        n /= p;
+        // RADIX_TWO_ONLY is not defined in the float build, so radices up to 5
+        // are allowed; our sizes never produce a factor > 5.
+        assert!(p <= 5, "unexpected radix {p} factoring {nfft}");
+        fac[2 * stages] = p as i16;
+        if p == 2 && stages > 1 {
+            // Move the radix-2 stage so a size-4 sub-transform precedes it.
+            fac[2 * stages] = 4;
+            fac[2] = 2;
+        }
+        stages += 1;
+        if n <= 1 {
+            break;
+        }
+    }
+    // Reverse the stage order (libopus emits inner→outer, runs outer→inner).
+    for i in 0..stages / 2 {
+        fac.swap(2 * i, 2 * (stages - i - 1));
+    }
+    // Fill each stage's remaining transform size `m = nfft / Π p_so_far`.
+    let mut m = nfft;
+    for i in 0..stages {
+        m /= i32::from(fac[2 * i]);
+        fac[2 * i + 1] = m as i16;
+    }
+    fac.truncate(2 * stages);
+    fac
+}
+
+/// libopus `celt/kiss_fft.c` `compute_bitrev_table` — the digit-reversal
+/// permutation for the mixed-radix decimation, derived from the (already
+/// stage-ordered) `factors`. `bitrev[i]` is where input element `i` is scattered
+/// before the in-place butterflies run.
+fn compute_bitrev(nfft: usize, factors: &[i16]) -> Vec<i16> {
+    let mut buf = vec![0i16; nfft];
+    bitrev_rec(0, &mut buf, 0, 1, factors, 0);
+    buf
+}
+
+fn bitrev_rec(
+    fout: i32,
+    buf: &mut [i16],
+    mut f: usize,
+    fstride: usize,
+    factors: &[i16],
+    fpos: usize,
+) {
+    let p = i32::from(factors[fpos]);
+    let m = i32::from(factors[fpos + 1]);
+    if m == 1 {
+        for j in 0..p {
+            buf[f] = (fout + j) as i16;
+            f += fstride; // in_stride == 1
+        }
+    } else {
+        let mut fout_v = fout;
+        for _ in 0..p {
+            bitrev_rec(fout_v, buf, f, fstride * (p as usize), factors, fpos + 2);
+            f += fstride;
+            fout_v += m;
+        }
+    }
+}
+
+/// libopus `celt/kiss_fft.c` `compute_twiddles` (float build): the forward-FFT
+/// twiddle factors `exp(-j·2π·i/nfft)`, emitted interleaved `[re, im, …]`.
+fn compute_fft_twiddles(nfft: usize) -> Vec<f32> {
+    let mut t = Vec::with_capacity(2 * nfft);
+    for i in 0..nfft {
+        let phase = -2.0 * PI * i as f64 / nfft as f64;
+        t.push(phase.cos() as f32);
+        t.push(phase.sin() as f32);
+    }
+    t
+}
+
+// ---------------------------------------------------------------------------
 // Emit helpers (mirror xtask/src/vorbis_tables.rs + ps_tables.rs conventions).
 // ---------------------------------------------------------------------------
 
@@ -645,6 +760,22 @@ fn generate() -> String {
     );
     emit_f32_1d("MDCT_WINDOW", &window, &mut out);
 
+    // ---- CELT inverse-MDCT FFT config (kiss-FFT, one set per N4) ----
+    out.push_str(
+        "// CELT inverse-MDCT mixed-radix FFT config (libopus celt/kiss_fft.c), one set\n\
+         // per N4 ∈ {60,120,240,480}: stage FACTORS [p,m,…] (radix 4/2/3/5), the BITREV\n\
+         // digit-reversal permutation, and the forward TWIDDLES exp(-j2πk/N4) interleaved\n\
+         // [re,im,…]. Consumed by celt/mdct.rs `opus_fft_impl` (derived host-side).\n",
+    );
+    for &nfft in &FFT_SIZES {
+        let fac = kf_factor(nfft as i32);
+        let bitrev = compute_bitrev(nfft, &fac);
+        let tw = compute_fft_twiddles(nfft);
+        emit_i16_1d(&format!("OPUS_FFT_FACTORS_{nfft}"), &fac, &mut out);
+        emit_i16_1d(&format!("OPUS_FFT_BITREV_{nfft}"), &bitrev, &mut out);
+        emit_f32_1d(&format!("OPUS_FFT_TWIDDLES_{nfft}"), &tw, &mut out);
+    }
+
     // ---- Self-check test (anchors derived tables to RFC 6716 / libopus) ----
     out.push_str(SELF_CHECK_TEST);
     out
@@ -717,6 +848,59 @@ mod generated_tests {
         for w in MDCT_WINDOW.windows(2) {
             assert!(w[1] >= w[0]);
         }
+    }
+
+    #[test]
+    fn fft_config_is_well_formed() {
+        // For each CELT MDCT FFT size: the stage factors multiply back to N4,
+        // the last stage's m is 1, the bit-reversal is a genuine permutation of
+        // 0..N4, and the twiddle DC term is exp(0) = (1, 0).
+        fn check(nfft: usize, factors: &[i16], bitrev: &[i16], tw: &[f32]) {
+            let mut prod = 1i64;
+            let mut l = 0;
+            while l < factors.len() {
+                prod *= i64::from(factors[l]);
+                l += 2;
+            }
+            assert_eq!(prod as usize, nfft, "factors product for {nfft}");
+            assert_eq!(*factors.last().unwrap(), 1, "last stage m for {nfft}");
+            assert_eq!(bitrev.len(), nfft, "bitrev len for {nfft}");
+            let mut seen = [false; 480];
+            for &b in bitrev {
+                let b = b as usize;
+                assert!(b < nfft && !seen[b], "bitrev not a permutation for {nfft}");
+                seen[b] = true;
+            }
+            assert_eq!(tw.len(), 2 * nfft, "twiddle len for {nfft}");
+            assert!(
+                (tw[0] - 1.0).abs() < 1e-6 && tw[1].abs() < 1e-6,
+                "DC twiddle {nfft}"
+            );
+        }
+        check(
+            60,
+            &OPUS_FFT_FACTORS_60,
+            &OPUS_FFT_BITREV_60,
+            &OPUS_FFT_TWIDDLES_60,
+        );
+        check(
+            120,
+            &OPUS_FFT_FACTORS_120,
+            &OPUS_FFT_BITREV_120,
+            &OPUS_FFT_TWIDDLES_120,
+        );
+        check(
+            240,
+            &OPUS_FFT_FACTORS_240,
+            &OPUS_FFT_BITREV_240,
+            &OPUS_FFT_TWIDDLES_240,
+        );
+        check(
+            480,
+            &OPUS_FFT_FACTORS_480,
+            &OPUS_FFT_BITREV_480,
+            &OPUS_FFT_TWIDDLES_480,
+        );
     }
 }
 "#;

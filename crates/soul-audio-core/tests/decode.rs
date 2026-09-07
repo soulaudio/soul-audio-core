@@ -1205,9 +1205,10 @@ fn vorbis_seek_then_decode_to_eof_length_matches_the_granule_exactly() {
 // Vorbis milestone hit) drops this by tens of dB rather than a rounding-level
 // residual.
 //
-// Measured segmental SNR = 86.97 dB at a 0-frame offset (our pre-skip trims the
-// same 312 priming samples ffmpeg does, so the streams align at the front). The
-// bar is 60 dB — far above a merely conformant CELT decode. The ~87 dB residual
+// Measured segmental SNR ≈ 84 dB at a 0-frame offset (our pre-skip trims the
+// same 312 priming samples ffmpeg does, so the streams align at the front); the
+// exact figure varies a little by platform / ffmpeg build. The bar is 60 dB —
+// far above a merely conformant CELT decode. The residual
 // (not near-∞ like the lossless goldens) is the two audio-quality-only
 // approximations the codec permits post-range-coder: the `celt_exp2` denormalise
 // gain (libopus's `FLOAT_APPROX` cubic) and the Q15 spreading-rotation cosine in
@@ -1795,6 +1796,44 @@ fn vorbis_decode_speed_benchmark() {
                 "decoded {frames} frames ({real_time_secs:.3}s of audio) in {:.6}s -> ratio {:.5}x real-time",
                 elapsed.as_secs_f64(),
                 elapsed.as_secs_f64() / real_time_secs
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Opus CELT decode throughput micro-benchmark (issue #38 — fast MDCT).
+// `#[ignore]` so it never runs in the default gate; invoke explicitly with
+// `cargo test -p soul-audio-core --release --test decode opus_celt_decode_throughput -- --ignored --nocapture`.
+// Decodes `tone.opus` in a loop and reports decode time vs audio duration.
+// ---------------------------------------------------------------------------
+#[test]
+#[ignore = "manual benchmark; run with --ignored --nocapture"]
+fn opus_celt_decode_throughput() {
+    let opus: &'static [u8] = include_bytes!("../../../testdata/tone.opus");
+    const ITERS: usize = 200;
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            // Warm up + measure total frames once.
+            let frames = decode_all(opus).len() / 2;
+            let real_time_secs = frames as f64 / 48_000.0;
+            let start = std::time::Instant::now();
+            let mut sink = 0u64;
+            for _ in 0..ITERS {
+                let out = decode_all(opus);
+                sink = sink.wrapping_add(out.len() as u64);
+            }
+            let elapsed = start.elapsed();
+            let per_decode = elapsed.as_secs_f64() / ITERS as f64;
+            println!(
+                "opus CELT: {ITERS} decodes of {frames} frames ({real_time_secs:.3}s audio) \
+                 in {:.4}s total -> {:.6}s/decode, {:.2}x faster than real-time (sink={sink})",
+                elapsed.as_secs_f64(),
+                per_decode,
+                real_time_secs / per_decode,
             );
         })
         .unwrap()
