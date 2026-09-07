@@ -1,5 +1,7 @@
 //! Integration tests exercising the public decode API end-to-end.
 
+use soul_audio_core::demux::ogg_packets::OggPackets;
+use soul_audio_core::formats::opus::toc::{self, Mode};
 use soul_audio_core::formats::vorbis::VorbisDecoder;
 use soul_audio_core::{DecodeError, Decoder, SeekableDecoder, SliceSource, open};
 
@@ -1455,6 +1457,98 @@ fn open_decodes_opus_hybrid_stereo_matching_ffmpeg() {
     assert!(
         diff_rms > 100.0,
         "hybrid stereo L/R nearly identical (RMS diff {diff_rms:.1}) — stereo image collapsed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Opus ADAPTIVE MODE-SWITCHING conformance vs libopus (issue #37). Unlike the
+// single-mode goldens above (all-CELT / all-SILK / all-Hybrid), `mode-switch-
+// mono.opus` is a real adaptive libopus encode whose TOC bytes span **all three
+// modes** with FIVE mid-stream transitions covering every direction —
+// Hybrid→SILK, SILK→CELT, CELT→SILK, SILK→Hybrid, Hybrid→CELT (see the mode-span
+// assertion below). Those transitions exercise the CELT redundancy / mode-
+// transition logic (the redundant 5 ms CELT-only frame, `smooth_fade`
+// cross-fades, and libopus's `OPUS_RESET_STATE` on a mode change) that the
+// raw-packet conformance path always had but the Ogg `open()` path originally
+// skipped. Before issue #37 the transition frames diverged badly from libopus
+// (thousands of counts per switch: the SILK↔CELT boundaries by 5000-12000, the
+// Hybrid boundaries by 7000-8000); after unifying both paths onto the shared
+// `OpusFrameDecoder` core, `open()` decodes each transition with the identical
+// RFC-8251-validated logic — Hybrid→SILK / SILK→CELT / SILK→Hybrid / Hybrid→CELT
+// become bit-exact-to-≤40 vs libopus, and CELT→SILK lands at the compounded-CELT
+// float-approximation ceiling (its redundant-CELT + cross-fade decode runs two
+// CELT passes whose approximations add).
+//
+// The reference (`mode-switch-mono.ref.pcm`) is ffmpeg's **libopus** decode
+// (`ffmpeg -c:a libopus -i mode-switch-mono.opus -f s16le`), i.e. the reference
+// decoder itself — not ffmpeg's *native* Opus decoder — so it uses libopus's own
+// SILK resampler (the one this decoder transcribes) and the achievable SNR is
+// the CELT float ceiling across every mode, not the resampler-limited ~20-30 dB
+// of the native-ffmpeg SILK/hybrid goldens. That makes this a tight,
+// discriminating gate on the transitions specifically: the pre-#37 `fill_packet`
+// scored 19.1 dB here (whole-signal SNR dominated by the diverging transition
+// frames), while the unified core scores 41.2 dB — bar 30 dB. (The whole-signal
+// figure is held to ~41 dB, not the ~80 dB of the per-frame masked metric, by
+// the single CELT→SILK boundary frame at the compounded-CELT ceiling; a
+// regression in ANY transition drops it straight back through 30 dB.)
+// ---------------------------------------------------------------------------
+
+/// Count the audio-packet modes of an Ogg-Opus stream by parsing each packet's
+/// TOC byte (RFC 6716 §3.1) — used to prove the fixture genuinely switches mode.
+/// Returns the per-mode packet counts `(silk, hybrid, celt)`.
+fn opus_mode_histogram(bytes: &[u8]) -> (usize, usize, usize) {
+    let mut ogg = OggPackets::new(SliceSource::new(bytes)).expect("ogg");
+    let mut buf = vec![0u8; 1 << 16];
+    // Skip the two Opus header packets (OpusHead + OpusTags).
+    ogg.read_packet_prefix(&mut buf).expect("head");
+    ogg.read_packet_prefix(&mut buf).expect("tags");
+    let (mut s, mut h, mut c) = (0, 0, 0);
+    while let Ok(n) = ogg.next_packet(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        match toc::parse_toc(buf[0]).mode {
+            Mode::SilkOnly => s += 1,
+            Mode::Hybrid => h += 1,
+            Mode::CeltOnly => c += 1,
+        }
+    }
+    (s, h, c)
+}
+
+/// `mode-switch-mono.opus` — a genuinely adaptive libopus encode spanning all
+/// three Opus modes with five mode transitions — decoded via `open()` →
+/// `AnyDecoder::Opus` matches the libopus reference decode, proving the Ogg path
+/// now applies the redundancy / mode-transition logic across every mode switch
+/// (the shared `OpusFrameDecoder` core it now embeds).
+///
+/// Measured whole-signal SNR vs the libopus reference = 41.2 dB (bar 30 dB); the
+/// pre-#37 Ogg path scored 19.1 dB here because it skipped the redundant CELT
+/// frame + cross-fades and never reset CELT on a mode change.
+#[test]
+fn open_decodes_mode_switching_opus_matching_libopus() {
+    let opus = include_bytes!("../testdata/mode-switch-mono.opus");
+    let refr = load_s16le(include_bytes!("../testdata/mode-switch-mono.ref.pcm"));
+
+    // The fixture must genuinely switch mode — it spans all THREE Opus modes
+    // (else it would not exercise the full transition logic across every
+    // direction). A degenerate single-mode fixture would make this golden a
+    // no-op regardless of the transition code.
+    let (s, h, c) = opus_mode_histogram(opus);
+    assert!(
+        s > 0 && h > 0 && c > 0,
+        "fixture must span all three Opus modes to test transitions (SilkOnly={s} Hybrid={h} CeltOnly={c})"
+    );
+
+    let dec = open(SliceSource::new(opus)).expect("probe + construct Opus");
+    assert_eq!(dec.stream_info().sample_rate, 48_000);
+    assert_eq!(dec.stream_info().channels, 1);
+    let ours = decode_all(opus);
+    let (off, snr) = best_align_segsnr(&ours, &refr, 1);
+    assert!(
+        snr > 30.0,
+        "mode-switching Opus decode SNR vs libopus too low: {snr:.2} dB (offset {off} frames) \
+         — a transition frame likely diverged (redundancy / OPUS_RESET_STATE)"
     );
 }
 

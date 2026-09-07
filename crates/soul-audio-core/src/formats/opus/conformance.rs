@@ -1,22 +1,28 @@
-//! Raw-packet Opus decode path for RFC 8251 conformance validation.
+//! The shared per-frame Opus decode core ([`OpusFrameDecoder`]) plus the
+//! raw-packet [`ConformanceDecoder`] wrapper used for RFC 8251 validation.
+//!
+//! [`OpusFrameDecoder`] owns the CELT + SILK sub-engines and the minimal
+//! cross-frame state `opus_decode_frame` needs (`prev_mode` / `prev_redundancy`
+//! / `final_range`) to decode ONE internal Opus frame with the full libopus
+//! v1.5.2 `opus_decode_native` → `opus_decode_frame` flow — including the
+//! **redundancy** and **mode-transition** handling (SILK↔CELT / CELT↔Hybrid
+//! switches use a redundant CELT-only frame, `smooth_fade` cross-fades, and an
+//! `OPUS_RESET_STATE` on a mode change). **Both** decode paths embed it:
+//! * the Ogg [`super::OpusDecoder`] wraps it with the container-level concerns
+//!   (Ogg demux, `OpusHead` pre-skip / end-trim / output gain, lost-packet PLC),
+//!   applying the redundancy/transition logic on every mode switch of an
+//!   adaptive `.opus` stream; and
+//! * [`ConformanceDecoder`] wraps it with the opus_demo `.bit` packet framing.
 //!
 //! The RFC 8251 test vectors (`testvectorNN.bit`) are **not** Ogg-Opus — they
 //! are opus_demo's raw framing (`[len][enc_final_range][packet]`, stripped by
-//! the test harness). This module decodes one raw Opus packet at a time at a
-//! caller-supplied output channel count (1 **or** 2, independent of any
-//! `OpusHead`), reusing the exact per-packet SILK / CELT / Hybrid synthesis of
-//! the Ogg decoder ([`super::OpusDecoder`]) but **without** the Ogg demux,
-//! `OpusHead`, pre-skip trim, or output gain — matching `opus_demo -d` (which
-//! decodes with `skip = 0`, i.e. emits the full untrimmed decoder output that
-//! the reference `.dec` files were generated from).
-//!
-//! [`ConformanceDecoder`] is a faithful port of libopus v1.5.2
-//! `opus_decode_native` → `opus_decode_frame`, including the **redundancy** and
-//! **mode-transition** handling the steady-state Ogg path does not exercise
-//! (SILK↔CELT / CELT↔Hybrid switches use a redundant CELT-only frame plus a
-//! cross-faded transition frame). It is `#[doc(hidden)] pub` purely so the
-//! `tests/opus_conformance.rs` integration test can drive it; it is not part of
-//! the stable decoder API and is never instantiated on the shipping Ogg path.
+//! the test harness). [`ConformanceDecoder`] decodes one raw Opus packet at a
+//! time at a caller-supplied output channel count (1 **or** 2, independent of
+//! any `OpusHead`) with **no** Ogg demux, `OpusHead`, pre-skip trim, or output
+//! gain — matching `opus_demo -d` (which decodes with `skip = 0`, i.e. emits the
+//! full untrimmed decoder output the reference `.dec` files were generated
+//! from). It is `#[doc(hidden)] pub` purely so the `tests/opus_conformance.rs`
+//! integration test can drive it; it is not part of the stable decoder API.
 
 use super::celt::decoder::CeltDecoder;
 use super::celt::mdct::WINDOW;
@@ -37,11 +43,17 @@ const F2_5: usize = 120;
 /// 5 ms at 48 kHz (libopus `F5`) — the redundant CELT frame length.
 const F5: usize = 240;
 
-/// A raw-packet Opus decoder for RFC 8251 conformance. Owns the CELT + SILK
-/// sub-engines and the minimal cross-packet state `opus_decode_frame` needs
-/// (`prev_mode` / `prev_redundancy`) to handle mode transitions.
-#[doc(hidden)]
-pub struct ConformanceDecoder {
+/// The shared per-frame Opus decode core (libopus `opus_decode_frame`). Owns
+/// the CELT + SILK sub-engines and the minimal cross-frame state needed
+/// (`prev_mode` / `prev_redundancy` / `final_range`) to handle mode transitions
+/// and redundancy. Embedded by BOTH the Ogg [`super::OpusDecoder`] and the
+/// raw-packet [`ConformanceDecoder`], so the transition logic cannot diverge
+/// between the two paths.
+///
+/// `pub(crate)` (not part of the public API): the Ogg decoder uses it directly;
+/// the `tests/` integration crate reaches it only through the
+/// [`ConformanceDecoder`] wrapper below.
+pub(crate) struct OpusFrameDecoder {
     celt: CeltDecoder,
     silk: SilkDecoder,
     /// Output (API) channel count, 1 or 2 — fixed for the stream, independent
@@ -60,10 +72,10 @@ pub struct ConformanceDecoder {
     final_range: u32,
 }
 
-impl ConformanceDecoder {
+impl OpusFrameDecoder {
     /// A fresh decoder emitting `channels` (1 or 2) interleaved 48 kHz channels.
     #[must_use]
-    pub fn new(channels: usize) -> Self {
+    pub(crate) fn new(channels: usize) -> Self {
         let channels = channels.clamp(1, 2);
         Self {
             celt: CeltDecoder::new(channels),
@@ -78,18 +90,20 @@ impl ConformanceDecoder {
     /// The most recently decoded frame's range coder final state (see
     /// [`Self::final_range`]).
     #[must_use]
-    pub fn final_range(&self) -> u32 {
+    pub(crate) fn final_range(&self) -> u32 {
         self.final_range
     }
 
     /// Decode one raw Opus packet into `out` (interleaved `i32` slots, `channels`
-    /// per sample), returning the number of `i32` written. `out` must hold at
-    /// least `frame_count * frame_size_48k * channels` slots (a 120 ms stereo
-    /// packet is `5760 * 2`). A malformed packet writes nothing and returns 0
-    /// (never panics). Mirrors `opus_decode_native`: split the packet into its
-    /// constituent frames, then decode each with the full
-    /// `opus_decode_frame` flow.
-    pub fn decode_packet(&mut self, data: &[u8], out: &mut [i32]) -> usize {
+    /// per sample) at unity output gain, returning the number of `i32` written.
+    /// `out` must hold at least `frame_count * frame_size_48k * channels` slots
+    /// (a 120 ms stereo packet is `5760 * 2`). A malformed packet writes nothing
+    /// and returns 0 (never panics). Mirrors `opus_decode_native`: split the
+    /// packet into its constituent frames, then decode each with the full
+    /// `opus_decode_frame` flow. Used by the raw-packet conformance path (the Ogg
+    /// path drives [`Self::decode_frame`] directly so it can trim/gain each
+    /// frame).
+    pub(crate) fn decode_packet(&mut self, data: &[u8], out: &mut [i32]) -> usize {
         let mut frames: [&[u8]; toc::MAX_FRAMES] = [&[][..]; toc::MAX_FRAMES];
         let (config, count) = match toc::frames(data, &mut frames) {
             Ok(v) => v,
@@ -97,14 +111,26 @@ impl ConformanceDecoder {
         };
         let mut written = 0usize;
         for &frame in frames.iter().take(count) {
-            written += self.decode_frame(frame, config, &mut out[written..]);
+            written += self.decode_frame(frame, config, 1.0, &mut out[written..]);
         }
         written
     }
 
-    /// Decode one internal Opus frame (`opus_decode_frame`) into `out`,
-    /// returning the interleaved sample count. `config` is the packet TOC.
-    fn decode_frame(&mut self, frame: &[u8], config: Config, out: &mut [i32]) -> usize {
+    /// Decode one internal Opus frame (`opus_decode_frame`) into `out`, applying
+    /// the linear `output_gain` (the `OpusHead` gain on the Ogg path; `1.0` on
+    /// the raw conformance path), returning the interleaved sample count.
+    /// `config` is the packet TOC. Updates the cross-frame transition state
+    /// (`prev_mode` / `prev_redundancy` / `final_range`) exactly as
+    /// `opus_decode_frame` does, so successive frames — across a mode switch —
+    /// decode with the correct redundancy / reset behavior regardless of which
+    /// path calls this.
+    pub(crate) fn decode_frame(
+        &mut self,
+        frame: &[u8],
+        config: Config,
+        output_gain: f32,
+        out: &mut [i32],
+    ) -> usize {
         let channels = self.channels;
         let n = usize::from(config.frame_size_48k); // per-channel samples
         let total = n * channels;
@@ -113,8 +139,10 @@ impl ConformanceDecoder {
         }
 
         match config.mode {
-            Mode::CeltOnly => self.decode_celt_only(frame, config, out, n),
-            Mode::SilkOnly | Mode::Hybrid => self.decode_silk_or_hybrid(frame, config, out, n),
+            Mode::CeltOnly => self.decode_celt_only(frame, config, output_gain, out, n),
+            Mode::SilkOnly | Mode::Hybrid => {
+                self.decode_silk_or_hybrid(frame, config, output_gain, out, n)
+            }
         }
     }
 
@@ -123,6 +151,7 @@ impl ConformanceDecoder {
         &mut self,
         frame: &[u8],
         config: Config,
+        output_gain: f32,
         out: &mut [i32],
         n: usize,
     ) -> usize {
@@ -134,7 +163,9 @@ impl ConformanceDecoder {
             self.celt = CeltDecoder::new(channels);
         }
         let mut tmp = [0i32; MAX_FRAME_N * 2];
-        let produced = self.celt.decode_frame(frame, config, 1.0, &mut tmp);
+        // CELT applies `output_gain` in its de-emphasis stage (matching the Ogg
+        // decoder's original CELT-only arm); the raw path passes `1.0`.
+        let produced = self.celt.decode_frame(frame, config, output_gain, &mut tmp);
         let take = produced.min(n * channels);
         out[..take].copy_from_slice(&tmp[..take]);
         self.final_range = if frame.len() <= 1 {
@@ -156,6 +187,7 @@ impl ConformanceDecoder {
         &mut self,
         frame: &[u8],
         config: Config,
+        output_gain: f32,
         out: &mut [i32],
         n: usize,
     ) -> usize {
@@ -285,9 +317,12 @@ impl ConformanceDecoder {
             );
         }
 
-        // (7) Round the float frame to interleaved i16 (libopus `float2int16`).
+        // (7) Apply the linear `OpusHead` output gain (libopus applies
+        // `st->decode_gain` to the final float `pcm` before `float2int16`; the
+        // raw conformance path passes `1.0`, an exact identity) and round the
+        // float frame to interleaved i16 (libopus `float2int16`).
         for i in 0..n * channels {
-            out[i] = round_clip_i16(pcm[i]);
+            out[i] = round_clip_i16(pcm[i] * output_gain);
         }
 
         // libopus `st->rangeFinal = dec.rng ^ redundant_rng` (0 for a <=1-byte
@@ -355,6 +390,45 @@ impl ConformanceDecoder {
             Some(prev) => prev != mode && !self.prev_redundancy,
             None => false,
         }
+    }
+}
+
+/// Raw-packet Opus decoder for RFC 8251 conformance — a thin wrapper over the
+/// shared [`OpusFrameDecoder`] core that adds only the opus_demo `.bit` packet
+/// framing (`opus_decode_native`: split a packet into its constituent frames and
+/// decode each at unity gain) and the `final_range` accessor. It decodes with no
+/// Ogg demux, `OpusHead`, pre-skip trim, or output gain (matching `opus_demo -d`
+/// / `skip = 0`), so its output is byte-identical to the pre-unification
+/// standalone decoder. `#[doc(hidden)] pub` purely so `tests/opus_conformance.rs`
+/// can drive it; it is not part of the stable decoder API and is never
+/// instantiated on the shipping Ogg path.
+#[doc(hidden)]
+pub struct ConformanceDecoder {
+    core: OpusFrameDecoder,
+}
+
+impl ConformanceDecoder {
+    /// A fresh decoder emitting `channels` (1 or 2) interleaved 48 kHz channels.
+    #[must_use]
+    pub fn new(channels: usize) -> Self {
+        Self {
+            core: OpusFrameDecoder::new(channels),
+        }
+    }
+
+    /// The most recently decoded frame's range coder final state (libopus
+    /// `st->rangeFinal`) — the RFC 8251 / `opus_demo` per-packet final-range
+    /// check compares this against the bitstream's stored `enc_final_range`.
+    #[must_use]
+    pub fn final_range(&self) -> u32 {
+        self.core.final_range()
+    }
+
+    /// Decode one raw Opus packet into `out` (interleaved `i32` slots, `channels`
+    /// per sample) at unity gain, returning the number of `i32` written. A
+    /// malformed packet writes nothing and returns 0 (never panics).
+    pub fn decode_packet(&mut self, data: &[u8], out: &mut [i32]) -> usize {
+        self.core.decode_packet(data, out)
     }
 }
 

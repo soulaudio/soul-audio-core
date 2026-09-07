@@ -124,3 +124,27 @@ into that sweep as a genuine valid-baseline PS input (never committed —
   ffmpeg 16-bit PCM reference.
 - `l2_*.mp2` — Layer II at assorted rates/modes/bitrates.
 - `vbr-44100-stereo.mp3` — a VBR MP3 (Xing header) for Layer III + VBR seeking.
+
+## Opus (adaptive mode switching)
+
+- `mode-switch-mono.opus` + `mode-switch-mono.ref.pcm` — a mono Ogg-Opus stream
+  that adaptively switches decode mode mid-stream, plus **libopus's** own s16le
+  decode of it. It is the golden for issue #37 (routing the Ogg `open()` decode
+  through the CELT redundancy / mode-transition logic).
+
+  **Self-encoded** (like the SBR fixtures, not a downloaded vector): a 3 s source
+  of alternating low tones (SILK-friendly) and mid-range triads with a light
+  high-frequency component (music-like → CELT/Hybrid) is encoded
+  `ffmpeg -i src.wav -c:a libopus -b:a 24k -application audio -frame_duration 20`.
+  libopus's adaptive encoder then spans **all three Opus modes** with five
+  mid-stream transitions (Hybrid→SILK→CELT→SILK→Hybrid→CELT, verified in the
+  golden by parsing every packet's TOC byte). The reference is the **libopus**
+  decode `ffmpeg -c:a libopus -i mode-switch-mono.opus -f s16le` — the reference
+  decoder itself, not ffmpeg's *native* Opus decoder, so it uses libopus's own
+  SILK resampler (the one this crate transcribes) and the golden's achievable SNR
+  is the CELT float-approximation ceiling across every mode, making it a tight
+  gate on the transition frames specifically (the pre-#37 Ogg path scored 19 dB
+  here; the unified core scores 41 dB — bar 30 dB). Opus is lossy, so this is a
+  segmental-SNR-with-tolerance golden, not a bit-exact one; the definitive
+  bit-exact validation is the committed RFC 8251 vectors (`opus_tv*.bit`,
+  `tests/opus_conformance.rs`).

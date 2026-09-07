@@ -36,11 +36,9 @@ pub mod toc;
 
 use core::cell::{Cell, RefCell};
 
-use celt::decoder::{CeltDecoder, celt_exp2};
+use celt::decoder::celt_exp2;
+use conformance::OpusFrameDecoder;
 use container::OpusHead;
-use range::RangeDecoder;
-use silk::decoder::SilkDecoder;
-use toc::Mode;
 
 use crate::decoder::{DecodeError, Decoder, SeekableDecoder};
 use crate::demux::ogg_packets::OggPackets;
@@ -56,11 +54,11 @@ const OUTPUT_SAMPLE_RATE: u32 = 48_000;
 /// [`OggPackets::next_packet`] `Unsupported` rather than a corrupt decode.
 const MAX_PACKET_BYTES: usize = 16_384;
 
-/// Largest per-channel frame length (`120 << 3` = 20 ms fullband).
-const MAX_FRAME_N: usize = 960;
-
-/// 48 kHz samples one 20 ms internal SILK frame resamples to (mono, per frame).
-const SILK_FRAME_N: usize = 960;
+/// Largest interleaved sample count ONE internal Opus frame can decode to: a
+/// 60 ms SILK-only frame is `2880` per-channel samples at 48 kHz, ×2 for a
+/// stereo stream. [`Self::fill_packet`] hands the shared core a scratch buffer
+/// this size per frame, then trims/copies the kept sub-range into `pcm_buf`.
+const MAX_FRAME_SAMPLES: usize = 2880 * 2;
 
 /// Largest number of decoded interleaved samples one Opus packet can yield: a
 /// 120 ms packet at 48 kHz, stereo (`5760 * 2`). One packet is decoded, then
@@ -127,14 +125,15 @@ pub struct OpusDecoder<S> {
     /// no length". [`OggPackets::end_granule`] is non-destructive, so
     /// computing this doesn't disturb sequential decode.
     total_frames: Cell<Option<Option<u64>>>,
-    /// The CELT synthesis engine + its cross-frame state (band-energy history,
-    /// per-channel MDCT decode buffers, de-emphasis / post-filter memory).
-    celt: CeltDecoder,
-    /// The SILK synthesis engine + its cross-frame state (NLSF/gain history,
-    /// LTP/LPC filter memory, output history, and the 48 kHz output resampler).
-    /// SILK-only and Hybrid packets decode through this — mono and stereo (it
-    /// holds two per-channel states + the mid/side prediction state).
-    silk: SilkDecoder,
+    /// The shared per-frame decode core (CELT + SILK sub-engines + the
+    /// `prev_mode`/`prev_redundancy`/`final_range` transition state). The SAME
+    /// [`OpusFrameDecoder`] the raw-packet [`conformance::ConformanceDecoder`]
+    /// embeds — so the redundancy / mode-transition handling (redundant CELT
+    /// frame, `smooth_fade` cross-fades, `OPUS_RESET_STATE` on a mode change) is
+    /// applied identically here on every mode switch of an adaptive `.opus`
+    /// stream. [`Self::fill_packet`] wraps it with the Ogg-level concerns
+    /// (granule pre-skip / end-trim, `OpusHead` output gain, lost-packet PLC).
+    core: OpusFrameDecoder,
     /// Running **absolute** per-channel decode position in RFC 7845 granule
     /// units (48 kHz, pre-skip *included*) — the granule the decoder is at.
     /// Every decoded frame advances it by its per-channel sample count. Both
@@ -209,8 +208,7 @@ impl<S: Source> OpusDecoder<S> {
             head,
             stream_info,
             total_frames: Cell::new(None),
-            celt: CeltDecoder::new(channels),
-            silk: SilkDecoder::new(),
+            core: OpusFrameDecoder::new(channels),
             granule_pos: 0,
             skip_to: u64::from(head.pre_skip),
             output_gain,
@@ -221,29 +219,36 @@ impl<S: Source> OpusDecoder<S> {
         })
     }
 
-    /// Decode the next audio packet into [`Self::pcm_buf`], applying the
-    /// stream-global pre-skip / seek-skip ([`Self::skip_to`]) and the Ogg
-    /// granule end-trim ([`trim_frame`]). Leaves `pcm_len == 0` at a clean end
-    /// of stream. CELT-only, SILK-only, and Hybrid packets — **mono and
-    /// stereo** — all decode to real PCM. Each mode arm is channel-generic: it
-    /// decodes `channels` (the stream's `OpusHead` count) interleaved 48 kHz
-    /// channels, and a mono packet in a stereo stream (the per-packet
-    /// `config.stereo` s-bit is independent of the container channel count) is
-    /// upmixed (L = R) by the sub-codecs, exactly as libopus does.
+    /// Decode the next audio packet into [`Self::pcm_buf`], delegating each
+    /// internal Opus frame to the shared [`OpusFrameDecoder`] core and wrapping
+    /// it with the Ogg-container concerns: the stream-global pre-skip / seek-skip
+    /// ([`Self::skip_to`]), the Ogg granule end-trim ([`trim_frame`]), the
+    /// `OpusHead` output gain, and lost-packet PLC. Leaves `pcm_len == 0` at a
+    /// clean end of stream.
     ///
-    /// **Pre-skip / seek run-in** (RFC 7845 §4.2, §4.4): a frame whose whole
-    /// span sits below [`Self::skip_to`] is still fully decoded — so the
-    /// CELT/SILK cross-frame state converges — but emits nothing; the loop then
-    /// fetches the next packet. This is exactly the mechanism a seek re-primes
-    /// through (it sets `skip_to` to the target granule).
+    /// The core decodes ONE full frame of `frame_pch * channels` interleaved
+    /// 48 kHz samples (CELT-only, SILK-only, or Hybrid — mono **and** stereo, a
+    /// mono packet in a stereo stream upmixed L = R by the sub-codecs) with the
+    /// full `opus_decode_frame` flow, **including** the redundancy /
+    /// mode-transition handling on a mode switch (redundant CELT frame,
+    /// `smooth_fade` cross-fades, `OPUS_RESET_STATE`) — the same logic the
+    /// raw-packet conformance path uses. This wrapper then trims that frame to
+    /// its kept `[s, e)` per-channel sub-range and copies it into `pcm_buf`.
     ///
-    /// **Minimal PLC**: a zero-length (DTX) frame or a frame whose range decode
-    /// fails is concealed as **silence** for its nominal duration (known from
-    /// the TOC `config.frame_size_48k`) rather than dropped, so the running
-    /// [`Self::granule_pos`] — and therefore the pre-skip / end-trim / seek
-    /// accounting — never desyncs. Full CELT pitch-extrapolation / comfort-noise
-    /// concealment (RFC 6716 §4.4) is deliberately **not** implemented; silence
-    /// is the documented simplification.
+    /// **Pre-skip / seek run-in** (RFC 7845 §4.2, §4.4): a frame whose whole span
+    /// sits below [`Self::skip_to`] is still fully decoded through the core — so
+    /// the CELT/SILK cross-frame state converges — but emits nothing; the loop
+    /// then fetches the next packet. This is exactly the mechanism a seek
+    /// re-primes through (it sets `skip_to` to the target granule).
+    ///
+    /// **Minimal PLC**: a zero-length (DTX) frame is concealed as **silence** for
+    /// its nominal duration (the TOC `config.frame_size_48k`) rather than dropped,
+    /// so the running [`Self::granule_pos`] — and therefore the pre-skip /
+    /// end-trim / seek accounting — never desyncs. A frame whose range decode
+    /// fails is likewise concealed as silence **inside** the core (which returns a
+    /// zeroed full frame). Full CELT pitch-extrapolation / comfort-noise
+    /// concealment (RFC 6716 §4.4) is deliberately **not** implemented; silence is
+    /// the documented simplification.
     fn fill_packet(&mut self) -> Result<(), DecodeError> {
         self.pcm_pos = 0;
         self.pcm_len = 0;
@@ -265,186 +270,41 @@ impl<S: Source> OpusDecoder<S> {
             // Per-channel sample count of one frame (48 kHz), from the TOC — the
             // granule-accounting/PLC size, independent of a successful decode.
             let frame_pch = usize::from(config.frame_size_48k);
-            // The branches access disjoint decoder fields (`celt`/`silk`/
-            // `granule_pos`/`pcm_buf` vs `packet_buf` the `frames` slices
-            // borrow), so they stay inline rather than in `&mut self` helpers
-            // that would re-borrow all of `self` and clash with `frames`.
-            match config.mode {
-                Mode::CeltOnly => {
-                    let mut tmp = [0i32; 2 * MAX_FRAME_N];
-                    for &frame in frames.iter().take(count) {
-                        let (s, e) = trim_frame(
-                            &mut self.granule_pos,
-                            self.skip_to,
-                            page_granule,
-                            frame_pch,
-                        );
-                        if frame.is_empty() {
-                            emit_silence(
-                                &mut self.pcm_buf,
-                                &mut self.pcm_len,
-                                e.saturating_sub(s) * channels,
-                            );
-                            continue;
-                        }
-                        let produced = self.celt.decode_frame(frame, config, output_gain, &mut tmp);
-                        let e = e.min(produced / channels);
-                        if e <= s {
-                            continue; // wholly pre-skipped / trimmed (state still built)
-                        }
-                        let keep = &tmp[s * channels..e * channels];
-                        let end = (self.pcm_len + keep.len()).min(self.pcm_buf.len());
-                        let take = end - self.pcm_len;
-                        self.pcm_buf[self.pcm_len..end].copy_from_slice(&keep[..take]);
-                        self.pcm_len = end;
-                    }
+            // One decoded frame's worth of interleaved PCM, gain already applied
+            // by the core. Reused across the packet's frames. The disjoint field
+            // borrows (`self.core` vs `self.packet_buf` the `frames` slices
+            // borrow vs `self.granule_pos`/`self.pcm_buf`) let the core call and
+            // the trim/copy stay inline in this loop.
+            let mut scratch = [0i32; MAX_FRAME_SAMPLES];
+            for &frame in frames.iter().take(count) {
+                let (s, e) =
+                    trim_frame(&mut self.granule_pos, self.skip_to, page_granule, frame_pch);
+                if frame.is_empty() {
+                    // DTX / lost frame: conceal as silence for its nominal span
+                    // (the core is NOT invoked, so its transition state is left
+                    // untouched across the gap — the documented minimal PLC).
+                    emit_silence(
+                        &mut self.pcm_buf,
+                        &mut self.pcm_len,
+                        e.saturating_sub(s) * channels,
+                    );
+                    continue;
                 }
-                // SILK-only, mono or stereo. A mono packet in a stereo-header
-                // stream is upmixed (duplicated L=R) by the SILK decoder; a
-                // stereo packet decodes mid/side → L/R (libopus `silk_Decode`).
-                Mode::SilkOnly => {
-                    // Up to 60 ms (three 20 ms SILK frames) of 48 kHz PCM, ×2 for
-                    // a stereo stream.
-                    let mut silk_out = [0i32; 3 * SILK_FRAME_N * 2];
-                    for &frame in frames.iter().take(count) {
-                        let (s, e) = trim_frame(
-                            &mut self.granule_pos,
-                            self.skip_to,
-                            page_granule,
-                            frame_pch,
-                        );
-                        if frame.is_empty() {
-                            emit_silence(
-                                &mut self.pcm_buf,
-                                &mut self.pcm_len,
-                                e.saturating_sub(s) * channels,
-                            );
-                            continue;
-                        }
-                        let mut rd = RangeDecoder::new(frame);
-                        let produced = match self.silk.decode_packet(
-                            &mut rd,
-                            config,
-                            channels,
-                            &mut silk_out,
-                            output_gain,
-                        ) {
-                            Ok(v) => v,
-                            Err(_) => {
-                                emit_silence(
-                                    &mut self.pcm_buf,
-                                    &mut self.pcm_len,
-                                    e.saturating_sub(s) * channels,
-                                ); // PLC: conceal
-                                continue;
-                            }
-                        };
-                        // `produced` is interleaved (channels per sample); trim in
-                        // per-channel units, then copy the interleaved sub-range.
-                        let e = e.min(produced / channels);
-                        if e <= s {
-                            continue;
-                        }
-                        let keep = &silk_out[s * channels..e * channels];
-                        let end = (self.pcm_len + keep.len()).min(self.pcm_buf.len());
-                        let take = end - self.pcm_len;
-                        self.pcm_buf[self.pcm_len..end].copy_from_slice(&keep[..take]);
-                        self.pcm_len = end;
-                    }
+                // Decode the full frame through the shared core (transitions +
+                // redundancy handled inside), applying the OpusHead output gain,
+                // then keep only the `[s, e)` per-channel sub-range.
+                let produced = self
+                    .core
+                    .decode_frame(frame, config, output_gain, &mut scratch);
+                let e = e.min(produced / channels);
+                if e <= s {
+                    continue; // wholly pre-skipped / trimmed (state still built)
                 }
-                // Hybrid (mono or stereo): SILK low band (0–8 kHz) + CELT high
-                // band, both from the SAME range coder, summed per interleaved
-                // sample (libopus `opus_decode_frame`). Channel-generic: SILK and
-                // CELT each emit `channels` interleaved 48 kHz channels (a mono
-                // packet in a stereo stream is upmixed by both), sized for two.
-                Mode::Hybrid => {
-                    let mut silk_out = [0i32; SILK_FRAME_N * 2];
-                    let mut celt_sig = [0f32; MAX_FRAME_N * 2];
-                    for &frame in frames.iter().take(count) {
-                        let (s, e) = trim_frame(
-                            &mut self.granule_pos,
-                            self.skip_to,
-                            page_granule,
-                            frame_pch,
-                        );
-                        if frame.is_empty() {
-                            emit_silence(
-                                &mut self.pcm_buf,
-                                &mut self.pcm_len,
-                                e.saturating_sub(s) * channels,
-                            );
-                            continue;
-                        }
-                        let mut rd = RangeDecoder::new(frame);
-                        // (1) SILK low band (WB, 16 kHz internal → 48 kHz) as raw
-                        // int16 (gain 1.0): the OpusHead gain is applied to the
-                        // SILK+CELT sum below, matching libopus's ordering.
-                        let silk_n = match self.silk.decode_packet(
-                            &mut rd,
-                            config,
-                            channels,
-                            &mut silk_out,
-                            1.0,
-                        ) {
-                            Ok(v) => v / channels,
-                            Err(_) => {
-                                emit_silence(
-                                    &mut self.pcm_buf,
-                                    &mut self.pcm_len,
-                                    e.saturating_sub(s) * channels,
-                                ); // PLC: conceal
-                                continue;
-                            }
-                        };
-                        // (2) Redundancy flag: libopus reads one bit between SILK
-                        // and CELT whenever `ec_tell + 17 + 20 <= 8*len`, so read
-                        // it under the identical gate to keep the coder aligned
-                        // for CELT. A steady hybrid stream always clears it;
-                        // mid-stream CELT redundancy is a codec-transition concern
-                        // (deferred).
-                        let redundancy =
-                            rd.tell() + 37 <= 8 * frame.len() as u32 && rd.decode_bit_logp(12) != 0;
-                        if redundancy {
-                            // Transition frame (deferred): emit the SILK low band
-                            // alone rather than desync on the redundant CELT data.
-                            let e = e.min(silk_n);
-                            if e > s {
-                                let keep = &silk_out[s * channels..e * channels];
-                                let end = (self.pcm_len + keep.len()).min(self.pcm_buf.len());
-                                let take = end - self.pcm_len;
-                                self.pcm_buf[self.pcm_len..end].copy_from_slice(&keep[..take]);
-                                self.pcm_len = end;
-                            }
-                            continue;
-                        }
-                        // (3) CELT high band (start band 17) from the same coder,
-                        // as a raw ±32768-domain interleaved signal.
-                        let celt_n = self.celt.decode_hybrid_high(
-                            &mut rd,
-                            frame.len(),
-                            config,
-                            &mut celt_sig,
-                        ) / channels;
-                        // (4) Align + sum the two 48 kHz bands per interleaved
-                        // sample, apply output gain, round/clamp to i16 (libopus
-                        // float2int16 of the combined signal). SILK and CELT emit
-                        // the same per-channel count, so the sum is index-aligned.
-                        let e = e.min(silk_n).min(celt_n);
-                        for i in s * channels..e * channels {
-                            if self.pcm_len >= self.pcm_buf.len() {
-                                break;
-                            }
-                            let combined = (celt_sig[i] + silk_out[i] as f32) * output_gain;
-                            let r = if combined >= 0.0 {
-                                (combined + 0.5) as i32
-                            } else {
-                                (combined - 0.5) as i32
-                            };
-                            self.pcm_buf[self.pcm_len] = r.clamp(-32768, 32767);
-                            self.pcm_len += 1;
-                        }
-                    }
-                }
+                let keep = &scratch[s * channels..e * channels];
+                let end = (self.pcm_len + keep.len()).min(self.pcm_buf.len());
+                let take = end - self.pcm_len;
+                self.pcm_buf[self.pcm_len..end].copy_from_slice(&keep[..take]);
+                self.pcm_len = end;
             }
             if self.pcm_len > 0 {
                 return Ok(());
@@ -455,18 +315,19 @@ impl<S: Source> OpusDecoder<S> {
 
     /// Reset every per-decode field to the pristine post-[`Self::new`] values
     /// so decoding can resume cleanly at a new Ogg position
-    /// ([`SeekableDecoder::seek_to`]). Rebuilds the CELT and SILK engines from
-    /// scratch (a fresh `new`), dropping every overlap / energy-history /
-    /// filter-memory / resampler-delay-line carry so no stale tail bleeds into
-    /// the first post-seek frame; drops any staged-but-undelivered PCM; and
+    /// ([`SeekableDecoder::seek_to`]). Rebuilds the whole [`OpusFrameDecoder`]
+    /// core from scratch (a fresh `new`), dropping every CELT/SILK overlap /
+    /// energy-history / filter-memory / resampler-delay-line carry **and** the
+    /// mode-transition state (`prev_mode = None`, `prev_redundancy = false`,
+    /// `final_range = 0`) so no stale tail — or stale transition context — bleeds
+    /// into the first post-seek frame; drops any staged-but-undelivered PCM; and
     /// re-baselines the pre-skip counters. The caller (`seek_to`) then sets
     /// [`Self::granule_pos`] / [`Self::skip_to`] to the landed position — this
     /// leaves them at the stream-start defaults, correct as-is for the
     /// seek-to-0 path.
     fn reset_decode_state(&mut self) {
         let channels = usize::from(self.stream_info.channels).clamp(1, 2);
-        self.celt = CeltDecoder::new(channels);
-        self.silk = SilkDecoder::new();
+        self.core = OpusFrameDecoder::new(channels);
         self.pcm_pos = 0;
         self.pcm_len = 0;
         self.granule_pos = 0;
@@ -774,10 +635,10 @@ mod tests {
     fn stereo_header_mono_hybrid_packet_decodes_without_panicking() {
         // RFC 6716 §3.1: the packet's `config.stereo` s-bit is independent of
         // the container's `OpusHead` channel count — a stereo stream may
-        // legally carry a mono hybrid packet. Task 13b decodes such a packet
-        // (mono SILK/CELT upmixed to the stereo output), rather than skipping
-        // it as the Task-12 stopgap did; the hybrid scratch buffers are now
-        // sized for two channels, so the interleaved write is in bounds. This
+        // legally carry a mono hybrid packet. Such a packet decodes through the
+        // shared `OpusFrameDecoder` core (mono SILK/CELT upmixed to the stereo
+        // output); `fill_packet`'s per-frame scratch is sized for two channels
+        // (`MAX_FRAME_SAMPLES`), so the interleaved write is in bounds. This
         // exercises that path end-to-end with an (arbitrary) short payload and
         // asserts only that it does not panic and yields a bounded, in-range
         // result — the garbage frame's exact samples are unspecified.
