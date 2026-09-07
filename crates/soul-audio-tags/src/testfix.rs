@@ -51,6 +51,71 @@ pub(crate) fn apic(mime: &str, ptype: u8, data: &[u8]) -> Vec<u8> {
     b
 }
 
+/// Standard-alphabet base64 encode (with `=` padding) — the inverse of the
+/// crate's `base64::decode_into`, for building `METADATA_BLOCK_PICTURE` test
+/// values.
+pub(crate) fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(ALPHABET[(n >> 18 & 0x3F) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6 & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Build a FLAC PICTURE metadata block (big-endian `type · mime_len · mime ·
+/// desc_len · desc · width · height · depth · colors · data_len · data`),
+/// with an empty description and fixed depth/colors.
+pub(crate) fn flac_picture_block(
+    pic_type: u32,
+    mime: &[u8],
+    width: u32,
+    height: u32,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&pic_type.to_be_bytes());
+    b.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+    b.extend_from_slice(mime);
+    b.extend_from_slice(&0u32.to_be_bytes()); // desc len (empty description)
+    b.extend_from_slice(&width.to_be_bytes());
+    b.extend_from_slice(&height.to_be_bytes());
+    b.extend_from_slice(&24u32.to_be_bytes()); // color depth
+    b.extend_from_slice(&0u32.to_be_bytes()); // indexed-color count
+    b.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    b.extend_from_slice(data);
+    b
+}
+
+/// A `METADATA_BLOCK_PICTURE=<base64 of a FLAC PICTURE block>` Vorbis comment
+/// — the embedded-cover-art form Ogg (Opus/Vorbis) uses.
+pub(crate) fn metadata_block_picture(
+    pic_type: u32,
+    mime: &[u8],
+    width: u32,
+    height: u32,
+    data: &[u8],
+) -> String {
+    let block = flac_picture_block(pic_type, mime, width, height, data);
+    let mut s = String::from("METADATA_BLOCK_PICTURE=");
+    s.push_str(&base64_encode(&block));
+    s
+}
+
 /// Wrap `frames` in a minimal ID3v2.3 tag header (no flags, synchsafe size).
 pub(crate) fn id3v23(frames: &[Vec<u8>]) -> Vec<u8> {
     let mut body = Vec::new();

@@ -339,6 +339,158 @@ pub fn read_ogg<S: SeekSource>(
     Ok(facts)
 }
 
+/// Longest `METADATA_BLOCK_PICTURE` base64 value we'll materialize, ~4/3 of the
+/// ~40 MB decoded cover-art cap the service enforces — a defensive bound so a
+/// hostile comment can't force an unbounded allocation (`data_len` may be 0 for
+/// an Ogg picture, so the caller's `data_len` check can't be relied on).
+#[cfg(feature = "alloc")]
+const MAX_PICTURE_B64: usize = 56 * 1024 * 1024;
+
+/// The `METADATA_BLOCK_PICTURE` key with its `=` separator; a comment matches
+/// iff its first [`KEY_EQ`]`.len()` bytes equal this (case-insensitive key,
+/// exact `=`).
+#[cfg(feature = "alloc")]
+const KEY_EQ: &[u8] = b"METADATA_BLOCK_PICTURE=";
+
+/// Walk a Vorbis comment vector streamed from `packet`, returning the raw
+/// base64 **value** (no key, no `=`) of the `ordinal`-th
+/// `METADATA_BLOCK_PICTURE` comment. Non-target comments are discarded, not
+/// buffered; only the target's value is allocated. Errors
+/// [`TagError::Malformed`] if the ordinal isn't found or the target value
+/// exceeds [`MAX_PICTURE_B64`].
+#[cfg(feature = "alloc")]
+fn nth_picture_value<R: embedded_io::Read>(
+    packet: &mut R,
+    ordinal: u64,
+) -> Result<alloc::vec::Vec<u8>, TagError> {
+    let mut u32buf = [0u8; 4];
+
+    read_exact(packet, &mut u32buf)?;
+    let vendor_len = u32::from_le_bytes(u32buf) as usize;
+    discard(packet, vendor_len)?;
+
+    read_exact(packet, &mut u32buf)?;
+    let count = u32::from_le_bytes(u32buf);
+
+    let mut seen = 0u64;
+    for _ in 0..count {
+        read_exact(packet, &mut u32buf)?;
+        let comment_len = u32::from_le_bytes(u32buf) as usize;
+
+        // Probe just the leading key bytes to classify the comment without
+        // buffering its (possibly huge) value.
+        let probe_len = comment_len.min(KEY_EQ.len());
+        let mut probe = [0u8; KEY_EQ.len()];
+        read_exact(packet, &mut probe[..probe_len])?;
+        let is_pic = probe_len == KEY_EQ.len() && probe[..probe_len].eq_ignore_ascii_case(KEY_EQ);
+        let rest = comment_len - probe_len;
+
+        if is_pic {
+            if seen == ordinal {
+                if rest > MAX_PICTURE_B64 {
+                    return Err(TagError::Malformed);
+                }
+                let mut value = alloc::vec![0u8; rest];
+                read_exact(packet, &mut value)?;
+                return Ok(value);
+            }
+            seen += 1;
+        }
+        discard(packet, rest)?;
+    }
+    Err(TagError::Malformed)
+}
+
+/// Extract the image `data` bytes from an in-memory FLAC PICTURE `block`
+/// (big-endian `type · mime_len · mime · desc_len · desc · width · height ·
+/// depth · colors · data_len · data`). Every field is bounds-checked; a block
+/// truncated before its declared `data` end is [`TagError::Malformed`] rather
+/// than a panic. Reuses `block`'s allocation (drains the header, truncates to
+/// `data_len`) instead of copying the image again.
+#[cfg(feature = "alloc")]
+fn extract_picture_data(mut block: alloc::vec::Vec<u8>) -> Result<alloc::vec::Vec<u8>, TagError> {
+    fn be32(b: &[u8], pos: usize) -> Result<u32, TagError> {
+        let end = pos.checked_add(4).ok_or(TagError::Malformed)?;
+        b.get(pos..end)
+            .map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+            .ok_or(TagError::Malformed)
+    }
+
+    let mut pos = 0usize; // type
+    pos = pos.checked_add(4).ok_or(TagError::Malformed)?;
+    let mime_len = be32(&block, pos)? as usize;
+    pos = pos
+        .checked_add(4)
+        .and_then(|p| p.checked_add(mime_len))
+        .ok_or(TagError::Malformed)?;
+    let desc_len = be32(&block, pos)? as usize;
+    pos = pos
+        .checked_add(4)
+        .and_then(|p| p.checked_add(desc_len))
+        .ok_or(TagError::Malformed)?;
+    // width, height, depth, colors (4 × u32), then data_len.
+    pos = pos.checked_add(16).ok_or(TagError::Malformed)?;
+    let data_len = be32(&block, pos)? as usize;
+    pos = pos.checked_add(4).ok_or(TagError::Malformed)?;
+
+    let end = pos.checked_add(data_len).ok_or(TagError::Malformed)?;
+    if end > block.len() {
+        return Err(TagError::Malformed);
+    }
+    block.truncate(end);
+    block.drain(..pos);
+    Ok(block)
+}
+
+/// Re-walk an Ogg (Opus or Vorbis) stream from the start and materialize the
+/// `ordinal`-th `METADATA_BLOCK_PICTURE` cover image: find the comment,
+/// base64-decode its full value (reassembled across pages by [`PacketReader`]),
+/// and return the FLAC PICTURE block's image `data` bytes.
+///
+/// This is the alloc/std consumer for a [`crate::Picture`] whose `encoding` is
+/// [`crate::DataEncoding::Base64`] — the descriptor the no-alloc scan path
+/// emits, with the picture ordinal stashed in its `data_offset`. Allocation is
+/// fine here (desktop only); the no-alloc scan path stays untouched.
+#[cfg(feature = "alloc")]
+pub(crate) fn read_ogg_picture<S: SeekSource>(
+    src: &mut S,
+    ordinal: u64,
+) -> Result<alloc::vec::Vec<u8>, TagError> {
+    src.seek(SeekFrom::Start(0)).map_err(|_| TagError::Io)?;
+    let mut walker = PageWalker::new(src);
+
+    // Packet 1: codec identification header — used only to pick the comment
+    // header's magic (its bytes are otherwise ignored here).
+    let mut id_buf = [0u8; 32];
+    let id_len = walker.read_packet(&mut id_buf)?;
+    let id = &id_buf[..id_len];
+    let magic: &[u8] = if id.starts_with(b"OpusHead") {
+        b"OpusTags"
+    } else if id.starts_with(b"\x01vorbis") {
+        b"\x03vorbis"
+    } else {
+        return Err(TagError::Unsupported);
+    };
+
+    // Packet 2: comment header — verify magic, then walk the comment vector.
+    let mut packet = PacketReader::new(&mut walker);
+    let mut magic_buf = [0u8; 8];
+    read_exact(&mut packet, &mut magic_buf[..magic.len()])?;
+    if &magic_buf[..magic.len()] != magic {
+        return Err(TagError::Malformed);
+    }
+
+    let value = nth_picture_value(&mut packet, ordinal)?;
+
+    // Decode the full base64 value into the FLAC PICTURE block, then hand back
+    // just its image bytes.
+    let out_cap = value.len() / 4 * 3;
+    let mut decoded = alloc::vec![0u8; out_cap];
+    let n = crate::base64::decode_into(&value, &mut decoded).map_err(|_| TagError::Malformed)?;
+    decoded.truncate(n);
+    extract_picture_data(decoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -769,5 +921,112 @@ mod tests {
 
         assert_eq!(facts.sample_rate, Some(44_100));
         assert_eq!(facts.total_frames, Some(granule));
+    }
+
+    /// Build an Ogg page with an *explicit* lacing table and body (unlike
+    /// [`ogg_page`], which derives lacing from the body length) — needed to
+    /// split one packet across two pages for the cross-page reassembly test.
+    #[cfg(feature = "alloc")]
+    fn raw_page(header_type: u8, serial: u32, seq: u32, lacing: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"OggS");
+        v.push(0);
+        v.push(header_type);
+        v.extend_from_slice(&0u64.to_le_bytes());
+        v.extend_from_slice(&serial.to_le_bytes());
+        v.extend_from_slice(&seq.to_le_bytes());
+        v.extend_from_slice(&[0, 0, 0, 0]);
+        v.push(lacing.len() as u8);
+        v.extend_from_slice(lacing);
+        v.extend_from_slice(body);
+        v
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn opus_embedded_picture_round_trips() {
+        let png = b"\x89PNG\r\n\x1a\nopus-cover-bytes";
+        let comment = crate::testfix::metadata_block_picture(3, b"image/png", 1, 1, png);
+        let mut bytes = Vec::new();
+        bytes.extend(ogg_page(0x02, 0, 1, 0, &opus_head(48_000, 2)));
+        bytes.extend(ogg_page(0x00, 0, 1, 1, &opus_tags(&["TITLE=x", &comment])));
+
+        let mut src = SliceSource::new(&bytes);
+        let got = read_ogg_picture(&mut src, 0).unwrap();
+        assert_eq!(got, png);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn vorbis_embedded_picture_round_trips() {
+        // The same code path drives Vorbis-in-Ogg, not just Opus.
+        let png = b"\x89PNG\r\n\x1a\nvorbis-cover";
+        let comment = crate::testfix::metadata_block_picture(3, b"image/png", 1, 1, png);
+        let mut bytes = Vec::new();
+        bytes.extend(ogg_page(0x02, 0, 7, 0, &vorbis_id_header(44_100, 2)));
+        bytes.extend(ogg_page(0x00, 0, 7, 1, &vorbis_comment_header(&[&comment])));
+
+        let mut src = SliceSource::new(&bytes);
+        let got = read_ogg_picture(&mut src, 0).unwrap();
+        assert_eq!(got, png);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn read_ogg_picture_selects_by_ordinal() {
+        let png0 = b"first-image-000";
+        let png1 = b"second-image-11";
+        let c0 = crate::testfix::metadata_block_picture(3, b"image/png", 1, 1, png0);
+        let c1 = crate::testfix::metadata_block_picture(4, b"image/jpeg", 2, 2, png1);
+        let mut bytes = Vec::new();
+        bytes.extend(ogg_page(0x02, 0, 3, 0, &opus_head(48_000, 2)));
+        bytes.extend(ogg_page(0x00, 0, 3, 1, &opus_tags(&[&c0, "TITLE=x", &c1])));
+
+        let mut src = SliceSource::new(&bytes);
+        assert_eq!(read_ogg_picture(&mut src, 0).unwrap(), png0);
+        // read_ogg_picture re-seeks to 0 itself, so the same src serves again.
+        assert_eq!(read_ogg_picture(&mut src, 1).unwrap(), png1);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn read_ogg_picture_reassembles_value_across_a_page_boundary() {
+        // A cover big enough that the OpusTags packet spans two pages — the
+        // classic Ogg paging trap. The PacketReader must stitch it back.
+        let png: Vec<u8> = (0..600u32).map(|i| i as u8).collect();
+        let comment = crate::testfix::metadata_block_picture(3, b"image/png", 4, 4, &png);
+        let tags = opus_tags(&[&comment]);
+
+        let full = lacing_for(tags.len());
+        assert!(
+            full.len() >= 2 && full[0] == 255,
+            "test needs a multi-segment packet"
+        );
+        // Page A carries the first (continuation) 255-byte segment, page B the
+        // remaining lacing/body — a genuine cross-page packet.
+        let a_bytes = 255usize;
+        let mut bytes = Vec::new();
+        bytes.extend(ogg_page(0x02, 0, 9, 0, &opus_head(48_000, 2)));
+        bytes.extend(raw_page(0x00, 9, 1, &full[..1], &tags[..a_bytes]));
+        bytes.extend(raw_page(0x00, 9, 2, &full[1..], &tags[a_bytes..]));
+
+        let mut src = SliceSource::new(&bytes);
+        let got = read_ogg_picture(&mut src, 0).unwrap();
+        assert_eq!(got, png);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn read_ogg_picture_missing_ordinal_is_malformed() {
+        let comment = crate::testfix::metadata_block_picture(3, b"image/png", 1, 1, b"img0");
+        let mut bytes = Vec::new();
+        bytes.extend(ogg_page(0x02, 0, 4, 0, &opus_head(48_000, 2)));
+        bytes.extend(ogg_page(0x00, 0, 4, 1, &opus_tags(&[&comment])));
+
+        let mut src = SliceSource::new(&bytes);
+        assert_eq!(
+            read_ogg_picture(&mut src, 1).unwrap_err(),
+            TagError::Malformed
+        );
     }
 }

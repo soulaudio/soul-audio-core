@@ -99,28 +99,25 @@ pub fn read_owned<S: SeekSource>(src: &mut S) -> Result<(Tags, StreamFacts), Tag
     Ok((sink.tags, facts))
 }
 
-/// Materialize the bytes a [`Picture`] describes: seeks to `p.data_offset`
-/// and reads exactly `p.data_len` bytes.
+/// Materialize the bytes a [`Picture`] describes.
 ///
-/// Only [`DataEncoding::Raw`] is implemented — every reader in this crate
-/// (FLAC `PICTURE`, ID3v2 `APIC`, MP4 `covr`) currently emits raw picture
-/// data. Ogg's `METADATA_BLOCK_PICTURE` comment value is base64-encoded
-/// ([`DataEncoding::Base64`]); decoding it is a paired follow-up (a producer
-/// in `ogg.rs` that emits a `Base64` [`Picture`], plus a
-/// [`crate::decode_into`]-based consumer here) — no reader emits one yet, so
-/// that path is intentionally left unimplemented (YAGNI).
+/// - [`DataEncoding::Raw`] (FLAC `PICTURE`, ID3v2 `APIC`, MP4 `covr`): seek to
+///   `p.data_offset` and read exactly `p.data_len` bytes.
+/// - [`DataEncoding::Base64`] (Ogg `METADATA_BLOCK_PICTURE`): `p.data_offset`
+///   is the picture *ordinal*, not a byte offset — re-walk the Ogg stream,
+///   base64-decode the Nth picture comment (reassembled across pages), and
+///   return the embedded FLAC PICTURE block's image bytes.
 pub fn read_picture_bytes<S: SeekSource>(src: &mut S, p: &Picture) -> Result<Vec<u8>, TagError> {
-    if p.encoding != DataEncoding::Raw {
-        // TODO: Ogg embedded-picture (METADATA_BLOCK_PICTURE) support: a
-        // producer in ogg.rs emitting DataEncoding::Base64, paired with a
-        // base64::decode_into-based consumer here.
-        return Err(TagError::Unsupported);
+    match p.encoding {
+        DataEncoding::Raw => {
+            src.seek(SeekFrom::Start(p.data_offset))
+                .map_err(|_| TagError::Io)?;
+            let mut buf = alloc::vec![0u8; p.data_len as usize];
+            read_exact(src, &mut buf)?;
+            Ok(buf)
+        }
+        DataEncoding::Base64 => crate::ogg::read_ogg_picture(src, p.data_offset),
     }
-    src.seek(SeekFrom::Start(p.data_offset))
-        .map_err(|_| TagError::Io)?;
-    let mut buf = alloc::vec![0u8; p.data_len as usize];
-    read_exact(src, &mut buf)?;
-    Ok(buf)
 }
 
 #[cfg(test)]
@@ -229,5 +226,49 @@ mod tests {
         let (tags, _facts) = read_owned(&mut src).unwrap();
 
         assert_eq!(tags.artist.as_deref(), Some("Jiro Inagaki"));
+    }
+
+    /// End-to-end acceptance for issue #26: a real `opusenc`-produced Opus file
+    /// carrying a `METADATA_BLOCK_PICTURE` cover must surface a [`Picture`]
+    /// (so `has_art` is true) and hand back the exact embedded image bytes
+    /// through the full public `read_owned` + `read_picture_bytes` path.
+    #[test]
+    fn opus_fixture_with_embedded_art_reports_has_art_and_returns_the_image() {
+        use crate::{MimeType, PictureKind};
+
+        let data = include_bytes!("../testdata/opus-cover.opus");
+
+        let mut src = SliceSource::new(data);
+        let (tags, _facts) = read_owned(&mut src).unwrap();
+
+        // `has_art`: the embedded cover surfaces as a Picture descriptor.
+        assert!(
+            !tags.pictures.is_empty(),
+            "embedded Ogg cover must surface as a Picture (has_art)"
+        );
+        let pic = tags
+            .pictures
+            .iter()
+            .find(|p| matches!(p.usage, PictureKind::FrontCover))
+            .unwrap_or(&tags.pictures[0]);
+        assert_eq!(
+            pic.encoding,
+            DataEncoding::Base64,
+            "Ogg pictures are lazy base64 descriptors"
+        );
+
+        // The bytes round-trip and their leading magic matches the declared MIME.
+        let mut src2 = SliceSource::new(data);
+        let img = read_picture_bytes(&mut src2, pic).unwrap();
+        assert!(!img.is_empty(), "decoded cover image must be non-empty");
+        match pic.mime {
+            MimeType::Png => {
+                assert_eq!(&img[..8], b"\x89PNG\r\n\x1a\n", "PNG magic");
+            }
+            MimeType::Jpeg => {
+                assert_eq!(&img[..3], b"\xFF\xD8\xFF", "JPEG magic");
+            }
+            MimeType::Other => {}
+        }
     }
 }

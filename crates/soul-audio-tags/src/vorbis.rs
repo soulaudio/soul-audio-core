@@ -75,6 +75,11 @@ pub fn read_comment_vector<S: embedded_io::Read>(
     read_exact(src, &mut u32buf)?;
     let count = u32::from_le_bytes(u32buf);
 
+    // 0-based counter of `METADATA_BLOCK_PICTURE` comments seen, stashed in the
+    // emitted descriptor's `data_offset` so the (alloc) consumer can re-walk
+    // the stream and pick out the Nth one to materialize its bytes.
+    let mut pic_ordinal: u32 = 0;
+
     for _ in 0..count {
         charge(&mut budget, 4)?;
         read_exact(src, &mut u32buf)?;
@@ -92,7 +97,22 @@ pub fn read_comment_vector<S: embedded_io::Read>(
         if let Some(eq) = text.find('=') {
             let key = &text[..eq];
             let value = &text[eq + 1..];
-            sink.text(map_vorbis_key(key), key, value);
+            if key.eq_ignore_ascii_case("METADATA_BLOCK_PICTURE") {
+                // A base64 FLAC PICTURE block: emit a descriptor from the
+                // header sitting at the *start* of the (possibly truncated)
+                // value prefix, and — like FLAC's native PICTURE handling —
+                // do NOT also surface it as a text field. The image bytes are
+                // never buffered here; the consumer decodes them on demand.
+                if let Some(pic) = decode_picture_prefix(value.as_bytes(), pic_ordinal) {
+                    sink.picture(&pic);
+                }
+                // Count every picture comment (even one whose prefix was too
+                // short to emit) so later ordinals stay aligned with the
+                // consumer's by-key walk.
+                pic_ordinal = pic_ordinal.saturating_add(1);
+            } else {
+                sink.text(map_vorbis_key(key), key, value);
+            }
         }
         // No `=` found (malformed comment, or it fell in the truncated tail):
         // silently skip it rather than guessing at a key/value split.
@@ -138,6 +158,92 @@ fn picture_kind(pic_type: u32) -> PictureKind {
         8 => PictureKind::Artist,
         _ => PictureKind::Other,
     }
+}
+
+/// Read a big-endian `u32` at `pos` in `buf`, or `None` if the four bytes
+/// aren't fully present (never panics / over-reads on a short prefix).
+fn be_u32(buf: &[u8], pos: usize) -> Option<u32> {
+    let end = pos.checked_add(4)?;
+    let s = buf.get(pos..end)?;
+    Some(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+/// Parse the *header* of a FLAC PICTURE block from a decoded base64 **prefix**
+/// (see [`decode_picture_prefix`]). The prefix may be truncated anywhere, so
+/// every field is read defensively and any field the prefix doesn't reach is
+/// degraded (`width`/`height` = `None`, `data_len` = 0) rather than failing.
+/// `ordinal` is stashed in `data_offset` so the consumer
+/// ([`crate::ogg`]-side) can locate the Nth `METADATA_BLOCK_PICTURE` comment;
+/// `encoding` is always [`DataEncoding::Base64`]. Returns `None` only when the
+/// prefix can't even yield the leading `type` word.
+fn picture_from_prefix(buf: &[u8], ordinal: u32) -> Option<Picture> {
+    let pic_type = be_u32(buf, 0)?;
+    let usage = picture_kind(pic_type);
+
+    // Best-effort defaults if the prefix stops before a later field.
+    let mut mime = MimeType::Other;
+    let mut width = None;
+    let mut height = None;
+    let mut data_len = 0u32;
+
+    // type(4) mime_len(4) mime desc_len(4) desc width(4) height(4) depth(4)
+    // colors(4) data_len(4) — walk it, bailing to the degraded defaults the
+    // moment a field runs past the decoded prefix.
+    'reach: {
+        let Some(mime_len) = be_u32(buf, 4) else {
+            break 'reach;
+        };
+        let mime_start = 8usize;
+        let Some(mime_end) = mime_start.checked_add(mime_len as usize) else {
+            break 'reach;
+        };
+        let Some(mime_bytes) = buf.get(mime_start..mime_end) else {
+            break 'reach;
+        };
+        mime = mime_kind(mime_bytes);
+
+        let Some(desc_len) = be_u32(buf, mime_end) else {
+            break 'reach;
+        };
+        let desc_end = mime_end.checked_add(4);
+        let Some(after_desc) = desc_end.and_then(|p| p.checked_add(desc_len as usize)) else {
+            break 'reach;
+        };
+        // width, height (depth/colors follow but aren't modeled on Picture).
+        width = be_u32(buf, after_desc);
+        height = be_u32(buf, after_desc.checked_add(4)?);
+        // data_len sits after width(4) height(4) depth(4) colors(4).
+        if let Some(dl_pos) = after_desc.checked_add(16) {
+            data_len = be_u32(buf, dl_pos).unwrap_or(0);
+        }
+    }
+
+    Some(Picture {
+        usage,
+        mime,
+        encoding: DataEncoding::Base64,
+        data_offset: u64::from(ordinal),
+        data_len,
+        width,
+        height,
+    })
+}
+
+/// Decode the leading whole base64 groups of a `METADATA_BLOCK_PICTURE` value
+/// into a fixed **stack** buffer (no alloc — this runs on the no-alloc scan
+/// path), then parse the FLAC PICTURE header out of the decoded prefix. Only
+/// as many leading groups as fit the stack buffer are decoded, which is far
+/// more than enough to reach the header fields (they sit at the very start of
+/// the block, before the image bytes). Returns `None` on invalid base64 or a
+/// prefix too short to yield even the `type` word.
+fn decode_picture_prefix(value: &[u8], ordinal: u32) -> Option<Picture> {
+    let mut hdr = [0u8; 512];
+    // Cap the input to the whole base64 groups whose output fits `hdr`.
+    let max_in = (hdr.len() / 3) * 4;
+    let usable = value.len() - (value.len() % 4);
+    let take = usable.min(max_in);
+    let n = crate::base64::decode_into(value.get(..take)?, &mut hdr).ok()?;
+    picture_from_prefix(&hdr[..n], ordinal)
 }
 
 /// Read a PICTURE block body: `u32 type, u32 mime_len, mime, u32 desc_len,
@@ -365,5 +471,115 @@ mod tests {
         assert_eq!(p.width, Some(1));
         // data_offset points at the 4 jpeg bytes:
         assert_eq!(&bytes[p.data_offset as usize..][..4], b"\xFF\xD8\xFF\xEE");
+    }
+
+    /// Build a bare Vorbis comment *body* (vendor + count + comments) — the
+    /// input `read_comment_vector` parses, without any container framing.
+    fn comment_body(comments: &[&str]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&6u32.to_le_bytes());
+        v.extend_from_slice(b"vendor");
+        v.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+        for c in comments {
+            v.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            v.extend_from_slice(c.as_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn metadata_block_picture_emits_base64_descriptor_not_text() {
+        // A full, untruncated value: the prefix reaches every header field.
+        let png = b"\x89PNG\r\n\x1a\ntiny-image-bytes";
+        let comment = crate::testfix::metadata_block_picture(3, b"image/png", 1, 1, png);
+        let body = comment_body(&["TITLE=Song", &comment]);
+
+        let mut src = SliceSource::new(&body);
+        let mut scratch = [0u8; 512];
+        let mut c = Collect::default();
+        read_comment_vector(&mut src, body.len() as u32, &mut scratch, &mut c).unwrap();
+
+        assert_eq!(c.pics.len(), 1);
+        let p = c.pics[0];
+        assert_eq!(p.usage, PictureKind::FrontCover);
+        assert_eq!(p.mime, MimeType::Png);
+        assert_eq!(p.encoding, DataEncoding::Base64);
+        assert_eq!(p.data_offset, 0); // ordinal 0
+        assert_eq!(p.data_len, png.len() as u32);
+        assert_eq!(p.width, Some(1));
+        assert_eq!(p.height, Some(1));
+
+        // The picture comment must NOT also surface as a text field...
+        assert!(
+            !c.fields
+                .iter()
+                .any(|(_, k, _)| k.eq_ignore_ascii_case("METADATA_BLOCK_PICTURE"))
+        );
+        // ...but ordinary fields around it still do.
+        assert!(c.fields.iter().any(|(_, k, v)| k == "TITLE" && v == "Song"));
+    }
+
+    #[test]
+    fn metadata_block_picture_second_picture_gets_ordinal_one() {
+        let a = crate::testfix::metadata_block_picture(3, b"image/png", 1, 1, b"aaaa");
+        let b = crate::testfix::metadata_block_picture(4, b"image/jpeg", 2, 2, b"bbbb");
+        let body = comment_body(&[&a, "TITLE=x", &b]);
+
+        let mut src = SliceSource::new(&body);
+        let mut scratch = [0u8; 512];
+        let mut c = Collect::default();
+        read_comment_vector(&mut src, body.len() as u32, &mut scratch, &mut c).unwrap();
+
+        assert_eq!(c.pics.len(), 2);
+        assert_eq!(c.pics[0].data_offset, 0);
+        assert_eq!(c.pics[0].usage, PictureKind::FrontCover);
+        assert_eq!(c.pics[1].data_offset, 1);
+        assert_eq!(c.pics[1].usage, PictureKind::BackCover);
+        assert_eq!(c.pics[1].mime, MimeType::Jpeg);
+    }
+
+    #[test]
+    fn metadata_block_picture_truncated_prefix_degrades_gracefully() {
+        // A scratch too small to reach width/data_len: the descriptor still
+        // carries the leading fields (usage) and degrades the rest.
+        let png = [0u8; 64];
+        let comment = crate::testfix::metadata_block_picture(3, b"image/png", 7, 7, &png);
+        let body = comment_body(&[&comment]);
+
+        let mut src = SliceSource::new(&body);
+        let mut scratch = [0u8; 40]; // < the ~30-byte header prefix + key
+        let mut c = Collect::default();
+        read_comment_vector(&mut src, body.len() as u32, &mut scratch, &mut c).unwrap();
+
+        assert_eq!(c.pics.len(), 1);
+        let p = c.pics[0];
+        assert_eq!(p.usage, PictureKind::FrontCover);
+        assert_eq!(p.encoding, DataEncoding::Base64);
+        assert_eq!(p.width, None);
+        assert_eq!(p.height, None);
+        assert_eq!(p.data_len, 0);
+    }
+
+    #[test]
+    fn metadata_block_picture_malformed_base64_emits_no_picture() {
+        // Invalid base64 characters: decode fails, no picture, no panic.
+        let body = comment_body(&["METADATA_BLOCK_PICTURE=****not valid base64****"]);
+        let mut src = SliceSource::new(&body);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        read_comment_vector(&mut src, body.len() as u32, &mut scratch, &mut c).unwrap();
+        assert!(c.pics.is_empty());
+        assert!(c.fields.is_empty());
+    }
+
+    #[test]
+    fn metadata_block_picture_too_short_to_reach_type_emits_no_picture() {
+        // "AA==" decodes to a single byte — not enough for the 4-byte type.
+        let body = comment_body(&["METADATA_BLOCK_PICTURE=AA=="]);
+        let mut src = SliceSource::new(&body);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        read_comment_vector(&mut src, body.len() as u32, &mut scratch, &mut c).unwrap();
+        assert!(c.pics.is_empty());
     }
 }
