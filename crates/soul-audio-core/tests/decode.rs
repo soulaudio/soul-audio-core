@@ -1230,6 +1230,50 @@ fn open_decodes_opus_celt_stereo_matching_ffmpeg() {
 }
 
 // ---------------------------------------------------------------------------
+// Opus non-zero OpusHead output-gain golden (issue #40). `tone-gain.opus` is
+// `tone.opus` with its `OpusHead` `output_gain` field edited to +5.0 dB
+// (Q7.8 = 1280 = 0x0500, LE at OpusHead byte offset 16-17) and the BOS Ogg page
+// CRC recomputed — the ONLY non-zero-output-gain fixture in the suite, so this
+// is the sole test that exercises the decoder's gain-application path (the
+// common `gain == 0` short-circuit is a plain 1.0 pass-through). +5 dB is a
+// deliberate, non-clipping choice: `tone.opus`'s peak sits at -5.95 dBFS, so the
+// task's example +6 dB would push the peak past full-scale and clip, and the
+// clip-saturation boundary — where our float `round_clip` to i16::MIN and
+// libopus's `SATURATE(x, 32767)` differ by ≤1 LSB, and the two decoders happen
+// to saturate a slightly different sample count — would confound the gain
+// comparison with a saturation artifact rather than measuring the gain itself.
+// At +5 dB the whole stream stays in range (peak -0.95 dBFS).
+//
+// libopus applies the gain as `celt_exp2(6.48814081e-4 · decode_gain)` to the
+// float PCM before `float2int16` (`opus_decoder.c`); our decoder applies the
+// byte-identical FLOAT-build form (`celt/mathops.h`'s cubic `celt_exp2`) at the
+// same point. The reference is ffmpeg's own decode of the SAME edited stream
+// (`tone-gain.ref.pcm`, s16le) — like every other Opus golden here — so a
+// spec-correct gain tracks it tightly. Measured segmental SNR ≈ 77.9 dB at a
+// 0-frame offset (validated against a from-scratch libopus v1.5.2 FLOAT `gcc`
+// oracle driving `opus_decode` with `OPUS_SET_GAIN`: our-vs-oracle is the SAME
+// ≈ 77.9 dB, and ffmpeg-native-vs-oracle is ≈ 115 dB — the two references agree,
+// so the residual is the pre-existing CELT audio-quality approximation amplified
+// by the gain, not a gain error). The 60 dB bar (matching the CELT golden above)
+// far exceeds the ≈ 7 dB a *missing* or grossly-wrong gain would score, so this
+// cleanly guards the gain path from a decode regression.
+#[test]
+fn open_decodes_opus_with_nonzero_output_gain_matching_ffmpeg() {
+    let opus = include_bytes!("../testdata/tone-gain.opus");
+    let refr = load_s16le(include_bytes!("../testdata/tone-gain.ref.pcm"));
+    let dec = open(SliceSource::new(opus)).expect("probe + construct Opus");
+    assert_eq!(dec.stream_info().sample_rate, 48_000);
+    assert_eq!(dec.stream_info().channels, 2);
+    let ours = decode_all(opus);
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 60.0,
+        "Opus non-zero output-gain decode SNR vs ffmpeg too low: {snr:.1} dB \
+         (offset {off} frames) — the OpusHead output gain is likely mis-applied"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Opus SILK conformance vs ffmpeg (Task 11 — the SILK milestone: LTP+LPC
 // synthesis → stereo unmix (mono here) → resampler → 48 kHz PCM). Unlike the
 // CELT golden, ffmpeg's native Opus decoder resamples SILK's internal rate

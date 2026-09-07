@@ -35,21 +35,36 @@ use soul_audio_core::formats::opus::conformance::ConformanceDecoder;
 // Raw `.bit` decode
 // ---------------------------------------------------------------------------
 
-/// Split an `opus_demo` `.bit` stream into its raw Opus packets (dropping the
-/// per-packet length + `enc_final_range` prefixes).
-fn bit_packets(data: &[u8]) -> Vec<&[u8]> {
+/// Split an `opus_demo` `.bit` stream into `(packet, enc_final_range)` pairs.
+/// The per-packet framing is `[4-byte BE length][4-byte BE enc_final_range]
+/// [packet]`; `enc_final_range` is the encoder's range-coder final state
+/// (libopus `st->rangeFinal`) after that packet — the value `opus_demo` checks
+/// the decoder's `OPUS_GET_FINAL_RANGE` against. A truncated trailing packet
+/// (as in the committed prefixes) is dropped.
+fn bit_packets_with_range(data: &[u8]) -> Vec<(&[u8], u32)> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i + 8 <= data.len() {
         let len = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
-        i += 8; // skip length + enc_final_range
+        let enc_final_range =
+            u32::from_be_bytes([data[i + 4], data[i + 5], data[i + 6], data[i + 7]]);
+        i += 8; // consume length + enc_final_range
         if i + len > data.len() {
             break;
         }
-        out.push(&data[i..i + len]);
+        out.push((&data[i..i + len], enc_final_range));
         i += len;
     }
     out
+}
+
+/// Split an `opus_demo` `.bit` stream into its raw Opus packets (dropping the
+/// per-packet length + `enc_final_range` prefixes).
+fn bit_packets(data: &[u8]) -> Vec<&[u8]> {
+    bit_packets_with_range(data)
+        .into_iter()
+        .map(|(pkt, _)| pkt)
+        .collect()
 }
 
 /// Decode a `.bit` stream at `channels` (1 or 2) into interleaved i16 samples —
@@ -397,6 +412,43 @@ fn corrupted_output_fails_the_metric() {
         best < 0.0,
         "corrupted decode must FAIL the metric, got Q={best:.2} %"
     );
+}
+
+/// Range-coder regression guard (RFC 8251 / `opus_demo`): after decoding each
+/// packet, the decoder's final range state (libopus `st->rangeFinal =
+/// dec.rng ^ redundant_rng`, exposed by [`ConformanceDecoder::final_range`])
+/// must **equal** the `enc_final_range` the encoder stored in the `.bit`
+/// framing. This is an exact, tolerance-free proof that the range decode is
+/// bit-identical to the encoder — a range-coder bug that `opus_compare`'s
+/// perceptual tolerance might mask fails this precisely. `opus_demo` performs
+/// this same per-packet check, skipping it only when the stored value is `0`
+/// (a `<=1`-byte DTX / no-final-range frame, for which libopus also reports
+/// `0`); we mirror that guard. The check is bitstream-only, so it holds at
+/// BOTH mono and stereo decode (the output channel count does not change the
+/// bits consumed) — the exact channels the harness runs.
+#[test]
+fn committed_vectors_match_enc_final_range() {
+    for v in committed() {
+        for &ch in &[1usize, 2] {
+            let mut dec = ConformanceDecoder::new(ch);
+            let mut buf = vec![0i32; 5760 * ch];
+            for (idx, (pkt, enc_final_range)) in
+                bit_packets_with_range(v.bit).into_iter().enumerate()
+            {
+                dec.decode_packet(pkt, &mut buf);
+                // `opus_demo` skips the comparison when the stored value is 0.
+                if enc_final_range != 0 {
+                    let got = dec.final_range();
+                    assert_eq!(
+                        got, enc_final_range,
+                        "{} ch{ch}: packet {idx} final-range mismatch: \
+                         decoder 0x{got:08x} != stored enc_final_range 0x{enc_final_range:08x}",
+                        v.name
+                    );
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
