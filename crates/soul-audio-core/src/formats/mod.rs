@@ -18,6 +18,7 @@ pub mod flac;
 pub mod mp3;
 pub mod mp3_codec;
 pub mod mp3_l12;
+pub mod opus;
 pub mod vorbis;
 pub mod wav;
 

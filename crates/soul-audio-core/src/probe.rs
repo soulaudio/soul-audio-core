@@ -32,10 +32,11 @@ fn identify(head: &[u8]) -> Option<Format> {
             b"fLaC" => return Some(Format::Flac),
             b"DSD " => return Some(Format::Dsf),
             b"FRM8" => return Some(Format::Dff),
-            // Ogg: FLAC-in-Ogg and Vorbis are recognized — their BOS page
-            // body begins with the `\x7FFLAC` mapping header or the Vorbis
-            // identification header's `\x01vorbis` prefix, respectively
-            // (both within the first page).
+            // Ogg: FLAC-in-Ogg, Vorbis, and Opus are recognized — their BOS
+            // page body begins with the `\x7FFLAC` mapping header, the Vorbis
+            // identification header's `\x01vorbis` prefix, or the Opus
+            // identification header's `OpusHead` magic, respectively (all
+            // within the first page).
             b"OggS" => {
                 let window = &head[..head.len().min(64)];
                 if window.windows(5).any(|w| w == b"\x7FFLAC") {
@@ -44,7 +45,10 @@ fn identify(head: &[u8]) -> Option<Format> {
                 if window.windows(7).any(|w| w == b"\x01vorbis") {
                     return Some(Format::Vorbis);
                 }
-                return None; // Ogg Opus/etc. are not supported
+                if window.windows(8).any(|w| w == b"OpusHead") {
+                    return Some(Format::Opus);
+                }
+                return None; // other Ogg mappings are not supported
             }
             _ => {}
         }
@@ -142,10 +146,42 @@ mod tests {
 
     #[test]
     fn ogg_without_a_known_mapping_is_still_unsupported() {
-        // Opus (or anything else) in Ogg: neither magic matches, so this
-        // must stay `Unsupported`, not silently become `Vorbis`/`OggFlac`.
+        // Anything else in Ogg: no magic matches, so this must stay
+        // `Unsupported`, not silently become `Vorbis`/`OggFlac`/`Opus`.
         let bytes = ogg_bos_page(&[0u8; 40]);
         assert_eq!(probe_bytes(&bytes).unwrap_err(), DecodeError::Unsupported);
+    }
+
+    #[test]
+    fn identifies_ogg_opus() {
+        // A realistic `OpusHead` id-header prefix (RFC 7845 §5.1): the exact
+        // trailing fields don't matter to `identify`, which only sniffs the
+        // magic.
+        let mut packet = b"OpusHead".to_vec();
+        packet.extend_from_slice(&[1, 2]); // version, channels
+        packet.extend_from_slice(&[0u8; 9]); // pre_skip + rate + gain + family
+        let bytes = ogg_bos_page(&packet);
+        assert_eq!(probe_bytes(&bytes).unwrap(), Format::Opus);
+    }
+
+    #[test]
+    fn identifies_ogg_flac_and_vorbis_still_work_alongside_opus() {
+        // Guards against the new Opus check accidentally shadowing the
+        // pre-existing FLAC-in-Ogg/Vorbis detection.
+        let mut flac_packet = b"\x7FFLAC".to_vec();
+        flac_packet.extend_from_slice(&[0u8; 46]);
+        assert_eq!(
+            probe_bytes(&ogg_bos_page(&flac_packet)).unwrap(),
+            Format::OggFlac
+        );
+
+        let mut vorbis_packet = vec![1u8];
+        vorbis_packet.extend_from_slice(b"vorbis");
+        vorbis_packet.extend_from_slice(&[0u8; 23]);
+        assert_eq!(
+            probe_bytes(&ogg_bos_page(&vorbis_packet)).unwrap(),
+            Format::Vorbis
+        );
     }
 
     #[test]

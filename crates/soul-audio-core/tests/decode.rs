@@ -1191,6 +1191,456 @@ fn vorbis_seek_then_decode_to_eof_length_matches_the_granule_exactly() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Opus CELT conformance vs ffmpeg (Task 8 — first correct PCM milestone). Opus
+// is LOSSY, but this golden decodes the SAME stream ffmpeg's own libopus-based
+// decoder does, so a spec-correct CELT synthesis (denormalise → anti-collapse →
+// inverse MDCT → overlap-add → post-filter → de-emphasis) tracks ffmpeg to near
+// float precision and should score very high. `tone.opus` is a CELT-only
+// fullband **stereo** encode (A4=440 Hz left, E5=659.25 Hz right); ffmpeg
+// applies pre-skip/output-gain, and so does our decoder, so the streams align
+// tightly. A scale/normalisation/overlap bug (the classic MDCT `n/2` class the
+// Vorbis milestone hit) drops this by tens of dB rather than a rounding-level
+// residual.
+//
+// Measured segmental SNR = 86.97 dB at a 0-frame offset (our pre-skip trims the
+// same 312 priming samples ffmpeg does, so the streams align at the front). The
+// bar is 60 dB — far above a merely conformant CELT decode. The ~87 dB residual
+// (not near-∞ like the lossless goldens) is the two audio-quality-only
+// approximations the codec permits post-range-coder: the `celt_exp2` denormalise
+// gain (libopus's `FLOAT_APPROX` cubic) and the Q15 spreading-rotation cosine in
+// the PVQ — neither is a bug, and any real MDCT/overlap/scale/pre-skip regression
+// drops straight through the bar.
+#[test]
+fn open_decodes_opus_celt_stereo_matching_ffmpeg() {
+    let opus = include_bytes!("../../../testdata/tone.opus");
+    let refr = load_s16le(include_bytes!("../testdata/tone-opus.ref.pcm"));
+    let dec = open(SliceSource::new(opus)).expect("probe + construct Opus");
+    assert_eq!(dec.stream_info().sample_rate, 48_000);
+    assert_eq!(dec.stream_info().channels, 2);
+    let ours = decode_all(opus);
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 60.0,
+        "Opus CELT decode SNR vs ffmpeg too low: {snr:.1} dB (offset {off} frames)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Opus SILK conformance vs ffmpeg (Task 11 — the SILK milestone: LTP+LPC
+// synthesis → stereo unmix (mono here) → resampler → 48 kHz PCM). Unlike the
+// CELT golden, ffmpeg's native Opus decoder resamples SILK's internal rate
+// (16 kHz WB here) up to 48 kHz with *libswresample*, NOT libopus's own IIR/FIR
+// resampler that this decoder faithfully transcribes — so (a) the achievable
+// ceiling sits far below CELT's ~87 dB (the two resamplers' pass/stop-band
+// shapes and group delays differ), and (b) our libopus-matching output leads
+// ffmpeg's by a couple of samples, a fixed delay-convention offset the alignment
+// search below absorbs.
+//
+// Measured segmental SNR = 33.75 dB at the aligned offset (per-0.1 s block:
+// 39–42 dB across the file, one transient block dipping to ~23 dB — the
+// resampler phase difference peaks on fast transients). The SILK *synthesis*
+// itself is exact: its inputs (`exc_Q14`, gains, LPC/LTP coefs) are the
+// byte-for-byte libopus oracle values the front-end unit tests lock, and
+// `silk_decode_core` is a line-for-line transcription — so the whole residual
+// vs ffmpeg is the resampler shape, not a decode error. The bar is 30 dB (a
+// synthesis/LCG/gain/state or resampler-delay-line bug drops this into single
+// digits). Bit-exact conformance is validated later by Task 14's RFC 8251
+// vectors.
+#[test]
+fn open_decodes_silk_mono_matching_ffmpeg() {
+    let opus = include_bytes!("../testdata/voice-silk-mono.opus");
+    let refr = load_s16le(include_bytes!("../testdata/voice-silk-mono.ref.pcm"));
+    let dec = open(SliceSource::new(opus)).expect("probe + construct Opus");
+    assert_eq!(dec.stream_info().sample_rate, 48_000);
+    assert_eq!(dec.stream_info().channels, 1);
+    let ours = decode_all(opus);
+
+    // Best segmental SNR over a small symmetric priming-offset window: our
+    // libopus-matching resampler leads ffmpeg's swr by a couple of samples, so
+    // — unlike the forward-only `best_align_segsnr` — this also lets the
+    // reference slide forward.
+    let mut best = (0i64, f64::NEG_INFINITY);
+    for off in -64i64..=64 {
+        let (o, r): (&[i32], &[i32]) = if off >= 0 {
+            (&ours[(off as usize).min(ours.len())..], &refr)
+        } else {
+            (&ours, &refr[(-off as usize).min(refr.len())..])
+        };
+        let n = o.len().min(r.len());
+        if n < refr.len() / 2 {
+            continue;
+        }
+        let snr = seg_snr_at(o, &r[..n], 0);
+        if snr > best.1 {
+            best = (off, snr);
+        }
+    }
+    let (off, snr) = best;
+    assert!(
+        snr > 30.0,
+        "SILK mono decode SNR vs ffmpeg too low: {snr:.2} dB (offset {off} samples)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Opus HYBRID conformance vs ffmpeg (Task 12 — SILK low band + CELT high band,
+// summed). `hybrid-mono.opus` is a mono, all-hybrid (TOC config 15 = Hybrid FB
+// 20 ms, every packet) libopus encode: SILK decodes 0–8 kHz (WB, 16 kHz
+// internal → 48 kHz resample), CELT decodes bands 17..21 (8 kHz+) from the SAME
+// range coder positioned after SILK, and the two 48 kHz signals are summed.
+//
+// Like the SILK golden, the hybrid *low* band is resampled by SILK's own IIR/FIR
+// resampler, which our decoder transcribes exactly but ffmpeg's NATIVE Opus
+// decoder replaces with libswresample — so the achievable SNR vs ffmpeg is
+// capped well below CELT's ~87 dB (the two resamplers' group delays differ, and
+// the tonal low-band content is phase-sensitive to that sub-sample delay). A
+// correct decode scores ~20 dB here (native-ffmpeg vs libopus itself only
+// reaches ~24 dB on this stream, the true ceiling); a start-band, delay, or
+// SILK+CELT-sum bug drops it to single digits or negative. The decisive
+// bit-exactness proof is sample-by-sample vs libopus (see the Task-12 report).
+#[test]
+fn open_decodes_opus_hybrid_mono_matching_ffmpeg() {
+    let opus = include_bytes!("../testdata/hybrid-mono.opus");
+    let refr = load_s16le(include_bytes!("../testdata/hybrid-mono.ref.pcm"));
+    let dec = open(SliceSource::new(opus)).expect("probe + construct Opus");
+    assert_eq!(dec.stream_info().sample_rate, 48_000);
+    assert_eq!(dec.stream_info().channels, 1);
+    let ours = decode_all(opus);
+
+    // Best segmental SNR over a small symmetric priming-offset window: our
+    // libopus-matching resampler leads/lags ffmpeg's swr by a couple of samples.
+    let mut best = (0i64, f64::NEG_INFINITY);
+    for off in -64i64..=64 {
+        let (o, r): (&[i32], &[i32]) = if off >= 0 {
+            (&ours[(off as usize).min(ours.len())..], &refr)
+        } else {
+            (&ours, &refr[(-off as usize).min(refr.len())..])
+        };
+        let n = o.len().min(r.len());
+        if n < refr.len() / 2 {
+            continue;
+        }
+        let snr = seg_snr_at(o, &r[..n], 0);
+        if snr > best.1 {
+            best = (off, snr);
+        }
+    }
+    let (off, snr) = best;
+    assert!(
+        snr > 15.0,
+        "Opus hybrid mono decode SNR vs ffmpeg too low: {snr:.2} dB (offset {off} samples)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Opus STEREO SILK + STEREO HYBRID conformance vs ffmpeg (Task 13b). These
+// decode genuine stereo Opus (nChannelsInternal == 2): the SILK mid/side
+// prediction + `silk_stereo_MS_to_LR` unmix drive two independent channel
+// states → L/R, then each is resampled to 48 kHz. Like the mono SILK/hybrid
+// goldens the ffmpeg-native reference is resampler-limited (ffmpeg resamples
+// SILK's internal rate with libswresample, we transcribe libopus's own IIR/FIR),
+// so the SNR ceiling vs ffmpeg is well below CELT's ~87 dB. The DECISIVE
+// bit-exactness proof is sample-by-sample vs the libopus v1.5.2 oracle: stereo
+// SILK is **bit-exact on both channels** (∞ dB, 100 %), stereo hybrid matches to
+// the CELT float ceiling (90.9 / 105.9 dB, max abs diff 1 — the SILK low band is
+// bit-exact, the ±1 is CELT's permitted `celt_exp2`/PVQ float approximation).
+// See the Task-13b report.
+//
+// Each golden scores L and R **independently** at a shared priming offset, so a
+// channel-swap / mono-collapse / mispaired-unmix bug (which decorrelates one
+// channel) cannot average out against a good channel — both must clear the bar.
+// ---------------------------------------------------------------------------
+
+/// Stereo SILK (`silk-stereo.opus`, TOC config 9 = SILK/WB/20 ms, stereo bit
+/// set on every packet): L is a 300 Hz tone, R a 500 Hz tone (distinct AM), so a
+/// stereo-image collapse or channel swap is caught by the per-channel SNR + the
+/// Goertzel tone-dominance checks below.
+///
+/// Measured (vs the ffmpeg-native reference): L = 44.0 dB, R = 40.9 dB at a
+/// 1-frame priming offset — both well above the 30 dB bar (same
+/// resampler-ceiling calibration as the 33.75 dB mono SILK golden). Bit-exact
+/// vs the libopus oracle (see the module comment).
+#[test]
+fn open_decodes_silk_stereo_matching_ffmpeg() {
+    let opus = include_bytes!("../testdata/silk-stereo.opus");
+    let refr = load_s16le(include_bytes!("../testdata/silk-stereo.ref.pcm"));
+    let dec = open(SliceSource::new(opus)).expect("probe + construct Opus");
+    assert_eq!(dec.stream_info().sample_rate, 48_000);
+    assert_eq!(dec.stream_info().channels, 2);
+    let ours = decode_all(opus);
+
+    // Shared priming offset (our libopus-matching resampler leads ffmpeg's swr
+    // by ~1 sample), then per-channel SNR at that offset.
+    let (off, _combined) = best_align_segsnr(&ours, &refr, 2);
+    for ch in 0..2 {
+        let o = deinterleave(&ours, 2, ch);
+        let r = deinterleave(&refr, 2, ch);
+        let snr = seg_snr_at(&o, &r, off);
+        assert!(
+            snr > 30.0,
+            "SILK stereo ch{ch} SNR vs ffmpeg too low: {snr:.2} dB (shared offset {off} frames)"
+        );
+    }
+
+    // Channel distinctness: L must be dominated by 300 Hz, R by 500 Hz, and the
+    // two channels must genuinely differ (a swap/collapse fails these).
+    let l = deinterleave(&ours, 2, 0);
+    let r = deinterleave(&ours, 2, 1);
+    let n = l.len().min(r.len());
+    let diff_rms = (l[..n]
+        .iter()
+        .zip(&r[..n])
+        .map(|(&a, &b)| f64::from(a - b).powi(2))
+        .sum::<f64>()
+        / n as f64)
+        .sqrt();
+    assert!(
+        diff_rms > 100.0,
+        "SILK stereo L/R nearly identical (RMS diff {diff_rms:.1}) — stereo image collapsed"
+    );
+    let l_300 = goertzel_power(&l, 48_000.0, 300.0);
+    let l_500 = goertzel_power(&l, 48_000.0, 500.0);
+    let r_300 = goertzel_power(&r, 48_000.0, 300.0);
+    let r_500 = goertzel_power(&r, 48_000.0, 500.0);
+    assert!(
+        l_300 > l_500,
+        "left channel not dominated by its 300 Hz tone (p300={l_300:.2e} p500={l_500:.2e})"
+    );
+    assert!(
+        r_500 > r_300,
+        "right channel not dominated by its 500 Hz tone (p500={r_500:.2e} p300={r_300:.2e})"
+    );
+}
+
+/// Stereo HYBRID (`hybrid-stereo.opus`, TOC config 15 = Hybrid/FB/20 ms, stereo
+/// on every packet): stereo SILK low band + stereo CELT high band, summed per
+/// channel. Measured (vs ffmpeg-native): L = 25.1 dB, R = 40.9 dB at a 1-frame
+/// offset — both above the 15 dB bar (same low resampler-ceiling as the 24 dB
+/// mono hybrid golden; the tonal low band is phase-sensitive to the sub-sample
+/// resampler-delay difference). Near-bit-exact vs the libopus oracle
+/// (90.9 / 105.9 dB, max abs diff 1 — see the module comment).
+#[test]
+fn open_decodes_opus_hybrid_stereo_matching_ffmpeg() {
+    let opus = include_bytes!("../testdata/hybrid-stereo.opus");
+    let refr = load_s16le(include_bytes!("../testdata/hybrid-stereo.ref.pcm"));
+    let dec = open(SliceSource::new(opus)).expect("probe + construct Opus");
+    assert_eq!(dec.stream_info().sample_rate, 48_000);
+    assert_eq!(dec.stream_info().channels, 2);
+    let ours = decode_all(opus);
+
+    let (off, _combined) = best_align_segsnr(&ours, &refr, 2);
+    for ch in 0..2 {
+        let o = deinterleave(&ours, 2, ch);
+        let r = deinterleave(&refr, 2, ch);
+        let snr = seg_snr_at(&o, &r, off);
+        assert!(
+            snr > 15.0,
+            "hybrid stereo ch{ch} SNR vs ffmpeg too low: {snr:.2} dB (shared offset {off} frames)"
+        );
+    }
+
+    // The two channels must genuinely differ (mid/side unmix produced a real
+    // stereo image, not a mono duplicate).
+    let l = deinterleave(&ours, 2, 0);
+    let r = deinterleave(&ours, 2, 1);
+    let n = l.len().min(r.len());
+    let diff_rms = (l[..n]
+        .iter()
+        .zip(&r[..n])
+        .map(|(&a, &b)| f64::from(a - b).powi(2))
+        .sum::<f64>()
+        / n as f64)
+        .sqrt();
+    assert!(
+        diff_rms > 100.0,
+        "hybrid stereo L/R nearly identical (RMS diff {diff_rms:.1}) — stereo image collapsed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Opus integration (Task 13): pre-skip + granule end-trim, seek round-trip,
+// seek-to-0, and beyond-end clamp. `tone.opus` is the CELT-only fullband stereo
+// fixture (A4 left / E5 right, pre-skip 312), decoded through the public
+// `open()` → `AnyDecoder::Opus` path.
+// ---------------------------------------------------------------------------
+
+/// `(total_frames, channels)` for an Opus stream, on the big-stack thread every
+/// other real-file decode here uses (the decoder carries large fixed CELT/SILK
+/// state by value).
+fn opus_total_frames_and_channels(bytes: &'static [u8]) -> (Option<u64>, u16) {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let dec = open(SliceSource::new(bytes)).expect("open opus");
+            (dec.total_frames(), dec.stream_info().channels)
+        })
+        .expect("spawn decode thread")
+        .join()
+        .expect("decode thread panicked")
+}
+
+/// Open an Opus stream, seek to per-channel output `seek_sample`, then decode up
+/// to `want_frames` per-channel frames worth of interleaved samples. Returns
+/// `(landed, pcm, channels)`.
+fn opus_seek_and_decode(
+    bytes: &'static [u8],
+    seek_sample: u64,
+    want_frames: usize,
+) -> (u64, Vec<i32>, u16) {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let mut dec = open(SliceSource::new(bytes)).expect("open opus");
+            let channels = dec.stream_info().channels;
+            let landed = dec.seek_to(seek_sample).expect("seek_to");
+            let mut out = Vec::new();
+            let mut buf = [0i32; 4096];
+            while out.len() < want_frames * usize::from(channels) {
+                let n = dec.decode_into(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            out.truncate(want_frames * usize::from(channels));
+            (landed, out, channels)
+        })
+        .expect("spawn decode thread")
+        .join()
+        .expect("decode thread panicked")
+}
+
+/// Task 13 (RFC 7845 §4.2 pre-skip + granule end-trim): the total decoded
+/// length must equal `(end_granule − pre_skip) · channels` **exactly** — the
+/// stream-global pre-skip discards the first 312 priming samples, and the final
+/// Ogg page's granule trims the last packet's tail. Because `tone.opus` encodes
+/// exactly 2.0 s at 48 kHz, that also matches ffmpeg's own reference PCM length
+/// (`tone-opus.ref.pcm`, s16le) to the sample — a stricter check than the SNR
+/// golden, which tolerates a too-long tail.
+#[test]
+fn opus_full_decode_length_matches_end_granule_minus_pre_skip() {
+    let opus: &'static [u8] = include_bytes!("../../../testdata/tone.opus");
+    let refr = load_s16le(include_bytes!("../testdata/tone-opus.ref.pcm"));
+    let ours = decode_all(opus);
+    let (total, channels) = opus_total_frames_and_channels(opus);
+    let total = total.expect("tone.opus declares a length");
+    assert_eq!(
+        ours.len(),
+        total as usize * usize::from(channels),
+        "decoded length must equal (end_granule − pre_skip) · channels exactly"
+    );
+    assert_eq!(
+        ours.len(),
+        refr.len(),
+        "decoded length must match ffmpeg's reference length exactly"
+    );
+}
+
+/// Task 13 seek round-trip: seeking mid-stream and decoding must reproduce the
+/// same samples a full linear decode produces from that point. Opus seeking is
+/// **sample-accurate** — the decoder lands on an Ogg page ≥80 ms before the
+/// target, decode-and-discards the run-in (reconverging the CELT overlap +
+/// energy-predictor state), and begins emitting exactly at the requested output
+/// sample — so `landed == target` and the re-primed audio aligns at offset 0
+/// with the full decode. Measured **bit-exact (∞ dB)** for this CELT-only
+/// fixture: the 80 ms pre-roll fully reconverges the MDCT overlap and coarse
+/// energy predictor, so the resumed decode is identical to the full one (the
+/// short warm-up skip is belt-and-braces, not needed here). The bar is 60 dB — a
+/// re-prime/state-reset bug (stale overlap, an un-reconverged energy predictor,
+/// or a wrong granule baseline) drops it by tens of dB.
+#[test]
+fn opus_seek_round_trip_matches_the_full_decode() {
+    let opus: &'static [u8] = include_bytes!("../../../testdata/tone.opus");
+    let full = decode_all(opus);
+    let (total, channels) = opus_total_frames_and_channels(opus);
+    let total = total.expect("tone.opus declares a length");
+    let channels = usize::from(channels);
+
+    let target = total / 2; // 1.0 s into the 2.0 s stream
+    let want = 8192usize;
+    let (landed, seek_pcm, ch) = opus_seek_and_decode(opus, target, want);
+    assert_eq!(usize::from(ch), channels);
+    assert_eq!(
+        landed, target,
+        "Opus seek is sample-accurate — it must land exactly on the requested output sample"
+    );
+
+    // Align the re-primed tail against the full decode starting at `target`.
+    let base = target as usize * channels;
+    let aligned = &full[base.min(full.len())..];
+    let n = seek_pcm.len().min(aligned.len());
+    assert!(n > 4096, "too few post-seek samples to score ({n})");
+    // Skip ~10 ms of warm-up so the tail of the energy-predictor error decay
+    // doesn't drag the score; the rest must match the full decode closely.
+    let warm = 480 * channels;
+    let snr = seg_snr_at(&seek_pcm[warm..n], &aligned[warm..n], 0);
+    assert!(
+        snr > 60.0,
+        "seek({target}) decode doesn't match the full decode: {snr:.1} dB (landed={landed})"
+    );
+}
+
+/// Seeking to 0 must reproduce a fresh decode of the whole stream exactly — the
+/// special-cased "back to start" path rewinds past the two Opus header packets
+/// and fully resets the CELT/SILK state, so there is no re-prime approximation
+/// (unlike a nonzero seek).
+#[test]
+fn opus_seek_to_zero_matches_a_fresh_decode() {
+    let opus: &'static [u8] = include_bytes!("../../../testdata/tone.opus");
+    let fresh = decode_all(opus);
+
+    let (landed, seek_pcm) = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let mut dec = open(SliceSource::new(opus)).expect("open opus");
+            // Decode partway first, so seek_to(0) has real state to undo.
+            let mut probe = [0i32; 4096];
+            let _ = dec.decode_into(&mut probe).unwrap();
+            let landed = dec.seek_to(0).expect("seek_to(0)");
+            let mut out = Vec::new();
+            let mut buf = [0i32; 4096];
+            loop {
+                let n = dec.decode_into(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            (landed, out)
+        })
+        .expect("spawn decode thread")
+        .join()
+        .expect("decode thread panicked");
+
+    assert_eq!(landed, 0);
+    assert_eq!(
+        seek_pcm, fresh,
+        "seek_to(0) must reproduce a fresh decode bit-for-bit"
+    );
+}
+
+/// Seeking beyond the stream's declared end must clamp to the total (never
+/// panic, never error), landing on the final output sample — from which there
+/// is nothing left to decode.
+#[test]
+fn opus_seek_beyond_end_clamps_without_panicking() {
+    let opus: &'static [u8] = include_bytes!("../../../testdata/tone.opus");
+    let (total, _) = opus_total_frames_and_channels(opus);
+    let total = total.expect("tone.opus declares a length");
+
+    let (landed, tail, _) = opus_seek_and_decode(opus, total * 100, 4096);
+    assert_eq!(
+        landed, total,
+        "a beyond-end seek clamps to the declared total"
+    );
+    assert!(
+        tail.is_empty(),
+        "seeking to the very end leaves nothing to decode (got {} samples)",
+        tail.len()
+    );
+}
+
 #[test]
 fn open_surfaces_mp3_stream_info() {
     // MPEG-1 Layer III, 128 kbps, 44.1 kHz, stereo. A synthetic all-zero frame

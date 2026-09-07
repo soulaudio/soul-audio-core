@@ -708,3 +708,41 @@ fn real_vorbis_renders_stereo_tones() {
         right.peak_hz
     );
 }
+
+#[test]
+fn real_opus_renders_stereo_tones() {
+    // Opus is lossy (like Vorbis/AAC above), so this is the same pitch-only
+    // golden: "the right two tones come out of the right channels" through the
+    // full render pipeline (decode → resample → normalize → file). `tone.opus`
+    // is the workspace-root fixture — the same 2 s A4-left/E5-right signal,
+    // CELT-only fullband, in an Ogg-Opus container (already 48 kHz, so the
+    // resampler is a passthrough here). Opus routes through `open()` →
+    // `AnyDecoder::Opus` → `OwnedDecoder::Pcm`, so this confirms that dispatch,
+    // plus the RFC 7845 pre-skip/end-trim, end to end. The CLI already runs the
+    // engine on a 64 MiB worker thread (the Opus decoder state is large), so no
+    // stack change is needed.
+    let out = tmp("opus_out.pcm");
+    Command::cargo_bin("soul-audio-cli")
+        .unwrap()
+        .args(["render"])
+        .arg(fixture("tone.opus"))
+        .args(["--out"])
+        .arg(&out)
+        .args(["--rate", "48000", "--channels", "2"])
+        .assert()
+        .success();
+    let pcm = read_pcm(&out);
+    let n = 16_384;
+    let left = analyze(&channel_window(&pcm, 2, 0, 4000, n), 48_000);
+    let right = analyze(&channel_window(&pcm, 2, 1, 4000, n), 48_000);
+    assert!(
+        (left.peak_hz - 440.0).abs() < 6.0,
+        "Opus left {:.1} Hz",
+        left.peak_hz
+    );
+    assert!(
+        (right.peak_hz - 659.25).abs() < 6.0,
+        "Opus right {:.1} Hz",
+        right.peak_hz
+    );
+}

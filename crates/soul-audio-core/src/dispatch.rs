@@ -7,12 +7,13 @@
 //! are **not** routed here — they require an explicit
 //! [`DsdMode`](crate::model::DsdMode) (see [`crate::dsd`]).
 
-use crate::decoder::{DecodeError, Decoder};
+use crate::decoder::{DecodeError, Decoder, SeekableDecoder};
 use crate::demux::adts::AdtsReader;
 use crate::demux::mp4::{Mp4Codec, Mp4Reader};
 use crate::demux::ogg::OggReader;
 use crate::formats::{
-    aac::AacDecoder, alac::AlacDecoder, flac::FlacDecoder, mp3::Mp3Decoder, wav::WavDecoder,
+    aac::AacDecoder, alac::AlacDecoder, flac::FlacDecoder, mp3::Mp3Decoder, opus::OpusDecoder,
+    wav::WavDecoder,
 };
 use crate::io::BufSource;
 use crate::model::{Format, StreamInfo};
@@ -38,11 +39,25 @@ pub enum AnyDecoder<S> {
     Alac(AlacDecoder<S>),
     /// AAC-LC in an MP4/M4A container or a raw ADTS (`.aac`) elementary stream.
     Aac(AacDecoder<S>),
+    /// Opus audio in an Ogg container (RFC 7845/6716). Unlike Vorbis, every
+    /// Opus table is RFC-fixed (no per-file setup), so it needs no
+    /// caller-provided arena and is a normal by-value variant here.
+    Opus(OpusDecoder<S>),
 }
 
-impl<S: crate::io::Source> AnyDecoder<S> {
+impl<S: crate::io::SeekSource> AnyDecoder<S> {
     /// Total per-channel frames, if the stream declares a length. `None` for a
-    /// raw MP3 without a Xing/Info/VBRI header.
+    /// raw MP3 without a Xing/Info/VBRI header, or for an Opus stream with no
+    /// discoverable final granule.
+    ///
+    /// Bound on [`SeekSource`](crate::io::SeekSource) — every other format's
+    /// length comes from a header parsed at `open()` time and needs no
+    /// seeking, but Opus's declared length is the final Ogg page's granule,
+    /// found only by a seek-and-scan
+    /// ([`crate::demux::ogg_packets::OggPackets::end_granule`]); every real
+    /// caller of this method already goes through [`crate::decoder::SeekableDecoder`]
+    /// (see the trait impl below, and `Deck`, which requires it), so this
+    /// bound costs nothing in practice while making Opus's case sound.
     #[must_use]
     pub fn total_frames(&self) -> Option<u64> {
         match self {
@@ -52,17 +67,18 @@ impl<S: crate::io::Source> AnyDecoder<S> {
             AnyDecoder::OggFlac(d) => d.total_frames(),
             AnyDecoder::Alac(d) => d.total_frames(),
             AnyDecoder::Aac(d) => d.total_frames(),
+            AnyDecoder::Opus(d) => d.total_frames(),
         }
     }
-}
 
-impl<S: crate::io::SeekSource> AnyDecoder<S> {
     /// Seek to per-channel `sample` (frame-granular for MP3, sample-accurate for
     /// WAV/FLAC). Returns the frame actually landed on.
     ///
     /// # Errors
     /// [`DecodeError::Unsupported`] for the streaming Ogg-FLAC variant (its source
-    /// is not seekable); otherwise the underlying decoder's seek error.
+    /// is not seekable), ALAC, and AAC (not yet implemented); otherwise the
+    /// underlying decoder's seek error. Opus seeks via Ogg-granule bisection +
+    /// pre-roll re-priming ([`crate::formats::opus::OpusDecoder`]).
     pub fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
         match self {
             AnyDecoder::Wav(d) => d.seek_to(sample),
@@ -71,6 +87,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::OggFlac(_) => Err(DecodeError::Unsupported),
             AnyDecoder::Alac(_) => Err(DecodeError::Unsupported),
             AnyDecoder::Aac(_) => Err(DecodeError::Unsupported),
+            AnyDecoder::Opus(d) => d.seek_to(sample),
         }
     }
 
@@ -86,6 +103,8 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::OggFlac(_) => Err(DecodeError::Unsupported),
             AnyDecoder::Alac(_) => Err(DecodeError::Unsupported),
             AnyDecoder::Aac(_) => Err(DecodeError::Unsupported),
+            // Opus always decodes at 48 kHz; convert seconds at that rate.
+            AnyDecoder::Opus(d) => d.seek_to(crate::decoder::secs_to_samples(secs, 48_000)),
         }
     }
 }
@@ -108,6 +127,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::OggFlac(d) => d.stream_info(),
             AnyDecoder::Alac(d) => d.stream_info(),
             AnyDecoder::Aac(d) => d.stream_info(),
+            AnyDecoder::Opus(d) => d.stream_info(),
         }
     }
 
@@ -119,6 +139,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::OggFlac(d) => d.decode_into(out),
             AnyDecoder::Alac(d) => d.decode_into(out),
             AnyDecoder::Aac(d) => d.decode_into(out),
+            AnyDecoder::Opus(d) => d.decode_into(out),
         }
     }
 }
@@ -159,6 +180,10 @@ pub fn open<S: BufSource>(mut src: S) -> Result<AnyDecoder<S>, DecodeError> {
         // `VorbisDecoder` directly (design spec, "Dispatch: per-platform, NOT
         // in `AnyDecoder`").
         Format::Vorbis => Err(DecodeError::Unsupported),
+        // Opus has no per-file setup (every RFC 6716 table is fixed-capacity),
+        // so — unlike Vorbis — it needs no caller-provided arena and is a
+        // normal `AnyDecoder` variant.
+        Format::Opus => OpusDecoder::new(src).map(AnyDecoder::Opus),
     }
 }
 
@@ -279,6 +304,35 @@ mod tests {
             open(SliceSource::new(b"XXXXYYYY")).err(),
             Some(DecodeError::Unsupported)
         );
+    }
+
+    #[test]
+    fn open_routes_opus_with_48k_stream_info() {
+        // The real fixture (CELT-only fullband, per the design spec's fixture
+        // naming): `open()` must route it to `AnyDecoder::Opus` and report
+        // 48 kHz/stereo/Int16 (Opus always decodes at 48 kHz regardless of the
+        // container's informational input rate).
+        let bytes = include_bytes!("../../../testdata/tone.opus");
+        let mut dec = open(SliceSource::new(bytes)).expect("probe + construct Opus");
+        assert!(matches!(dec, AnyDecoder::Opus(_)));
+        assert_eq!(dec.stream_info().sample_rate, 48_000);
+        assert_eq!(dec.stream_info().channels, 2);
+        assert_eq!(
+            dec.stream_info().format,
+            crate::model::SampleFormat::Int { bits: 16 }
+        );
+        // Task 8: CELT decode is live — the fixture yields real interleaved
+        // PCM (bit-level fidelity vs ffmpeg is the golden in tests/decode.rs).
+        let mut out = [7i32; 8];
+        let n = dec.decode_into(&mut out).unwrap();
+        assert_eq!(n, 8, "a full CELT frame fills the whole 8-sample request");
+        assert!(
+            out.iter().all(|&s| (-32768..=32767).contains(&s)),
+            "decoded samples are 16-bit range"
+        );
+        // Opus seeking is implemented (Task 13): seek-to-0 returns to the start
+        // (output sample 0), routed through `AnyDecoder::Opus`.
+        assert_eq!(dec.seek_to(0).unwrap(), 0);
     }
 
     #[test]

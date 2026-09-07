@@ -113,6 +113,12 @@ pub enum Format {
     /// `formats::vorbis::VorbisDecoder`, which needs a caller-provided arena
     /// that `open()`'s by-value decoders don't carry).
     Vorbis,
+    /// Opus audio in an Ogg container (RFC 7845). Unlike Vorbis, every Opus
+    /// table is RFC-fixed (no per-file setup header), so it needs no
+    /// caller-provided arena and **is** a normal
+    /// [`AnyDecoder`](crate::dispatch::AnyDecoder) variant (see
+    /// `formats::opus::OpusDecoder`).
+    Opus,
 }
 
 /// Explicit DSD output mode chosen by the caller. Selects which path a native

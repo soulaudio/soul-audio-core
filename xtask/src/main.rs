@@ -8,12 +8,14 @@ use std::path::Path;
 use std::process::{Command, exit};
 
 mod filterbank_tables;
+mod opus_tables;
 mod ps_tables;
 mod resample_tables;
 mod sbr_tables;
+mod silk_tables;
 mod vorbis_tables;
 
-const USAGE: &str = "usage: cargo xtask <verify|ci|qa-audio|gen-resample-tables|gen-filterbank-tables|gen-sbr-tables|gen-ps-tables|gen-vorbis-tables>";
+const USAGE: &str = "usage: cargo xtask <verify|ci|qa-audio|gen-resample-tables|gen-filterbank-tables|gen-sbr-tables|gen-ps-tables|gen-vorbis-tables|gen-opus-tables|gen-silk-tables>";
 
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
@@ -30,6 +32,10 @@ fn main() {
         "check-ps-tables" => ps_tables::check(),
         "gen-vorbis-tables" => vorbis_tables::run(),
         "check-vorbis-tables" => vorbis_tables::check(),
+        "gen-opus-tables" => opus_tables::run(),
+        "check-opus-tables" => opus_tables::check(),
+        "gen-silk-tables" => silk_tables::run(),
+        "check-silk-tables" => silk_tables::check(),
         "" => {
             eprintln!("{USAGE}");
             exit(2);
@@ -71,6 +77,8 @@ fn verify() -> Result<(), String> {
     sbr_tables::check()?;
     ps_tables::check()?;
     vorbis_tables::check()?;
+    opus_tables::check()?;
+    silk_tables::check()?;
     run(&["test"])?;
     // The Vorbis embedded profile (design spec "Profiles" / Task 11) is a
     // separate const configuration (stereo + 4096 max block) from the default
@@ -203,6 +211,11 @@ fn qa_audio() -> Result<(), String> {
             "Vorbis (.ogg)",
             "tone-vorbis.ogg",
             "libvorbis — should sound like the WAV (Vorbis is dispatched by soul-audio-desktop, not AnyDecoder)",
+        ),
+        (
+            "Opus (.opus)",
+            "tone.opus",
+            "libopus (CELT) — should sound like the WAV (RFC 7845 pre-skip/end-trim applied)",
         ),
         (
             "DSD (DSF)",
