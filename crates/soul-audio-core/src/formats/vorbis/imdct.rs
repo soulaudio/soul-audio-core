@@ -60,15 +60,189 @@ fn cos_from_quarter(r: usize) -> f32 {
     }
 }
 
-/// Naïve inverse MDCT (spec §4.3.7): reconstruct `bs = 2·n` time samples in
+/// Complex number for the FFT scratch (no-alloc, on-stack).
+#[derive(Clone, Copy)]
+struct Cpx {
+    re: f32,
+    im: f32,
+}
+impl Cpx {
+    const ZERO: Cpx = Cpx { re: 0.0, im: 0.0 };
+}
+
+/// In-place iterative radix-2 DIT complex FFT (`a.len()` a power of two,
+/// `≤ VFFT_TW_N`). `inverse` selects the `exp(+iθ)` kernel; **no** `1/N`
+/// normalization (the IMDCT folds the whole scale into its final factor).
+/// Twiddles come from the shared size-`VFFT_TW_N` tables: a length-`len`
+/// sub-DFT's column-`j` twiddle is `VFFT_*[j·(VFFT_TW_N/len)]`, an index always
+/// `< VFFT_TW_N/2`, so the lookup can never go out of bounds.
+#[allow(clippy::needless_range_loop)]
+fn fft(a: &mut [Cpx], inverse: bool) {
+    let n = a.len();
+    if n < 2 {
+        return;
+    }
+    // Bit-reversal permutation.
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if i < j {
+            a.swap(i, j);
+        }
+    }
+    let mut len = 2;
+    while len <= n {
+        let half = len / 2;
+        let stride = VFFT_TW_N / len;
+        let mut start = 0;
+        while start < n {
+            for k in 0..half {
+                let idx = k * stride;
+                let c = VFFT_COS[idx];
+                let s = if inverse {
+                    VFFT_SIN[idx]
+                } else {
+                    -VFFT_SIN[idx]
+                };
+                let b = a[start + k + half];
+                let wr = b.re * c - b.im * s;
+                let wi = b.re * s + b.im * c;
+                let u = a[start + k];
+                a[start + k] = Cpx {
+                    re: u.re + wr,
+                    im: u.im + wi,
+                };
+                a[start + k + half] = Cpx {
+                    re: u.re - wr,
+                    im: u.im - wi,
+                };
+            }
+            start += len;
+        }
+        len <<= 1;
+    }
+}
+
+/// Fast inverse MDCT via an `N/4`-point complex FFT — the exact MDCT→FFT
+/// reduction the AAC filterbank uses, so this is the same math as [`imdct_naive`]
+/// at `O(N log N)` instead of `O(N²)`. `scratch.len() == N/4` sets the size:
+/// `spec` supplies the `N/2` coefficients, `out` receives `N` time samples scaled
+/// by `scale` (Vorbis is unnormalized, so `scale = 1.0`). `tw_*` are the length
+/// `N/4` pre/post twiddles `trig(2π(k+⅛)/N)`. Bounds-guarded: a size mismatch
+/// returns without touching `out`, and every index is provably in range.
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+fn imdct_fft(
+    spec: &[f32],
+    scratch: &mut [Cpx],
+    tw_cos: &[f32],
+    tw_sin: &[f32],
+    out: &mut [f32],
+    scale: f32,
+) {
+    let l = scratch.len();
+    let m = 2 * l; // N/2 input coeffs
+    let n = 4 * l; // N output samples
+    if spec.len() < m || out.len() < n || tw_cos.len() < l || tw_sin.len() < l {
+        return;
+    }
+    // Pre-twiddle: Z[k] = (spec[N/2-1-2k] + i·spec[2k]) · t[k].
+    for k in 0..l {
+        let a = spec[2 * k];
+        let b = spec[m - 1 - 2 * k];
+        let c = tw_cos[k];
+        let s = tw_sin[k];
+        scratch[k] = Cpx {
+            re: b * c - a * s,
+            im: b * s + a * c,
+        };
+    }
+    fft(scratch, true);
+    // Post-twiddle.
+    for k in 0..l {
+        let re = scratch[k].re;
+        let im = scratch[k].im;
+        let c = tw_cos[k];
+        let s = tw_sin[k];
+        scratch[k] = Cpx {
+            re: re * c - im * s,
+            im: re * s + im * c,
+        };
+    }
+    // Reorder into the N outputs (same layout as the AAC §10 IMDCT).
+    let n8 = n / 8;
+    let n4 = n / 4;
+    let n2 = n / 2;
+    for k in 0..n8 {
+        out[2 * k] = scratch[n8 + k].im * scale;
+        out[2 * k + 1] = -scratch[n8 - 1 - k].re * scale;
+        out[n4 + 2 * k] = scratch[k].re * scale;
+        out[n4 + 2 * k + 1] = -scratch[n4 - 1 - k].im * scale;
+        out[n2 + 2 * k] = scratch[n8 + k].re * scale;
+        out[n2 + 2 * k + 1] = -scratch[n8 - 1 - k].im * scale;
+        out[n2 + n4 + 2 * k] = -scratch[k].im * scale;
+        out[n2 + n4 + 2 * k + 1] = scratch[n4 - 1 - k].re * scale;
+    }
+}
+
+/// Pre/post IMDCT rotation twiddles for block size `bs` (a power of two in
+/// `[64, MAX_BLOCKSIZE]`); `None` for any other size (then [`imdct`] uses the
+/// naïve fallback — unreachable for a spec-valid stream).
+fn mdct_tw(bs: usize) -> Option<(&'static [f32], &'static [f32])> {
+    Some(match bs {
+        64 => (&VMDCT_COS_64, &VMDCT_SIN_64),
+        128 => (&VMDCT_COS_128, &VMDCT_SIN_128),
+        256 => (&VMDCT_COS_256, &VMDCT_SIN_256),
+        512 => (&VMDCT_COS_512, &VMDCT_SIN_512),
+        1024 => (&VMDCT_COS_1024, &VMDCT_SIN_1024),
+        2048 => (&VMDCT_COS_2048, &VMDCT_SIN_2048),
+        4096 => (&VMDCT_COS_4096, &VMDCT_SIN_4096),
+        8192 => (&VMDCT_COS_8192, &VMDCT_SIN_8192),
+        _ => return None,
+    })
+}
+
+/// Inverse MDCT (spec §4.3.7): reconstruct `bs = 2·n` time samples in
 /// `out[0..bs]` from the `n` spectral lines in `spec[0..n]`, **unnormalized** to
-/// match libvorbis's `mdct_backward` absolute scale (see the module docs — no
-/// `1/n` factor is applied here). `bs` is always a power of two in
+/// match libvorbis's `mdct_backward` scale. **O(N log N)** via an `N/4`-point FFT
+/// ([`imdct_fft`]), with the naïve O(N²) reference ([`imdct_naive`]) as a fallback
+/// for any block size lacking a precomputed twiddle table (none in a valid
+/// stream). Never panics: sizes are bounds-checked and every index is in range.
+pub(crate) fn imdct(spec: &[f32], n: usize, out: &mut [f32]) {
+    let bs = 2 * n;
+    if n == 0 || bs > MAX_BLOCKSIZE || out.len() < bs || spec.len() < n {
+        return;
+    }
+    match mdct_tw(bs) {
+        Some((tw_cos, tw_sin)) => {
+            // Scratch = N/4 = n/2 complex points; libvorbis scale (unnormalized).
+            let mut scratch = [Cpx::ZERO; MAX_BLOCKSIZE / 4];
+            imdct_fft(
+                &spec[..n],
+                &mut scratch[..n / 2],
+                tw_cos,
+                tw_sin,
+                &mut out[..bs],
+                1.0,
+            );
+        }
+        None => imdct_naive(spec, n, out),
+    }
+}
+
+/// Naïve inverse MDCT (spec §4.3.7) — the direct-sum **reference/oracle** the
+/// fast [`imdct`] is validated against, and the fallback for an unusual block
+/// size. Unnormalized (no `1/n` factor) to match libvorbis's `mdct_backward`
+/// scale (see the module docs). `bs` is always a power of two in
 /// `[64, MAX_BLOCKSIZE]`, so `MAX_BLOCKSIZE/bs` is an exact integer stride onto
 /// the shared cosine table. Slices shorter than required are left untouched past
 /// their length (never panics): the loops are bounded by `n`/`bs` and every
 /// table index is provably in range.
-pub(crate) fn imdct(spec: &[f32], n: usize, out: &mut [f32]) {
+fn imdct_naive(spec: &[f32], n: usize, out: &mut [f32]) {
     let bs = 2 * n;
     if n == 0 || bs > MAX_BLOCKSIZE || out.len() < bs || spec.len() < n {
         return;
@@ -245,6 +419,43 @@ mod tests {
         let mut out = [1.0f32; 4096];
         imdct(&[0.0f32; 2048], 2048, &mut out);
         assert!(out.iter().all(|&v| v.abs() < 1e-9));
+    }
+
+    /// The fast `N/4`-FFT [`imdct`] must agree with the direct-sum
+    /// [`imdct_naive`] oracle for **every** supported block size, over a
+    /// deterministic pseudo-random spectrum — the proof the FFT reduction
+    /// (pre/post twiddles + reorder + scale) is the same transform.
+    #[test]
+    fn fast_imdct_matches_naive_for_every_block_size() {
+        for e in 6..=13u32 {
+            let bs = 1usize << e;
+            if bs > MAX_BLOCKSIZE {
+                break;
+            }
+            let n = bs / 2;
+            // Deterministic LCG spectrum in ~[-1, 1].
+            let mut x = 0x9e37_79b9u32;
+            let spec: Vec<f32> = (0..n)
+                .map(|_| {
+                    x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (x >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+                })
+                .collect();
+            let mut fast = vec![0.0f32; bs];
+            let mut naive = vec![0.0f32; bs];
+            imdct(&spec, n, &mut fast);
+            imdct_naive(&spec, n, &mut naive);
+            let max_abs = naive.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+            let max_err = fast
+                .iter()
+                .zip(&naive)
+                .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
+            // f32 FFT vs f32 direct sum: only accumulation-order rounding differs.
+            assert!(
+                max_err <= 1e-3 * (max_abs + 1e-6),
+                "bs {bs}: fast vs naive max_err {max_err} (max_abs {max_abs})"
+            );
+        }
     }
 
     /// The full symmetric long window (both flags set) satisfies the

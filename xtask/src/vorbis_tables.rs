@@ -60,6 +60,36 @@ fn cos_quarter() -> Vec<f32> {
         .collect()
 }
 
+/// Shared FFT twiddle resolution for the fast IMDCT: the largest radix-2 FFT a
+/// block needs is `N/4 = MAX_BLOCKSIZE/4` points, and a length-`len` sub-DFT's
+/// column-`j` twiddle is `VFFT_*[j·(VFFT_TW_N/len)]`.
+const VFFT_TW_N: usize = MAX_BLOCKSIZE / 4;
+
+/// FFT twiddle half-period: `fn(i) = trig(2π·i / VFFT_TW_N)`, `i = 0..VFFT_TW_N/2`
+/// (every sub-DFT index stays `< VFFT_TW_N/2`). `cos` and `sin` variants.
+fn fft_twiddles(sin: bool) -> Vec<f32> {
+    let period = VFFT_TW_N as f64;
+    (0..VFFT_TW_N / 2)
+        .map(|i| {
+            let th = 2.0 * PI * i as f64 / period;
+            (if sin { th.sin() } else { th.cos() }) as f32
+        })
+        .collect()
+}
+
+/// Per-block-size IMDCT pre/post-rotation twiddle `trig(2π·(k+⅛)/N)`,
+/// `k = 0..N/4` (`N` = block size) — the rotation an `N/4`-point FFT IMDCT folds
+/// around its transform (same convention as the AAC filterbank). `cos`/`sin`.
+fn mdct_twiddles(bs: usize, sin: bool) -> Vec<f32> {
+    let n = bs as f64;
+    (0..bs / 4)
+        .map(|k| {
+            let th = 2.0 * PI * (k as f64 + 0.125) / n;
+            (if sin { th.sin() } else { th.cos() }) as f32
+        })
+        .collect()
+}
+
 /// Shortest round-tripping f32 literal, guaranteed to parse in an `[f32; _]`
 /// array — `{v}` renders whole values as bare integers (`1`, `0`), which Rust
 /// rejects as float elements, so append `.0` when there's no `.`/`e` already.
@@ -102,6 +132,25 @@ fn generate() -> String {
         emit(&format!("WIN_{l}"), &window_half(l), &mut out);
     }
     emit("COS_QUARTER", &cos_quarter(), &mut out);
+
+    // Fast IMDCT (N/4-point FFT) tables: a shared FFT twiddle half-period + the
+    // per-block-size pre/post rotation twiddles.
+    writeln!(out, "pub(super) const VFFT_TW_N: usize = {VFFT_TW_N};").unwrap();
+    emit("VFFT_COS", &fft_twiddles(false), &mut out);
+    emit("VFFT_SIN", &fft_twiddles(true), &mut out);
+    for e in BLOCKSIZE_EXPONENTS {
+        let bs = 1usize << e;
+        emit(
+            &format!("VMDCT_COS_{bs}"),
+            &mdct_twiddles(bs, false),
+            &mut out,
+        );
+        emit(
+            &format!("VMDCT_SIN_{bs}"),
+            &mdct_twiddles(bs, true),
+            &mut out,
+        );
+    }
     out
 }
 
