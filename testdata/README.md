@@ -21,11 +21,37 @@ right = 659.25 Hz (E5), −6 dB, with 50 ms in/out fades. So:
 | `tone-aac.m4a` | AAC-LC in MP4/M4A |
 | `tone.aac`  | AAC-LC, raw ADTS elementary stream |
 | `tone.dsf`  | DSD64 (Sony DSF), 0.5 s — 1-bit, decimated to PCM for playback |
+| `tone-dsd128.dsf` | DSD128 (Sony DSF), 0.5 s |
+| `tone-dsd256.dsf` | DSD256 (Sony DSF), 0.1 s — decimation-rate e2e golden |
+| `tone-dsd512.dsf` | DSD512 (Sony DSF), 0.1 s — decimation-rate e2e golden |
+| `tone.dff`  | DSD64 (Philips DSDIFF, raw) — MSB-first/interleaved DFF + `DIIN` tags |
+| `tone-dst.dff` | DST-compressed DSDIFF (FFmpeg FATE slice) — lossless-DSD decode e2e |
 | `tagged.flac` | native FLAC with ID3-style tags (title/artist/album) — used by the library-scan `Some(tag)` test |
 
 DSD is 1-bit at 2.8 MHz, so `tone.dsf` is deliberately shorter (0.5 s) to keep
 it small. The CLI decimates it to multi-bit PCM (DSD64 → 352.8 kHz) and the deck
-resamples that to the device rate, so it plays on any DAC.
+resamples that to the device rate, so it plays on any DAC. Decode is rate-agnostic
+(fixed 8:1 decimation), so `tone-dsd256/512.dsf` only need to be long enough for
+the decimation-rate goldens (0.1 s). `tone.dff` / `tone-dst.dff` cover the Philips
+DSDIFF container (raw and DST-compressed).
+
+### DSD real-time headroom (release)
+
+Measured decode-vs-real-time ratio per rate (`cargo test -p soul-audio-cli
+--release --test dsd_realtime -- --ignored --nocapture`; lower = more headroom):
+
+| Rate | decode / real-time |
+|------|--------------------|
+| DSD64  | ~0.009× |
+| DSD128 | ~0.018× |
+| DSD256 | ~0.035× |
+| DSD512 | ~0.068× |
+
+Cost scales ~2× per rate doubling (byte rate doubles). Even DSD512 sustains
+real-time with ~15× headroom in the **release** profile. The dev/debug profile is
+roughly an order of magnitude slower, so prefer `--release` (or the audio-crate
+dev opt profile) for DSD256+ playback. Numbers are machine-dependent — the test
+is `#[ignore]`d and prints rather than asserts.
 
 `tone-aac.m4a` is deliberately **not** named `tone.m4a` — that name is already
 the lossless ALAC fixture above (same `.m4a` container, different codec), and
@@ -63,9 +89,13 @@ bash testdata/generate.sh   # needs ffmpeg (libmp3lame + flac) and python3 + num
 
 The PCM fixtures are produced by ffmpeg (independent of `soul-audio-core`), so
 decoding them validates our from-scratch decoders against an external encoder.
-`tone.dsf` is synthesized by `generate_dsd.py` — ffmpeg cannot *encode* PCM→DSD,
-so a 2nd-order sigma-delta modulator turns the tone into a 1-bit DSD64 stream
-wrapped in a Sony DSF container (ffmpeg *can* decode it, for cross-checking).
+The DSD fixtures are synthesized by `generate_dsd.py` — ffmpeg cannot *encode*
+PCM→DSD, so a 2nd-order sigma-delta modulator turns the tone into a 1-bit stream
+wrapped in a Sony DSF (`.dsf`, LSB-first/planar) or Philips DSDIFF (`.dff`,
+MSB-first/interleaved) container (ffmpeg *can* decode both, for cross-checking):
+`generate_dsd.py <out> [rate_hz] [dur_secs]` picks the container by extension.
+`tone-dst.dff` is a copy of the committed DST FATE slice (DST has no open
+encoder).
 
 > Minimal decode-correctness **vectors** (DSD/DST slice, IMA-ADPCM, MPEG
 > Layer I/II, VBR MP3, FLAC-in-Ogg) live in

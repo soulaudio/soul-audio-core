@@ -43,20 +43,42 @@ def sigma_delta_2nd(x: np.ndarray) -> np.ndarray:
     return bits
 
 
-def main() -> None:
-    out = sys.argv[1] if len(sys.argv) > 1 else "tone.dsf"
-    rate = int(sys.argv[2]) if len(sys.argv) > 2 else DSD64
-    n = int(DUR * rate)
-    t = np.arange(n) / rate
+def big_chunk(cid: bytes, body: bytes) -> bytes:
+    """A big-endian IFF chunk: 4-byte id + u64 BE size + body (caller pads)."""
+    return cid + struct.pack(">Q", len(body)) + body
 
-    # One byte per 8 samples; DSF packs LSB-first.
-    ch_bytes = []
-    for f in FREQS:
-        sig = AMP * np.sin(2.0 * np.pi * f * t)
-        bits = sigma_delta_2nd(sig)
-        ch_bytes.append(np.packbits(bits, bitorder="little"))
 
-    channels = len(FREQS)
+def write_dff(out: str, rate: int, ch_bits: list) -> None:
+    """Write a raw-DSD DSDIFF (.dff): MSB-first, channel-interleaved."""
+    channels = len(ch_bits)
+    ch_bytes = [np.packbits(b, bitorder="big") for b in ch_bits]
+    nbytes = ch_bytes[0].shape[0]
+    inter = np.empty(nbytes * channels, dtype=np.uint8)
+    for c, cb in enumerate(ch_bytes):
+        inter[c::channels] = cb
+
+    chnl = struct.pack(">H", channels) + b"".join(
+        (b"SLFT" if c == 0 else b"SRGT") for c in range(channels)
+    )
+    name = b"raw"
+    cmpr = b"DSD " + bytes([len(name)]) + name  # 4 + 1 + 3 = 8 (even)
+    prop_body = (
+        b"SND "
+        + big_chunk(b"FS  ", struct.pack(">I", rate))
+        + big_chunk(b"CHNL", chnl)
+        + big_chunk(b"CMPR", cmpr)
+    )
+    body = big_chunk(b"PROP", prop_body) + big_chunk(b"DSD ", inter.tobytes())
+    frm8 = b"FRM8" + struct.pack(">Q", 4 + len(body)) + b"DSD " + body
+    with open(out, "wb") as fh:
+        fh.write(frm8)
+    print(f"wrote {out}: {len(frm8)} bytes, {channels}ch raw-DSD (.dff)")
+
+
+def write_dsf(out: str, rate: int, n: int, ch_bits: list) -> None:
+    """Write a Sony DSF (.dsf): LSB-first, block-planar."""
+    channels = len(ch_bits)
+    ch_bytes = [np.packbits(b, bitorder="little") for b in ch_bits]
     valid_bpc = ch_bytes[0].shape[0]  # bytes per channel (n // 8)
     blocks = (valid_bpc + BLOCK - 1) // BLOCK
     padded_bpc = blocks * BLOCK
@@ -92,7 +114,23 @@ def main() -> None:
         fh.write(fmt_chunk)
         fh.write(data_chunk)
     label = f"DSD{64 * rate // DSD64}" if rate % DSD64 == 0 else f"{rate}Hz"
-    print(f"wrote {out}: {total} bytes, {channels}ch {label}, {DUR}s")
+    print(f"wrote {out}: {total} bytes, {channels}ch {label} (.dsf)")
+
+
+def main() -> None:
+    out = sys.argv[1] if len(sys.argv) > 1 else "tone.dsf"
+    rate = int(sys.argv[2]) if len(sys.argv) > 2 else DSD64
+    dur = float(sys.argv[3]) if len(sys.argv) > 3 else DUR
+    n = int(dur * rate)
+    t = np.arange(n) / rate
+
+    # 1-bit stream per channel (True = +1); packing/layout is per-container.
+    ch_bits = [sigma_delta_2nd(AMP * np.sin(2.0 * np.pi * f * t)) for f in FREQS]
+
+    if out.endswith(".dff"):
+        write_dff(out, rate, ch_bits)
+    else:
+        write_dsf(out, rate, n, ch_bits)
 
 
 if __name__ == "__main__":

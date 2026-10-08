@@ -549,6 +549,65 @@ fn real_dsd_decodes_decimates_and_preserves_stereo_tones() {
 }
 
 #[test]
+fn real_dff_decodes_and_preserves_stereo_tones() {
+    // A raw-DSD DSDIFF (DSD64) through the whole pipeline — same tone goldens as
+    // the DSF path, proving MSB-first/interleaved DFF decode is correct.
+    let out = tmp("dff_out.pcm");
+    Command::cargo_bin("soul-audio-cli")
+        .unwrap()
+        .args(["render"])
+        .arg(fixture("tone.dff"))
+        .args(["--out"])
+        .arg(&out)
+        .args(["--rate", "48000", "--channels", "2"])
+        .assert()
+        .success();
+
+    let pcm = read_pcm(&out);
+    let n = 16_384;
+    let left = analyze(&channel_window(&pcm, 2, 0, 4000, n), 48_000);
+    let right = analyze(&channel_window(&pcm, 2, 1, 4000, n), 48_000);
+    assert!(
+        (left.peak_hz - 440.0).abs() < 6.0,
+        "DFF left tone {:.1} Hz, not 440",
+        left.peak_hz
+    );
+    assert!(
+        (right.peak_hz - 659.25).abs() < 6.0,
+        "DFF right tone {:.1} Hz, not 659",
+        right.peak_hz
+    );
+    assert!(
+        left.sfdr_db > 40.0 && right.sfdr_db > 40.0,
+        "DFF not clean: {:.0}/{:.0} dB",
+        left.sfdr_db,
+        right.sfdr_db
+    );
+}
+
+#[test]
+fn real_dst_compressed_dff_renders_nonsilent() {
+    // DST-compressed DSDIFF (the committed FFmpeg FATE slice) decodes through the
+    // arithmetic coder → DSD → decimate → resample without error, non-silent.
+    // The slice is a real-music fragment, so assert it renders + is non-silent
+    // rather than a specific pitch.
+    let out = tmp("dst_out.pcm");
+    Command::cargo_bin("soul-audio-cli")
+        .unwrap()
+        .args(["render"])
+        .arg(fixture("tone-dst.dff"))
+        .args(["--out"])
+        .arg(&out)
+        .args(["--rate", "48000", "--channels", "2"])
+        .assert()
+        .success();
+
+    let pcm = read_pcm(&out);
+    assert!(!pcm.is_empty(), "DST render produced no PCM");
+    assert!(pcm.iter().any(|&s| s.abs() > 1000), "DST render silent");
+}
+
+#[test]
 fn real_flac_plays_through_the_render_pipeline() {
     // A real FLAC all the way through decode → resample → normalize → file.
     let out = tmp("fx_flac_render.pcm");

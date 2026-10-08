@@ -50,8 +50,11 @@ rm -f _cover.png
 
 # DSD: ffmpeg cannot encode PCM->DSD, so synthesize the 1-bit stream ourselves
 # (2nd-order sigma-delta + Sony DSF container). Needs python3 + numpy.
-python3 generate_dsd.py tone.dsf                 # DSD64
-python3 generate_dsd.py tone-dsd128.dsf 5644800  # DSD128
+python3 generate_dsd.py tone.dsf                      # DSD64  DSF (0.5 s)
+python3 generate_dsd.py tone-dsd128.dsf 5644800       # DSD128 DSF (0.5 s)
+python3 generate_dsd.py tone-dsd256.dsf 11289600 0.1  # DSD256 DSF (0.1 s, size)
+python3 generate_dsd.py tone-dsd512.dsf 22579200 0.1  # DSD512 DSF (0.1 s, size)
+python3 generate_dsd.py tone.dff                      # DSD64  DSDIFF/raw (0.5 s)
 
 echo "generated:"
-ls -la tone.wav tone.flac tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus arted.flac tone-dsd128.dsf
+ls -la tone.wav tone.flac tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff

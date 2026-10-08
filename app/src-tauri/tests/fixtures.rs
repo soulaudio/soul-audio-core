@@ -1,7 +1,8 @@
-//! Validates the committed testdata fixtures. Playable formats (incl. the new
-//! DSD128 rate) decode to non-silent PCM; the tag-only new fixtures (Opus
-//! duration, embedded-art FLAC) validate through the `Library::scan` path the
-//! app uses. Opus is intentionally NOT decoded — the core has no Opus decoder.
+//! Validates the committed testdata fixtures. Playable formats (incl. the DSD
+//! rates and raw-DSD DSDIFF) decode to non-silent PCM; the tag-path fixtures
+//! (Opus duration, embedded-art FLAC) validate through the `Library::scan` path
+//! the app uses. Opus decodes fine in the core now; it is simply exercised in
+//! the CLI e2e suite rather than re-decoded here.
 use std::path::PathBuf;
 
 use soul_audio_core::Decoder;
@@ -44,7 +45,7 @@ fn decode_all(name: &str) -> (u64, i32, u32) {
 
 #[test]
 fn playable_fixtures_decode_nonsilent() {
-    // NOTE: tone.opus is excluded — the core has no Opus decoder (see below).
+    // tone.opus decodes too; it is covered in the CLI e2e suite, omitted here.
     for name in [
         "tone.wav",
         "tone.flac",
@@ -54,6 +55,7 @@ fn playable_fixtures_decode_nonsilent() {
         "tone.aac",
         "tone.dsf",
         "tone-dsd128.dsf",
+        "tone.dff",
     ] {
         let (samples, peak, _) = decode_all(name);
         assert!(samples > 0, "{name}: decoded 0 samples");
@@ -62,17 +64,20 @@ fn playable_fixtures_decode_nonsilent() {
 }
 
 #[test]
-fn dsd128_decimates_to_double_rate() {
-    // DSD64 (2.8224 MHz) -> 352.8 kHz; DSD128 (5.6448 MHz) -> 705.6 kHz (8:1).
-    assert_eq!(decode_all("tone.dsf").2, 352_800);
-    assert_eq!(decode_all("tone-dsd128.dsf").2, 705_600);
+fn dsd_rates_decimate_eight_to_one() {
+    // Fixed 8:1 decimation: each DSD rate → rate / 8 PCM.
+    assert_eq!(decode_all("tone.dsf").2, 352_800); // DSD64
+    assert_eq!(decode_all("tone-dsd128.dsf").2, 705_600); // DSD128
+    assert_eq!(decode_all("tone-dsd256.dsf").2, 1_411_200); // DSD256
+    assert_eq!(decode_all("tone-dsd512.dsf").2, 2_822_400); // DSD512
+    assert_eq!(decode_all("tone.dff").2, 352_800); // DSD64 via DSDIFF
 }
 
 #[test]
 fn opus_duration_reads_from_tags() {
-    // The core can't decode Opus, but the tags layer reads its duration from the
-    // last Ogg-page granule — the path the app relies on. Scan a folder with
-    // only tone.opus so the single view is unambiguous.
+    // The library view's duration comes from the tags layer (the last Ogg-page
+    // granule), independent of decoding — the path the app relies on. Scan a
+    // folder with only tone.opus so the single view is unambiguous.
     let dir = tempfile::tempdir().unwrap();
     std::fs::copy(testdata("tone.opus"), dir.path().join("tone.opus")).unwrap();
     let views = Library::scan(dir.path()).expect("scan").views();

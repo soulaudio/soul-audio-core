@@ -254,6 +254,13 @@ impl<S: Source> DsdDecoder for DffDecoder<S> {
         self.audio_bytes_remaining -= n as u64;
         Ok(n)
     }
+
+    fn total_samples(&self) -> Option<u64> {
+        // Per-channel 1-bit sample count: audio bytes ÷ channels × 8 samples per
+        // byte — the same figure `seek_to_sample` derives. `audio_total` is set
+        // on both the raw `DSD ` and DST paths, so this covers both.
+        Some(self.audio_total / self.channels * 8)
+    }
 }
 
 impl<S: SeekSource> DsdSeek for DffDecoder<S> {
@@ -543,6 +550,28 @@ mod tests {
         assert_eq!(n, 4);
         assert_eq!(&out[..4], &audio); // passthrough, no bit reversal
         assert_eq!(d.read_dsd(&mut out).unwrap(), 0);
+    }
+
+    #[test]
+    fn reports_total_samples_for_raw_dsd() {
+        // 8 audio bytes, stereo → 4 bytes/channel → 4 × 8 = 32 per-channel samples.
+        let audio = [10, 20, 11, 21, 12, 22, 13, 23];
+        let bytes = dff(2_822_400, 2, b"DSD ", &audio);
+        let d = DffDecoder::new(SliceSource::new(&bytes)).unwrap();
+        assert_eq!(d.total_samples(), Some(32));
+    }
+
+    #[test]
+    fn reports_total_samples_for_dst() {
+        // Two 9408-byte stored frames → audio_total 18816, stereo → 75264 samples.
+        let frame_bytes = 9408usize;
+        let mut f0 = vec![0u8; 1 + frame_bytes];
+        let mut f1 = vec![0u8; 1 + frame_bytes];
+        f0[0] = 0x00;
+        f1[0] = 0x00;
+        let bytes = dff_dst(2_822_400, 2, 75, &[&f0, &f1]);
+        let d = DffDecoder::new(SliceSource::new(&bytes)).unwrap();
+        assert_eq!(d.total_samples(), Some(75_264));
     }
 
     #[test]
