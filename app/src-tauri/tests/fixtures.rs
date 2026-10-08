@@ -92,10 +92,16 @@ fn opus_duration_reads_from_tags() {
 }
 
 #[test]
-fn arted_flac_reports_embedded_art() {
+fn arted_flac_embedded_art_resolves() {
+    // `has_art` was dropped (issue #33); embedded art is resolved lazily by the
+    // service's `cover_bytes` (the path the UI actually uses). arted.flac scans
+    // into one view and its embedded cover resolves to bytes.
     let dir = tempfile::tempdir().unwrap();
     std::fs::copy(testdata("arted.flac"), dir.path().join("arted.flac")).unwrap();
     let views = Library::scan(dir.path()).expect("scan").views();
     assert_eq!(views.len(), 1);
-    assert!(views[0].has_art, "arted.flac should report has_art");
+    assert!(
+        soul_audio_service::cover_bytes(&testdata("arted.flac")).is_some(),
+        "arted.flac embedded cover must resolve"
+    );
 }

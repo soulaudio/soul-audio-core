@@ -16,7 +16,6 @@ const library: TrackView[] = [
 		artist: "A",
 		album: "Alpha",
 		duration_secs: 200,
-		has_art: false,
 	},
 	{
 		id: 2,
@@ -24,7 +23,6 @@ const library: TrackView[] = [
 		artist: "B",
 		album: "Beta",
 		duration_secs: 100,
-		has_art: false,
 	},
 ];
 

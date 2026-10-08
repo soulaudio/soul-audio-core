@@ -56,7 +56,6 @@ test("openFolder resolves the scanned library views on success", async () => {
 			artist: null,
 			album: null,
 			duration_secs: 120,
-			has_art: false,
 		},
 	];
 	mockIPC((cmd) => {

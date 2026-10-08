@@ -83,14 +83,6 @@ export type TrackView = {
 	artist: string | null,
 	album: string | null,
 	duration_secs: number | null,
-	/**
-	 *  Whether the file carries *embedded* cover art only. The UI still
-	 *  requests cover art for every visible row regardless of this flag,
-	 *  because *external* cover art (e.g. `Scans/Front.jpg`, resolved
-	 *  separately by the `track_art` command) is not reflected here — a
-	 *  track with `has_art: false` can still have art.
-	 */
-	has_art: boolean,
 };
 
 /* Tauri Specta runtime */

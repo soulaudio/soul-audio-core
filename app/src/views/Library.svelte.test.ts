@@ -17,7 +17,6 @@ const tracks: TrackView[] = [
 		artist: "A",
 		album: "Alpha",
 		duration_secs: 100,
-		has_art: true,
 	},
 	{
 		id: 2,
@@ -25,7 +24,6 @@ const tracks: TrackView[] = [
 		artist: "B",
 		album: "Beta",
 		duration_secs: 120,
-		has_art: false,
 	},
 	{
 		id: 3,
@@ -33,7 +31,6 @@ const tracks: TrackView[] = [
 		artist: "C",
 		album: null,
 		duration_secs: 90,
-		has_art: false,
 	},
 ];
 
@@ -63,17 +60,14 @@ test("renders one row per library track", async () => {
 	expect(rows).toHaveLength(tracks.length);
 });
 
-// Required coverage per the task brief: "a row with has_art=false does not
-// request art". Reading art-cache.svelte.ts and Library.svelte: neither
-// gates the fetch on `has_art` — `has_art` only reflects *embedded* art (see
-// bindings.ts / PlayerBar.svelte's own comment on this), and cover
-// resolution also tries an external "Scans/" file, so a has_art=false track
-// can still have real art. The actual, working gate is row *visibility*
-// (`inView`/`IntersectionObserver`), regardless of `has_art`. This test
-// documents that real behavior: a row not yet scrolled into view is never
-// fetched (has_art:true or false alike); once visible, has_art:false rows
-// *are* fetched exactly like has_art:true ones.
-test("art is requested only for rows that have scrolled into view, regardless of has_art", async () => {
+// Cover art is fetched per row only when the row scrolls into view — the gate
+// is row *visibility* (`inView`/`IntersectionObserver`), nothing else. (There
+// is no scan-time art flag to gate on: `has_art` was dropped as unused and
+// misleading in issue #33, since cover resolution also tries an external
+// "Scans/" file, so every visible row requests art and lets the resolver
+// decide.) This test documents that: a row not yet scrolled into view is never
+// fetched; once visible, it is.
+test("art is requested only for rows that have scrolled into view", async () => {
 	const seenIds: number[] = [];
 	mockIPC((cmd, payload) => {
 		if (cmd === "track_art") {
@@ -85,8 +79,8 @@ test("art is requested only for rows that have scrolled into view, regardless of
 	await render(Library);
 	expect(FakeIntersectionObserver.instances).toHaveLength(tracks.length);
 
-	// Track #3 (has_art:false, own album key) never intersects: no request.
-	// Tracks #1 (has_art:true) and #2 (has_art:false) both scroll into view.
+	// Track #3 (own album key) never intersects: no request.
+	// Tracks #1 and #2 both scroll into view.
 	FakeIntersectionObserver.instances[0]?.fire(true); // track 1
 	FakeIntersectionObserver.instances[1]?.fire(true); // track 2
 	await tick();

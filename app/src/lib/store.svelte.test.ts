@@ -77,7 +77,6 @@ test("bindPlayerEvents loads the current library views up front", async () => {
 			artist: null,
 			album: null,
 			duration_secs: 1,
-			has_art: false,
 		},
 	];
 	mockIPC(

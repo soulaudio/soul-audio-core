@@ -275,13 +275,21 @@ fn track_art_resolves_embedded_and_missing() {
     let state = app.state::<PlayerState>();
     let views = load_folder(state.inner(), app.handle(), dir.path()).unwrap();
 
-    // The arted.flac view has_art; its art resolves to a data URL.
-    let arted = views.iter().find(|v| v.has_art).expect("arted has_art");
+    // arted.flac (title "Arted Track" from the fixture's metadata) carries an
+    // embedded cover; its art resolves to a data URL. (Fixtures are selected by
+    // title now that the `has_art` DTO flag is gone — issue #33.)
+    let arted = views
+        .iter()
+        .find(|v| v.title.as_deref() == Some("Arted Track"))
+        .expect("arted.flac view");
     let url = track_art(app.state::<PlayerState>(), arted.id).unwrap();
     assert!(url.unwrap().starts_with("data:image/"));
 
-    // The plain WAV has no art.
-    let plain = views.iter().find(|v| !v.has_art).expect("wav artless");
+    // The plain WAV (no tags → no title) has no art.
+    let plain = views
+        .iter()
+        .find(|v| v.title.is_none())
+        .expect("plain wav view");
     assert_eq!(
         track_art(app.state::<PlayerState>(), plain.id).unwrap(),
         None

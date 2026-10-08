@@ -68,9 +68,9 @@
   const repeatIcon = $derived(player.repeat === "Off" ? "↻" : player.repeat === "All" ? "↻" : "↻₁");
 
   // Now-playing cover art: fetched on demand for every track (the backend
-  // resolves embedded art AND an external cover file, so we can't gate on
-  // `has_art`, which only reflects embedded art). `track_art` returns a
-  // ready-to-use `data:` URL, so there's no Blob/object-URL lifecycle to manage.
+  // resolves embedded art AND an external cover file, so there is no scan-time
+  // flag worth gating on). `track_art` returns a ready-to-use `data:` URL, so
+  // there's no Blob/object-URL lifecycle to manage.
   // Re-runs whenever `current` changes (track switch or a library reload).
   let artUrl = $state<string | null>(null);
 

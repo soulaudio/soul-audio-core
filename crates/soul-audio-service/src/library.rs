@@ -15,10 +15,6 @@ pub struct Track {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub duration_secs: f64,
-    /// Whether the file carries embedded cover art (front cover or otherwise).
-    /// The bytes themselves are not kept here — the app command re-reads the
-    /// file on demand (see `Library::path_of`).
-    pub has_art: bool,
 }
 
 /// An ordered set of tracks with stable session ids.
@@ -124,7 +120,7 @@ impl Library {
             .into_iter()
             .enumerate()
             .map(|(i, path)| {
-                let (title, artist, album, duration_secs, has_art) = read_tags(&path);
+                let (title, artist, album, duration_secs) = read_tags(&path);
                 Track {
                     id: i as u32,
                     path,
@@ -132,7 +128,6 @@ impl Library {
                     artist,
                     album,
                     duration_secs,
-                    has_art,
                 }
             })
             .collect();
@@ -156,15 +151,16 @@ impl Library {
                 artist: t.artist.clone(),
                 album: t.album.clone(),
                 duration_secs: t.duration_secs,
-                has_art: t.has_art,
             })
             .collect()
     }
 }
 
-/// Read (title, artist, album, duration_secs, has_art) with `soul-audio-tags`;
-/// all-`None`/`0.0`/`false` on any read error (a corrupt tag must not sink the
-/// scan).
+/// Read (title, artist, album, duration_secs) with `soul-audio-tags`;
+/// all-`None`/`0.0` on any read error (a corrupt tag must not sink the scan).
+/// Cover art is NOT probed here — it is resolved lazily per track by
+/// [`crate::cover_bytes`] (embedded *or* external), so an eager flag here would
+/// be both a per-track filesystem cost and misleading (see issue #33).
 ///
 /// KNOWN, ACCEPTED REGRESSION: MP3 and Opus containers don't carry a total
 /// sample/frame count in their tag-level header, so `read_owned`'s
@@ -172,25 +168,16 @@ impl Library {
 /// falls back to `0.0` (lofty used to compute this from Xing/granule data).
 /// Fixing that (Xing header / Opus granule-position duration) is a follow-up,
 /// not in scope here.
-fn read_tags(path: &Path) -> (Option<String>, Option<String>, Option<String>, f64, bool) {
+fn read_tags(path: &Path) -> (Option<String>, Option<String>, Option<String>, f64) {
     use soul_audio_tags::read_owned;
 
     let Ok(file) = std::fs::File::open(path) else {
-        return (None, None, None, 0.0, false);
+        return (None, None, None, 0.0);
     };
     let mut src = embedded_io_adapters::std::FromStd::new(file);
     match read_owned(&mut src) {
-        Ok((tags, facts)) => {
-            let has_art = !tags.pictures.is_empty();
-            (
-                tags.title,
-                tags.artist,
-                tags.album,
-                duration_secs(&facts),
-                has_art,
-            )
-        }
-        Err(_) => (None, None, None, 0.0, false),
+        Ok((tags, facts)) => (tags.title, tags.artist, tags.album, duration_secs(&facts)),
+        Err(_) => (None, None, None, 0.0),
     }
 }
 
@@ -322,10 +309,6 @@ mod tests {
             "tagged fixture has a real duration, got {}",
             t.duration_secs
         );
-        assert!(
-            !t.has_art,
-            "tagged.flac carries no embedded cover art fixture"
-        );
     }
 
     /// A minimal FLAC container: `fLaC` marker, STREAMINFO, a
@@ -392,26 +375,24 @@ mod tests {
         v
     }
 
+    /// Embedded cover art is resolved per-track by `cover_bytes` (the lazy path
+    /// the UI actually uses), not an eager scan flag (issue #33 dropped the
+    /// `has_art` DTO field). A FLAC with a PICTURE block must yield a cover; its
+    /// tags still scan normally.
     #[test]
-    fn scan_sets_has_art_when_cover_present() {
+    fn embedded_cover_resolves_via_cover_bytes() {
         let root = tmpdir("art");
-        std::fs::write(
-            root.join("cover.flac"),
-            flac_with_art("Artful", "Artist", "Album"),
-        )
-        .unwrap();
+        let path = root.join("cover.flac");
+        std::fs::write(&path, flac_with_art("Artful", "Artist", "Album")).unwrap();
         let lib = Library::scan(&root).unwrap();
         assert_eq!(lib.tracks.len(), 1);
+        assert_eq!(lib.tracks[0].title.as_deref(), Some("Artful"));
+        assert_eq!(lib.tracks[0].artist.as_deref(), Some("Artist"));
+        assert_eq!(lib.tracks[0].album.as_deref(), Some("Album"));
         assert!(
-            lib.tracks[0].has_art,
-            "embedded PICTURE block must be detected"
+            crate::cover_bytes(&path).is_some(),
+            "embedded PICTURE block must resolve to a cover"
         );
-        let views = lib.views();
-        assert_eq!(views.len(), 1);
-        assert!(views[0].has_art, "TrackView must carry has_art too");
-        assert_eq!(views[0].title.as_deref(), Some("Artful"));
-        assert_eq!(views[0].artist.as_deref(), Some("Artist"));
-        assert_eq!(views[0].album.as_deref(), Some("Album"));
     }
 
     #[test]
@@ -432,7 +413,6 @@ mod tests {
         assert_eq!(bad.artist, None);
         assert_eq!(bad.album, None);
         assert_eq!(bad.duration_secs, 0.0);
-        assert!(!bad.has_art);
         let ok = lib
             .tracks
             .iter()
