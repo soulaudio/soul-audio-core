@@ -109,6 +109,33 @@ impl<'a> BitReader<'a> {
     pub fn bits_read(&self) -> usize {
         self.bit_pos
     }
+
+    /// Peek the next `n` bits (`n <= 32`) LSb-first **without consuming** them;
+    /// bits past end of stream read as `0`. A FAST_HUFFMAN prefix table consults
+    /// this, then [`Self::advance`]s by only the matched codeword length.
+    pub fn peek_bits(&self, n: u32) -> u32 {
+        debug_assert!(n <= 32, "peek_bits: n must be <= 32, got {n}");
+        let mut v = 0u32;
+        for i in 0..n {
+            let pos = self.bit_pos + i as usize;
+            let byte = self.bytes.get(pos >> 3).copied().unwrap_or(0);
+            if (byte >> (pos & 7)) & 1 != 0 {
+                v |= 1u32 << i;
+            }
+        }
+        v
+    }
+
+    /// Advance the cursor by `n` bits, saturating at end of stream (an
+    /// over-advance can never move `bit_pos` past the backing slice).
+    pub fn advance(&mut self, n: u32) {
+        self.bit_pos = (self.bit_pos + n as usize).min(self.total_bits());
+    }
+
+    /// Bits not yet consumed.
+    pub fn bits_remaining(&self) -> usize {
+        self.total_bits().saturating_sub(self.bit_pos)
+    }
 }
 
 /// `ilog(n)`: bits needed to represent `0..=n-1` (spec §9.2.1) — equivalently,
@@ -304,6 +331,32 @@ mod tests {
         let mut r = BitReader::new(&[0xFF]);
         assert_eq!(r.read_bits(9), Err(DecodeError::UnexpectedEof));
         assert_eq!(r.bits_read(), 0);
+    }
+
+    #[test]
+    fn peek_does_not_consume_and_advance_matches_read_bits() {
+        let mut r = BitReader::new(&[0xFC, 0x48]);
+        assert_eq!(r.peek_bits(4), 12); // same 4 bits read_bits(4) returns
+        assert_eq!(r.bits_read(), 0, "peek must not consume");
+        r.advance(4);
+        assert_eq!(r.bits_read(), 4);
+        assert_eq!(r.read_bits(3).unwrap(), 0b111);
+    }
+
+    #[test]
+    fn peek_zero_pads_past_eof() {
+        // 8 bits available; peek 12: low 4 are 0xF, remaining 8 bits zero-pad.
+        let r = BitReader::new(&[0x0F]);
+        assert_eq!(r.peek_bits(12), 0x00F);
+        assert_eq!(r.bits_read(), 0);
+    }
+
+    #[test]
+    fn advance_is_bounded_at_eof() {
+        let mut r = BitReader::new(&[0xAB]);
+        r.advance(100); // clamped to total_bits()
+        assert_eq!(r.bits_remaining(), 0);
+        assert_eq!(r.read_bit(), Err(DecodeError::UnexpectedEof));
     }
 
     #[test]

@@ -85,6 +85,19 @@ pub(crate) const MAX_CHANNELS: usize = 4;
 #[cfg(feature = "vorbis-embedded-profile")]
 pub(crate) const MAX_CHANNELS: usize = 2;
 
+/// Width of the per-codebook FAST_HUFFMAN acceleration table
+/// (`2^FAST_HUFFMAN_BITS` slots) built at setup to resolve any codeword this
+/// long or shorter in one table lookup, short-circuiting the `decode_scalar`
+/// linear scan (the residue hot loop, #34). The desktop profile uses 10
+/// (stb_vorbis's value; 4 KiB/book); the `vorbis-embedded-profile` feature turns
+/// it **off** (`0` → no table built, zero extra arena RAM). Longer codewords and
+/// near-EOF reads fall back to the exact scan, so this never affects decoded
+/// output — only speed.
+#[cfg(not(feature = "vorbis-embedded-profile"))]
+pub(crate) const FAST_HUFFMAN_BITS: u32 = 10;
+#[cfg(feature = "vorbis-embedded-profile")]
+pub(crate) const FAST_HUFFMAN_BITS: u32 = 0;
+
 /// Largest (long) block size this profile supports (profile knob, Task 11).
 /// The desktop profile (default) keeps the Vorbis I spec ceiling (`2^13` =
 /// 8192); the `vorbis-embedded-profile` feature caps it at 4096 (design spec
@@ -440,6 +453,14 @@ impl<S: Source, A: AsMut<[u8]> + AsRef<[u8]>> VorbisDecoder<S, A> {
                 &mut mappings,
                 &mut modes,
             )?;
+            // FAST_HUFFMAN post-pass (#34): required setup (codebooks, floors,
+            // residues, multiplicands) is now fully allocated, so build the
+            // large best-effort acceleration tables from whatever arena space
+            // remains — never starving a required allocation. `arena.top()` is
+            // read AFTER so the recorded consumption includes them.
+            for cb in &mut codebooks[..codebook_count] {
+                cb.build_fast_table(&mut arena);
+            }
             (
                 codebook_count,
                 floor_count,

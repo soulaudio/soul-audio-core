@@ -32,6 +32,11 @@ ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a aac -b:a 192k -f adts to
 # NOT `tone.ogg` — that name is already the FLAC-in-Ogg fixture above.
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a libvorbis -q:a 5 tone-vorbis.ogg
 
+# Dense Vorbis: two independent pink-noise channels at high quality (q8) → a
+# heavy, decorrelated residue payload — the #34 fast-Huffman decode hot path (a
+# pure tone's residue is misleadingly light). Synthetic, no copyright; 2 s.
+ffmpeg -y -hide_banner -loglevel error -filter_complex "anoisesrc=d=2:c=pink:seed=1:a=0.5[l];anoisesrc=d=2:c=pink:seed=2:a=0.5[r];[l][r]join=inputs=2:channel_layout=stereo[a]" -map "[a]" -c:a libvorbis -q:a 8 tone-vorbis-dense.ogg
+
 # HE-AAC (SBR): aac_mf at a low bitrate emits explicit HE-AAC for MP4. Exercises
 # the SBR decode path end-to-end in the playback tier (the ADTS-implicit-SBR path
 # is covered by the core sbr.aac golden). NOTE: aac_mf emits plain LC for `-f
@@ -63,4 +68,4 @@ python3 generate_dsd.py tone-dsd512.dsf 22579200 0.1  # DSD512 DSF (0.1 s, size)
 python3 generate_dsd.py tone.dff                      # DSD64  DSDIFF/raw (0.5 s)
 
 echo "generated:"
-ls -la tone.wav tone.flac tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a
+ls -la tone.wav tone.flac tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg

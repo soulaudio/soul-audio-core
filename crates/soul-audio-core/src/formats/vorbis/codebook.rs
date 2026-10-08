@@ -29,6 +29,7 @@
 
 use crate::decoder::DecodeError;
 
+use super::FAST_HUFFMAN_BITS;
 use super::arena::Arena;
 use super::bitread::{BitReader, float32_unpack, ilog};
 
@@ -82,6 +83,12 @@ pub struct Codebook {
     minimum_value: f32,
     /// `codebook_delta_value` (already `float32_unpack`-ed).
     delta_value: f32,
+    /// Offset of the FAST_HUFFMAN acceleration table (`u32` × `2^FAST_HUFFMAN_BITS`),
+    /// or `0` if none was built (embedded profile, no usable entries, or the
+    /// arena was full — [`Self::decode_scalar`] then uses the scan only). Each
+    /// slot packs `(len << 24) | entry` for a codeword `≤ FAST_HUFFMAN_BITS`, or
+    /// `0` (sentinel: no such codeword covers that prefix).
+    fast_off: u32,
 }
 
 impl Codebook {
@@ -99,6 +106,7 @@ impl Codebook {
         lookup_values: 0,
         minimum_value: 0.0,
         delta_value: 0.0,
+        fast_off: 0,
     };
 
     /// Parse one packed codebook (spec §3.2.1) from `br`, laying its tables
@@ -172,6 +180,11 @@ impl Codebook {
         )?;
         let (max_length, _used) = assign_codewords(arena, lengths_off, codewords_off, entries)?;
 
+        // The FAST_HUFFMAN acceleration table (#34) is NOT built here: it is a
+        // post-pass over leftover arena space (see [`Self::build_fast_table`]),
+        // so these large (4 KiB) best-effort tables never starve the *required*
+        // floor/residue/multiplicand allocations that follow in the same arena.
+
         // --- VQ lookup table (spec §3.2.1) ------------------------------
         let lookup_type = br.read_bits(4)? as u8;
         let mut minimum_value = 0.0f32;
@@ -219,7 +232,56 @@ impl Codebook {
             lookup_values,
             minimum_value,
             delta_value,
+            fast_off: 0, // set later by build_fast_table (post-setup pass)
         })
+    }
+
+    /// Build this book's FAST_HUFFMAN table (#34) from whatever arena space is
+    /// left after the full setup parse, recording its offset in `fast_off`.
+    /// Best-effort: the embedded profile (`FAST_HUFFMAN_BITS == 0`), a book with
+    /// no used entries, or a full arena all leave `fast_off == 0` (scan-only).
+    /// Idempotent (a non-zero `fast_off` is left untouched). Called in a
+    /// post-pass so it never competes with required floor/residue allocations.
+    pub(super) fn build_fast_table(&mut self, arena: &mut Arena) {
+        if FAST_HUFFMAN_BITS == 0 || self.max_length == 0 || self.fast_off != 0 {
+            return;
+        }
+        let slots = 1usize << FAST_HUFFMAN_BITS;
+        let Ok(off) = arena.alloc(slots * 4, 4) else {
+            return; // arena full → this book stays scan-only (still correct)
+        };
+        let lengths_off = self.lengths_off as usize;
+        let codewords_off = self.codewords_off as usize;
+        let buf = arena.bytes_mut();
+        // Clear to the "no short codeword" sentinel (len == 0 → scan fallback).
+        for s in 0..slots {
+            buf[off + s * 4..off + s * 4 + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
+        for i in 0..self.entries as usize {
+            let len = u32::from(buf[lengths_off + i]);
+            if len == 0 || len > FAST_HUFFMAN_BITS {
+                continue;
+            }
+            let cw = u32::from_le_bytes(
+                buf[codewords_off + i * 4..codewords_off + i * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            // `cw` is left-justified (first branch at value bit 31) with zeros
+            // below the codeword, so its MSb-first prefix is the top
+            // `FAST_HUFFMAN_BITS` bits; every index sharing the codeword's top
+            // `len` bits maps to this entry.
+            let prefix = cw >> (32 - FAST_HUFFMAN_BITS);
+            let shift = FAST_HUFFMAN_BITS - len;
+            let base = (prefix >> shift) << shift;
+            let count = 1u32 << shift;
+            let packed = (len << 24) | (i as u32);
+            for k in 0..count {
+                let idx = (base + k) as usize;
+                buf[off + idx * 4..off + idx * 4 + 4].copy_from_slice(&packed.to_le_bytes());
+            }
+        }
+        self.fast_off = off as u32;
     }
 
     /// Huffman-decode one entry index from `br`. `storage` is the arena bytes
@@ -235,6 +297,21 @@ impl Codebook {
         if max == 0 {
             // A book with no used entries can decode nothing.
             return Err(DecodeError::Malformed);
+        }
+        // Fast path (#34): a FAST_HUFFMAN table resolves any codeword
+        // `<= FAST_HUFFMAN_BITS` in one peek. A miss (sentinel `0` — the real
+        // codeword is longer — or not enough bits left for the matched length)
+        // falls through to the exact scan below, so output is identical.
+        if self.fast_off != 0 {
+            let peeked = br.peek_bits(FAST_HUFFMAN_BITS); // LSb-first
+            let idx = reverse_bits(peeked, FAST_HUFFMAN_BITS) as usize; // MSb-first
+            let off = self.fast_off as usize + idx * 4;
+            let packed = u32::from_le_bytes(storage[off..off + 4].try_into().unwrap());
+            let len = packed >> 24;
+            if len != 0 && (len as usize) <= br.bits_remaining() {
+                br.advance(len);
+                return Ok(packed & 0x00FF_FFFF);
+            }
         }
         let lengths_off = self.lengths_off as usize;
         let codewords_off = self.codewords_off as usize;
@@ -362,6 +439,20 @@ fn lookup1_values(entries: u32, dims: u16) -> u32 {
         }
     }
     lo
+}
+
+/// Reverse the low `n` bits of `v` (`n <= 32`): converts the [`BitReader`]'s
+/// LSb-first peek into the MSb-first codeword-prefix index the FAST_HUFFMAN
+/// table is keyed by (the first stream bit is the most-significant index bit,
+/// matching how `decode_scalar`'s scan builds `acc`).
+fn reverse_bits(v: u32, n: u32) -> u32 {
+    let mut r = 0u32;
+    for i in 0..n {
+        if (v >> i) & 1 != 0 {
+            r |= 1u32 << (n - 1 - i);
+        }
+    }
+    r
 }
 
 /// Assign canonical Huffman codewords to every used entry and validate tree
@@ -499,7 +590,10 @@ mod tests {
         let mut storage = vec![0u8; 8192];
         let mut arena = Arena::new(&mut storage);
         let mut br = BitReader::new(bytes);
-        let cb = Codebook::parse(&mut br, &mut arena)?;
+        let mut cb = Codebook::parse(&mut br, &mut arena)?;
+        // Build the FAST_HUFFMAN table (the real decoder's post-setup pass) so
+        // the decode tests exercise the fast path, not just the scan.
+        cb.build_fast_table(&mut arena);
         Ok((cb, storage))
     }
 
@@ -567,6 +661,35 @@ mod tests {
         assert_eq!(
             cb.decode_scalar(&mut br, &storage).unwrap_err(),
             DecodeError::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn long_codeword_falls_back_past_the_fast_table() {
+        // A book whose longest codewords exceed FAST_HUFFMAN_BITS (=10 desktop)
+        // must still decode via the scan fallback. Lengths [1,2,..,10,11,11]
+        // form a full tree with two 11-bit leaves (the deepest two entries).
+        let mut w = BitWriter::new();
+        write_header(&mut w, 1, 12);
+        w.write(0, 1); // ordered = 0
+        w.write(0, 1); // sparse  = 0
+        for len in [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 11] {
+            w.write(len - 1, 5);
+        }
+        w.write(0, 4); // lookup_type = 0
+        let (cb, storage) = parse(&w.into_bytes()).expect("valid deep codebook");
+        // Entry 0 (codeword "0") resolves via the fast table.
+        assert_eq!(decode(&cb, &storage, &[0]).unwrap(), 0);
+        // The deepest codeword is 11 bits (ten leading 1s then a 0/1) — longer
+        // than the 10-bit fast table, so it exercises the scan fallback. Entry
+        // 10's canonical codeword is "11111111110", entry 11's "11111111111".
+        assert_eq!(
+            decode(&cb, &storage, &[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0]).unwrap(),
+            10
+        );
+        assert_eq!(
+            decode(&cb, &storage, &[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]).unwrap(),
+            11
         );
     }
 

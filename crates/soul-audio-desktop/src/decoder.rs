@@ -24,14 +24,18 @@ pub type Src = FromStd<IoBufReader<File>>;
 /// Default byte size of the heap arena [`VorbisDecoder::new`] bump-allocates
 /// its setup-header tables (codebooks/floors/residues/mappings/modes) into.
 /// Generous over Xiph's own budget guidance (design spec: "~150 KB typical,
-/// 250 KB 'use low-mem below this'").
-pub const VORBIS_DEFAULT_ARENA: usize = 256 * 1024;
+/// 250 KB 'use low-mem below this'"), with extra headroom since #34: the
+/// desktop profile also builds a `4 KiB` FAST_HUFFMAN acceleration table per
+/// codebook here (best-effort — books that don't fit fall back to the scan, so
+/// this only affects decode *speed* on dense many-codebook files, never
+/// correctness).
+pub const VORBIS_DEFAULT_ARENA: usize = 512 * 1024;
 
 /// "Accept-anything" arena size, used instead of [`VORBIS_DEFAULT_ARENA`] when
 /// `SOUL_VORBIS_ROBUST` is set in the environment — an escape hatch for an
 /// exceptionally large setup header (design spec: "~500 KB rare worst case")
-/// without paying the cost by default.
-pub const VORBIS_ROBUST_ARENA: usize = 512 * 1024;
+/// plus its FAST_HUFFMAN tables (#34), without paying the cost by default.
+pub const VORBIS_ROBUST_ARENA: usize = 1024 * 1024;
 
 /// Build the heap arena a desktop `VorbisDecoder::new` call bump-allocates
 /// into, sized by the `SOUL_VORBIS_ROBUST` environment variable (see
