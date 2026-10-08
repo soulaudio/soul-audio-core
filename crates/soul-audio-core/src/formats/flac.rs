@@ -15,7 +15,8 @@
 //! (header CRC-8 + frame CRC-16) — a mismatch fails with `Malformed`. Off by
 //! default (lenient, matching most players).
 
-use crate::decoder::{DecodeError, Decoder, secs_to_samples};
+use crate::decoder::{DecodeError, Decoder, SeekableDecoder, secs_to_samples};
+use crate::demux::ogg::OggReader;
 use crate::demux::{Demuxer, FlacDemuxer};
 use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
@@ -633,6 +634,40 @@ impl<S: Source> FlacDecoder<S> {
     }
 }
 
+impl<S: Source> FlacDecoder<S> {
+    /// Reset the bit reader + current-block cursors and set the decoded-sample
+    /// baseline to `base`. Shared by every seek path so no stale byte/bit/plane
+    /// from the pre-seek position can leak into the post-seek stream.
+    fn reset_stream_state(&mut self, base: u64) {
+        self.byte_len = 0;
+        self.byte_cur = 0;
+        self.acc = 0;
+        self.acc_bits = 0;
+        self.block_total = 0;
+        self.emit_i = 0;
+        self.decoded_per_ch = base;
+    }
+
+    /// Decode-and-discard whole frames until the frame containing `target`,
+    /// positioning the emit cursor at the exact sample. Assumes the stream is
+    /// positioned at a frame boundary with `decoded_per_ch` matching it.
+    /// Returns the sample landed on — `target` normally, or the true end if the
+    /// stream runs out first (an out-of-range seek on an unknown-length stream).
+    fn decode_discard_to(&mut self, target: u64) -> Result<u64, DecodeError> {
+        loop {
+            let frame_start = self.decoded_per_ch;
+            if !self.decode_next_frame()? {
+                return Ok(self.decoded_per_ch); // end of stream
+            }
+            if target < self.decoded_per_ch {
+                self.emit_i = ((target - frame_start) as usize) * self.channels as usize;
+                return Ok(target);
+            }
+            self.emit_i = self.block_total; // discard the whole frame
+        }
+    }
+}
+
 impl<S: SeekSource> FlacDecoder<S> {
     /// Seek to per-channel `sample` (sample-accurate). Uses the SEEKTABLE to jump
     /// near, then decodes forward to the exact sample. Returns the sample landed
@@ -643,36 +678,10 @@ impl<S: SeekSource> FlacDecoder<S> {
     /// from the forward pass.
     pub fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
         let target = self.total_samples.map_or(sample, |t| sample.min(t));
-
-        // Jump to the best SEEKTABLE point at or before the target (or the start).
         let (base_sample, byte_off) = self.demux.seek_point_before(target);
         self.demux.seek_audio(byte_off)?;
-
-        // Full reset — drop every byte/bit/plane of the pre-seek position so no
-        // stale sample can leak into the post-seek stream.
-        self.byte_len = 0;
-        self.byte_cur = 0;
-        self.acc = 0;
-        self.acc_bits = 0;
-        self.block_total = 0;
-        self.emit_i = 0;
-        self.decoded_per_ch = base_sample;
-
-        // Decode-and-discard whole frames until the frame containing `target`.
-        loop {
-            let frame_start = self.decoded_per_ch;
-            if !self.decode_next_frame()? {
-                break; // reached end of stream (target == total): next read is 0
-            }
-            if target < self.decoded_per_ch {
-                // This frame covers `target`; position the emit cursor at it.
-                self.emit_i = ((target - frame_start) as usize) * self.channels as usize;
-                break;
-            }
-            // Otherwise discard the whole frame and continue.
-            self.emit_i = self.block_total;
-        }
-        Ok(target)
+        self.reset_stream_state(base_sample);
+        self.decode_discard_to(target)
     }
 
     /// Seek to `secs` seconds (convenience over [`Self::seek_to`]). Returns the
@@ -682,6 +691,29 @@ impl<S: SeekSource> FlacDecoder<S> {
     /// Propagates [`Self::seek_to`] errors.
     pub fn seek_to_time(&mut self, secs: f64) -> Result<u64, DecodeError> {
         self.seek_to(secs_to_samples(secs, self.demux.stream_info().sample_rate))
+    }
+}
+
+impl<S: SeekSource> SeekableDecoder for FlacDecoder<OggReader<S>> {
+    /// Seek **FLAC-in-Ogg** to per-channel `sample`. The synthetic native-FLAC
+    /// stream the [`OggReader`] presents has no usable SEEKTABLE (its byte
+    /// offsets don't map to the real Ogg file), so this rewinds the Ogg reader
+    /// to the first audio page ([`OggReader::restart_audio`]) and decode-
+    /// discards FLAC frames to the target. Sample-accurate (FLAC frames are
+    /// independent — no pre-roll); O(target). Ogg-page granule bisection would
+    /// make it O(log n) — a noted future optimization.
+    ///
+    /// # Errors
+    /// Propagates the Ogg rewind + forward-decode errors.
+    fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        let target = self.total_samples.map_or(sample, |t| sample.min(t));
+        self.demux.src_mut().restart_audio()?;
+        self.reset_stream_state(0);
+        self.decode_discard_to(target)
+    }
+
+    fn total_frames(&self) -> Option<u64> {
+        self.total_samples
     }
 }
 
@@ -1655,5 +1687,84 @@ mod tests {
                 assert_eq!(out[i * 4 + c], (c as i32) * 100 + i as i32);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ogg_seek_tests {
+    use super::FlacDecoder;
+    use crate::decoder::{Decoder, SeekableDecoder};
+    use crate::demux::ogg::OggReader;
+    use crate::io::SliceSource;
+
+    const OGG: &[u8] = include_bytes!("../../testdata/flac-in-ogg.ogg");
+
+    type Dec = FlacDecoder<OggReader<SliceSource<'static>>>;
+
+    fn mk() -> Dec {
+        FlacDecoder::new(OggReader::new(SliceSource::new(OGG)).unwrap()).unwrap()
+    }
+
+    fn drain(d: &mut Dec) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut buf = [0i32; 4096];
+        loop {
+            let n = d.decode_into(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    /// FLAC-in-Ogg is lossless + its frames are independent, so a seek is
+    /// bit-identical to decoding from the start and dropping the head.
+    #[test]
+    fn ogg_flac_seek_round_trip_bit_exact() {
+        let ch = mk().stream_info().channels as usize;
+        let full = drain(&mut mk());
+        let pc = (full.len() / ch) as u64;
+        for &t in &[0u64, 1, 500, pc / 3, pc / 2, (3 * pc) / 4, pc - 1] {
+            let mut d = mk();
+            let landed = d.seek_to(t).unwrap();
+            assert_eq!(landed, t, "sample-accurate landing at {t}");
+            let rest = drain(&mut d);
+            let from = t as usize * ch;
+            assert_eq!(rest.len(), full.len() - from, "tail length at {t}");
+            assert_eq!(rest, &full[from..], "bit-exact tail after seek to {t}");
+        }
+    }
+
+    #[test]
+    fn ogg_flac_seek_to_zero_matches_fresh() {
+        let full = drain(&mut mk());
+        let mut d = mk();
+        let mut buf = [0i32; 777];
+        let _ = d.decode_into(&mut buf).unwrap(); // partial decode first
+        assert_eq!(d.seek_to(0).unwrap(), 0);
+        assert_eq!(drain(&mut d), full, "seek-to-0 == fresh decode");
+    }
+
+    #[test]
+    fn ogg_flac_backward_seek_matches() {
+        let ch = mk().stream_info().channels as usize;
+        let full = drain(&mut mk());
+        let mut d = mk();
+        d.seek_to(8_000).unwrap();
+        d.seek_to(1_000).unwrap(); // backward
+        assert_eq!(drain(&mut d), &full[1_000 * ch..], "backward seek is exact");
+    }
+
+    #[test]
+    fn ogg_flac_seek_beyond_end_clamps() {
+        let ch = mk().stream_info().channels as usize;
+        let full = drain(&mut mk());
+        let pc = (full.len() / ch) as u64;
+        let mut d = mk();
+        let landed = d.seek_to(10_000_000).unwrap();
+        assert_eq!(landed, pc, "clamps to the true decoded length");
+        let mut buf = [0i32; 16];
+        assert_eq!(d.decode_into(&mut buf).unwrap(), 0, "at EOF after clamp");
     }
 }

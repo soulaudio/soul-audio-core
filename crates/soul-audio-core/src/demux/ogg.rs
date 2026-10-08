@@ -9,10 +9,10 @@
 //! FLAC frames). Since the FLAC codec re-syncs on the frame sync code, audio
 //! packet boundaries need not be preserved.
 
-use embedded_io::{ErrorType, Read};
+use embedded_io::{ErrorType, Read, SeekFrom};
 
 use crate::decoder::DecodeError;
-use crate::io::Source;
+use crate::io::{SeekSource, Source};
 
 /// An [`embedded_io::Read`] adapter over an Ogg stream that yields the embedded
 /// native FLAC bitstream.
@@ -26,6 +26,9 @@ pub struct OggReader<S> {
     /// Reconstructed `fLaC` + STREAMINFO(last-flag) prelude.
     prelude: [u8; 42],
     prelude_pos: usize,
+    /// Count of header packets after the mapping packet (VORBIS_COMMENT, …) —
+    /// retained so [`Self::restart_audio`] can re-skip the same prefix on a seek.
+    num_headers: u16,
 }
 
 impl<S: Source> OggReader<S> {
@@ -43,6 +46,7 @@ impl<S: Source> OggReader<S> {
             seg_off: 0,
             prelude: [0; 42],
             prelude_pos: 0,
+            num_headers: 0,
         };
         // BOS page, then packet 0 = the FLAC-in-Ogg mapping header.
         if !r.next_page()? {
@@ -62,6 +66,7 @@ impl<S: Source> OggReader<S> {
             return Err(DecodeError::Unsupported);
         }
         let num_headers = u16::from_be_bytes([p0[7], p0[8]]);
+        r.num_headers = num_headers;
         r.prelude[0..4].copy_from_slice(b"fLaC");
         r.prelude[4] = p0[13] | 0x80; // STREAMINFO header, force last-block flag
         r.prelude[5..42].copy_from_slice(&p0[14..51]); // length(3) + STREAMINFO(34)
@@ -74,6 +79,40 @@ impl<S: Source> OggReader<S> {
             }
         }
         Ok(r)
+    }
+
+    /// Rewind to the first **audio** page (past the mapping + header packets),
+    /// so the next [`Read::read`] yields FLAC frame bytes from the stream start
+    /// — the prelude is *not* re-emitted (the FLAC demuxer already consumed it).
+    /// Used by [`crate::formats::flac::FlacDecoder`]'s FLAC-in-Ogg seek, which
+    /// decode-discards from here.
+    ///
+    /// # Errors
+    /// [`DecodeError::Io`] on seek failure; [`DecodeError::Malformed`]/
+    /// `UnexpectedEof` if the header prefix no longer re-parses.
+    pub fn restart_audio(&mut self) -> Result<(), DecodeError>
+    where
+        S: SeekSource,
+    {
+        self.inner
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| DecodeError::Io)?;
+        self.segs = [0; 255];
+        self.nsegs = 0;
+        self.seg_i = 0;
+        self.seg_off = 0;
+        self.prelude_pos = self.prelude.len(); // already delivered — don't re-emit
+        if !self.next_page()? {
+            return Err(DecodeError::Malformed);
+        }
+        // Re-skip the mapping packet (1) + the `num_headers` header packets,
+        // matching `new`, to land on the first audio page.
+        for _ in 0..=self.num_headers {
+            if !self.consume_packet(|_| {})? {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Read the next Ogg page header + segment table. `false` at a clean EOF.

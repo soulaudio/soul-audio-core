@@ -120,6 +120,13 @@ impl<S: Source> FlacDemuxer<S> {
         self.total_samples
     }
 
+    /// Mutable access to the underlying source — used by the FLAC-in-Ogg seek
+    /// to drive [`OggReader::restart_audio`](crate::demux::ogg::OggReader),
+    /// which the demuxer itself is unaware of (it sees only a byte stream).
+    pub(crate) fn src_mut(&mut self) -> &mut S {
+        &mut self.src
+    }
+
     /// Read raw post-metadata audio bytes into `out` (thin wrapper over the
     /// source, mapping reader errors to [`DecodeError::Io`]).
     ///

@@ -96,10 +96,11 @@ impl<'a> BitReader<'a> {
 // (sample reconstruction) or `i64` intermediates (the predictor sum).
 // ===========================================================================
 
-use crate::decoder::{DecodeError, Decoder};
+use crate::decoder::{DecodeError, Decoder, SeekableDecoder};
 use crate::demux::mp4::Mp4Reader;
-use crate::io::Source;
+use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
+use embedded_io::SeekFrom;
 
 const MAX_CHANNELS: usize = 2; // v1: mono + stereo
 const MAX_FRAME: usize = 4096; // frameLength cap
@@ -809,6 +810,68 @@ impl<S: Source> Decoder for AlacDecoder<S> {
     }
 }
 
+impl<S: SeekSource> AlacDecoder<S> {
+    /// Seek to per-channel `sample` (clamped to the stream length; returns the
+    /// landed sample, always `== sample` when in range). **Sample-accurate**:
+    /// ALAC packets are fully independent (each carries its own predictor
+    /// coefficients and overwrites the scratch buffers), so there is no
+    /// cross-frame state and no pre-roll — land on the coded frame containing
+    /// the target via the MP4 sample table, then trim the first decoded packet
+    /// to the exact sample.
+    ///
+    /// # Errors
+    /// Propagates [`Mp4Reader::frame_file_offset`] table / IO errors and the
+    /// first packet's decode error.
+    pub fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        let frame_len = self.cfg.frame_length as u64;
+        let target = sample.min(self.total_samples);
+        let frame_index =
+            u32::try_from(target / frame_len).map_err(|_| DecodeError::Unsupported)?;
+        let frame_start = u64::from(frame_index) * frame_len;
+
+        let num_frames = self.reader.coded_frame_count()?;
+        let offset = self.reader.frame_file_offset(frame_index)?;
+        let end_offset = self.reader.frame_file_offset(num_frames)?;
+
+        self.reader
+            .src_mut()
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| DecodeError::Io)?;
+        self.filled = 0;
+        self.used = 0;
+        self.out_len = 0;
+        self.out_pos = 0;
+        self.eof = false;
+        self.mdat_remaining = end_offset.saturating_sub(offset);
+        self.samples_left = self.total_samples.saturating_sub(frame_start);
+
+        // Trim within the landed frame to the exact target sample.
+        let drop_frames = target - frame_start; // per-channel samples to discard
+        if drop_frames > 0 && self.decode_next_packet()? {
+            let drop = (drop_frames * self.cfg.channels as u64).min(self.out_len as u64) as usize;
+            self.out_pos = drop;
+        }
+        Ok(target)
+    }
+
+    /// Seek to `secs` seconds (convenience over [`Self::seek_to`]).
+    ///
+    /// # Errors
+    /// As [`Self::seek_to`].
+    pub fn seek_to_time(&mut self, secs: f64) -> Result<u64, DecodeError> {
+        self.seek_to(crate::decoder::secs_to_samples(secs, self.sample_rate))
+    }
+}
+
+impl<S: SeekSource> SeekableDecoder for AlacDecoder<S> {
+    fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        AlacDecoder::seek_to(self, sample)
+    }
+    fn total_frames(&self) -> Option<u64> {
+        AlacDecoder::total_frames(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1156,5 +1219,96 @@ mod malformed {
             AlacDecoder::new(SliceSource::new(&data)).err(),
             Some(DecodeError::Unsupported)
         );
+    }
+}
+
+#[cfg(test)]
+mod seek_tests {
+    use super::*;
+    use crate::io::SliceSource;
+
+    const ALAC: &[u8] = include_bytes!("../../testdata/alac.m4a");
+    const CH: usize = 2;
+    const TOTAL: u64 = 13_230;
+
+    fn decode_all<S: Source>(dec: &mut AlacDecoder<S>) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut buf = [0i32; 4096];
+        loop {
+            let n = dec.decode_into(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    fn full() -> Vec<i32> {
+        decode_all(&mut AlacDecoder::new(SliceSource::new(ALAC)).unwrap())
+    }
+
+    /// ALAC is lossless + frame-independent ⇒ seeking is exactly bit-identical
+    /// to decoding from the start and dropping the head. Covers frame
+    /// boundaries, interiors, and the partial final frame.
+    #[test]
+    fn alac_seek_round_trip_bit_exact() {
+        let reference = full();
+        assert_eq!(reference.len(), TOTAL as usize * CH);
+        for &target in &[0u64, 1, 100, 4095, 4096, 4097, 8192, 12_288, 12_289, 13_229] {
+            let mut d = AlacDecoder::new(SliceSource::new(ALAC)).unwrap();
+            let landed = d.seek_to(target).unwrap();
+            assert_eq!(landed, target, "sample-accurate landing at {target}");
+            let rest = decode_all(&mut d);
+            let from = target as usize * CH;
+            assert_eq!(
+                rest.len(),
+                reference.len() - from,
+                "tail length at {target}"
+            );
+            assert_eq!(
+                rest,
+                reference[from..],
+                "bit-exact tail after seek to {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn alac_seek_to_zero_matches_fresh() {
+        let reference = full();
+        let mut d = AlacDecoder::new(SliceSource::new(ALAC)).unwrap();
+        let mut buf = [0i32; 1000];
+        let _ = d.decode_into(&mut buf).unwrap(); // partial decode first
+        assert_eq!(d.seek_to(0).unwrap(), 0);
+        assert_eq!(decode_all(&mut d), reference, "seek-to-0 == fresh decode");
+    }
+
+    #[test]
+    fn alac_backward_seek_matches() {
+        let reference = full();
+        let mut d = AlacDecoder::new(SliceSource::new(ALAC)).unwrap();
+        d.seek_to(10_000).unwrap();
+        d.seek_to(2_000).unwrap(); // backward
+        let rest = decode_all(&mut d);
+        assert_eq!(rest, reference[2_000 * CH..], "backward seek is exact");
+    }
+
+    #[test]
+    fn alac_seek_beyond_end_clamps() {
+        let mut d = AlacDecoder::new(SliceSource::new(ALAC)).unwrap();
+        assert_eq!(d.seek_to(1_000_000).unwrap(), TOTAL, "clamps to length");
+        let mut buf = [0i32; 16];
+        assert_eq!(d.decode_into(&mut buf).unwrap(), 0, "at EOF after clamp");
+    }
+
+    #[test]
+    fn alac_seek_to_time_matches_sample() {
+        let reference = full();
+        let mut d = AlacDecoder::new(SliceSource::new(ALAC)).unwrap();
+        // 0.1 s @ 44100 = sample 4410.
+        let landed = d.seek_to_time(0.1).unwrap();
+        assert_eq!(landed, 4_410);
+        assert_eq!(decode_all(&mut d), reference[4_410 * CH..]);
     }
 }

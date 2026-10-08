@@ -22,11 +22,12 @@ pub(crate) mod sbr;
 mod syntax;
 mod tables;
 
-use crate::decoder::{DecodeError, Decoder};
+use crate::decoder::{DecodeError, Decoder, SeekableDecoder};
 use crate::demux::adts::{AacConfig, AdtsReader};
 use crate::demux::mp4::{Mp4Codec, Mp4Reader};
-use crate::io::Source;
+use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
+use embedded_io::SeekFrom;
 
 use filterbank::Filterbank;
 
@@ -428,6 +429,161 @@ impl<S: Source> AacDecoder<S> {
     }
 }
 
+impl<S: SeekSource> AacDecoder<S> {
+    /// Seek to per-channel output `sample` (clamped). AAC frames are **not**
+    /// independent — the filterbank carries a 1024-sample MDCT overlap, and
+    /// HE-AAC SBR/PS carry QMF delay lines + delta-time-coded envelopes — so a
+    /// seek resets all decode state and **pre-rolls** (decode-and-discards) a
+    /// run of frames before the target to reconverge before emitting. MP4 lands
+    /// via the sample table (Task 1); ADTS (no index) decode-discards from the
+    /// start. The landing is trimmed to the exact output sample.
+    ///
+    /// # Errors
+    /// Propagates the sample-table / IO / decode errors of the pre-roll.
+    pub fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        match &self.src {
+            FrameSrc::Mp4(_) => self.seek_to_mp4(sample),
+            FrameSrc::Adts(_) => self.seek_to_adts(sample),
+        }
+    }
+
+    /// Seek to `secs` seconds (convenience over [`Self::seek_to`]). Uses the
+    /// reported output rate (2× core once SBR is confirmed).
+    ///
+    /// # Errors
+    /// As [`Self::seek_to`].
+    pub fn seek_to_time(&mut self, secs: f64) -> Result<u64, DecodeError> {
+        let rate = if self.sbr_confirmed {
+            self.output_rate
+        } else {
+            self.config.sample_rate
+        };
+        self.seek_to(crate::decoder::secs_to_samples(secs, rate))
+    }
+
+    /// Output samples per access unit: 1024 core samples, doubled once dual-rate
+    /// SBR is confirmed (output rate = 2× core).
+    fn output_samples_per_au(&self) -> u64 {
+        if self.sbr_confirmed && self.config.sample_rate != 0 {
+            1024 * u64::from((self.output_rate / self.config.sample_rate).max(1))
+        } else {
+            1024
+        }
+    }
+
+    /// Reset all cross-frame decode state to a clean post-seek baseline. Keeps
+    /// the monotonic `sbr_confirmed`/`channels`/`output_rate` promotions (the
+    /// pre-roll re-establishes the SBR/PS state they describe).
+    fn reset_decode_state(&mut self) {
+        self.fb = Filterbank::new();
+        self.sbr = sbr::SbrState::default();
+        self.sbr_out = sbr::SbrOutput::default();
+        self.pcm_len = 0;
+        self.pcm_pos = 0;
+        self.eof = false;
+        self.mp4_filled = 0;
+        self.mp4_used = 0;
+    }
+
+    fn mp4_reader(&mut self) -> &mut Mp4Reader<S> {
+        match &mut self.src {
+            FrameSrc::Mp4(r) => r,
+            FrameSrc::Adts(_) => unreachable!("mp4 seek path"),
+        }
+    }
+
+    fn seek_to_mp4(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        // Pre-roll frames to reconverge filterbank overlap (1 needed) and SBR
+        // QMF delay lines + delta-time envelopes (several); a generous fixed
+        // run covers both. For tiny targets this clamps to frame 0 (= decode
+        // from start, which is exact).
+        const PREROLL: u32 = 12;
+        let out_per_au = self.output_samples_per_au();
+        let num_frames = self.mp4_reader().coded_frame_count()?;
+        if num_frames == 0 {
+            return Ok(0);
+        }
+        let max_out = u64::from(num_frames) * out_per_au;
+        let target = sample.min(max_out);
+        let au_index = u32::try_from(target / out_per_au)
+            .unwrap_or(num_frames)
+            .min(num_frames - 1);
+        // Pure AAC-LC: a short pre-roll restores the MDCT overlap → land near the
+        // target (efficient, bit-exact). HE-AAC: SBR is initialized by a header
+        // typically sent only in frame 0, and envelopes are delta-time coded, so
+        // a mid-stream landing can't reconstruct the high band — decode from the
+        // start instead (correct + bit-exact; O(target), acceptable on the rarer
+        // HE-AAC seek). (Implicit-SBR MP4, where `sbr_confirmed` is still false
+        // here, uses the pre-roll path — no such fixture ships; documented.)
+        let land = if self.sbr_confirmed {
+            0
+        } else {
+            au_index.saturating_sub(PREROLL)
+        };
+        let within_out = target - u64::from(au_index) * out_per_au;
+
+        let offset = self.mp4_reader().frame_file_offset(land)?;
+        let end_offset = self.mp4_reader().frame_file_offset(num_frames)?;
+        self.mp4_reader()
+            .src_mut()
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| DecodeError::Io)?;
+        self.mp4_mdat_remaining = end_offset.saturating_sub(offset);
+        self.reset_decode_state();
+
+        // Decode-and-discard whole frames [land, au_index).
+        let mut cur = land;
+        while cur < au_index {
+            if !self.fill_next_frame()? {
+                return Ok(target); // EOF during pre-roll — clamp
+            }
+            self.pcm_pos = self.pcm_len;
+            cur += 1;
+        }
+        // Land in au_index's frame and trim to the exact output sample.
+        if within_out > 0 && self.fill_next_frame()? {
+            let drop = (within_out * u64::from(self.channels.max(1))).min(self.pcm_len as u64);
+            self.pcm_pos = drop as usize;
+        }
+        Ok(target)
+    }
+
+    fn seek_to_adts(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        // ADTS has no index/length: rewind, reset, and decode-discard output
+        // samples until the target (O(target), but correct across LC/SBR/PS).
+        match &mut self.src {
+            FrameSrc::Adts(r) => r.rewind()?,
+            FrameSrc::Mp4(_) => unreachable!("adts seek path"),
+        }
+        self.reset_decode_state();
+        let mut passed = 0u64; // per-channel output samples discarded so far
+        while passed < sample {
+            if !self.fill_next_frame()? {
+                return Ok(passed); // EOF → clamp to the true length
+            }
+            let ch = u64::from(self.channels.max(1));
+            let frame_pc = self.pcm_len as u64 / ch;
+            if passed + frame_pc <= sample {
+                self.pcm_pos = self.pcm_len; // discard the whole frame
+                passed += frame_pc;
+            } else {
+                self.pcm_pos = ((sample - passed) * ch) as usize;
+                passed = sample;
+            }
+        }
+        Ok(sample)
+    }
+}
+
+impl<S: SeekSource> SeekableDecoder for AacDecoder<S> {
+    fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        AacDecoder::seek_to(self, sample)
+    }
+    fn total_frames(&self) -> Option<u64> {
+        AacDecoder::total_frames(self)
+    }
+}
+
 impl<S: Source> Decoder for AacDecoder<S> {
     fn stream_info(&self) -> StreamInfo {
         StreamInfo {
@@ -619,5 +775,158 @@ mod tests {
             "LC decode length changed — 23 frames × 1024/ch × 2ch expected"
         );
         assert!(pcm.iter().any(|&s| s != 0), "LC decode was all-silent");
+    }
+}
+
+#[cfg(test)]
+mod seek_tests {
+    use super::AacDecoder;
+    use crate::decoder::Decoder;
+    use crate::demux::adts::AdtsReader;
+    use crate::demux::mp4::Mp4Reader;
+    use crate::io::{SliceSource, Source};
+
+    /// AAC decoders (esp. HE-AAC's ~250 KiB SBR state) overflow the default
+    /// test-thread stack; run the whole decode on a generous one (as the
+    /// integration suite and the CLI loader do).
+    fn on_big_stack<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn_scoped(s, f)
+                .unwrap()
+                .join()
+                .unwrap()
+        })
+    }
+
+    fn drain<S: Source>(d: &mut AacDecoder<S>) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut buf = [0i32; 4096];
+        loop {
+            let n = d.decode_into(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    fn full_mp4(bytes: &'static [u8]) -> Vec<i32> {
+        on_big_stack(|| {
+            let mut d =
+                AacDecoder::new_mp4(Mp4Reader::new(SliceSource::new(bytes)).unwrap()).unwrap();
+            drain(&mut d)
+        })
+    }
+
+    fn seek_tail_mp4(bytes: &'static [u8], target: u64) -> (u64, Vec<i32>) {
+        on_big_stack(move || {
+            let mut d =
+                AacDecoder::new_mp4(Mp4Reader::new(SliceSource::new(bytes)).unwrap()).unwrap();
+            let landed = d.seek_to(target).unwrap();
+            (landed, drain(&mut d))
+        })
+    }
+
+    fn full_adts(bytes: &'static [u8]) -> Vec<i32> {
+        on_big_stack(|| {
+            let mut d =
+                AacDecoder::new_adts(AdtsReader::new(SliceSource::new(bytes)).unwrap()).unwrap();
+            drain(&mut d)
+        })
+    }
+
+    fn seek_tail_adts(bytes: &'static [u8], target: u64) -> (u64, Vec<i32>) {
+        on_big_stack(move || {
+            let mut d =
+                AacDecoder::new_adts(AdtsReader::new(SliceSource::new(bytes)).unwrap()).unwrap();
+            let landed = d.seek_to(target).unwrap();
+            (landed, drain(&mut d))
+        })
+    }
+
+    /// AAC-LC: a 12-frame pre-roll fully restores the 1-frame MDCT overlap, so
+    /// the post-seek tail is **bit-identical** to decoding from the start and
+    /// dropping the head — at frame boundaries and interiors alike.
+    #[test]
+    fn aac_mp4_lc_seek_bit_exact() {
+        const CH: usize = 2;
+        let full = full_mp4(include_bytes!("../../../testdata/aac.m4a"));
+        let pc = (full.len() / CH) as u64;
+        for &t in &[0u64, 1, 1024, 1500, pc / 3, pc / 2, (3 * pc) / 4, pc - 1] {
+            let (landed, tail) = seek_tail_mp4(include_bytes!("../../../testdata/aac.m4a"), t);
+            assert_eq!(landed, t, "LC seek landing");
+            let from = t as usize * CH;
+            assert_eq!(tail.len(), full.len() - from, "LC tail length at {t}");
+            assert_eq!(tail, &full[from..], "LC tail bit-exact at {t}");
+        }
+    }
+
+    #[test]
+    fn aac_mp4_lc_seek_to_zero_matches_fresh() {
+        let full = full_mp4(include_bytes!("../../../testdata/aac.m4a"));
+        let (_, tail) = seek_tail_mp4(include_bytes!("../../../testdata/aac.m4a"), 0);
+        assert_eq!(tail, full, "LC seek-to-0 == fresh decode");
+    }
+
+    #[test]
+    fn aac_mp4_lc_seek_beyond_end_clamps() {
+        const CH: usize = 2;
+        let full = full_mp4(include_bytes!("../../../testdata/aac.m4a"));
+        let pc = (full.len() / CH) as u64;
+        let (landed, _) = seek_tail_mp4(include_bytes!("../../../testdata/aac.m4a"), 10_000_000);
+        assert!(
+            landed <= pc + 1024,
+            "clamps near the declared length: {landed}"
+        );
+    }
+
+    /// HE-AAC (SBR, dual-rate): seeking decodes from the start so the frame-0
+    /// SBR header + delta-time envelopes are always seen, making the tail
+    /// bit-identical to the from-start decode (the output position is
+    /// sample-accurate at the dual rate).
+    #[test]
+    fn aac_mp4_sbr_seek_bit_exact() {
+        const CH: usize = 2;
+        let full = full_mp4(include_bytes!("../../../testdata/sbr.m4a"));
+        let pc = (full.len() / CH) as u64;
+        for &t in &[pc / 4, pc / 2, (3 * pc) / 4] {
+            let (landed, tail) = seek_tail_mp4(include_bytes!("../../../testdata/sbr.m4a"), t);
+            assert_eq!(landed, t, "SBR seek landing (sample-accurate output pos)");
+            let from = t as usize * CH;
+            assert_eq!(tail.len(), full.len() - from, "SBR tail length at {t}");
+            assert_eq!(tail, &full[from..], "HE-AAC SBR tail bit-exact at {t}");
+        }
+    }
+
+    /// ADTS LC decode-discards from the start (no index) → bit-exact tail.
+    #[test]
+    fn aac_adts_lc_seek_bit_exact() {
+        const CH: usize = 2;
+        let full = full_adts(include_bytes!("../../../testdata/aac.aac"));
+        let pc = (full.len() / CH) as u64;
+        for &t in &[0u64, 1024, pc / 2, pc - 1] {
+            let (landed, tail) = seek_tail_adts(include_bytes!("../../../testdata/aac.aac"), t);
+            assert_eq!(landed, t, "ADTS seek landing");
+            let from = t as usize * CH;
+            assert_eq!(tail, &full[from..], "ADTS LC tail bit-exact at {t}");
+        }
+    }
+
+    /// ADTS HE-AAC decode-discards from the start too → also bit-exact (no
+    /// reconvergence gap, unlike the sample-table pre-roll path).
+    #[test]
+    fn aac_adts_sbr_seek_bit_exact() {
+        const CH: usize = 2;
+        let full = full_adts(include_bytes!("../../../testdata/sbr.aac"));
+        let pc = (full.len() / CH) as u64;
+        for &t in &[pc / 4, pc / 2] {
+            let (landed, tail) = seek_tail_adts(include_bytes!("../../../testdata/sbr.aac"), t);
+            assert_eq!(landed, t, "ADTS SBR seek landing");
+            let from = t as usize * CH;
+            assert_eq!(tail, &full[from..], "ADTS SBR tail bit-exact at {t}");
+        }
     }
 }

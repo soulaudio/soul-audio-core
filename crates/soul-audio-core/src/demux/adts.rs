@@ -170,6 +170,25 @@ impl<S: Source> AdtsReader<S> {
         self.config
     }
 
+    /// Rewind to the stream start and re-validate the first header, so the next
+    /// [`Self::next_frame`] serves frame 0 again. ADTS has no index, so
+    /// [`crate::formats::aac::AacDecoder`]'s seek decode-discards from the start
+    /// via this.
+    ///
+    /// # Errors
+    /// As [`Self::new`], plus [`DecodeError::Io`] if the seek fails.
+    pub fn rewind(&mut self) -> Result<(), DecodeError>
+    where
+        S: crate::io::SeekSource,
+    {
+        self.src
+            .seek(embedded_io::SeekFrom::Start(0))
+            .map_err(|_| DecodeError::Io)?;
+        let header = read_first_header(&mut self.src)?;
+        self.pending = Some(header.frame_len - header.header_len);
+        Ok(())
+    }
+
     /// Read the next frame's `raw_data_block` bytes into `buf`, returning the
     /// filled prefix. `Ok(None)` at a clean end of stream (no more frames).
     ///

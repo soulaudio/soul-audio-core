@@ -71,22 +71,24 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
         }
     }
 
-    /// Seek to per-channel `sample` (frame-granular for MP3, sample-accurate for
-    /// WAV/FLAC). Returns the frame actually landed on.
+    /// Seek to per-channel `sample`. Returns the frame actually landed on.
+    /// Granularity: **sample-accurate** for WAV, FLAC (native + Ogg), ALAC, AAC,
+    /// and Opus; **frame-granular** for MP3 (a short format-inherent warm-up).
     ///
     /// # Errors
-    /// [`DecodeError::Unsupported`] for the streaming Ogg-FLAC variant (its source
-    /// is not seekable), ALAC, and AAC (not yet implemented); otherwise the
-    /// underlying decoder's seek error. Opus seeks via Ogg-granule bisection +
-    /// pre-roll re-priming ([`crate::formats::opus::OpusDecoder`]).
+    /// Propagates the underlying decoder's seek error. (Every `open()`-produced
+    /// variant seeks; only DSD and bare Ogg-Vorbis — neither routed through
+    /// `open` — are constructed directly and seek via their own types.)
     pub fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
         match self {
             AnyDecoder::Wav(d) => d.seek_to(sample),
             AnyDecoder::Flac(d) => d.seek_to(sample),
             AnyDecoder::Mp3(d) => d.seek_to(sample),
-            AnyDecoder::OggFlac(_) => Err(DecodeError::Unsupported),
-            AnyDecoder::Alac(_) => Err(DecodeError::Unsupported),
-            AnyDecoder::Aac(_) => Err(DecodeError::Unsupported),
+            // FLAC-in-Ogg seeks via its SeekableDecoder impl (its source isn't a
+            // bare SeekSource, so the inherent FlacDecoder::seek_to doesn't apply).
+            AnyDecoder::OggFlac(d) => SeekableDecoder::seek_to(d, sample),
+            AnyDecoder::Alac(d) => d.seek_to(sample),
+            AnyDecoder::Aac(d) => d.seek_to(sample),
             AnyDecoder::Opus(d) => d.seek_to(sample),
         }
     }
@@ -100,9 +102,12 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::Wav(d) => d.seek_to_time(secs),
             AnyDecoder::Flac(d) => d.seek_to_time(secs),
             AnyDecoder::Mp3(d) => d.seek_to_time(secs),
-            AnyDecoder::OggFlac(_) => Err(DecodeError::Unsupported),
-            AnyDecoder::Alac(_) => Err(DecodeError::Unsupported),
-            AnyDecoder::Aac(_) => Err(DecodeError::Unsupported),
+            AnyDecoder::OggFlac(d) => {
+                let rate = d.stream_info().sample_rate;
+                SeekableDecoder::seek_to(d, crate::decoder::secs_to_samples(secs, rate))
+            }
+            AnyDecoder::Alac(d) => d.seek_to_time(secs),
+            AnyDecoder::Aac(d) => d.seek_to_time(secs),
             // Opus always decodes at 48 kHz; convert seconds at that rate.
             AnyDecoder::Opus(d) => d.seek_to(crate::decoder::secs_to_samples(secs, 48_000)),
         }
@@ -345,10 +350,17 @@ mod tests {
         let mut buf = [0i32; 16];
         let n = dec.decode_into(&mut buf).unwrap();
         assert!(n > 0);
-        // seek is unsupported in v1 (like Ogg-FLAC)
+        // ALAC seeking is sample-accurate (routed through `AnyDecoder::Alac`).
+        assert_eq!(dec.seek_to(0).unwrap(), 0, "seek-to-0 lands at the start");
         assert_eq!(
-            dec.seek_to(0).err(),
-            Some(crate::decoder::DecodeError::Unsupported)
+            dec.seek_to(4_000).unwrap(),
+            4_000,
+            "sample-accurate landing"
+        );
+        assert_eq!(
+            dec.seek_to(1_000_000).unwrap(),
+            13_230,
+            "out-of-range clamps"
         );
     }
 }

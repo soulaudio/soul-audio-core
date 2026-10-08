@@ -9,6 +9,7 @@ use crate::decoder::DecodeError;
 use crate::demux::adts::AacConfig;
 use crate::demux::{SAMPLE_RATES, channels_for};
 use crate::io::Source;
+use embedded_io::SeekFrom;
 
 /// The 24-byte `ALACSpecificConfig` from the `stsd`→`alac` cookie (big-endian on
 /// disk; the fields we need for decode).
@@ -41,6 +42,24 @@ pub struct Mp4Reader<S> {
     codec: Mp4Codec,
     total_samples: u64,
     mdat_remaining: u64,
+    /// Located lazily on the first seek (needs `S: SeekSource`); `None` until
+    /// then so the forward-only decode-open path pays nothing.
+    tables: Option<SampleTableLoc>,
+}
+
+/// Absolute file offsets + lengths of the `stbl` sample-table boxes needed to
+/// map a coded-frame index to a file offset, located on the first seek. All
+/// `Copy` (a few integers) — no heap, per the crate's no-alloc rule.
+#[derive(Clone, Copy, Debug)]
+struct SampleTableLoc {
+    /// `stsc` (sample-to-chunk) content `(offset, len)`.
+    stsc: (u64, u64),
+    /// `stsz` (sample sizes) content `(offset, len)`.
+    stsz: (u64, u64),
+    /// `stco`/`co64` (chunk offsets) content `(offset, len)`.
+    stco: (u64, u64),
+    /// `true` when the chunk-offset box was `co64` (64-bit offsets).
+    co64: bool,
 }
 
 /// Read exactly `N` bytes or error [`DecodeError::Malformed`].
@@ -116,6 +135,7 @@ impl<S: Source> Mp4Reader<S> {
                         codec,
                         total_samples,
                         mdat_remaining: len,
+                        tables: None,
                     });
                 }
                 _ => skip(&mut src, len)?, // ftyp, free, udta, ...
@@ -160,6 +180,67 @@ impl<S: Source> Mp4Reader<S> {
     }
     pub fn src_mut(&mut self) -> &mut S {
         &mut self.src
+    }
+
+    /// PCM samples per coded frame (MP4 "sample"): ALAC's `frame_length`, or
+    /// AAC's fixed 1024-sample access unit. Callers divide a target per-channel
+    /// sample by this to get the coded-frame index to seek to. Assumes a
+    /// constant frame duration (the `stts` has a single run — true for every
+    /// ALAC/AAC encoder in practice); variable-duration tracks are not handled.
+    pub fn samples_per_frame(&self) -> u32 {
+        match self.codec {
+            Mp4Codec::Alac(c) => c.frame_length,
+            Mp4Codec::Aac(_) => 1024,
+        }
+    }
+}
+
+impl<S: crate::io::SeekSource> Mp4Reader<S> {
+    /// Locate (once, cached) the `stbl` sample-table boxes by re-walking the box
+    /// tree from the start using `SeekSource`. Additive to `new`'s forward walk.
+    fn ensure_tables(&mut self) -> Result<SampleTableLoc, DecodeError> {
+        if let Some(t) = self.tables {
+            return Ok(t);
+        }
+        let t = locate_tables(&mut self.src)?;
+        self.tables = Some(t);
+        Ok(t)
+    }
+
+    /// Total coded frames (MP4 samples), read from the `stsz` sample_count.
+    pub fn coded_frame_count(&mut self) -> Result<u32, DecodeError> {
+        let t = self.ensure_tables()?;
+        self.src
+            .seek(SeekFrom::Start(t.stsz.0))
+            .map_err(|_| DecodeError::Io)?;
+        let head: [u8; 12] = read_exact(&mut self.src)?;
+        Ok(be32(&head[8..12]))
+    }
+
+    /// Absolute file offset of coded frame `frame_index` (0-based). Accepts
+    /// `frame_index == coded_frame_count` to return the end-of-audio offset
+    /// (so a caller can size the remaining byte span). **Leaves `src`
+    /// repositioned** — the caller seeks to the returned offset to decode.
+    pub fn frame_file_offset(&mut self, frame_index: u32) -> Result<u64, DecodeError> {
+        let t = self.ensure_tables()?;
+        // Total coded frames (stsz sample_count) and chunk count (stco entry_count).
+        self.src
+            .seek(SeekFrom::Start(t.stsz.0))
+            .map_err(|_| DecodeError::Io)?;
+        let stsz_head: [u8; 12] = read_exact(&mut self.src)?;
+        let total_frames = be32(&stsz_head[8..12]);
+        self.src
+            .seek(SeekFrom::Start(t.stco.0))
+            .map_err(|_| DecodeError::Io)?;
+        let stco_head: [u8; 8] = read_exact(&mut self.src)?;
+        let total_chunks = be32(&stco_head[4..8]);
+
+        // Which chunk holds the frame (clamp the probe for the one-past index).
+        let probe = frame_index.min(total_frames.saturating_sub(1));
+        let (chunk0, first_sample, _spc) = stsc_locate(&mut self.src, t.stsc, total_chunks, probe)?;
+        let chunk_off = chunk_offset(&mut self.src, t.stco, t.co64, chunk0)?;
+        let within = stsz_sum(&mut self.src, t.stsz, first_sample, frame_index)?;
+        Ok(chunk_off + within)
     }
 }
 
@@ -573,6 +654,184 @@ fn parse_audio_specific_config(data: &[u8]) -> Result<AacConfig, DecodeError> {
     })
 }
 
+/// Find the first direct child box named `want` within a container whose
+/// content spans `[content_start, content_start + content_len)`, using
+/// `SeekSource` to skip siblings. Returns the matched box's `(content_offset,
+/// content_len)`. `Unsupported` if absent.
+fn descend_seek<S: crate::io::SeekSource>(
+    src: &mut S,
+    content_start: u64,
+    content_len: u64,
+    want: &[u8; 4],
+) -> Result<(u64, u64), DecodeError> {
+    let end = content_start
+        .checked_add(content_len)
+        .ok_or(DecodeError::Malformed)?;
+    let mut here = content_start;
+    while here.checked_add(8).ok_or(DecodeError::Malformed)? <= end {
+        src.seek(SeekFrom::Start(here))
+            .map_err(|_| DecodeError::Io)?;
+        let (len, fourcc, hdr) = box_header(src)?;
+        let cstart = here + hdr;
+        if &fourcc == want {
+            return Ok((cstart, len));
+        }
+        here = cstart.checked_add(len).ok_or(DecodeError::Malformed)?;
+    }
+    Err(DecodeError::Unsupported)
+}
+
+/// Re-walk the box tree (`moov`→`trak`→`mdia`→`minf`→`stbl`) from the file
+/// start and record the `stbl` sample-table boxes needed for seeking. Uses the
+/// first audio `trak`, matching [`parse_moov`]'s first-trak behavior. `stz2`
+/// (compact sample sizes) is treated as absent → seeking that rare variant
+/// reports `Unsupported` rather than mis-reading it.
+fn locate_tables<S: crate::io::SeekSource>(src: &mut S) -> Result<SampleTableLoc, DecodeError> {
+    let file_len = src.seek(SeekFrom::End(0)).map_err(|_| DecodeError::Io)?;
+    let (moov_c, moov_l) = descend_seek(src, 0, file_len, b"moov")?;
+    let (trak_c, trak_l) = descend_seek(src, moov_c, moov_l, b"trak")?;
+    let (mdia_c, mdia_l) = descend_seek(src, trak_c, trak_l, b"mdia")?;
+    let (minf_c, minf_l) = descend_seek(src, mdia_c, mdia_l, b"minf")?;
+    let (stbl_c, stbl_l) = descend_seek(src, minf_c, minf_l, b"stbl")?;
+
+    let end = stbl_c.checked_add(stbl_l).ok_or(DecodeError::Malformed)?;
+    let mut stsc = None;
+    let mut stsz = None;
+    let mut stco = None;
+    let mut co64 = false;
+    let mut here = stbl_c;
+    while here.checked_add(8).ok_or(DecodeError::Malformed)? <= end {
+        src.seek(SeekFrom::Start(here))
+            .map_err(|_| DecodeError::Io)?;
+        let (len, fourcc, hdr) = box_header(src)?;
+        let cstart = here + hdr;
+        match &fourcc {
+            b"stsc" => stsc = Some((cstart, len)),
+            b"stsz" => stsz = Some((cstart, len)),
+            b"stco" => {
+                stco = Some((cstart, len));
+                co64 = false;
+            }
+            b"co64" => {
+                stco = Some((cstart, len));
+                co64 = true;
+            }
+            _ => {}
+        }
+        here = cstart.checked_add(len).ok_or(DecodeError::Malformed)?;
+    }
+    Ok(SampleTableLoc {
+        stsc: stsc.ok_or(DecodeError::Unsupported)?,
+        stsz: stsz.ok_or(DecodeError::Unsupported)?,
+        stco: stco.ok_or(DecodeError::Unsupported)?,
+        co64,
+    })
+}
+
+/// Map a 0-based coded sample to its chunk via the run-length `stsc` table.
+/// Returns `(chunk0 /*0-based*/, first_sample_of_chunk, samples_per_chunk)`.
+/// Streams the entries (no table stored). `total_chunks` (from `stco`) bounds
+/// the final run.
+fn stsc_locate<S: crate::io::SeekSource>(
+    src: &mut S,
+    stsc: (u64, u64),
+    total_chunks: u32,
+    sample: u32,
+) -> Result<(u32, u32, u32), DecodeError> {
+    src.seek(SeekFrom::Start(stsc.0))
+        .map_err(|_| DecodeError::Io)?;
+    let head: [u8; 8] = read_exact(src)?;
+    let entry_count = be32(&head[4..8]);
+    let mut last_first = 1u32; // first_chunk of the pending (not-yet-closed) run
+    let mut last_spc = 1u32;
+    let mut have = false;
+    let mut samples_before = 0u32; // samples in all chunks before `last_first`
+    for _ in 0..entry_count {
+        let e: [u8; 12] = read_exact(src)?;
+        let first_chunk = be32(&e[0..4]);
+        let spc = be32(&e[4..8]);
+        if have {
+            // Close the previous run: chunks [last_first, first_chunk).
+            let run_chunks = first_chunk.saturating_sub(last_first);
+            let run_samples = run_chunks.saturating_mul(last_spc);
+            if last_spc != 0 && sample < samples_before.saturating_add(run_samples) {
+                let into = sample - samples_before;
+                let chunk_in_run = into / last_spc;
+                return Ok((
+                    (last_first - 1) + chunk_in_run,
+                    samples_before + chunk_in_run * last_spc,
+                    last_spc,
+                ));
+            }
+            samples_before = samples_before.saturating_add(run_samples);
+        }
+        last_first = first_chunk;
+        last_spc = spc;
+        have = true;
+    }
+    // Final run spans [last_first, total_chunks].
+    let run_chunks = (total_chunks + 1).saturating_sub(last_first);
+    let into = sample.saturating_sub(samples_before);
+    let chunk_in_run = if last_spc == 0 {
+        0
+    } else {
+        (into / last_spc).min(run_chunks.saturating_sub(1))
+    };
+    Ok((
+        (last_first - 1) + chunk_in_run,
+        samples_before + chunk_in_run * last_spc,
+        last_spc,
+    ))
+}
+
+/// Absolute file offset of chunk `chunk0` (0-based) from `stco`/`co64`.
+fn chunk_offset<S: crate::io::SeekSource>(
+    src: &mut S,
+    stco: (u64, u64),
+    co64: bool,
+    chunk0: u32,
+) -> Result<u64, DecodeError> {
+    let entry_size: u64 = if co64 { 8 } else { 4 };
+    let pos = stco.0 + 8 + u64::from(chunk0) * entry_size;
+    src.seek(SeekFrom::Start(pos))
+        .map_err(|_| DecodeError::Io)?;
+    if co64 {
+        let b: [u8; 8] = read_exact(src)?;
+        Ok(be64(&b))
+    } else {
+        let b: [u8; 4] = read_exact(src)?;
+        Ok(u64::from(be32(&b)))
+    }
+}
+
+/// Sum the byte sizes of coded samples `[from, to)` from `stsz` (constant-size
+/// shortcut when `sample_size != 0`). Streams the per-sample sizes otherwise.
+fn stsz_sum<S: crate::io::SeekSource>(
+    src: &mut S,
+    stsz: (u64, u64),
+    from: u32,
+    to: u32,
+) -> Result<u64, DecodeError> {
+    if from >= to {
+        return Ok(0);
+    }
+    src.seek(SeekFrom::Start(stsz.0))
+        .map_err(|_| DecodeError::Io)?;
+    let head: [u8; 12] = read_exact(src)?;
+    let sample_size = be32(&head[4..8]);
+    if sample_size != 0 {
+        return Ok(u64::from(to - from) * u64::from(sample_size));
+    }
+    src.seek(SeekFrom::Start(stsz.0 + 12 + u64::from(from) * 4))
+        .map_err(|_| DecodeError::Io)?;
+    let mut sum = 0u64;
+    for _ in from..to {
+        let b: [u8; 4] = read_exact(src)?;
+        sum += u64::from(be32(&b));
+    }
+    Ok(sum)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,6 +884,34 @@ mod tests {
         assert_eq!(c.channels, 2);
         assert!(c.sbr_signalled);
         assert_eq!(c.ext_sample_rate, Some(44_100));
+    }
+
+    /// Task 1: the sample-table seek machinery maps coded-frame indices to file
+    /// offsets that (a) start at the first chunk, (b) increase monotonically,
+    /// and (c) span exactly the `mdat` payload (sum of all frame sizes). The
+    /// absolute-correctness proof is the bit-exact ALAC seek round-trip.
+    #[test]
+    fn frame_offsets_span_mdat_and_increase() {
+        let mut r = Mp4Reader::new(SliceSource::new(ALAC)).unwrap();
+        let n = r.coded_frame_count().unwrap();
+        assert_eq!(n, 4, "13230 samples / 4096 frame_length ⇒ 4 coded frames");
+        let mdat_len = r.mdat_remaining();
+
+        let mut offs = [0u64; 5];
+        for k in 0..=n {
+            offs[k as usize] = r.frame_file_offset(k).unwrap();
+            if k > 0 {
+                assert!(
+                    offs[k as usize] > offs[(k - 1) as usize],
+                    "frame offsets must strictly increase"
+                );
+            }
+        }
+        assert_eq!(
+            offs[n as usize] - offs[0],
+            mdat_len,
+            "coded frames must exactly fill mdat"
+        );
     }
 
     #[test]

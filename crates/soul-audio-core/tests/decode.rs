@@ -95,16 +95,50 @@ fn open_decodes_native_flac_bit_exact_vs_wav() {
     );
 }
 
+/// Ogg-FLAC seeks sample-accurately through `open()`/`AnyDecoder` (the tail is
+/// bit-identical to a from-start decode — FLAC-in-Ogg is lossless with
+/// independent frames). This fixture's STREAMINFO declares no total, so
+/// `total_frames()` is `None` — a valid streaming case that must not panic.
 #[test]
-fn ogg_flac_reports_duration_but_rejects_seek() {
-    // Streaming Ogg-FLAC: the source is not seekable, so seek returns Unsupported.
-    // (This fixture's STREAMINFO declares no total, so duration is unknown — a
-    // valid streaming case; total_frames just must not panic.)
-    let ogg = include_bytes!("../testdata/flac-in-ogg.ogg");
-    let mut dec = open(SliceSource::new(ogg)).expect("open ogg-flac");
-    assert_eq!(dec.total_frames(), None);
-    assert_eq!(dec.seek_to(1000), Err(DecodeError::Unsupported));
-    assert_eq!(dec.seek_to_time(0.1), Err(DecodeError::Unsupported));
+fn ogg_flac_seeks_sample_accurate() {
+    let ogg: &[u8] = include_bytes!("../testdata/flac-in-ogg.ogg");
+    let full = decode_all(ogg);
+    assert_eq!(
+        open(SliceSource::new(ogg)).unwrap().total_frames(),
+        None,
+        "fixture declares no total"
+    );
+    for &t in &[0u64, 1000, 5000] {
+        // `AnyDecoder` is large by value; seek+decode on a generous stack.
+        let (landed, ch, tail) = std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn_scoped(s, move || {
+                    let mut dec = open(SliceSource::new(ogg)).expect("open ogg-flac");
+                    let ch = dec.stream_info().channels as usize;
+                    let landed = dec.seek_to(t).expect("ogg-flac seek");
+                    let mut out = Vec::new();
+                    let mut buf = [0i32; 4096];
+                    loop {
+                        let n = dec.decode_into(&mut buf).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        out.extend_from_slice(&buf[..n]);
+                    }
+                    (landed, ch, out)
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        });
+        assert_eq!(landed, t, "sample-accurate landing at {t}");
+        assert_eq!(
+            tail,
+            full[t as usize * ch..],
+            "bit-exact tail after seek to {t}"
+        );
+    }
 }
 
 #[test]
