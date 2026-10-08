@@ -1,0 +1,56 @@
+name: Release
+
+# Tag → build → bundle → (sign, if a cert is configured) → attach installers.
+# The desktop app (app/) is an isolated Cargo workspace, so this release job is
+# separate from the root `ci.yml`. Windows-first (the app's target); a macOS /
+# Linux matrix can be added later.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {} # allow a manual run for testing the pipeline
+
+jobs:
+  windows:
+    name: Windows installer (MSI + NSIS)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install frontend deps
+        working-directory: app
+        run: npm ci
+
+      # Builds the Svelte frontend (vite) + the optimized release binary
+      # (profile.release = opt-level 3 + strip) + the Windows bundles (MSI via
+      # WiX, setup .exe via NSIS) per tauri.conf.json `bundle.targets`.
+      #
+      # CODE SIGNING (issue #30): unsigned by default. To sign, configure the
+      # Windows signing cert and Tauri will sign during `tauri build`:
+      #   - set `bundle.windows.certificateThumbprint` in tauri.conf.json to a
+      #     cert installed in the runner's store, OR provide a custom
+      #     `bundle.windows.signCommand`; and import the PFX from a CI secret in
+      #     a step before this one. See https://v2.tauri.app/distribute/sign/windows/
+      # Left to the owner (needs a real cert); the build+bundle below is
+      # cert-agnostic and produces working (unsigned) installers today.
+      - name: Tauri build (bundle installers)
+        working-directory: app
+        run: npm run tauri build
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: soul-player-windows-installers
+          path: |
+            app/src-tauri/target/release/bundle/msi/*.msi
+            app/src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
