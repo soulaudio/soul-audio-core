@@ -570,6 +570,46 @@ fn ps_local_matches_ffmpeg_per_channel() {
     }
 }
 
+/// **Committed** HE-AACv2 / Parametric Stereo conformance vs ffmpeg — the CI gate
+/// the license-restricted [`ps_local_matches_ffmpeg_per_channel`] above cannot be
+/// (its Coding Technologies fixture is gitignored). `ps-synth.aac` is a SYNTHETIC
+/// fixture: our own A4/E5 tone (`tone.wav`) encoded to HE-AACv2 (AOT 29, mono
+/// core + PS) by a from-source `fdk-aac` build, so it carries no license
+/// encumbrance and ships in-repo. Same metric as the local test — one shared
+/// priming offset, then each channel scored independently against ffmpeg's s16le
+/// decode (`ps-synth.ref.pcm`). Measured L ≈ 48.8 dB, R ≈ 46.3 dB at the
+/// 384-frame offset (a clean synthetic tone scores well above the real-music
+/// `ps-local`'s ~34 dB), comfortably over `PS_SNR_BAR`.
+#[test]
+fn open_decodes_ps_synth_matching_ffmpeg_per_channel() {
+    let aac = include_bytes!("../testdata/ps-synth.aac");
+    let refr = load_s16le(include_bytes!("../testdata/ps-synth.ref.pcm"));
+    let (ours, channels) = decode_all_with_channels(aac);
+    // PS promotes the mono core to stereo (1→2) once the first PS frame's `apply`
+    // runs (reconciliation R6).
+    assert_eq!(
+        channels, 2,
+        "PS must promote the decoded stream to 2 channels"
+    );
+    let (off, _combined) = best_align_segsnr(&ours, &refr, 2);
+    for ch in 0..2 {
+        let o = deinterleave(&ours, 2, ch);
+        let r = deinterleave(&refr, 2, ch);
+        let snr = seg_snr_at(&o, &r, off);
+        assert!(
+            snr > PS_SNR_BAR,
+            "synthetic PS ch{ch} segmental SNR vs ffmpeg too low: {snr:.2} dB \
+             (bar {PS_SNR_BAR} dB, shared offset {off} frames)"
+        );
+    }
+    // Lock that PS actually ran (distinct channels), not a mono duplicate.
+    assert_ne!(
+        deinterleave(&ours, 2, 0),
+        deinterleave(&ours, 2, 1),
+        "PS output channels must genuinely differ"
+    );
+}
+
 /// Local-only structural stereo gate for the PS decode, independent of the
 /// per-sample ffmpeg match above (a backstop if the reference PCM were ever
 /// wrong): the output must report 2 channels, be ~2× the SBR rate (per-channel

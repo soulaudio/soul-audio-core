@@ -109,5 +109,9 @@ MSB-first/interleaved) container (ffmpeg *can* decode both, for cross-checking):
 encoder).
 
 > Minimal decode-correctness **vectors** (DSD/DST slice, IMA-ADPCM, MPEG
-> Layer I/II, VBR MP3, FLAC-in-Ogg) live in
+> Layer I/II, VBR MP3, FLAC-in-Ogg, and a synthetic HE-AACv2/Parametric-Stereo
+> `ps-synth.aac` + its ffmpeg reference) live in
 > `crates/soul-audio-core/testdata/`, next to the codec tests that embed them.
+> `ps-synth.aac` is our own tone encoded to HE-AACv2 by a from-source `fdk-aac`
+> build (AOT 29, mono core + PS) — committable, unlike the gitignored,
+> license-restricted `ps-local.*` Coding-Technologies conformance fixture.
