@@ -20,6 +20,8 @@ right = 659.25 Hz (E5), −6 dB, with 50 ms in/out fades. So:
 | `tone.m4a`  | ALAC (Apple Lossless) in MP4/M4A |
 | `tone-aac.m4a` | AAC-LC in MP4/M4A |
 | `tone.aac`  | AAC-LC, raw ADTS elementary stream |
+| `tone-sbr.m4a` | HE-AAC (AAC-LC + SBR) in MP4/M4A |
+| `tone-vorbis.ogg` | Vorbis I in Ogg |
 | `tone.dsf`  | DSD64 (Sony DSF), 0.5 s — 1-bit, decimated to PCM for playback |
 | `tone-dsd128.dsf` | DSD128 (Sony DSF), 0.5 s |
 | `tone-dsd256.dsf` | DSD256 (Sony DSF), 0.1 s — decimation-rate e2e golden |
@@ -80,6 +82,13 @@ channel routing on rendered output (including a rendered ALAC pass). AAC-LC
 (`tone-aac.m4a` and `tone.aac`) is lossy, so its render tests are **pitch-only**
 — FFT-assert left ≈ 440 Hz / right ≈ 659.25 Hz on a steady-state window past
 the encoder's priming delay — not bit-exact equality or a tight SFDR bar.
+
+Native FLAC is additionally gated in the **core** decode suite
+(`crates/soul-audio-core/tests/decode.rs::open_decodes_native_flac_bit_exact_vs_wav`)
+as a bit-exact match against `tone.wav` (the lossless source). Vorbis and the
+raw-DSD DSDIFF (`tone.dff`) are covered end-to-end in the desktop Tier-1 suite
+(`app/src-tauri/tests/`). HE-AAC/SBR (`tone-sbr.m4a`) renders pitch-only through
+the CLI e2e, like the other lossy AAC fixtures.
 
 ## Regenerating
 

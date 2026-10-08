@@ -54,6 +54,7 @@ fn playable_fixtures_decode_nonsilent() {
         "tone-aac.m4a",
         "tone.aac",
         "tone-sbr.m4a",
+        "tone-vorbis.ogg",
         "tone.dsf",
         "tone-dsd128.dsf",
         "tone.dff",

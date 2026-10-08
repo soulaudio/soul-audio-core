@@ -78,6 +78,23 @@ fn open_decodes_flac_in_ogg_matching_ffmpeg() {
     assert_eq!(h, 0xc9ba_54f0_06b2_9f75);
 }
 
+/// Native `.flac` decodes **bit-exact** to the WAV it was encoded from — FLAC is
+/// lossless and `tone.wav` is the ground-truth source both fixtures share. This
+/// is a stronger check than an ffmpeg hash (equality against the actual source),
+/// and lives in the core suite (gated by `cargo xtask verify`), complementing
+/// the CLI e2e's own FLAC==WAV render check.
+#[test]
+fn open_decodes_native_flac_bit_exact_vs_wav() {
+    let flac = decode_all(include_bytes!("../../../testdata/tone.flac"));
+    let wav = decode_all(include_bytes!("../../../testdata/tone.wav"));
+    assert_eq!(flac.len(), wav.len(), "FLAC/WAV sample counts differ");
+    assert_eq!(
+        fnv1a(&flac),
+        fnv1a(&wav),
+        "native FLAC decode != source WAV"
+    );
+}
+
 #[test]
 fn ogg_flac_reports_duration_but_rejects_seek() {
     // Streaming Ogg-FLAC: the source is not seekable, so seek returns Unsupported.
