@@ -6,16 +6,17 @@ on the desktop and on an STM32H743 (bare-metal, Embassy).
 
 The pipeline is **decode → resample → sink**:
 
-- **Decode** WAV, FLAC, MP3 (Layers I/II/III), DSD, and FLAC-in-Ogg to interleaved
-  `i32` PCM.
+- **Decode** WAV, FLAC (incl. FLAC-in-Ogg), MP3 (Layers I/II/III), AAC (AAC-LC,
+  HE-AAC/SBR, HE-AACv2/PS), ALAC, Ogg Vorbis, Opus, and DSD to interleaved `i32`
+  PCM. Every codec is a from-scratch Rust decoder — no C bindings.
 - **Resample** to any rate with a windowed-sinc converter (anti-aliased both
   directions, Fast/HQ tiers, runtime-variable ratio).
 - **Play** through a `Sink` — a cpal output device on the desktop (an SAI/I²S DMA
-  sink on the STM32 is the next step).
+  sink on the STM32 is implemented, pending on-hardware bring-up).
 
-Every codec is validated against external references (ffmpeg, minimp3, kjmp2)
-bit-exactly where the arithmetic allows, and the whole decode + seek surface is
-fuzzed for panic/hang safety.
+Every codec is validated against external references (ffmpeg, minimp3, kjmp2,
+libopus, and the RFC 8251 Opus test vectors) bit-exactly where the arithmetic
+allows, and the whole decode + seek surface is fuzzed for panic/hang safety.
 
 ## Supported formats
 
@@ -24,10 +25,19 @@ fuzzed for panic/hang safety.
 | **WAV** | PCM integer (8/16/24/32), IEEE float (32/64), G.711 A-law/µ-law, IMA/DVI-ADPCM, RF64/BW64 (>4 GiB), RIFX (big-endian), up to 8 channels |
 | **FLAC** | Full decode, optional CRC-8/16 verification, up to 8 channels, sample-accurate seeking, **FLAC-in-Ogg** |
 | **MP3** | MPEG-1/2/2.5 **Layers I, II, and III**, VBR (Xing/Info/VBRI), frame-granular + time seeking |
+| **AAC** | **AAC-LC**, **HE-AAC** (SBR), **HE-AACv2** (Parametric Stereo); MP4/M4A and raw ADTS (`.aac`) |
+| **ALAC** | Apple Lossless, MP4/M4A container |
+| **Vorbis** | Ogg Vorbis, full decode (floor 0/1), page-granular seeking |
+| **Opus** | From-scratch RFC 6716 decoder — SILK, CELT, and hybrid modes; Ogg-encapsulated (RFC 7845), RFC 8251-conformant; sample-accurate seeking |
 | **DSD** | DSF and DFF/DSDIFF, DoP passthrough, decimation to PCM, DST decompression |
 
 Output is interleaved `i32` in the source's sample range (16/24/32-bit), matching
 across every format.
+
+`open` handles WAV, FLAC, Ogg-FLAC, MP3, AAC (MP4 + ADTS), ALAC, and Opus
+directly. **DSD** and **Ogg Vorbis** are constructed by hand instead of through
+`open` — DSD needs an explicit output mode (native / DoP / decimate) and Vorbis
+needs a caller-provided decode arena (see the DSD section below).
 
 ---
 
@@ -290,4 +300,7 @@ CI). See `docs/superpowers/specs/` for the design specs of each subsystem.
 
 Algorithms ported from (and cross-checked against) minimp3 (MP3 Layer III), kjmp2
 (MP3 Layer I/II, Martin Fiedler), and the libsamplerate / CCRMA windowed-sinc
-resampling method. Decode goldens generated with ffmpeg.
+resampling method. The AAC (LC/SBR/PS), Vorbis, and Opus decoders are written
+from scratch against their specifications (RFC 6716/7845/8251 for Opus) and
+cross-checked against ffmpeg and libopus; the Opus decoder additionally passes
+the RFC 8251 test vectors. Decode goldens generated with ffmpeg.

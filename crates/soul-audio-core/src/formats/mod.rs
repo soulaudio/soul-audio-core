@@ -1,13 +1,15 @@
 //! Format decoders.
 //!
-//! Every format is a **stub** in this slice — each `new` returns
-//! [`crate::DecodeError::Unsupported`]. They implement the decode seam so the
-//! wiring ([`probe`](crate::probe) → [`AnyDecoder`](crate::dispatch::AnyDecoder))
-//! is real and exercised; the container parsing and codec logic are the next
-//! slice.
+//! Every format here is a complete, from-scratch decoder (no C bindings,
+//! `no_std` + no-alloc). [`probe`](crate::probe) identifies the container and
+//! [`open`](crate::open) dispatches to the right one via
+//! [`AnyDecoder`](crate::dispatch::AnyDecoder).
 //!
-//! - PCM formats ([`wav`], [`flac`], [`mp3`]) implement [`crate::Decoder`].
-//! - DSD containers ([`dsf`], [`dff`]) implement [`crate::DsdDecoder`].
+//! - PCM formats implement [`crate::Decoder`]: [`wav`], [`flac`] (incl.
+//!   FLAC-in-Ogg), [`mp3`] (Layers I/II/III), [`aac`] (AAC-LC, HE-AAC/SBR,
+//!   HE-AACv2/PS), [`alac`], [`vorbis`], [`opus`].
+//! - DSD containers ([`dsf`], [`dff`]) implement [`crate::DsdDecoder`]; [`dst`]
+//!   is the lossless DSD-stream decompressor they feed through.
 
 pub mod aac;
 pub mod alac;
