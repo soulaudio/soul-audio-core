@@ -55,20 +55,18 @@ fn per_format_durations_are_reported() {
     let views = load_folder(state.inner(), app.handle(), dir.path()).unwrap();
 
     // Assert durations as a multiset (the library sorts by path, so we don't
-    // rely on per-file ordering): three DSD @ ~0.5 s (dsf, dsd128, dff — the DFF
-    // duration now reads from the tags layer), five containered-PCM @ ~2.0 s, one
-    // bare-ADTS (tone.aac) with no tag-level duration @ 0.0 s.
+    // rely on per-file ordering): three DSD @ ~0.5 s (dsf, dsd128, dff), six
+    // containered/scanned-PCM @ ~2.0 s — including tone.aac, whose duration now
+    // comes from the ADTS frame-scan in the tags layer. No untagged fixtures
+    // remain.
     let mut secs: Vec<f64> = views.iter().map(|v| v.duration_secs).collect();
     secs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let dsd = secs.iter().filter(|d| (**d - 0.5).abs() < 0.06).count();
     let pcm = secs.iter().filter(|d| (**d - 2.0).abs() < 0.16).count();
     let untagged = secs.iter().filter(|d| **d == 0.0).count();
     assert_eq!(dsd, 3, "three DSD fixtures ~0.5s: {secs:?}");
-    assert_eq!(pcm, 5, "five containered-PCM fixtures ~2.0s: {secs:?}");
-    assert_eq!(
-        untagged, 1,
-        "tone.aac (bare ADTS) has no tag-level duration: {secs:?}"
-    );
+    assert_eq!(pcm, 6, "six PCM fixtures ~2.0s (incl. ADTS): {secs:?}");
+    assert_eq!(untagged, 0, "ADTS now has a frame-scan duration: {secs:?}");
 }
 
 #[test]

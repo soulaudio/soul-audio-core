@@ -14,6 +14,7 @@ pub use base64::decode_into;
 #[cfg(feature = "alloc")]
 pub use owned::{Tags, read_owned, read_picture_bytes};
 
+mod adts;
 mod base64;
 mod dff;
 mod dsf;
@@ -119,6 +120,7 @@ pub fn read<S: SeekSource>(
         locate::Container::Wav => riff::read_wav(src, scratch, sink),
         locate::Container::Dsf => dsf::read_dsf(src, scratch, sink),
         locate::Container::Dff => dff::read_dff(src, scratch, sink),
+        locate::Container::Adts => adts::read_adts(src, scratch, sink),
         locate::Container::Mp4 => mp4::read_mp4(src, scratch, sink),
         locate::Container::Ogg => ogg::read_ogg(src, scratch, sink),
         _ => Err(TagError::Unsupported),

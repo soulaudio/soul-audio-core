@@ -608,6 +608,37 @@ fn real_dst_compressed_dff_renders_nonsilent() {
 }
 
 #[test]
+fn real_he_aac_sbr_renders_stereo_tones() {
+    // HE-AAC (explicit SBR in MP4): decode → SBR (2× rate) → resample → file.
+    // Pitch-only (lossy), like the AAC-LC render goldens.
+    let out = tmp("sbr_out.pcm");
+    Command::cargo_bin("soul-audio-cli")
+        .unwrap()
+        .args(["render"])
+        .arg(fixture("tone-sbr.m4a"))
+        .args(["--out"])
+        .arg(&out)
+        .args(["--rate", "48000", "--channels", "2"])
+        .assert()
+        .success();
+
+    let pcm = read_pcm(&out);
+    let n = 16_384;
+    let left = analyze(&channel_window(&pcm, 2, 0, 4000, n), 48_000);
+    let right = analyze(&channel_window(&pcm, 2, 1, 4000, n), 48_000);
+    assert!(
+        (left.peak_hz - 440.0).abs() < 6.0,
+        "SBR left tone {:.1} Hz, not 440",
+        left.peak_hz
+    );
+    assert!(
+        (right.peak_hz - 659.25).abs() < 6.0,
+        "SBR right tone {:.1} Hz, not 659",
+        right.peak_hz
+    );
+}
+
+#[test]
 fn real_flac_plays_through_the_render_pipeline() {
     // A real FLAC all the way through decode → resample → normalize → file.
     let out = tmp("fx_flac_render.pcm");

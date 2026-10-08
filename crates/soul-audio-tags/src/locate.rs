@@ -11,6 +11,7 @@ pub enum Container {
     Mp4,
     Dsf,
     Dff,
+    Adts,
     Unknown,
 }
 
@@ -34,6 +35,10 @@ pub fn sniff<S: SeekSource>(src: &mut S) -> Result<Container, TagError> {
         Container::Dsf
     } else if h.starts_with(b"FRM8") && h.len() >= 16 && &h[12..16] == b"DSD " {
         Container::Dff
+    } else if h.len() >= 2 && h[0] == 0xFF && (h[1] & 0xF6) == 0xF0 {
+        // ADTS syncword 0xFFF + layer == 00 (the 0x06 mask rules out an MP3
+        // frame, whose layer bits are non-zero).
+        Container::Adts
     } else {
         Container::Unknown
     };
@@ -73,6 +78,7 @@ mod tests {
         assert_eq!(sniff_bytes(b"\0\0\0\x20ftypM4A "), Container::Mp4);
         assert_eq!(sniff_bytes(b"DSD \0\0\0\0"), Container::Dsf);
         assert_eq!(sniff_bytes(b"FRM8\0\0\0\0\0\0\0\0DSD "), Container::Dff);
+        assert_eq!(sniff_bytes(b"\xFF\xF1\x50\x80"), Container::Adts);
         assert_eq!(sniff_bytes(b"garbage!"), Container::Unknown);
     }
 }
