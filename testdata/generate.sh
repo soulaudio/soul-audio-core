@@ -17,6 +17,12 @@ GRAPH="aevalsrc=exprs=0.5*sin(2*PI*440*t)|0.5*sin(2*PI*659.25*t):s=44100:d=2:c=s
 ffmpeg -y -hide_banner -loglevel error -f lavfi -i "$GRAPH" -c:a pcm_s16le tone.wav
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a flac tone.flac
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a libmp3lame -b:a 192k tone.mp3
+# MPEG Layer II (the MP3 decoder also handles L2/L1; this gives L2 a playback-tier
+# render golden, not just the kjmp2 decode vectors). No `tone.mp1` — ffmpeg has no
+# MPEG Layer I encoder, so the L1 playback fixture reuses the committed conformance
+# vector (copied to `tone-layer1.mp1`; see below).
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a mp2 -b:a 192k tone.mp2
+cp ../crates/soul-audio-core/testdata/layer1-32k-stereo.mp1 tone-layer1.mp1
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a flac -f ogg tone.ogg
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a alac -movflags +faststart tone.m4a
 
@@ -68,4 +74,4 @@ python3 generate_dsd.py tone-dsd512.dsf 22579200 0.1  # DSD512 DSF (0.1 s, size)
 python3 generate_dsd.py tone.dff                      # DSD64  DSDIFF/raw (0.5 s)
 
 echo "generated:"
-ls -la tone.wav tone.flac tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg
+ls -la tone.wav tone.flac tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1

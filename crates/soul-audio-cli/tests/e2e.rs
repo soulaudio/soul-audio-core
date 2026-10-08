@@ -608,6 +608,59 @@ fn real_dst_compressed_dff_renders_nonsilent() {
 }
 
 #[test]
+fn real_mp2_renders_stereo_tones() {
+    // MPEG Layer II through the full pipeline — the MP3 decoder also handles L2.
+    // Pitch-only (lossy), like the MP3/AAC render goldens; gives L2 playback-tier
+    // coverage beyond its kjmp2 decode vectors.
+    let out = tmp("mp2_out.pcm");
+    Command::cargo_bin("soul-audio-cli")
+        .unwrap()
+        .args(["render"])
+        .arg(fixture("tone.mp2"))
+        .args(["--out"])
+        .arg(&out)
+        .args(["--rate", "48000", "--channels", "2"])
+        .assert()
+        .success();
+
+    let pcm = read_pcm(&out);
+    let n = 16_384;
+    let left = analyze(&channel_window(&pcm, 2, 0, 4000, n), 48_000);
+    let right = analyze(&channel_window(&pcm, 2, 1, 4000, n), 48_000);
+    assert!(
+        (left.peak_hz - 440.0).abs() < 6.0,
+        "MP2 left {:.1} Hz",
+        left.peak_hz
+    );
+    assert!(
+        (right.peak_hz - 659.25).abs() < 6.0,
+        "MP2 right {:.1} Hz",
+        right.peak_hz
+    );
+}
+
+#[test]
+fn real_mp1_renders_nonsilent() {
+    // MPEG Layer I through the full pipeline (the committed conformance vector —
+    // ffmpeg has no L1 encoder, so it is not the A4/E5 tone). Renders cleanly and
+    // non-silent, giving L1 playback-tier coverage beyond its decode vector.
+    let out = tmp("mp1_out.pcm");
+    Command::cargo_bin("soul-audio-cli")
+        .unwrap()
+        .args(["render"])
+        .arg(fixture("tone-layer1.mp1"))
+        .args(["--out"])
+        .arg(&out)
+        .args(["--rate", "48000", "--channels", "2"])
+        .assert()
+        .success();
+
+    let pcm = read_pcm(&out);
+    assert!(!pcm.is_empty(), "MP1 render produced no PCM");
+    assert!(pcm.iter().any(|&s| s.abs() > 1000), "MP1 render silent");
+}
+
+#[test]
 fn real_he_aac_sbr_renders_stereo_tones() {
     // HE-AAC (explicit SBR in MP4): decode → SBR (2× rate) → resample → file.
     // Pitch-only (lossy), like the AAC-LC render goldens.

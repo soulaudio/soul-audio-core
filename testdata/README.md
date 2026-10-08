@@ -16,6 +16,8 @@ right = 659.25 Hz (E5), −6 dB, with 50 ms in/out fades. So:
 | `tone.wav`  | RIFF/WAVE PCM (the reference) |
 | `tone.flac` | native FLAC |
 | `tone.mp3`  | MPEG Layer III |
+| `tone.mp2`  | MPEG Layer II |
+| `tone-layer1.mp1` | MPEG Layer I (conformance vector; ffmpeg has no L1 encoder, so not the shared tone) |
 | `tone.ogg`  | FLAC-in-Ogg |
 | `tone.m4a`  | ALAC (Apple Lossless) in MP4/M4A |
 | `tone-aac.m4a` | AAC-LC in MP4/M4A |
