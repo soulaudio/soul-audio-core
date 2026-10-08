@@ -17,9 +17,11 @@ use soul_audio_core::formats::dff::DffDecoder;
 use soul_audio_core::formats::dsf::DsfDecoder;
 use soul_audio_core::formats::flac::FlacDecoder;
 use soul_audio_core::formats::mp3::Mp3Decoder;
+use soul_audio_core::formats::opus::OpusDecoder;
+use soul_audio_core::formats::vorbis::VorbisDecoder;
 use soul_audio_core::formats::wav::WavDecoder;
 use soul_audio_core::{
-    DecimateAdapter, Decoder, DopAdapter, DsdDecoder, DsdSeek, SliceSource, open,
+    DecimateAdapter, Decoder, DopAdapter, DsdDecoder, DsdSeek, SeekableDecoder, SliceSource, open,
 };
 
 /// Deterministic xorshift64* PRNG (no external dev-deps; reproducible corpus).
@@ -149,6 +151,22 @@ fn drive_all(bytes: &[u8]) -> Result<(), &'static str> {
             return Err("dff-dop");
         }
     }
+    // Opus (Ogg): the whole range-decoder → CELT/SILK → resampler pipeline, which
+    // has no error channel in the CELT core — any out-of-range decoded value must
+    // stay a bounded `Ok`/graceful `Err`, never a debug-assert panic or OOB.
+    if let Ok(mut d) = OpusDecoder::new(SliceSource::new(bytes)) {
+        if !drain_pcm(&mut d, len) {
+            return Err("opus");
+        }
+    }
+    // Vorbis (Ogg): needs a caller arena. Fuzzes the audio-packet value decode
+    // (residue scalar-Huffman / VQ, floor-1 synthesis, inverse coupling, IMDCT)
+    // that setup-header validation can't backstop.
+    if let Ok(mut d) = VorbisDecoder::new(SliceSource::new(bytes), vec![0u8; 128 * 1024]) {
+        if !drain_pcm(&mut d, len) {
+            return Err("vorbis");
+        }
+    }
 
     // --- seek surface: seek to each target (incl. overflow-prone extremes) on a
     // fresh decoder, then probe a few reads. Seek panics fire in the seek call or
@@ -183,6 +201,20 @@ fn drive_all(bytes: &[u8]) -> Result<(), &'static str> {
             let mut a = DecimateAdapter::new(inner);
             let _ = a.seek_to_frame(t);
             probe_pcm(&mut a);
+        }
+        // Dispatch-level seek: reaches ALAC/AAC/Opus/OggFlac seek on mutated
+        // input — i.e. the MP4 `stsc`/`stsz`/`stco` sample-table arithmetic and
+        // the Ogg-granule bisection running over corrupt streams, a surface the
+        // per-codec seeks above don't touch.
+        if let Ok(mut d) = open(SliceSource::new(bytes)) {
+            let _ = d.seek_to(t);
+            probe_pcm(&mut d);
+        }
+        // Vorbis seek (not routed through `open`): Ogg-granule bisection + the
+        // decode-discard-to-target value path on a fuzzed stream.
+        if let Ok(mut d) = VorbisDecoder::new(SliceSource::new(bytes), vec![0u8; 128 * 1024]) {
+            let _ = SeekableDecoder::seek_to(&mut d, t);
+            probe_pcm(&mut d);
         }
     }
     // Time-based seeks: the edge cases (start, negative, non-finite).
@@ -322,6 +354,28 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
         // (see the `seeds()` doc-comment).
         ("sbr-m4a", include_bytes!("../testdata/sbr.m4a").to_vec()),
         ("sbr-adts", include_bytes!("../testdata/sbr.aac").to_vec()),
+        // Opus + Vorbis: the previously-unfuzzed Ogg codec bodies. Mutating a
+        // valid baseline drives the range-decoder/CELT/SILK (Opus) and the
+        // residue/floor/IMDCT value decode (Vorbis) to `Err`/`Ok(0)`, never a
+        // panic — the surfaces the setup/TOC unit tests can't reach.
+        (
+            "opus",
+            include_bytes!("../../../testdata/tone.opus").to_vec(),
+        ),
+        (
+            "vorbis-mono",
+            include_bytes!("../testdata/tone-vorbis-mono.ogg").to_vec(),
+        ),
+        (
+            "vorbis-blocks",
+            include_bytes!("../testdata/tone-vorbis-blocks.ogg").to_vec(),
+        ),
+        // Multipage Ogg-FLAC: fuzzes the cross-page packet-continuation (255-byte
+        // lacing) path the single-page `ogg-flac` seed can't reach.
+        (
+            "ogg-flac-multipage",
+            include_bytes!("../testdata/flac-in-ogg-multipage.ogg").to_vec(),
+        ),
     ];
 
     // Genuine valid-baseline PS fuzz, local-only: the license-restricted
@@ -344,6 +398,7 @@ const MAGICS: &[&[u8]] = &[
     b"fLaC",
     b"OggS\x00\x02",
     b"OggS\x00\x02____________________________\x7fFLAC",
+    b"OggS\x00\x02____________________________OpusHead", // Ogg Opus
     b"DSD ",
     b"FRM8",
     b"ID3\x04\x00\x00",

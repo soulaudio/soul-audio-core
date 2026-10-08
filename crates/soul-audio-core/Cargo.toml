@@ -27,3 +27,10 @@ embedded-io = { workspace = true }
 # measurement). Never compiled into the no_std library or the firmware.
 [dev-dependencies]
 rustfft = "6"
+
+# Decode + resample throughput baseline / regression gate. Dependency-free
+# (hand-rolled timing, no criterion) to keep the dep tree minimal; runs on the
+# host only. `cargo bench -p soul-audio-core --bench throughput`.
+[[bench]]
+name = "throughput"
+harness = false

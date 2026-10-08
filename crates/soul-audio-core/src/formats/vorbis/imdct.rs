@@ -73,21 +73,29 @@ pub(crate) fn imdct(spec: &[f32], n: usize, out: &mut [f32]) {
     if n == 0 || bs > MAX_BLOCKSIZE || out.len() < bs || spec.len() < n {
         return;
     }
-    let four_bs = (4 * bs) as u64;
     let stride = (COS_QUARTER_N / bs) as u64; // MAX_BLOCKSIZE / bs, exact
     let half = (bs / 2) as u64;
+    // Full cosine period in table-index units: `((a·(2k+1)) mod 4·bs)·stride ==
+    // (a·(2k+1)·stride) mod (4·bs·stride)`, and `4·bs·stride == 4·COS_QUARTER_N`.
+    let period = 4 * COS_QUARTER_N as u64;
     // `i` drives both the cosine phase `a` and the output index, so the range
     // loop reads more directly than an enumerated iterator.
     #[allow(clippy::needless_range_loop)]
     for i in 0..bs {
-        // a = (2i + 1 + bs/2); the running cosine argument is a·(2k+1).
+        // a = (2i + 1 + bs/2); the running cosine argument is a·(2k+1). As `k`
+        // steps, the table phase `r` advances by a constant `delta` — so the
+        // innermost loop is an add + conditional subtract, not a 64-bit modulo
+        // (an integer division was the dominant cost of this O(n²) transform).
         let a = (2 * i as u64) + 1 + half;
+        let delta = (2 * a * stride) % period;
+        let mut r = (a * stride) % period; // phase at k = 0 (b = 1)
         let mut acc = 0.0f32;
-        for (k, &xk) in spec.iter().enumerate().take(n) {
-            let b = (2 * k as u64) + 1;
-            let j = a * b;
-            let r = ((j % four_bs) * stride) as usize;
-            acc += xk * cos_from_quarter(r);
+        for (_k, &xk) in spec.iter().enumerate().take(n) {
+            acc += xk * cos_from_quarter(r as usize);
+            r += delta;
+            if r >= period {
+                r -= period;
+            }
         }
         out[i] = acc;
     }
