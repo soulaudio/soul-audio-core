@@ -75,6 +75,11 @@ pub struct FlacDecoder<S> {
     crc8: u8,
     /// Running CRC-16 over the current frame (poly 0x8005).
     crc16: u16,
+    /// Set by a container-level seek that lands mid-stream without a reliable
+    /// absolute baseline (FLAC-in-Ogg): the next decoded frame overrides
+    /// `decoded_per_ch` from its own coded number, so position is exact even if
+    /// a resync skipped a partial frame at the landing point.
+    anchor_pending: bool,
 }
 
 /// FLAC frame-header CRC-8 (poly `x⁸+x²+x+1` = 0x07, init 0, MSB-first).
@@ -111,6 +116,13 @@ struct FrameHeader {
     ca: u32,
     /// Declared sample bit depth for this frame.
     frame_bps: u32,
+    /// Blocking strategy: `true` = variable (the coded number is the first
+    /// per-channel *sample* number); `false` = fixed (it's the *frame* number).
+    blocking_variable: bool,
+    /// The frame's coded UTF-8 number — a sample index (variable blocking) or a
+    /// frame index (fixed). Lets a seek anchor its absolute position from the
+    /// bitstream itself rather than trusting a container granule.
+    coded_num: u64,
 }
 
 impl<S: Source> FlacDecoder<S> {
@@ -147,6 +159,7 @@ impl<S: Source> FlacDecoder<S> {
             validate_crc: false,
             crc8: 0,
             crc16: 0,
+            anchor_pending: false,
         })
     }
 
@@ -299,6 +312,18 @@ impl<S: Source> FlacDecoder<S> {
             return Err(DecodeError::Malformed);
         }
 
+        // After a mid-stream container seek (FLAC-in-Ogg), anchor the absolute
+        // position to this frame's own coded number — exact regardless of where
+        // the landing point fell or whether a partial frame was resynced past.
+        if self.anchor_pending {
+            self.decoded_per_ch = if h.blocking_variable {
+                h.coded_num
+            } else {
+                h.coded_num * h.block as u64
+            };
+            self.anchor_pending = false;
+        }
+
         for c in 0..nchannels {
             // The "side" channel of a stereo decorrelation carries one extra bit.
             let cbps = match h.ca {
@@ -341,13 +366,13 @@ impl<S: Source> FlacDecoder<S> {
             return Err(DecodeError::Malformed);
         }
         let _reserved = self.read_bits(1)?; // mandatory 0
-        let _blocking = self.read_bits(1)?; // 0 = fixed, 1 = variable block size
+        let blocking = self.read_bits(1)?; // 0 = fixed, 1 = variable block size
         let bsc = self.read_bits(4)?; // block size code
         let src = self.read_bits(4)?; // sample rate code
         let ca = self.read_bits(4)?; // channel assignment
         let ssc = self.read_bits(3)?; // sample size code
         let _reserved2 = self.read_bits(1)?;
-        let _num = self.read_utf8()?; // frame or sample number
+        let coded_num = self.read_utf8()?; // frame or sample number
 
         let block: usize = match bsc {
             0 => return Err(DecodeError::Malformed),
@@ -391,6 +416,8 @@ impl<S: Source> FlacDecoder<S> {
             block,
             ca,
             frame_bps,
+            blocking_variable: blocking == 1,
+            coded_num,
         })
     }
 
@@ -649,16 +676,18 @@ impl<S: Source> FlacDecoder<S> {
     }
 
     /// Decode-and-discard whole frames until the frame containing `target`,
-    /// positioning the emit cursor at the exact sample. Assumes the stream is
-    /// positioned at a frame boundary with `decoded_per_ch` matching it.
-    /// Returns the sample landed on — `target` normally, or the true end if the
-    /// stream runs out first (an out-of-range seek on an unknown-length stream).
+    /// positioning the emit cursor at the exact sample. The frame's own start is
+    /// derived *after* decoding (`decoded_per_ch - emitted`), so it stays correct
+    /// whether `decoded_per_ch` was counted forward (SEEKTABLE path) or anchored
+    /// from a frame header (the FLAC-in-Ogg path). Returns the sample landed on —
+    /// `target` normally, or the true end if the stream runs out first.
     fn decode_discard_to(&mut self, target: u64) -> Result<u64, DecodeError> {
         loop {
-            let frame_start = self.decoded_per_ch;
             if !self.decode_next_frame()? {
                 return Ok(self.decoded_per_ch); // end of stream
             }
+            let emit_pc = (self.block_total / self.channels.max(1) as usize) as u64;
+            let frame_start = self.decoded_per_ch.saturating_sub(emit_pc);
             if target < self.decoded_per_ch {
                 self.emit_i = ((target - frame_start) as usize) * self.channels as usize;
                 return Ok(target);
@@ -695,20 +724,23 @@ impl<S: SeekSource> FlacDecoder<S> {
 }
 
 impl<S: SeekSource> SeekableDecoder for FlacDecoder<OggReader<S>> {
-    /// Seek **FLAC-in-Ogg** to per-channel `sample`. The synthetic native-FLAC
-    /// stream the [`OggReader`] presents has no usable SEEKTABLE (its byte
-    /// offsets don't map to the real Ogg file), so this rewinds the Ogg reader
-    /// to the first audio page ([`OggReader::restart_audio`]) and decode-
-    /// discards FLAC frames to the target. Sample-accurate (FLAC frames are
-    /// independent — no pre-roll); O(target). Ogg-page granule bisection would
-    /// make it O(log n) — a noted future optimization.
+    /// Seek **FLAC-in-Ogg** to per-channel `sample`, **sample-accurate** in
+    /// **O(log n)**: the Ogg reader byte-bisects pages by granule
+    /// ([`OggReader::seek_to_granule`]) to land just before the target, then the
+    /// FLAC decoder decode-discards forward — anchoring its absolute position
+    /// from the first frame's own coded number (so a resync past a page-boundary
+    /// partial frame can't desync it). FLAC frames are independent, so no
+    /// pre-roll is needed. The synthetic native-FLAC stream has no usable
+    /// SEEKTABLE (its byte offsets don't map to the real Ogg file), which is why
+    /// this granule path exists instead of the native one.
     ///
     /// # Errors
-    /// Propagates the Ogg rewind + forward-decode errors.
+    /// Propagates the Ogg bisection + forward-decode errors.
     fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
         let target = self.total_samples.map_or(sample, |t| sample.min(t));
-        self.demux.src_mut().restart_audio()?;
+        self.demux.src_mut().seek_to_granule(target)?;
         self.reset_stream_state(0);
+        self.anchor_pending = true;
         self.decode_discard_to(target)
     }
 
@@ -1766,5 +1798,57 @@ mod ogg_seek_tests {
         assert_eq!(landed, pc, "clamps to the true decoded length");
         let mut buf = [0i32; 16];
         assert_eq!(d.decode_into(&mut buf).unwrap(), 0, "at EOF after clamp");
+    }
+
+    // A deliberately MULTI-PAGE FLAC-in-Ogg fixture (6 audio pages) so the
+    // O(log n) granule bisection actually lands on mid-stream pages — the
+    // single-audio-page fixture above only ever exercises the restart_audio
+    // fallback. Generated with:
+    //   ffmpeg -f lavfi -i "anoisesrc=d=3:c=pink:seed=7:a=0.6:r=44100" \
+    //          -c:a flac -f ogg flac-in-ogg-multipage.ogg
+    const OGG_MP: &[u8] = include_bytes!("../../testdata/flac-in-ogg-multipage.ogg");
+
+    fn mk_mp() -> FlacDecoder<OggReader<SliceSource<'static>>> {
+        FlacDecoder::new(OggReader::new(SliceSource::new(OGG_MP)).unwrap()).unwrap()
+    }
+
+    /// Seeking into later pages must byte-bisect to a mid-stream page and still
+    /// land sample-exact (frame-number anchored), bit-identical to from-start.
+    #[test]
+    fn ogg_flac_multipage_seek_bit_exact() {
+        let ch = mk_mp().stream_info().channels as usize;
+        let full = drain(&mut mk_mp());
+        let pc = (full.len() / ch) as u64;
+        // Targets spread across all 6 audio pages, incl. page interiors.
+        for n in 1u64..=11 {
+            let t = (pc * n) / 12;
+            let mut d = mk_mp();
+            let landed = d.seek_to(t).unwrap();
+            assert_eq!(landed, t, "sample-accurate landing at {t}/{pc}");
+            let rest = drain(&mut d);
+            let from = t as usize * ch;
+            assert_eq!(rest.len(), full.len() - from, "tail length at {t}");
+            assert_eq!(
+                rest,
+                &full[from..],
+                "bit-exact tail after mid-stream bisect to {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn ogg_flac_multipage_backward_and_repeat() {
+        let ch = mk_mp().stream_info().channels as usize;
+        let full = drain(&mut mk_mp());
+        let pc = (full.len() / ch) as u64;
+        let mut d = mk_mp();
+        d.seek_to((pc * 5) / 6).unwrap(); // deep
+        d.seek_to(pc / 6).unwrap(); // back near the front (new bisection)
+        let from = (pc / 6) as usize * ch;
+        assert_eq!(
+            drain(&mut d),
+            &full[from..],
+            "backward cross-page seek is exact"
+        );
     }
 }

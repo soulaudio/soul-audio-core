@@ -115,6 +115,47 @@ impl<S: Source> OggReader<S> {
         Ok(())
     }
 
+    /// Reposition to an **audio** page whose granule is `< target` (O(log n)
+    /// byte bisection on page granule), so a caller decoding forward reaches
+    /// `target` after dropping at most one page of frames. In FLAC-in-Ogg the
+    /// granule IS the per-channel sample number, so this is a direct sample
+    /// bisection. Header pages (granule 0) are skipped; if `target` falls within
+    /// the first audio page (no earlier audio page exists) it rewinds to the
+    /// first audio page via [`Self::restart_audio`]. The prelude is not
+    /// re-emitted. The caller (FLAC decoder) anchors its exact position from the
+    /// first decoded frame's coded number, so landing slightly early — or on a
+    /// page that starts mid-frame — stays sample-accurate.
+    ///
+    /// # Errors
+    /// [`DecodeError::Io`] on seek/read failure; [`DecodeError::Malformed`] if a
+    /// landing page can't be loaded.
+    pub fn seek_to_granule(&mut self, target: u64) -> Result<(), DecodeError>
+    where
+        S: SeekSource,
+    {
+        if target == 0 {
+            return self.restart_audio();
+        }
+        match bisect_last_audio_page_before(&mut self.inner, target)? {
+            Some(page_start) => {
+                self.inner
+                    .seek(SeekFrom::Start(page_start))
+                    .map_err(|_| DecodeError::Io)?;
+                self.segs = [0; 255];
+                self.nsegs = 0;
+                self.seg_i = 0;
+                self.seg_off = 0;
+                self.prelude_pos = self.prelude.len(); // already delivered
+                if !self.next_page()? {
+                    return Err(DecodeError::Malformed);
+                }
+                Ok(())
+            }
+            // `target` is inside the first audio page — start from the top.
+            None => self.restart_audio(),
+        }
+    }
+
     /// Read the next Ogg page header + segment table. `false` at a clean EOF.
     fn next_page(&mut self) -> Result<bool, DecodeError> {
         let mut h = [0u8; 27];
@@ -202,6 +243,120 @@ impl<S: Source> OggReader<S> {
             }
         }
     }
+}
+
+/// Read exactly `buf.len()` bytes or error.
+fn read_full<S: Source>(src: &mut S, buf: &mut [u8]) -> Result<(), DecodeError> {
+    let mut n = 0;
+    while n < buf.len() {
+        match src.read(&mut buf[n..]) {
+            Ok(0) => return Err(DecodeError::UnexpectedEof),
+            Ok(k) => n += k,
+            Err(_) => return Err(DecodeError::Io),
+        }
+    }
+    Ok(())
+}
+
+/// Forward byte-sync scan from `start` for the next `OggS` page; returns
+/// `(page_start, granule, page_len)`. `None` at end of stream before a sync.
+/// A byte-sync scan (matching `OggS` + trusting the header), like every other
+/// Ogg reader here — no page-CRC validation.
+fn scan_page_at_or_after<S: SeekSource>(
+    src: &mut S,
+    start: u64,
+) -> Result<Option<(u64, u64, u64)>, DecodeError> {
+    src.seek(SeekFrom::Start(start))
+        .map_err(|_| DecodeError::Io)?;
+    let mut window = [0u8; 4];
+    let mut filled = 0usize;
+    let mut pos = start;
+    loop {
+        let mut b = [0u8; 1];
+        match src.read(&mut b) {
+            Ok(0) => return Ok(None),
+            Ok(_) => {}
+            Err(_) => return Err(DecodeError::Io),
+        }
+        if filled < 4 {
+            window[filled] = b[0];
+            filled += 1;
+        } else {
+            window.copy_within(1..4, 0);
+            window[3] = b[0];
+        }
+        pos += 1;
+        if filled == 4 && &window == b"OggS" {
+            let page_start = pos - 4;
+            let mut rest = [0u8; 23]; // version..page_segments (granule at [2..10], LE)
+            read_full(src, &mut rest)?;
+            let granule = u64::from_le_bytes(rest[2..10].try_into().unwrap());
+            let seg_count = usize::from(rest[22]);
+            let mut lacing = [0u8; 255];
+            read_full(src, &mut lacing[..seg_count])?;
+            let body: u64 = lacing[..seg_count].iter().map(|&v| u64::from(v)).sum();
+            return Ok(Some((page_start, granule, 27 + seg_count as u64 + body)));
+        }
+    }
+}
+
+/// Byte-bisect for the start of the last **audio** page (granule `> 0`) whose
+/// granule is `< target`. Header pages (granule `0`) and `u64::MAX` ("no packet
+/// finished") pages are stepped past, never chosen. `None` if no such page
+/// exists (`target` is within the first audio page). Pure function of `src` —
+/// deliberately independent of `OggReader`'s page/segment state and of the
+/// `OggPackets` reader, so it can't regress the Vorbis/Opus seek path.
+fn bisect_last_audio_page_before<S: SeekSource>(
+    src: &mut S,
+    target: u64,
+) -> Result<Option<u64>, DecodeError> {
+    let file_len = src.seek(SeekFrom::End(0)).map_err(|_| DecodeError::Io)?;
+    let mut lo: u64 = 0;
+    let mut hi: u64 = file_len;
+    let mut best: Option<u64> = None;
+    let mut iters = 0usize;
+    while lo < hi && iters < 128 {
+        iters += 1;
+        let mid = lo + (hi - lo) / 2;
+        match scan_page_at_or_after(src, mid)? {
+            None => {
+                if mid == lo {
+                    break;
+                }
+                hi = mid;
+            }
+            Some((page_start, granule, page_len)) => {
+                if page_start >= hi {
+                    if mid == lo {
+                        break;
+                    }
+                    hi = mid;
+                    continue;
+                }
+                let next = page_start + page_len;
+                if granule != u64::MAX && granule > 0 && granule < target {
+                    best = Some(page_start); // audio page strictly before target
+                    if next <= lo {
+                        break;
+                    }
+                    lo = next;
+                } else if granule == u64::MAX || granule == 0 || granule < target {
+                    // header / no-packet / (defensive) — advance past it.
+                    if next <= lo {
+                        break;
+                    }
+                    lo = next;
+                } else {
+                    // granule >= target: target is at or before this page.
+                    if page_start <= lo {
+                        break;
+                    }
+                    hi = page_start;
+                }
+            }
+        }
+    }
+    Ok(best)
 }
 
 impl<S: Source> ErrorType for OggReader<S> {
