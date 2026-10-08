@@ -4,6 +4,10 @@ name: Release
 # The desktop app (app/) is an isolated Cargo workspace, so this release job is
 # separate from the root `ci.yml`. Windows-first (the app's target); a macOS /
 # Linux matrix can be added later.
+#
+# NOTE: this (and ci.yml) only run once a Forgejo Actions runner is registered
+# for the repo/org — Windows-labeled, with WebView2 present for the Tauri build.
+# Until then the workflow is a dormant declaration.
 on:
   push:
     tags:
@@ -14,6 +18,17 @@ jobs:
   windows:
     name: Windows installer (MSI + NSIS)
     runs-on: windows-latest
+    # Authenticode signing is OPT-IN via repo/org secrets (issue #30). When
+    # WINDOWS_CERT_PFX_BASE64 is set, the step below imports the PFX and patches
+    # the cert thumbprint into tauri.conf.json so `tauri build` signs the
+    # bundles. When the secret is empty/unset the signing step is skipped and
+    # the build produces working UNSIGNED installers (today's behavior).
+    #   - WINDOWS_CERT_PFX_BASE64: base64 of your code-signing .pfx
+    #       (PowerShell: [Convert]::ToBase64String([IO.File]::ReadAllBytes("cert.pfx")))
+    #   - WINDOWS_CERT_PASSWORD:   the .pfx export password
+    env:
+      WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -30,18 +45,28 @@ jobs:
         working-directory: app
         run: npm ci
 
+      # Import the code-signing cert and point tauri.conf.json at it — ONLY when
+      # the signing secret is configured. Tauri signs during `tauri build` when
+      # bundle.windows.certificateThumbprint is non-empty; this patches it in.
+      - name: Configure code signing
+        if: ${{ env.WINDOWS_CERT_PFX_BASE64 != '' }}
+        shell: pwsh
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "signing-cert.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+          $securePwd = ConvertTo-SecureString $env:WINDOWS_CERT_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePwd
+          Remove-Item $pfxPath -Force
+          $confPath = "app/src-tauri/tauri.conf.json"
+          $conf = Get-Content $confPath -Raw | ConvertFrom-Json
+          $conf.bundle.windows.certificateThumbprint = $cert.Thumbprint
+          $conf | ConvertTo-Json -Depth 32 | Set-Content $confPath -Encoding utf8
+          Write-Host "Code signing enabled (thumbprint $($cert.Thumbprint))."
+
       # Builds the Svelte frontend (vite) + the optimized release binary
       # (profile.release = opt-level 3 + strip) + the Windows bundles (MSI via
-      # WiX, setup .exe via NSIS) per tauri.conf.json `bundle.targets`.
-      #
-      # CODE SIGNING (issue #30): unsigned by default. To sign, configure the
-      # Windows signing cert and Tauri will sign during `tauri build`:
-      #   - set `bundle.windows.certificateThumbprint` in tauri.conf.json to a
-      #     cert installed in the runner's store, OR provide a custom
-      #     `bundle.windows.signCommand`; and import the PFX from a CI secret in
-      #     a step before this one. See https://v2.tauri.app/distribute/sign/windows/
-      # Left to the owner (needs a real cert); the build+bundle below is
-      # cert-agnostic and produces working (unsigned) installers today.
+      # WiX, setup .exe via NSIS) per tauri.conf.json `bundle.targets`. Signs
+      # the bundles iff the step above set a thumbprint; otherwise unsigned.
       - name: Tauri build (bundle installers)
         working-directory: app
         run: npm run tauri build
