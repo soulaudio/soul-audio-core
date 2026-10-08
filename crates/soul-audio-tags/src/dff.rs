@@ -18,11 +18,10 @@ use soul_audio_core::{SeekSource, Source};
 /// Read big-endian IFF facts (`FS `/`CHNL` + sound-chunk size) and human tags
 /// (`DIIN` → `DITI`/`DIAR`, and/or `ID3 `) from a DSDIFF stream.
 ///
-/// `total_frames` is the per-channel 1-bit sample count, derived from a raw
-/// `DSD ` sound chunk's byte size (`bytes / channels × 8`). DST-compressed
-/// sound data needs frame math the tag layer does not do, so a DST stream
-/// yields facts without `total_frames` (playback duration still comes from the
-/// decoder's `total_samples`).
+/// `total_frames` is the per-channel 1-bit sample count: for a raw `DSD ` chunk
+/// it is `bytes / channels × 8`; for a DST-compressed `DST ` chunk it is derived
+/// from the `FRTE` header (`numFrames × sample_rate / frameRate`), the same
+/// figure the decoder's `open_dst` computes.
 pub fn read_dff<S: SeekSource>(
     src: &mut S,
     scratch: &mut [u8],
@@ -53,6 +52,26 @@ pub fn read_dff<S: SeekSource>(
             b"DSD " => {
                 if channels > 0 {
                     facts.total_frames = Some(size / channels * 8);
+                }
+            }
+            b"DST " => {
+                // DST-compressed sound data: its first sub-chunk is
+                // `FRTE {numFrames:u32, frameRate:u16}`. Per-channel 1-bit
+                // samples = numFrames × (sample_rate / frameRate) — the same
+                // figure the decoder's `open_dst` derives, without decoding any
+                // frame. (PROP precedes DST, so `sample_rate` is already known.)
+                let mut fb = [0u8; 6];
+                if let Some(rate) = facts.sample_rate
+                    && let Ok((fid, _)) = read_chunk_header(src)
+                    && &fid == b"FRTE"
+                    && read_exact(src, &mut fb).is_ok()
+                {
+                    let num_frames = u64::from(u32::from_be_bytes([fb[0], fb[1], fb[2], fb[3]]));
+                    let frame_rate = u16::from_be_bytes([fb[4], fb[5]]);
+                    if frame_rate != 0 {
+                        let spf = u64::from(rate) / u64::from(frame_rate);
+                        facts.total_frames = Some(num_frames.saturating_mul(spf));
+                    }
                 }
             }
             b"DIIN" => read_diin(src, size, scratch, sink)?,
@@ -212,6 +231,52 @@ mod tests {
         v.extend_from_slice(b"DSD ");
         v.extend_from_slice(&body);
         v
+    }
+
+    /// Build a DST-compressed DSDIFF: PROP(FS,CHNL) + a `DST ` sound chunk whose
+    /// first sub-chunk is `FRTE {numFrames:u32, frameRate:u16}` (the only part
+    /// the tags layer reads — it derives duration without decoding frames).
+    fn build_dff_dst(num_frames: u32, frame_rate: u16) -> Vec<u8> {
+        let mut fs = Vec::new();
+        fs.extend_from_slice(&2_822_400u32.to_be_bytes());
+        let mut chnl = Vec::new();
+        chnl.extend_from_slice(&2u16.to_be_bytes());
+        chnl.extend_from_slice(b"SLFTSRGT");
+        let mut prop = Vec::new();
+        prop.extend_from_slice(b"SND ");
+        prop.extend_from_slice(&be_chunk(b"FS  ", &fs));
+        prop.extend_from_slice(&be_chunk(b"CHNL", &chnl));
+
+        let mut frte = Vec::new();
+        frte.extend_from_slice(&num_frames.to_be_bytes());
+        frte.extend_from_slice(&frame_rate.to_be_bytes());
+        // DST sound chunk = FRTE then (omitted here) DSTF frames.
+        let dst_body = be_chunk(b"FRTE", &frte);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&be_chunk(b"PROP", &prop));
+        body.extend_from_slice(&be_chunk(b"DST ", &dst_body));
+
+        let mut v = Vec::new();
+        v.extend_from_slice(b"FRM8");
+        v.extend_from_slice(&((4 + body.len()) as u64).to_be_bytes());
+        v.extend_from_slice(b"DSD ");
+        v.extend_from_slice(&body);
+        v
+    }
+
+    #[test]
+    fn dff_dst_reports_duration_from_frte() {
+        // DSD64 (2 822 400 Hz), 75 frames at 75 fps → 1 s. Per-channel samples =
+        // num_frames × (sample_rate / frame_rate) = 75 × 37632 = 2 822 400.
+        let bytes = build_dff_dst(75, 75);
+        let mut src = SliceSource::new(&bytes);
+        let mut scratch = [0u8; 64];
+        let mut c = Collect::default();
+        let facts = super::read_dff(&mut src, &mut scratch, &mut c).unwrap();
+        assert_eq!(facts.sample_rate, Some(2_822_400));
+        assert_eq!(facts.channels, Some(2));
+        assert_eq!(facts.total_frames, Some(2_822_400));
     }
 
     #[test]
