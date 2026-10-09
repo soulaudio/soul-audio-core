@@ -262,34 +262,57 @@ impl Ics {
 /// 5/6's signatures read naturally against either name.
 pub(crate) type ChannelData = Ics;
 
-/// One decoded `raw_data_block()`: up to 2 channels (this decoder targets
-/// stereo/mono AAC-LC; a `channel_configuration` needing more elements than
-/// fit is `Err(Unsupported)`, see [`decode_raw_data_block`]), plus the CPE's
-/// M/S side info Task 6's `apply_stereo` needs (`ms_mask_present`/
-/// `ms_used`, valid only when `n_channels == 2` and the stream used a CPE
-/// with `common_window`).
-pub(crate) struct DecodedFrame {
-    pub(crate) channels: [ChannelData; 2],
-    pub(crate) n_channels: u8,
+/// One CPE's stereo side info. The pair occupies channels `(ch0, ch0+1)` of
+/// [`DecodedFrame::channels`]; `apply_stereo` needs its own M/S mask, so a
+/// block with several CPEs (5.1/7.1) carries one `StereoPair` per CPE rather
+/// than a single frame-global mask.
+#[derive(Clone)]
+pub(crate) struct StereoPair {
+    /// First channel of the pair (the second is `ch0 + 1`).
+    pub(crate) ch0: u8,
     /// Raw `ms_mask_present` field (0/1/2 — 3 is rejected as `Malformed`).
     pub(crate) ms_mask_present: u8,
     /// Per `(group, sfb)`, only populated (and only meaningful) when
     /// `ms_mask_present == 1`.
     pub(crate) ms_used: [[bool; MAX_SFB]; MAX_WINDOWS],
+}
+
+impl Default for StereoPair {
+    fn default() -> Self {
+        Self {
+            ch0: 0,
+            ms_mask_present: 0,
+            ms_used: [[false; MAX_SFB]; MAX_WINDOWS],
+        }
+    }
+}
+
+/// One decoded `raw_data_block()`: up to [`MAX_CHANNELS`](super::MAX_CHANNELS)
+/// channels decoded from its element sequence (SCE/CPE/LFE), covering mono,
+/// stereo, and the multichannel layouts (5.1 = SCE+CPE+CPE+LFE, 7.1 =
+/// SCE+CPE+CPE+CPE+LFE). `stereo[..n_stereo]` holds each CPE's M/S side info,
+/// in element order.
+pub(crate) struct DecodedFrame {
+    pub(crate) channels: [ChannelData; super::MAX_CHANNELS],
+    pub(crate) n_channels: u8,
+    /// One entry per CPE in the block (a CPE is the only two-channel element).
+    pub(crate) stereo: [StereoPair; super::MAX_CHANNELS / 2],
+    pub(crate) n_stereo: u8,
     /// SBR side data location, if a `fill_element` in this block carried
     /// `EXT_SBR_DATA`/`EXT_SBR_DATA_CRC` (HE-AAC). `None` for pure AAC-LC — the
     /// LC-only path stays byte-identical. [`super::decode_rdb`] runs the SBR
-    /// drive from this location after the LC core PCM is reconstructed.
+    /// drive from this location after the LC core PCM is reconstructed (mono/
+    /// stereo only — multichannel HE-AAC is out of scope).
     pub(crate) sbr: Option<SbrLoc>,
 }
 
 impl Default for DecodedFrame {
     fn default() -> Self {
         Self {
-            channels: [Ics::default(), Ics::default()],
+            channels: core::array::from_fn(|_| Ics::default()),
             n_channels: 0,
-            ms_mask_present: 0,
-            ms_used: [[false; MAX_SFB]; MAX_WINDOWS],
+            stereo: core::array::from_fn(|_| StereoPair::default()),
+            n_stereo: 0,
             sbr: None,
         }
     }
@@ -788,10 +811,8 @@ fn decode_element(
     match id {
         ID_SCE | ID_LFE => {
             let _tag = r.read(4);
-            if *next_ch >= 2 {
-                // DecodedFrame holds at most 2 channels; a stream whose
-                // channel_configuration needs more elements than that is a
-                // documented v1 limitation.
+            if *next_ch >= super::MAX_CHANNELS {
+                // More audio channels than the 7.1 ceiling: out of scope.
                 return Err(DecodeError::Unsupported);
             }
             let ch = *next_ch;
@@ -803,9 +824,15 @@ fn decode_element(
         ID_CPE => {
             let _tag = r.read(4);
             let common_window = r.read_bit() == 1;
-            if *next_ch != 0 {
-                return Err(DecodeError::Unsupported); // see ID_SCE/ID_LFE note above
+            let ch0 = *next_ch;
+            let si = frame.n_stereo as usize;
+            if ch0 + 2 > super::MAX_CHANNELS || si >= frame.stereo.len() {
+                return Err(DecodeError::Unsupported);
             }
+            // `frame` is built fresh (`DecodedFrame::default`) per block, so this
+            // pair's `ms_used` starts all-false; only `ms_mask_present == 1`
+            // overwrites it (and only that case is read by `apply_stereo`).
+            frame.stereo[si].ch0 = ch0 as u8;
             let mut shared = Ics::default();
             if common_window {
                 decode_ics_info(r, &mut shared, sfi)?;
@@ -813,20 +840,21 @@ fn decode_element(
                 if ms_mask_present == 3 {
                     return Err(DecodeError::Malformed); // reserved
                 }
-                frame.ms_mask_present = ms_mask_present;
+                frame.stereo[si].ms_mask_present = ms_mask_present;
                 if ms_mask_present == 1 {
                     for g in 0..shared.num_window_groups as usize {
                         for sfb in 0..shared.max_sfb as usize {
-                            frame.ms_used[g][sfb] = r.read_bit() == 1;
+                            frame.stereo[si].ms_used[g][sfb] = r.read_bit() == 1;
                         }
                     }
                 }
             }
-            frame.channels[0] = shared.clone();
-            frame.channels[1] = shared;
-            decode_ics(r, &mut frame.channels[0], sfi, common_window)?;
-            decode_ics(r, &mut frame.channels[1], sfi, common_window)?;
-            *next_ch = 2;
+            frame.channels[ch0] = shared.clone();
+            frame.channels[ch0 + 1] = shared;
+            decode_ics(r, &mut frame.channels[ch0], sfi, common_window)?;
+            decode_ics(r, &mut frame.channels[ch0 + 1], sfi, common_window)?;
+            *next_ch = ch0 + 2;
+            frame.n_stereo += 1;
             *last_id_cpe = Some(true); // preceding-element type for a following SBR fill
             Ok(())
         }
@@ -839,9 +867,9 @@ fn decode_element(
 }
 
 /// Decode one `raw_data_block()`: the element-tag loop (§3) until `ID_END`,
-/// filling up to 2 channels' [`Ics`] (quantized `coeffs` included) via
-/// [`decode_ics`]. AAC-LC only — `config.object_type != 2` (LC) is
-/// `Err(Unsupported)`.
+/// filling up to [`MAX_CHANNELS`](super::MAX_CHANNELS) channels' [`Ics`]
+/// (quantized `coeffs` included) via [`decode_ics`] from the block's SCE/CPE/LFE
+/// sequence. AAC-LC only — `config.object_type != 2` (LC) is `Err(Unsupported)`.
 ///
 /// # Errors
 /// [`DecodeError::Malformed`] on any syntactically invalid field (bad

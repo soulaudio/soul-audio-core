@@ -339,6 +339,104 @@ fn open_decodes_fragmented_aac_mp4() {
     );
 }
 
+/// **Multichannel 5.1 AAC-LC** (`aac-5p1.m4a`, `channel_configuration` 6 =
+/// SCE+CPE+CPE+LFE): every one of the 6 channels decodes intact. The decoder's
+/// element loop now fills up to `MAX_CHANNELS` and applies M/S per CPE, so a
+/// 5.1 block reconstructs all six channels rather than erroring `Unsupported`.
+///
+/// Our channel order (element order: C, FL, FR, BL, BR, LFE) differs from
+/// ffmpeg's s16le 5.1 layout (FL, FR, FC, LFE, BL, BR), and the AAC encoder
+/// prepends priming the MP4 edit list trims from ffmpeg's decode but not ours,
+/// so the check is: find the global priming offset (our 700 Hz center channel
+/// vs its best-matching ffmpeg channel), then at that offset match each of our
+/// channels to ffmpeg's by best SNR and require a **bijection** (no channel
+/// collapsed/duplicated/swapped) with every match clearing 40 dB. Distinct
+/// per-channel tones (300/500/700/90/1300/1700 Hz) make the mapping unambiguous.
+#[test]
+fn open_decodes_aac_5p1_matching_ffmpeg() {
+    const CH: usize = 6;
+    let m4a = include_bytes!("../testdata/aac-5p1.m4a");
+    let refr = load_s16le(include_bytes!("../testdata/aac-5p1.m4a.ref.pcm"));
+    let dec = open(SliceSource::new(m4a)).expect("probe + construct AAC 5.1");
+    assert_eq!(dec.stream_info().sample_rate, 44_100);
+    assert_eq!(dec.stream_info().channels, 6);
+    let ours = decode_all(m4a);
+
+    // Per-channel planar f64 (deinterleave); ours may be a few frames longer
+    // (untrimmed priming) than ffmpeg's, so lengths are handled per comparison.
+    let plane = |pcm: &[i32], ch: usize, start: usize, len: usize| -> Vec<f64> {
+        (0..len)
+            .map(|f| f64::from(pcm[(start + f) * CH + ch]))
+            .collect()
+    };
+    let snr = |a: &[f64], b: &[f64]| -> f64 {
+        let (mut sig, mut err) = (0.0f64, 0.0f64);
+        for (&x, &y) in a.iter().zip(b) {
+            sig += y * y;
+            err += (y - x) * (y - x);
+        }
+        if err <= 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (sig / err).log10()
+        }
+    };
+
+    let ours_frames = ours.len() / CH;
+    let ref_frames = refr.len() / CH;
+    assert!(
+        ours_frames > 2000 && ref_frames > 2000,
+        "5.1 AAC: too few frames (ours {ours_frames}, ref {ref_frames})"
+    );
+    // Window used for the offset search and per-channel SNR (well clear of both
+    // the priming head and either stream's tail).
+    let win = 8192usize;
+    let max_off = 3072usize;
+
+    // 1) Global priming offset: slide our channel 0 against each ffmpeg channel.
+    let ref0: Vec<Vec<f64>> = (0..CH).map(|c| plane(&refr, c, 0, win)).collect();
+    let mut best = (0usize, f64::NEG_INFINITY);
+    for off in 0..=max_off {
+        if off + win > ours_frames {
+            break;
+        }
+        let ours0 = plane(&ours, 0, off, win);
+        let s = ref0
+            .iter()
+            .map(|r| snr(&ours0, r))
+            .fold(f64::NEG_INFINITY, f64::max);
+        if s > best.1 {
+            best = (off, s);
+        }
+    }
+    let off = best.0;
+
+    // 2) Bijection at that offset: each of our channels → a distinct ffmpeg one.
+    let ours_ch: Vec<Vec<f64>> = (0..CH).map(|c| plane(&ours, c, off, win)).collect();
+    let mut matched = [usize::MAX; CH];
+    for (c, ours_c) in ours_ch.iter().enumerate() {
+        let (best_r, best_s) = ref0
+            .iter()
+            .enumerate()
+            .map(|(r, ref_r)| (r, snr(ours_c, ref_r)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap();
+        assert!(
+            best_s > 40.0,
+            "our 5.1 AAC channel {c} best SNR vs any ffmpeg channel only {best_s:.1} dB (offset {off})"
+        );
+        matched[c] = best_r;
+    }
+    let mut seen = [false; CH];
+    for &m in &matched {
+        seen[m] = true;
+    }
+    assert!(
+        seen.iter().all(|&s| s),
+        "the 6 channels must map one-to-one onto ffmpeg's; got {matched:?} (collapse/swap)"
+    );
+}
+
 /// Raw ADTS `.aac` AAC-LC (`aac.aac`) decoded via `open()` matches ffmpeg's own
 /// decode (`aac.aac.ref.pcm`, s16le) within tolerance.
 ///

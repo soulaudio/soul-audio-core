@@ -354,6 +354,14 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
             "frag-aac-m4a",
             include_bytes!("../testdata/frag-aac.m4a").to_vec(),
         ),
+        // 5.1 AAC-LC: mutations drive the multichannel element loop (SCE/CPE/LFE
+        // sequence, per-CPE M/S, channel counts up toward MAX_CHANNELS) that the
+        // stereo seeds never reach — every out-of-range element tag/count must
+        // stay a bounded Err, never a panic or OOB channel index.
+        (
+            "aac-5p1-m4a",
+            include_bytes!("../testdata/aac-5p1.m4a").to_vec(),
+        ),
         // HE-AAC (SBR): mutating the fill-element SBR payload exercises the
         // sbr_header/grid/envelope-Huffman bounds checks → Err/upsample-only
         // fallback, never a panic/OOB (the §3.3 firmware invariant). The same

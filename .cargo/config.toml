@@ -1,3 +1,13 @@
+# The by-value `AnyDecoder` enum is large (~220 KiB — sized by its multichannel
+# AAC/FLAC variants), and debug-build moves through the `open()` construction
+# chain transiently need several times that. libtest runs each test on a thread
+# whose stack honours `RUST_MIN_STACK`; its 2 MiB default overflows on that
+# construction, so raise it to match the big-stack threads the library's own
+# decode paths (and the CLI) already use. Affects std-spawned threads only — the
+# no_std firmware build is unaffected.
+[env]
+RUST_MIN_STACK = "16777216"
+
 [alias]
 xtask = "run --package xtask --"
 fw = "build --package soul-audio-firmware --target thumbv7em-none-eabihf"

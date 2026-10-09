@@ -39,7 +39,18 @@ use filterbank::Filterbank;
 /// accumulates, so a second frame's headroom was pure slack. Keeping
 /// `AacDecoder` compact matters because it is the largest [`AnyDecoder`]
 /// variant, embedded by value on the (default-stack) construction path.
-const PCM_CAP: usize = 2048 * 2;
+/// Maximum channels this decoder reconstructs: 7.1 (`channel_configuration` 7).
+/// Covers mono/stereo (1/2), 5.1 (6), and 7.1 (8) — every standard AAC layout.
+/// The large per-channel [`syntax::DecodedFrame`] scales with this but stays a
+/// transient on the (big-stack) decode path, never embedded in the persistent
+/// `AacDecoder`/[`AnyDecoder`](crate::AnyDecoder) value.
+pub(crate) const MAX_CHANNELS: usize = 8;
+
+/// Interleaved PCM scratch for one decoded frame: the larger of the LC
+/// multichannel write (1024 samples × `MAX_CHANNELS`) and the ≤2-channel SBR
+/// write (2048 × 2 at the doubled HE-AAC rate). `decode_rdb` overwrites `pcm`
+/// per frame and never accumulates.
+const PCM_CAP: usize = 1024 * MAX_CHANNELS;
 
 /// Input byte buffer: one whole `raw_data_block` must fit. ADTS's 13-bit
 /// `aac_frame_length` caps a frame at 8191 bytes (payload a little less), and a
@@ -78,11 +89,12 @@ fn round_i16(s: f32) -> i32 {
 /// window advances by; ADTS ignores it (its header already framed the block).
 ///
 /// Pipeline order (matters — the ISO 14496-3 decoder block diagram): syntax
-/// parse → per-channel `dequantize` → (CPE only) `apply_stereo` (M/S +
-/// intensity, needs both channels' dequantized spectra) → per-channel
-/// `apply_tns` → per-channel `imdct_and_overlap` → interleave + round. The
-/// caller's [`Filterbank`] is stateful (per-channel overlap carried across
-/// frames), so channel indices stay 0/1 every frame.
+/// parse → per-channel `dequantize` → per-CPE `apply_stereo` (M/S + intensity,
+/// needs both of a pair's dequantized spectra; a 5.1/7.1 block has several
+/// CPEs) → per-channel `apply_tns` → per-channel `imdct_and_overlap` →
+/// interleave + round. The caller's [`Filterbank`] is stateful (per-channel
+/// overlap carried across frames), so a channel keeps the same index every
+/// frame.
 ///
 /// Never panics: `decode_raw_data_block` bounds-checks every field, and every
 /// DSP stage independently re-clamps its indices (see `dsp`/`filterbank`).
@@ -113,33 +125,44 @@ fn decode_rdb(
         dsp::dequantize(&mut frame.channels[ch]);
     }
 
-    // A CPE is the only path to two channels here (two independent SCEs are out
-    // of scope), so `n == 2` means M/S + intensity side info may apply. Both
-    // are no-ops when the bitstream didn't signal them, and `apply_stereo`
-    // re-validates the shared window layout, so this is safe for any 2-channel
-    // frame.
-    if n == 2 {
-        let ms_mask_present = frame.ms_mask_present;
-        let ms_used = frame.ms_used;
-        let (a, b) = frame.channels.split_at_mut(1);
-        dsp::apply_stereo(&mut a[0], &mut b[0], ms_mask_present, &ms_used);
+    // M/S + intensity stereo, applied per CPE (each carries its own side info —
+    // a 5.1/7.1 block has several CPEs). Both are no-ops when the bitstream
+    // didn't signal them, and `apply_stereo` re-validates the shared window
+    // layout, so this is safe for any pair. `ms_used` is a `Copy` bool matrix,
+    // so copying it out releases the `frame.stereo` borrow before the disjoint
+    // `frame.channels` split.
+    for si in 0..frame.n_stereo as usize {
+        let ch0 = frame.stereo[si].ch0 as usize;
+        let ms_mask_present = frame.stereo[si].ms_mask_present;
+        let ms_used = frame.stereo[si].ms_used;
+        let (a, b) = frame.channels.split_at_mut(ch0 + 1);
+        dsp::apply_stereo(&mut a[ch0], &mut b[0], ms_mask_present, &ms_used);
     }
 
     for ch in 0..n {
         dsp::apply_tns(&mut frame.channels[ch], sfi);
     }
 
-    // LC core PCM for both channels (the SBR analysis QMF's input).
-    let mut outs = [[0f32; 1024]; 2];
+    // LC core PCM for every channel (also the SBR analysis QMF's input).
+    let mut outs = [[0f32; 1024]; MAX_CHANNELS];
     for (ch, out) in outs.iter_mut().enumerate().take(n) {
         fb.imdct_and_overlap(ch, &frame.channels[ch], out);
     }
 
     // SBR (HE-AAC): a fill element in this block carried EXT_SBR_DATA. Run the
     // §10 drive over the core PCM; when it produces output, emit **2048**
-    // interleaved samples/channel (2× rate) instead of 1024. The LC-only path
-    // below is byte-identical when no SBR fill element was present.
-    if let Some(loc) = frame.sbr {
+    // interleaved samples/channel (2× rate) instead of 1024. Mono/stereo only
+    // — the SBR drive and its QMF scratch are sized for ≤2 channels, so a
+    // (rare) multichannel HE-AAC stream decodes its LC core without SBR rather
+    // than misindex. The LC-only path below is byte-identical when no SBR fill
+    // element was present.
+    if let Some(loc) = frame.sbr.filter(|_| n <= 2) {
+        // SBR consumes the ≤2 core channels; hand it a fixed 2-element view of
+        // the wider multichannel `outs` (always in range — `outs` is length
+        // `MAX_CHANNELS` ≥ 2, and this arm only runs when `n <= 2`).
+        let core: &[[f32; 1024]; 2] = outs[..2]
+            .try_into()
+            .expect("outs has >= 2 channels for the SBR path");
         let applied = sbr::decode_fill_sbr(
             rdb,
             loc.start_bit,
@@ -147,7 +170,7 @@ fn decode_rdb(
             loc.crc,
             loc.id_cpe,
             sbr,
-            &outs,
+            core,
             n,
             output_rate,
             sbr_out,
@@ -190,10 +213,10 @@ enum FrameSrc<S> {
 }
 
 /// A streaming AAC-LC decoder over an MP4/`.m4a` or raw ADTS [`Source`],
-/// producing interleaved 16-bit-range `i32` PCM. Mono + stereo only. No
-/// allocation: every buffer is fixed-size and owned by value; the [`Filterbank`]
-/// overlap state and the decoded-PCM carry buffer persist across `decode_into`
-/// calls.
+/// producing interleaved 16-bit-range `i32` PCM. Mono through 7.1 (up to
+/// [`MAX_CHANNELS`]); HE-AAC (SBR/PS) is mono/stereo only. No allocation: every
+/// buffer is fixed-size and owned by value; the [`Filterbank`] overlap state
+/// and the decoded-PCM carry buffer persist across `decode_into` calls.
 pub struct AacDecoder<S> {
     src: FrameSrc<S>,
     config: AacConfig,
@@ -267,8 +290,8 @@ impl<S: Source> AacDecoder<S> {
         if config.object_type != 2 {
             return Err(DecodeError::Unsupported); // AAC-LC only
         }
-        if config.channels == 0 || config.channels > 2 {
-            return Err(DecodeError::Unsupported); // mono + stereo only
+        if config.channels == 0 || config.channels as usize > MAX_CHANNELS {
+            return Err(DecodeError::Unsupported); // mono … 7.1 (channel_configuration 1-7)
         }
         // Validate the sample rate up front (also the `sfi` the DSP stages need)
         // so a bad ASC/header fails at construction, not mid-decode.

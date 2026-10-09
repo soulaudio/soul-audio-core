@@ -208,8 +208,9 @@ fn short_window(shape: u8) -> &'static [f32] {
     if shape == 0 { &SINE_SHORT } else { &KBD_SHORT }
 }
 
-/// Per-channel IMDCT filterbank state (`aac-reference.md` §10). Stereo LC uses
-/// at most 2 channels; `overlap[ch]` carries the previous frame's windowed
+/// Per-channel IMDCT filterbank state (`aac-reference.md` §10). Up to
+/// [`MAX_CHANNELS`](super::MAX_CHANNELS) channels (mono … 7.1); `overlap[ch]`
+/// carries the previous frame's windowed
 /// second half, and `prev_window_shape[ch]` records which window shape produced
 /// it (so this frame's *left* overlap half is windowed with the previous
 /// frame's shape and its *right* half with the current one). `Default`/[`new`]
@@ -217,8 +218,8 @@ fn short_window(shape: u8) -> &'static [f32] {
 ///
 /// [`new`]: Filterbank::new
 pub(crate) struct Filterbank {
-    overlap: [[f32; 1024]; 2],
-    prev_window_shape: [u8; 2],
+    overlap: [[f32; 1024]; super::MAX_CHANNELS],
+    prev_window_shape: [u8; super::MAX_CHANNELS],
 }
 
 impl Default for Filterbank {
@@ -231,8 +232,8 @@ impl Filterbank {
     /// A fresh filterbank with zeroed overlap (sine previous shape).
     pub(crate) fn new() -> Self {
         Self {
-            overlap: [[0.0; 1024]; 2],
-            prev_window_shape: [0; 2],
+            overlap: [[0.0; 1024]; super::MAX_CHANNELS],
+            prev_window_shape: [0; super::MAX_CHANNELS],
         }
     }
 
@@ -250,7 +251,7 @@ impl Filterbank {
     /// which is the point of a verbatim overlap-add.
     #[allow(clippy::needless_range_loop, clippy::manual_memcpy)]
     pub(crate) fn imdct_and_overlap(&mut self, ch: usize, ics: &Ics, out: &mut [f32; 1024]) {
-        if ch >= 2 {
+        if ch >= super::MAX_CHANNELS {
             *out = [0.0; 1024];
             return;
         }
@@ -675,13 +676,10 @@ mod tests {
                 dequantize(&mut frame.channels[ch]);
             }
             if frame.n_channels == 2 {
+                let ms_mask_present = frame.stereo[0].ms_mask_present;
+                let ms_used = frame.stereo[0].ms_used;
                 let (l, rest) = frame.channels.split_at_mut(1);
-                apply_stereo(
-                    &mut l[0],
-                    &mut rest[0],
-                    frame.ms_mask_present,
-                    &frame.ms_used,
-                );
+                apply_stereo(&mut l[0], &mut rest[0], ms_mask_present, &ms_used);
             }
             for ch in 0..frame.n_channels as usize {
                 let sfi = frame.channels[ch].sfi;

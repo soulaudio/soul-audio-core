@@ -962,13 +962,10 @@ mod tests {
                 dequantize(&mut frame.channels[ch]);
             }
             if frame.n_channels == 2 {
+                let ms_mask_present = frame.stereo[0].ms_mask_present;
+                let ms_used = frame.stereo[0].ms_used;
                 let (l, rest) = frame.channels.split_at_mut(1);
-                apply_stereo(
-                    &mut l[0],
-                    &mut rest[0],
-                    frame.ms_mask_present,
-                    &frame.ms_used,
-                );
+                apply_stereo(&mut l[0], &mut rest[0], ms_mask_present, &ms_used);
             }
             for ch in 0..frame.n_channels as usize {
                 let sfi = frame.channels[ch].sfi;
