@@ -27,6 +27,10 @@ embedded-io = { workspace = true }
 # measurement). Never compiled into the no_std library or the firmware.
 [dev-dependencies]
 rustfft = "6"
+# For the I/O-error test harness (`tests/io_errors.rs`): implement a custom
+# `embedded_io::Read` source that returns a hard error mid-stream. Same
+# workspace version as the library dep above — no extra lock entry.
+embedded-io = { workspace = true }
 
 # Decode + resample throughput baseline / regression gate. Dependency-free
 # (hand-rolled timing, no criterion) to keep the dep tree minimal; runs on the
