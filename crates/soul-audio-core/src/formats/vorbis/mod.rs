@@ -81,7 +81,7 @@ const COMMENT_PREFIX_BUF: usize = 16;
 /// [`DecodeError::Unsupported`] at decode time (`decode_audio_packet`'s early
 /// channel-count check), never a panic.
 #[cfg(not(feature = "vorbis-embedded-profile"))]
-pub(crate) const MAX_CHANNELS: usize = 4;
+pub(crate) const MAX_CHANNELS: usize = 8;
 #[cfg(feature = "vorbis-embedded-profile")]
 pub(crate) const MAX_CHANNELS: usize = 2;
 
@@ -1150,7 +1150,33 @@ mod tests {
         b
     }
 
-    fn open_dec(packet: &[u8]) -> Result<VorbisDecoder<SliceSource<'_>, [u8; 256]>, DecodeError> {
+    /// Construct a decoder on a **generous stack** and heap-box it. The desktop
+    /// `VorbisDecoder` is large by value (multichannel-capable: per-channel
+    /// overlap/spectrum/residue/PCM scratch × up to [`MAX_CHANNELS`]), more than
+    /// a default test-thread stack holds — even just `new`'s return slot. A
+    /// scoped thread builds it, boxes it onto the heap, and the `Box` moves out;
+    /// callers use it transparently (`Deref`), with only a pointer on their
+    /// stack. Mirrors the crate's big-stack loader discipline for real callers.
+    fn big_boxed<'a, A: AsMut<[u8]> + AsRef<[u8]> + Send + 'a>(
+        bytes: &'a [u8],
+        arena: A,
+    ) -> Result<Box<VorbisDecoder<SliceSource<'a>, A>>, DecodeError> {
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn_scoped(s, || {
+                    VorbisDecoder::new(SliceSource::new(bytes), arena).map(Box::new)
+                })
+                .expect("spawn vorbis construct thread")
+                .join()
+                .expect("vorbis construct thread panicked")
+        })
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn open_dec(
+        packet: &[u8],
+    ) -> Result<Box<VorbisDecoder<SliceSource<'static>, [u8; 256]>>, DecodeError> {
         // A complete three-header stream: `new` now parses all three headers,
         // so a corrupt id fails at packet 1 while the (valid) comment/setup
         // pages that follow keep every positive case openable.
@@ -1158,7 +1184,7 @@ mod tests {
         // Leaked so the returned decoder's `S` can outlive this helper — fine
         // in tests (no repeated-call growth: each fixture is tiny).
         let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-        VorbisDecoder::new(SliceSource::new(bytes), [0u8; 256])
+        big_boxed(bytes, [0u8; 256])
     }
 
     #[test]
@@ -1374,7 +1400,7 @@ mod tests {
     #[test]
     fn seek_beyond_end_clamps_to_total_frames_without_panicking() {
         let bytes = seek_test_stream();
-        let mut dec = VorbisDecoder::new(SliceSource::new(bytes), [0u8; 256]).unwrap();
+        let mut dec = big_boxed(bytes, [0u8; 256]).unwrap();
         assert_eq!(dec.total_frames(), Some(256));
         assert_eq!(dec.seek_to(1_000_000).unwrap(), 256);
         // Whatever trails after landing at/near the end must still decode
@@ -1410,7 +1436,7 @@ mod tests {
         bytes.extend(ogg_page(0x00, 0, 1, 2, &setup));
         let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
         assert_eq!(
-            VorbisDecoder::new(SliceSource::new(bytes), [0u8; 256]).err(),
+            big_boxed(bytes, [0u8; 256]).err(),
             Some(DecodeError::Malformed)
         );
     }
@@ -1427,7 +1453,7 @@ mod tests {
         let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
         // 8-byte storage cannot even hold the ~18-byte raw setup packet.
         assert_eq!(
-            VorbisDecoder::new(SliceSource::new(bytes), [0u8; 8]).err(),
+            big_boxed(bytes, [0u8; 8]).err(),
             Some(DecodeError::Unsupported)
         );
     }
@@ -1439,7 +1465,7 @@ mod tests {
         let id = id_header_packet(2, 44_100);
         let bytes = ogg_page(0x02, 0, 1, 0, &id);
         let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-        assert!(VorbisDecoder::new(SliceSource::new(bytes), [0u8; 256]).is_err());
+        assert!(big_boxed(bytes, [0u8; 256]).is_err());
     }
 
     #[test]
@@ -1451,7 +1477,7 @@ mod tests {
         bytes.extend(ogg_page(0x04, 12_345, 7, 3, b"audio-packet"));
         let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
 
-        let dec = VorbisDecoder::new(SliceSource::new(bytes), [0u8; 256]).unwrap();
+        let dec = big_boxed(bytes, [0u8; 256]).unwrap();
         assert_eq!(dec.total_frames(), Some(12_345));
         // Memoized: calling again must return the same value (not re-scan
         // and potentially disagree).
@@ -1467,7 +1493,7 @@ mod tests {
         let bytes = header_pages(&id_packet, 0, 7);
         let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
 
-        let dec = VorbisDecoder::new(SliceSource::new(bytes), [0u8; 256]).unwrap();
+        let dec = big_boxed(bytes, [0u8; 256]).unwrap();
         assert_eq!(dec.total_frames(), Some(0));
     }
 
@@ -1481,7 +1507,7 @@ mod tests {
         let bytes = header_pages(&id_packet, u64::MAX, 7);
         let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
 
-        let dec = VorbisDecoder::new(SliceSource::new(bytes), [0u8; 256]).unwrap();
+        let dec = big_boxed(bytes, [0u8; 256]).unwrap();
         assert_eq!(dec.total_frames(), None);
     }
 
@@ -1499,7 +1525,7 @@ mod tests {
             "/../../testdata/tone-vorbis.ogg"
         ));
         let storage = vec![0u8; 128 * 1024];
-        let dec = VorbisDecoder::new(SliceSource::new(bytes), storage)
+        let dec = big_boxed(bytes, storage)
             .expect("a real ffmpeg/libvorbis setup header must parse cleanly");
 
         let info = dec.stream_info();

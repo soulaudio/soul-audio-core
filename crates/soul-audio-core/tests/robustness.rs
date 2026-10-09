@@ -346,6 +346,14 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
         ("alac", include_bytes!("../testdata/alac.m4a").to_vec()),
         ("aac-m4a", include_bytes!("../testdata/aac.m4a").to_vec()),
         ("aac-adts", include_bytes!("../testdata/aac.aac").to_vec()),
+        // Fragmented AAC (empty_moov + moof/mdat fragments): truncations and
+        // bit-flips land in the inter-fragment box walk (`advance_to_next_mdat`)
+        // — a corrupt `moof` length or a mid-box EOF must end the stream cleanly
+        // (Err/short decode), never a panic, OOB, or runaway skip.
+        (
+            "frag-aac-m4a",
+            include_bytes!("../testdata/frag-aac.m4a").to_vec(),
+        ),
         // HE-AAC (SBR): mutating the fill-element SBR payload exercises the
         // sbr_header/grid/envelope-Huffman bounds checks → Err/upsample-only
         // fallback, never a panic/OOB (the §3.3 firmware invariant). The same

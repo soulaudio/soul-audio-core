@@ -100,7 +100,6 @@ use crate::decoder::{DecodeError, Decoder, SeekableDecoder};
 use crate::demux::mp4::Mp4Reader;
 use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
-use embedded_io::SeekFrom;
 
 const MAX_CHANNELS: usize = 2; // v1: mono + stereo
 const MAX_FRAME: usize = 4096; // frameLength cap
@@ -633,7 +632,6 @@ pub struct AlacDecoder<S> {
     inbuf: [u8; PACKET_CAP],
     filled: usize,
     used: usize,
-    mdat_remaining: u64,
     samples_left: u64,
     total_samples: u64,
     out_len: usize,
@@ -701,8 +699,17 @@ impl<S: Source> AlacDecoder<S> {
             kb: u32::from(c.kb),
             frame_length: c.frame_length as usize,
         };
-        let mdat_remaining = reader.mdat_remaining();
         let total_samples = reader.total_samples();
+        // A fragmented stream carries no `mdhd` total (it reads 0), so decode
+        // can't be gated on a known sample count — run until the `mdat` stream
+        // is exhausted (`read_audio` returns 0). The final packet may then emit
+        // up to `frame_length - 1` trailing padding samples, since there is no
+        // sample table to trim it — acceptable, matching the ADTS/raw-AAC path.
+        let samples_left = if reader.is_fragmented() {
+            u64::MAX
+        } else {
+            total_samples
+        };
         Ok(Self {
             reader,
             scratch: Scratch {
@@ -715,8 +722,7 @@ impl<S: Source> AlacDecoder<S> {
             inbuf: [0; PACKET_CAP],
             filled: 0,
             used: 0,
-            mdat_remaining,
-            samples_left: total_samples,
+            samples_left,
             total_samples,
             out_len: 0,
             out_pos: 0,
@@ -727,9 +733,14 @@ impl<S: Source> AlacDecoder<S> {
     }
 
     /// Total per-channel frames, from the container's `mdhd` duration.
+    /// `None` for a fragmented stream, whose `moov` declares no total.
     #[must_use]
     pub fn total_frames(&self) -> Option<u64> {
-        Some(self.total_samples)
+        if self.reader.is_fragmented() {
+            None
+        } else {
+            Some(self.total_samples)
+        }
     }
 
     /// Refill the sliding input buffer and decode one packet into `scratch.out`.
@@ -748,21 +759,15 @@ impl<S: Source> AlacDecoder<S> {
             }
             self.used = 0;
         }
-        // Refill from the mdat stream (bounded by the capacity and what's left).
-        while self.filled < self.inbuf.len() && self.mdat_remaining > 0 {
-            let want = core::cmp::min((self.inbuf.len() - self.filled) as u64, self.mdat_remaining)
-                as usize;
-            let end = self.filled + want;
-            let n = self
-                .reader
-                .src_mut()
-                .read(&mut self.inbuf[self.filled..end])
-                .map_err(|_| DecodeError::Io)?;
+        // Refill from the mdat stream (up to capacity). `read_audio` bounds the
+        // read to the current `mdat` and, for a fragmented file, transparently
+        // crosses into the next fragment's `mdat`; it returns 0 at true EOF.
+        while self.filled < self.inbuf.len() {
+            let n = self.reader.read_audio(&mut self.inbuf[self.filled..])?;
             if n == 0 {
                 break;
             }
             self.filled += n;
-            self.mdat_remaining -= n as u64;
         }
         if self.filled == 0 {
             return Ok(false);
@@ -834,15 +839,12 @@ impl<S: SeekSource> AlacDecoder<S> {
         let end_offset = self.reader.frame_file_offset(num_frames)?;
 
         self.reader
-            .src_mut()
-            .seek(SeekFrom::Start(offset))
-            .map_err(|_| DecodeError::Io)?;
+            .seek_audio(offset, end_offset.saturating_sub(offset))?;
         self.filled = 0;
         self.used = 0;
         self.out_len = 0;
         self.out_pos = 0;
         self.eof = false;
-        self.mdat_remaining = end_offset.saturating_sub(offset);
         self.samples_left = self.total_samples.saturating_sub(frame_start);
 
         // Trim within the landed frame to the exact target sample.

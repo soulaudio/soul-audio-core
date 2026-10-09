@@ -298,6 +298,47 @@ fn open_decodes_aac_mp4_matching_ffmpeg_within_tolerance() {
     );
 }
 
+/// **Fragmented** AAC in MP4 (`frag-aac.m4a`: `empty_moov` + 9 `moof`/`mdat`
+/// fragments, the DASH/CMAF streaming layout) decodes end-to-end — the reader
+/// spans every fragment's `mdat`, skipping the `moof`s between them, rather than
+/// stopping at the first. This guards the former faststart-only reader, which
+/// returned at the first `mdat` and emitted ~1/9 of the audio.
+///
+/// A fragmented stream carries no `moov` sample table or `mdhd` total, so
+/// `total_frames()` is `None` (like ADTS) and decode runs until the fragment
+/// chain drains. Fidelity is checked against ffmpeg's own decode of the same
+/// file (segmental SNR, the same lossy tolerance convention as `aac.m4a`). The
+/// content is tone-based (no PNS silence) and the fragmented layout has no edit
+/// list, so our decode and ffmpeg's align at offset 0 and the measured SNR is
+/// 73.7 dB; the bar is 63 dB (~10 dB margin), far above a conformant decode's
+/// need and decisive against a per-fragment desync.
+#[test]
+fn open_decodes_fragmented_aac_mp4() {
+    let m4a = include_bytes!("../testdata/frag-aac.m4a");
+    let refr = load_s16le(include_bytes!("../testdata/frag-aac.m4a.ref.pcm"));
+    let dec = open(SliceSource::new(m4a)).expect("probe + construct fragmented AAC/MP4");
+    assert_eq!(dec.stream_info().sample_rate, 44_100);
+    assert_eq!(dec.stream_info().channels, 2);
+    assert_eq!(dec.total_frames(), None); // fragmented: no moov sample table/total
+
+    let ours = decode_all(m4a);
+    // Spanning every fragment is the whole point: the file is ~46k per-channel
+    // frames across 9 fragments; a first-mdat-only reader yields a few hundred.
+    // Require we recovered essentially all of ffmpeg's decoded length.
+    let ours_frames = ours.len() / 2;
+    let ref_frames = refr.len() / 2;
+    assert!(
+        ours_frames * 100 >= ref_frames * 90,
+        "fragmented decode truncated: {ours_frames} of {ref_frames} per-channel frames \
+         (a first-fragment-only reader yields a tiny fraction)"
+    );
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 63.0,
+        "fragmented AAC/MP4 decode SNR vs ffmpeg too low: {snr:.1} dB (offset {off} frames)"
+    );
+}
+
 /// Raw ADTS `.aac` AAC-LC (`aac.aac`) decoded via `open()` matches ffmpeg's own
 /// decode (`aac.aac.ref.pcm`, s16le) within tolerance.
 ///
@@ -878,6 +919,77 @@ fn open_decodes_vorbis_stereo_coupling_matching_ffmpeg() {
         r_659 > r_440 * 4.0,
         "right channel not dominated by its expected 659.25 Hz tone \
          (power659={r_659:.3e}, power440={r_440:.3e}) — possible coupling channel-swap"
+    );
+}
+
+/// Multichannel (5.1 / 6-channel) Vorbis: the decode is channel-general and the
+/// `MAX_CHANNELS` cap was raised to 8, so a 6-channel stream must decode with
+/// every channel intact. Each of our channels is matched to ffmpeg's own decode
+/// of the *same* stream (so the encoder's lossy surround coupling cancels — both
+/// decoders invert it) by best per-channel SNR; every channel must clear the bar
+/// and the match must be a **bijection** (no channel collapsed, duplicated, or
+/// swapped). SNR-based + best-match makes it robust to any 5.1 channel-order
+/// difference between the two decoders.
+///
+/// Desktop profile only: `vorbis-embedded-profile` keeps the 2-channel cap (a
+/// 6-channel stream is a graceful `Unsupported` there), so skip it rather than
+/// assert a decode that profile intentionally refuses.
+#[cfg(not(feature = "vorbis-embedded-profile"))]
+#[test]
+fn open_decodes_6ch_vorbis_matching_ffmpeg() {
+    const CH: usize = 6;
+    let ogg = include_bytes!("../testdata/tone-vorbis-6ch.ogg");
+    let refr = load_s16le(include_bytes!("../testdata/tone-vorbis-6ch.ref.pcm"));
+    let ours = decode_vorbis_all(ogg);
+    let n = (ours.len() / CH).min(refr.len() / CH);
+    assert!(
+        n > 1000,
+        "6ch Vorbis: too few frames (ours {}, ref {})",
+        ours.len() / CH,
+        refr.len() / CH
+    );
+
+    let deinterleave = |pcm: &[i32]| -> Vec<Vec<f64>> {
+        (0..CH)
+            .map(|c| (0..n).map(|f| f64::from(pcm[f * CH + c])).collect())
+            .collect()
+    };
+    let ours_ch = deinterleave(&ours);
+    let ref_ch = deinterleave(&refr);
+    let snr = |a: &[f64], b: &[f64]| -> f64 {
+        let (mut sig, mut err) = (0.0f64, 0.0f64);
+        for (&x, &y) in a.iter().zip(b) {
+            sig += y * y;
+            err += (y - x) * (y - x);
+        }
+        if err <= 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (sig / err).log10()
+        }
+    };
+
+    let mut matched = [usize::MAX; CH];
+    for (c, ours_c) in ours_ch.iter().enumerate() {
+        let (best_r, best_s) = ref_ch
+            .iter()
+            .enumerate()
+            .map(|(r, ref_r)| (r, snr(ours_c, ref_r)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap();
+        assert!(
+            best_s > 40.0,
+            "our 6ch Vorbis channel {c} best SNR vs any ffmpeg channel only {best_s:.1} dB"
+        );
+        matched[c] = best_r;
+    }
+    let mut seen = [false; CH];
+    for &m in &matched {
+        seen[m] = true;
+    }
+    assert!(
+        seen.iter().all(|&s| s),
+        "the 6 channels must map one-to-one onto ffmpeg's; got {matched:?} (collapse/swap)"
     );
 }
 

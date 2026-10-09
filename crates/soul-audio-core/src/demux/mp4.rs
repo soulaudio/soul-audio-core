@@ -41,7 +41,14 @@ pub struct Mp4Reader<S> {
     src: S,
     codec: Mp4Codec,
     total_samples: u64,
+    /// Bytes left in the **current** `mdat`. In a fragmented file this is one
+    /// fragment's `mdat`; [`Mp4Reader::read_audio`] advances to the next
+    /// fragment's `mdat` (skipping its `moof`) when it hits 0.
     mdat_remaining: u64,
+    /// `true` for a fragmented stream (`moof`/`mdat` fragments after the init
+    /// `moov`): the sample data spans multiple `mdat`s, and the `moov` carries no
+    /// sample tables (so seeking — which needs them — is unsupported) or total.
+    fragmented: bool,
     /// Located lazily on the first seek (needs `S: SeekSource`); `None` until
     /// then so the forward-only decode-open path pays nothing.
     tables: Option<SampleTableLoc>,
@@ -112,14 +119,20 @@ fn box_header<S: Source>(src: &mut S) -> Result<(u64, [u8; 4], u64), DecodeError
 }
 
 impl<S: Source> Mp4Reader<S> {
-    /// Parse the header of a faststart ALAC `.m4a`, leaving `src` at `mdat`.
+    /// Parse the header of an ALAC/AAC `.m4a`, leaving `src` at the first
+    /// `mdat`. Handles both progressive (`moov` then one `mdat`) and
+    /// **fragmented** (`moov` then `moof`/`mdat` fragments) layouts; a `moof`
+    /// seen before the first `mdat` flags the stream fragmented, and
+    /// [`Mp4Reader::read_audio`] then spans the fragments' `mdat`s.
     ///
     /// # Errors
-    /// [`DecodeError::Unsupported`] for non-faststart / non-ALAC / missing boxes;
-    /// [`DecodeError::Malformed`] on truncation.
+    /// [`DecodeError::Unsupported`] for a `moov`-after-`mdat` (non-faststart,
+    /// non-fragmented) layout or missing/unknown boxes; [`DecodeError::Malformed`]
+    /// on truncation.
     pub fn new(mut src: S) -> Result<Self, DecodeError> {
         let mut codec: Option<Mp4Codec> = None;
         let mut total_samples: u64 = 0;
+        let mut fragmented = false;
         loop {
             let (len, fourcc, _) = box_header(&mut src)?;
             match &fourcc {
@@ -128,6 +141,12 @@ impl<S: Source> Mp4Reader<S> {
                     codec = Some(c);
                     total_samples = ts;
                 }
+                // A movie fragment before the first `mdat`: the sample data is
+                // split across `moof`/`mdat` fragments (DASH/CMAF/streaming).
+                b"moof" => {
+                    fragmented = true;
+                    skip(&mut src, len)?;
+                }
                 b"mdat" => {
                     let codec = codec.ok_or(DecodeError::Unsupported)?; // moov must precede mdat
                     return Ok(Self {
@@ -135,10 +154,70 @@ impl<S: Source> Mp4Reader<S> {
                         codec,
                         total_samples,
                         mdat_remaining: len,
+                        fragmented,
                         tables: None,
                     });
                 }
                 _ => skip(&mut src, len)?, // ftyp, free, udta, ...
+            }
+        }
+    }
+
+    /// `true` if this is a fragmented stream (sample data in `moof`/`mdat`
+    /// fragments). Fragmented streams carry no `moov` sample tables, so seeking
+    /// is unsupported and the declared total length is unknown.
+    pub fn is_fragmented(&self) -> bool {
+        self.fragmented
+    }
+
+    /// Read up to `buf.len()` bytes of coded audio from the `mdat` stream,
+    /// transparently spanning fragments: when the current `mdat` is exhausted in
+    /// a fragmented file, skip the following `moof` (and any other non-`mdat`
+    /// boxes) to the next `mdat` and continue. Returns the number of bytes read;
+    /// `0` at the true end of the sample data. For a progressive file this is
+    /// just a bounded read of the single `mdat` (identical to the former
+    /// `src.read` + `mdat_remaining` decrement the codecs did inline).
+    pub fn read_audio(&mut self, buf: &mut [u8]) -> Result<usize, DecodeError> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            if self.mdat_remaining == 0 {
+                if self.fragmented && self.advance_to_next_mdat()? {
+                    continue;
+                }
+                break; // progressive EOF, or no more fragments
+            }
+            let want = ((buf.len() - filled) as u64).min(self.mdat_remaining) as usize;
+            let n = self
+                .src
+                .read(&mut buf[filled..filled + want])
+                .map_err(|_| DecodeError::Io)?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+            self.mdat_remaining -= n as u64;
+        }
+        Ok(filled)
+    }
+
+    /// Skip boxes (a `moof` and anything else that isn't audio) until the next
+    /// `mdat`, setting [`Self::mdat_remaining`] to its length. Returns `false`
+    /// at the end of the stream (no further `mdat`). A truncated box between
+    /// fragments ends the stream cleanly rather than erroring: a partially
+    /// received fragmented stream degrades to the audio decoded so far, the same
+    /// graceful end the old per-`mdat` `read() == 0` path gave.
+    fn advance_to_next_mdat(&mut self) -> Result<bool, DecodeError> {
+        loop {
+            let (len, fourcc, _) = match box_header(&mut self.src) {
+                Ok(h) => h,
+                Err(_) => return Ok(false), // no (complete) box left → end of stream
+            };
+            if &fourcc == b"mdat" {
+                self.mdat_remaining = len;
+                return Ok(true);
+            }
+            if skip(&mut self.src, len).is_err() {
+                return Ok(false); // truncated mid-box → treat as end of stream
             }
         }
     }
@@ -241,6 +320,20 @@ impl<S: crate::io::SeekSource> Mp4Reader<S> {
         let chunk_off = chunk_offset(&mut self.src, t.stco, t.co64, chunk0)?;
         let within = stsz_sum(&mut self.src, t.stsz, first_sample, frame_index)?;
         Ok(chunk_off + within)
+    }
+
+    /// Reposition the `mdat` read cursor to absolute file `offset`, declaring
+    /// `remaining` bytes of coded audio from there to the end of the `mdat`.
+    /// Used by the codecs' sample-accurate seek after it maps a frame index to a
+    /// file offset via the sample table; subsequent [`Mp4Reader::read_audio`]
+    /// calls read that window. Progressive streams only — a fragmented stream
+    /// has no sample table, so its seek never reaches here.
+    pub fn seek_audio(&mut self, offset: u64, remaining: u64) -> Result<(), DecodeError> {
+        self.src
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| DecodeError::Io)?;
+        self.mdat_remaining = remaining;
+        Ok(())
     }
 }
 

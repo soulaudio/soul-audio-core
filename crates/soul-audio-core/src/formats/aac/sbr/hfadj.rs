@@ -73,7 +73,7 @@ const RING_COLS: usize = 48;
 // `x > 0.0` is false for NaN too) -- exactly the guard this fn's doc comment
 // and the brief's test (`sqrtf(-1.0) == 0.0`, "guarded") require.
 #[allow(clippy::neg_cmp_op_on_partial_ord)]
-pub(super) fn sqrtf(x: f32) -> f32 {
+pub(crate) fn sqrtf(x: f32) -> f32 {
     if !(x > 0.0) {
         return 0.0;
     }

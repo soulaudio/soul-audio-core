@@ -27,7 +27,6 @@ use crate::demux::adts::{AacConfig, AdtsReader};
 use crate::demux::mp4::{Mp4Codec, Mp4Reader};
 use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
-use embedded_io::SeekFrom;
 
 use filterbank::Filterbank;
 
@@ -206,7 +205,6 @@ pub struct AacDecoder<S> {
     inbuf: [u8; AU_CAP],
     mp4_filled: usize,
     mp4_used: usize,
-    mp4_mdat_remaining: u64,
     total_samples: Option<u64>,
     /// SBR (HE-AAC) decode state — always present, starts inactive (pure
     /// upsample-only, `kx=32 M=0`). Costs nothing on an LC-only stream: the
@@ -240,9 +238,14 @@ impl<S: Source> AacDecoder<S> {
             Mp4Codec::Aac(c) => c,
             Mp4Codec::Alac(_) => return Err(DecodeError::Unsupported),
         };
-        let mdat_remaining = reader.mdat_remaining();
-        let total = reader.total_samples();
-        Self::build(FrameSrc::Mp4(reader), config, mdat_remaining, Some(total))
+        // A fragmented stream carries no `mdhd` total; report length unknown
+        // (like ADTS) and let decode run until the `mdat` fragments drain.
+        let total = if reader.is_fragmented() {
+            None
+        } else {
+            Some(reader.total_samples())
+        };
+        Self::build(FrameSrc::Mp4(reader), config, total)
     }
 
     /// Build over an ADTS reader (its first header already validated). ADTS is
@@ -253,13 +256,12 @@ impl<S: Source> AacDecoder<S> {
     /// As [`Self::new_mp4`] (config validation).
     pub fn new_adts(reader: AdtsReader<S>) -> Result<Self, DecodeError> {
         let config = reader.config();
-        Self::build(FrameSrc::Adts(reader), config, 0, None)
+        Self::build(FrameSrc::Adts(reader), config, None)
     }
 
     fn build(
         src: FrameSrc<S>,
         config: AacConfig,
-        mdat_remaining: u64,
         total_samples: Option<u64>,
     ) -> Result<Self, DecodeError> {
         if config.object_type != 2 {
@@ -287,7 +289,6 @@ impl<S: Source> AacDecoder<S> {
             inbuf: [0; AU_CAP],
             mp4_filled: 0,
             mp4_used: 0,
-            mp4_mdat_remaining: mdat_remaining,
             total_samples,
             sbr: sbr::SbrState::default(),
             sbr_out: sbr::SbrOutput::default(),
@@ -346,26 +347,22 @@ impl<S: Source> AacDecoder<S> {
             }
             self.mp4_used = 0;
         }
-        // Refill from the mdat stream (bounded by capacity and what's left).
-        while self.mp4_filled < AU_CAP && self.mp4_mdat_remaining > 0 {
+        // Refill from the mdat stream (up to capacity). `read_audio` bounds the
+        // read to the current `mdat` and, for a fragmented file, transparently
+        // crosses into the next fragment's `mdat`; it returns 0 at true EOF.
+        while self.mp4_filled < AU_CAP {
             let start = self.mp4_filled;
-            let want = ((AU_CAP - start) as u64).min(self.mp4_mdat_remaining) as usize;
-            let end = start + want;
             let n = {
                 let reader = match &mut self.src {
                     FrameSrc::Mp4(r) => r,
                     FrameSrc::Adts(_) => unreachable!("dispatched by decode_next_rdb"),
                 };
-                reader
-                    .src_mut()
-                    .read(&mut self.inbuf[start..end])
-                    .map_err(|_| DecodeError::Io)?
+                reader.read_audio(&mut self.inbuf[start..])?
             };
             if n == 0 {
                 break;
             }
             self.mp4_filled += n;
-            self.mp4_mdat_remaining -= n as u64;
         }
         if self.mp4_filled == 0 {
             return Ok(None); // mdat drained
@@ -525,10 +522,7 @@ impl<S: SeekSource> AacDecoder<S> {
         let offset = self.mp4_reader().frame_file_offset(land)?;
         let end_offset = self.mp4_reader().frame_file_offset(num_frames)?;
         self.mp4_reader()
-            .src_mut()
-            .seek(SeekFrom::Start(offset))
-            .map_err(|_| DecodeError::Io)?;
-        self.mp4_mdat_remaining = end_offset.saturating_sub(offset);
+            .seek_audio(offset, end_offset.saturating_sub(offset))?;
         self.reset_decode_state();
 
         // Decode-and-discard whole frames [land, au_index).

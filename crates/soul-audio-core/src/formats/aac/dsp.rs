@@ -111,9 +111,10 @@ fn sfb_gain(sf: i32) -> f32 {
 /// Task 7's IMDCT. Long windows are a single group covering the whole
 /// 1024-line spectrum, so the same loop reduces to a straight 1:1 copy.
 ///
-/// ZERO/NOISE(PNS)/INTENSITY bands are left at `0.0` (already true since
-/// `spec` is zeroed up front): PNS bands are silent per Task 4's documented
-/// v1 simplification, and intensity bands are Task 6's job.
+/// ZERO and INTENSITY bands are left at `0.0` here (intensity is reconstructed
+/// from the other channel in `apply_stereo`). NOISE (PNS, codebook 13) bands
+/// are **filled with energy-scaled noise** ([`fill_pns`]) — they carry no
+/// spectral data, only a noise scalefactor.
 ///
 /// Never panics: every `spec` write and `coeffs` read is index-guarded
 /// against the table/array bounds, and [`dequant_line`] clamps `pow_43`'s
@@ -148,9 +149,26 @@ pub(crate) fn dequantize(ics: &mut Ics) {
             }
 
             let cb = ics.sfb_cb[g][sfb];
-            let silent =
-                cb == HCB_ZERO || cb == HCB_NOISE || cb == HCB_INTENSITY2 || cb == HCB_INTENSITY;
-            if !silent {
+            if cb == HCB_NOISE {
+                // PNS (§6): no spectral data — fill the band with pseudo-random
+                // noise scaled to the energy its noise scalefactor implies, so
+                // it reconstructs as noise of the intended loudness, not silence.
+                let gain = sfb_gain(ics.scale_factors[g][sfb]);
+                for w in 0..glen {
+                    let window = window_base + w;
+                    let dst_base = if short { window * 128 + lo } else { lo };
+                    let end = (dst_base + band_width).min(ics.spec.len());
+                    if dst_base < end {
+                        // Deterministic per-band seed (reproducible; a PNS band's
+                        // noise is decoder-specific — never bit/SNR-matched to
+                        // another decoder's PRNG).
+                        let seed = (ics.scale_factors[g][sfb] as u32).wrapping_mul(2_654_435_761)
+                            ^ (dst_base as u32).wrapping_mul(40_503)
+                            ^ (g as u32);
+                        fill_pns(&mut ics.spec[dst_base..end], gain, seed);
+                    }
+                }
+            } else if cb != HCB_ZERO && cb != HCB_INTENSITY2 && cb != HCB_INTENSITY {
                 let gain = sfb_gain(ics.scale_factors[g][sfb]);
                 for w in 0..glen {
                     let window = window_base + w;
@@ -167,6 +185,48 @@ pub(crate) fn dequantize(ics: &mut Ics) {
             pos += total;
         }
         window_base += glen;
+    }
+}
+
+/// One xorshift32 step (nonzero state in), mapped to `[-1, 1)`. A `libm`-free,
+/// no-alloc PRNG for PNS noise generation (the only randomness the decoder
+/// needs).
+#[inline]
+fn pns_rand(state: &mut u32) -> f32 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    (x as f32 / u32::MAX as f32) * 2.0 - 1.0
+}
+
+/// Fill a Perceptual Noise Substitution band (§6, codebook 13) with
+/// pseudo-random noise whose **per-line RMS equals `gain`** — the band's noise
+/// scalefactor energy. A two-pass normalize (fill → measure energy → rescale)
+/// makes the output energy exact regardless of the finite sample set, so the
+/// band reconstructs as noise of the intended loudness instead of silence.
+/// `seed` is deterministic per band (reproducible); the actual noise values are
+/// decoder-specific and intentionally not matched to any other decoder's PRNG —
+/// PNS is never bit/SNR-reproducible across decoders.
+fn fill_pns(dst: &mut [f32], gain: f32, seed: u32) {
+    if dst.is_empty() {
+        return;
+    }
+    let mut state = seed | 1; // xorshift requires a nonzero state
+    let mut energy = 0.0f32;
+    for v in dst.iter_mut() {
+        let r = pns_rand(&mut state);
+        *v = r;
+        energy += r * r;
+    }
+    if energy > 0.0 {
+        // scale·√(Σr²/N) == gain  ⇒  scale = gain·√(N/energy). `f32::sqrt` is
+        // std-only; the crate's no_std software sqrt is in `sbr::hfadj`.
+        let scale = gain * super::sbr::hfadj::sqrtf(dst.len() as f32 / energy);
+        for v in dst.iter_mut() {
+            *v *= scale;
+        }
     }
 }
 
@@ -593,14 +653,50 @@ mod tests {
     }
 
     #[test]
-    fn zero_noise_and_intensity_bands_stay_silent() {
-        for cb in [HCB_ZERO, HCB_NOISE, HCB_INTENSITY2, HCB_INTENSITY] {
+    fn zero_and_intensity_bands_stay_silent() {
+        // ZERO + both intensity codebooks carry no spectral data for this channel
+        // (intensity is reconstructed from the other channel in `apply_stereo`),
+        // so `dequantize` must leave them at 0.0. (NOISE/PNS is handled
+        // separately below — it is now *filled* with noise, not left silent.)
+        for cb in [HCB_ZERO, HCB_INTENSITY2, HCB_INTENSITY] {
             let mut ics = Ics::long_test();
             ics.sfb_cb[0][0] = cb;
             ics.coeffs[0] = 3; // would be nonzero if dequantize ignored the codebook
             dequantize(&mut ics);
             assert_eq!(ics.spec[0], 0.0, "cb {cb}");
             assert_eq!(ics.spec[1], 0.0, "cb {cb}");
+        }
+    }
+
+    #[test]
+    fn noise_band_is_filled_not_silent() {
+        // A PNS band (codebook 13) must reconstruct as noise, not silence.
+        let mut ics = Ics::long_test();
+        ics.sfb_cb[0][0] = HCB_NOISE;
+        ics.scale_factors[0][0] = 100; // sfb_gain(100) = 1.0
+        dequantize(&mut ics);
+        // swb[0] of the long table is several lines wide; at least one must be
+        // non-zero now that PNS synthesizes noise.
+        assert!(
+            ics.spec[..4].iter().any(|&v| v != 0.0),
+            "PNS band must be filled with noise, not left silent"
+        );
+    }
+
+    #[test]
+    fn fill_pns_matches_target_rms() {
+        // The two-pass normalize must make the band's per-line RMS equal the
+        // target `gain` exactly (within f32 rounding), for any gain.
+        for &gain in &[0.25f32, 1.0, 4.0, 32.0] {
+            let mut buf = [0.0f32; 512];
+            fill_pns(&mut buf, gain, 0x9E37_79B9);
+            let energy: f32 = buf.iter().map(|&v| v * v).sum();
+            let rms = (energy / buf.len() as f32).sqrt();
+            assert!(
+                (rms - gain).abs() <= 1e-3 * gain,
+                "PNS RMS {rms} vs target gain {gain}"
+            );
+            assert!(buf.iter().any(|&v| v != 0.0));
         }
     }
 
