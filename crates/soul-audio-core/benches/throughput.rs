@@ -17,6 +17,9 @@ use soul_audio_core::{DecimateAdapter, Decoder, Quality, Resampler, SliceSource,
 const STACK: usize = 16 << 20;
 /// Calibrate each benchmark to at least this much wall time for a stable number.
 const MIN_WALL: Duration = Duration::from_millis(300);
+/// Timed batches per benchmark; the fastest is reported (best-of-N, so transient
+/// system load on a shared machine can't inflate the result).
+const REPEAT: usize = 5;
 
 /// Run `f` (one full decode/process, returning `(interleaved_samples,
 /// sample_rate, channels)`) enough times to exceed [`MIN_WALL`], and print the
@@ -26,19 +29,31 @@ fn bench(label: &str, f: impl Fn() -> (usize, u32, u16) + Send + 'static) {
         .stack_size(STACK)
         .spawn(move || {
             let (samples, rate, channels) = f(); // warm up + capture shape
+            // Calibrate the iteration count so one timed batch spans ~MIN_WALL.
             let mut iters = 1u64;
             loop {
                 let t = Instant::now();
                 for _ in 0..iters {
                     let _ = f();
                 }
-                let el = t.elapsed();
-                if el >= MIN_WALL {
-                    let per = el.as_nanos() as f64 / iters as f64;
-                    break (samples, rate, channels, per);
+                if t.elapsed() >= MIN_WALL {
+                    break;
                 }
                 iters = iters.saturating_mul(2);
             }
+            // Best-of-N: report the fastest batch. System noise can only ever
+            // *add* wall time, so the minimum is the least-contended (most
+            // representative) run — the standard robust throughput estimator,
+            // resilient to the shared-CI jitter a single sample suffers.
+            let mut per = f64::INFINITY;
+            for _ in 0..REPEAT {
+                let t = Instant::now();
+                for _ in 0..iters {
+                    let _ = f();
+                }
+                per = per.min(t.elapsed().as_nanos() as f64 / iters as f64);
+            }
+            (samples, rate, channels, per)
         })
         .expect("spawn bench thread")
         .join()

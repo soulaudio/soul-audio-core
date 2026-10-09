@@ -220,9 +220,16 @@ impl Resampler {
         }
     }
 
-    /// Reconstruct one output frame for channel `ch` at position `i0 + eta` under
-    /// input/output step `step`, via the two-sided windowed-sinc walk.
-    fn kernel(&self, ch: usize, input: &[i32], i0: isize, eta: f64, step: f64) -> f32 {
+    /// Reconstruct one output frame for **all** channels at position `i0 + eta`
+    /// under input/output step `step`, writing `acc[0..channels]`.
+    ///
+    /// The windowed-sinc weight `interp(sinc, fidx)` depends only on the tap
+    /// position, not the channel, so it is computed **once per tap** and
+    /// multiplied into every channel's accumulator — halving the dominant
+    /// `interp` work for stereo (it was recomputed once per channel per tap).
+    /// Each channel accumulates the same taps in the same order, so the result
+    /// is bit-identical to the former per-channel kernel.
+    fn kernel_multi(&self, input: &[i32], i0: isize, eta: f64, step: f64, acc: &mut [f32]) {
         let (sinc, l, half) = match self.quality {
             Quality::Fast => (&FAST_SINC[..], FAST_L, FAST_HALF),
             Quality::Hq => (&HQ_SINC[..], HQ_L, HQ_HALF),
@@ -230,12 +237,18 @@ impl Resampler {
         let ratio_c = (1.0 / step).min(1.0); // out/in, capped at 1
         let inc = l as f64 * ratio_c;
         let half_f = half as f64;
-        let mut acc = 0.0f32;
+        let ch = self.channels;
+        for a in acc[..ch].iter_mut() {
+            *a = 0.0;
+        }
         // Left wing: input i0, i0-1, …; distances eta, eta+1, …
         let mut fidx = eta * inc;
         let mut di = i0;
         while fidx < half_f {
-            acc += interp(sinc, fidx) * self.at(ch, input, di);
+            let w = interp(sinc, fidx);
+            for (c, a) in acc[..ch].iter_mut().enumerate() {
+                *a += w * self.at(c, input, di);
+            }
             fidx += inc;
             di -= 1;
         }
@@ -243,11 +256,17 @@ impl Resampler {
         let mut fidx = (1.0 - eta) * inc;
         let mut di = i0 + 1;
         while fidx < half_f {
-            acc += interp(sinc, fidx) * self.at(ch, input, di);
+            let w = interp(sinc, fidx);
+            for (c, a) in acc[..ch].iter_mut().enumerate() {
+                *a += w * self.at(c, input, di);
+            }
             fidx += inc;
             di += 1;
         }
-        acc * ratio_c as f32
+        let rc = ratio_c as f32;
+        for a in acc[..ch].iter_mut() {
+            *a *= rc;
+        }
     }
 
     /// Resample: consume exactly `input_frames_next()` interleaved input frames,
@@ -264,6 +283,7 @@ impl Resampler {
         }
         let of = self.output_frames;
         let mut pos = self.read;
+        let mut acc = [0.0f32; MAX_CHANNELS];
         for o in 0..of {
             let s = if self.ramp {
                 self.step + (self.target_step - self.step) * (o as f64 + 1.0) / of as f64
@@ -272,9 +292,9 @@ impl Resampler {
             };
             let i0 = libm_floor(pos) as isize;
             let eta = pos - libm_floor(pos);
+            self.kernel_multi(input, i0, eta, s, &mut acc);
             for ch in 0..self.channels {
-                let y = self.kernel(ch, input, i0, eta, s);
-                output[o * self.channels + ch] = f32_to_i32(y);
+                output[o * self.channels + ch] = f32_to_i32(acc[ch]);
             }
             pos += s;
         }

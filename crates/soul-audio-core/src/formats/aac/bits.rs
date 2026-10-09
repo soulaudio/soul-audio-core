@@ -39,6 +39,16 @@ impl<'a> BitReader<'a> {
     /// Read `n` bits (0 <= n <= 32), MSB-first, right-aligned. Reads past the
     /// end of `data` return zero bits.
     pub(crate) fn read(&mut self, n: u32) -> u32 {
+        let v = self.peek(n);
+        self.bit_pos += n as usize;
+        v
+    }
+
+    /// Peek the next `n` bits (0 <= n <= 32), MSB-first, right-aligned,
+    /// **without** advancing — the fast-path Huffman table indexes a fixed-width
+    /// peek, then [`advance`](Self::advance)s only the matched codeword's length.
+    /// Reads past the end of `data` return zero bits.
+    pub(crate) fn peek(&self, n: u32) -> u32 {
         debug_assert!(n <= 32);
         if n == 0 {
             return 0;
@@ -53,9 +63,13 @@ impl<'a> BitReader<'a> {
             | (self.byte(byte_idx + 3) << 8)
             | self.byte(byte_idx + 4);
         let masked = (window << bit) & 0xFF_FFFF_FFFF; // keep the low 40 bits
-        let v = masked >> (40 - n);
+        (masked >> (40 - n)) as u32
+    }
+
+    /// Advance the cursor by `n` bits (used after a [`peek`](Self::peek)-driven
+    /// fast-table match consumes a known codeword length).
+    pub(crate) fn advance(&mut self, n: u32) {
         self.bit_pos += n as usize;
-        v as u32
     }
 
     /// Read a single bit.

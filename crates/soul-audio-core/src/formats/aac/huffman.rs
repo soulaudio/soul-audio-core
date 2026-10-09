@@ -408,6 +408,76 @@ const MAX_SPECTRAL_LEN: u32 = 16;
 /// Longest scalefactor-book codeword (19 bits).
 const MAX_SF_LEN: u32 = 19;
 
+/// Fast-decode prefix width: a spectral codeword of up to this many bits
+/// resolves in a single table lookup; the (rare) longer ones fall back to the
+/// linear scan. 10 bits covers the vast majority of codewords (the longest is
+/// 16). Table cost: `11 · 2¹⁰ · 4 B ≈ 44 KiB` of rodata.
+const FAST_BITS: u32 = 10;
+const FAST_SIZE: usize = 1 << FAST_BITS;
+
+/// Build a prefix-indexed fast-decode table from a prefix-free `(codes, bits)`
+/// codebook **at compile time**. `table[prefix]` packs `(len << 16) | symbol`
+/// for the codeword (length `len ≤ FAST_BITS`) whose top `len` bits equal the
+/// top `len` bits of the `FAST_BITS`-wide `prefix`; every filled slot has
+/// `len ≥ 1`, so a `0` entry means "no short codeword — scan for the longer
+/// one". The tables live in rodata and cost nothing at runtime.
+const fn build_fast_u16(codes: &[u16], bits: &[u8]) -> [u32; FAST_SIZE] {
+    let mut table = [0u32; FAST_SIZE];
+    let mut i = 0;
+    while i < codes.len() {
+        let len = bits[i] as u32;
+        if len >= 1 && len <= FAST_BITS {
+            let shift = FAST_BITS - len;
+            let base = (codes[i] as usize) << shift; // left-align into FAST_BITS
+            let packed = (len << 16) | i as u32;
+            let count = 1usize << shift;
+            let mut j = 0;
+            while j < count {
+                table[base + j] = packed; // fill every prefix sharing this codeword
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    table
+}
+
+/// One prefix table per spectral codebook (cb1..11), built at compile time from
+/// the verbatim FFmpeg codeword tables above — so it can never drift from them.
+#[rustfmt::skip]
+static CB_FAST: [[u32; FAST_SIZE]; 11] = [
+    build_fast_u16(&CB1_CODES, &CB1_BITS),
+    build_fast_u16(&CB2_CODES, &CB2_BITS),
+    build_fast_u16(&CB3_CODES, &CB3_BITS),
+    build_fast_u16(&CB4_CODES, &CB4_BITS),
+    build_fast_u16(&CB5_CODES, &CB5_BITS),
+    build_fast_u16(&CB6_CODES, &CB6_BITS),
+    build_fast_u16(&CB7_CODES, &CB7_BITS),
+    build_fast_u16(&CB8_CODES, &CB8_BITS),
+    build_fast_u16(&CB9_CODES, &CB9_BITS),
+    build_fast_u16(&CB10_CODES, &CB10_BITS),
+    build_fast_u16(&CB11_CODES, &CB11_BITS),
+];
+
+/// Decode one spectral codebook index (`cb_idx = cb - 1`): one fast-table lookup
+/// for the common short codewords, falling back to [`match_huffman`] only for
+/// codewords longer than `FAST_BITS` (the deep tail of a few books). Replaces a
+/// full linear scan of the (up-to-289-entry) codebook at every bit length.
+#[inline]
+fn decode_spectral_index(
+    r: &mut BitReader,
+    cb_idx: usize,
+    codes: &[u16],
+    bits: &[u8],
+) -> Result<usize, DecodeError> {
+    let entry = CB_FAST[cb_idx][r.peek(FAST_BITS) as usize];
+    if entry != 0 {
+        r.advance(entry >> 16);
+        return Ok((entry & 0xFFFF) as usize);
+    }
+    match_huffman(r, codes, bits, MAX_SPECTRAL_LEN)
+}
+
 /// Match a Huffman codeword MSB-first against a `(codes, bits)` table,
 /// returning the table index. Reads one bit at a time and does a linear scan
 /// at each length for an exact `(code, len)` match: correct because AAC's
@@ -513,7 +583,7 @@ pub(super) fn decode_spectral(r: &mut BitReader, cb: u8) -> Result<[i32; 4], Dec
         return Err(DecodeError::Malformed);
     }
     let props = &CB_PROPS[(cb - 1) as usize];
-    let idx = match_huffman(r, props.codes, props.bits, MAX_SPECTRAL_LEN)? as i32;
+    let idx = decode_spectral_index(r, (cb - 1) as usize, props.codes, props.bits)? as i32;
     let m = props.m;
     let mut out = [0i32; 4];
     if props.dim == 4 {
@@ -624,5 +694,46 @@ mod tests {
         }
         let mut r = BitReader::new(&[]);
         let _ = decode_scalefactor(&mut r);
+    }
+
+    /// Pack `code` (`len` bits, MSB-first) at the front of a buffer long enough
+    /// for `peek(FAST_BITS)` + the scan to read safely past it.
+    fn pack(code: u32, len: u32) -> [u8; 8] {
+        let mut bytes = [0u8; 8];
+        for (p, b) in (0..len).rev().enumerate() {
+            if (code >> b) & 1 == 1 {
+                bytes[p / 8] |= 1 << (7 - (p % 8));
+            }
+        }
+        bytes
+    }
+
+    /// The fast-table path (and its scan fallback) must decode **every** spectral
+    /// codeword to its own symbol index, consuming exactly its bit length — the
+    /// proof the compile-time prefix tables agree with the verbatim codebooks
+    /// across both the `≤ FAST_BITS` (table) and longer (scan) paths.
+    #[test]
+    fn fast_index_matches_every_spectral_codeword() {
+        for (cb_idx, props) in CB_PROPS.iter().enumerate() {
+            for (sym, (&code, &bits)) in props.codes.iter().zip(props.bits.iter()).enumerate() {
+                let buf = pack(u32::from(code), u32::from(bits));
+                let mut r = BitReader::new(&buf);
+                let got = decode_spectral_index(&mut r, cb_idx, props.codes, props.bits).unwrap();
+                assert_eq!(
+                    got,
+                    sym,
+                    "cb{} code {:#x}/{bits}b decoded as {got}, want {sym}",
+                    cb_idx + 1,
+                    code
+                );
+                assert_eq!(
+                    r.bit_pos(),
+                    usize::from(bits),
+                    "cb{} sym {sym}: consumed {} bits, want {bits}",
+                    cb_idx + 1,
+                    r.bit_pos()
+                );
+            }
+        }
     }
 }
