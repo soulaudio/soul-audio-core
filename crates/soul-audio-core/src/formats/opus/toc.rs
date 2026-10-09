@@ -218,6 +218,113 @@ pub fn frames<'a>(
     Ok((config, frame_count))
 }
 
+/// Split one **self-delimited** Opus packet (RFC 6716 Appendix B) out of the
+/// front of `buf`, as used for every stream but the last in an Opus
+/// *multistream* packet (RFC 7845 §3). Identical to [`frames`] except the
+/// compressed length of the **last** frame is encoded explicitly (right after
+/// the per-frame VBR lengths / code-3 header), rather than inferred from the
+/// remaining bytes — so the packet's exact byte length is known and the next
+/// stream's packet begins immediately after. Fills `out[..count]` with frame
+/// subslices and returns `(Config, count, bytes_consumed)`.
+///
+/// A faithful port of libopus `opus_packet_parse_impl(self_delimited=1)`.
+///
+/// # Errors
+/// [`DecodeError::Malformed`] for any inconsistency an attacker can craft: a
+/// missing TOC/length byte, a declared frame length that overruns `buf`, a
+/// code-3 frame count of 0 or over [`MAX_FRAMES`], or a duration over 120 ms.
+/// Never panics or indexes out of bounds.
+pub fn frames_self_delimited<'a>(
+    buf: &'a [u8],
+    out: &mut [&'a [u8]; MAX_FRAMES],
+) -> Result<(Config, usize, usize), DecodeError> {
+    let (&b0, rest) = buf.split_first().ok_or(DecodeError::Malformed)?;
+    let config = parse_toc(b0);
+    let code = b0 & 0x3;
+
+    let mut sizes = [0usize; MAX_FRAMES];
+    let mut pos = 0usize; // cursor into `rest` (past the TOC)
+    let mut padding = 0usize;
+
+    // Code-specific header + per-frame VBR lengths for frames `0..count-1`
+    // (the last frame's length is read by the self-delimited step below).
+    let (count, cbr) = match code {
+        0 => (1usize, true),
+        1 => (2usize, true),
+        2 => {
+            let (len, c) = read_frame_length(rest, pos).ok_or(DecodeError::Malformed)?;
+            sizes[0] = len;
+            pos += c;
+            (2usize, false)
+        }
+        _ => {
+            let fc = *rest.get(pos).ok_or(DecodeError::Malformed)?;
+            pos += 1;
+            let vbr = fc & 0x80 != 0;
+            let has_padding = fc & 0x40 != 0;
+            let m = usize::from(fc & 0x3F);
+            if m == 0 || m > MAX_FRAMES {
+                return Err(DecodeError::Malformed);
+            }
+            if has_padding {
+                loop {
+                    let p = *rest.get(pos).ok_or(DecodeError::Malformed)?;
+                    pos += 1;
+                    padding = padding
+                        .checked_add(if p == 255 { 254 } else { usize::from(p) })
+                        .ok_or(DecodeError::Malformed)?;
+                    if p != 255 {
+                        break;
+                    }
+                }
+            }
+            if vbr {
+                for size in sizes.iter_mut().take(m - 1) {
+                    let (len, c) = read_frame_length(rest, pos).ok_or(DecodeError::Malformed)?;
+                    *size = len;
+                    pos += c;
+                }
+            }
+            (m, !vbr)
+        }
+    };
+
+    // Self-delimited: the last frame's length is explicit.
+    let (last_len, c) = read_frame_length(rest, pos).ok_or(DecodeError::Malformed)?;
+    sizes[count - 1] = last_len;
+    pos += c;
+    // For CBR framing (codes 0/1 and code-3 CBR) that single length sizes every
+    // frame.
+    if cbr {
+        for size in sizes.iter_mut().take(count - 1) {
+            *size = last_len;
+        }
+    }
+
+    // `pos` now indexes the first frame byte within `rest`; frame data is
+    // followed by `padding` trailing pad bytes.
+    let body = rest.get(pos..).ok_or(DecodeError::Malformed)?;
+    let frame_bytes: usize = sizes[..count].iter().sum();
+    let needed = frame_bytes
+        .checked_add(padding)
+        .ok_or(DecodeError::Malformed)?;
+    if needed > body.len() {
+        return Err(DecodeError::Malformed);
+    }
+    let mut off = 0usize;
+    for (slot, &len) in out.iter_mut().zip(sizes[..count].iter()) {
+        *slot = &body[off..off + len];
+        off += len;
+    }
+
+    let total_samples = count as u32 * u32::from(config.frame_size_48k);
+    if total_samples > MAX_TOTAL_SAMPLES_48K {
+        return Err(DecodeError::Malformed);
+    }
+    // TOC(1) + header/length bytes + frame data + trailing padding.
+    Ok((config, count, 1 + pos + needed))
+}
+
 /// Code-3 frame packing (RFC 6716 §3.2): frame-count byte (VBR flag,
 /// padding flag, 6-bit count `M`), optional padding-length bytes, then
 /// either `M` equal CBR frames or `M-1` self-delimited VBR lengths followed
@@ -391,6 +498,50 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(out[0], &[1, 2, 3, 4][..]);
         assert_eq!(config.mode, Mode::CeltOnly);
+    }
+
+    // ---- Appendix B self-delimiting framing (multistream) -------------
+
+    #[test]
+    fn self_delimited_code0_reads_explicit_length() {
+        // TOC(code 0) | len=3 | 3 frame bytes | (a trailing byte NOT consumed).
+        let pkt = packet(16, false, 0, &[3, 0xAA, 0xBB, 0xCC, 0x99]);
+        let mut out: [&[u8]; MAX_FRAMES] = [&[]; MAX_FRAMES];
+        let (config, n, used) = frames_self_delimited(&pkt, &mut out).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(out[0], &[0xAA, 0xBB, 0xCC][..]);
+        assert_eq!(used, 1 + 1 + 3); // TOC + length byte + frame
+        assert_eq!(config.mode, Mode::CeltOnly);
+    }
+
+    #[test]
+    fn self_delimited_code2_reads_both_lengths() {
+        // TOC(code 2) | size0=2 | size1=3 | frame0(2) | frame1(3).
+        let pkt = packet(16, false, 2, &[2, 3, 0x10, 0x11, 0x20, 0x21, 0x22]);
+        let mut out: [&[u8]; MAX_FRAMES] = [&[]; MAX_FRAMES];
+        let (_, n, used) = frames_self_delimited(&pkt, &mut out).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(out[0], &[0x10, 0x11][..]);
+        assert_eq!(out[1], &[0x20, 0x21, 0x22][..]);
+        assert_eq!(used, pkt.len());
+    }
+
+    #[test]
+    fn self_delimited_boundary_splits_a_two_stream_packet() {
+        // Stream 0 (self-delimited, one 1-byte frame) then stream 1 (standard
+        // framing, 4-byte frame) — the multistream layout: all but the last
+        // stream are self-delimited, the last uses `frames`.
+        let mut buf = packet(16, false, 0, &[1, 0xAA]); // self-delim stream 0
+        buf.extend_from_slice(&packet(16, false, 0, &[0xBB, 0xBB, 0xBB, 0xBB]));
+        let mut out: [&[u8]; MAX_FRAMES] = [&[]; MAX_FRAMES];
+        let (_, n0, used) = frames_self_delimited(&buf, &mut out).unwrap();
+        assert_eq!(n0, 1);
+        assert_eq!(out[0], &[0xAA][..]);
+        assert_eq!(used, 3); // TOC + len + 1 byte
+        // The remainder parses as an ordinary (last-stream) packet.
+        let (_, n1) = frames(&buf[used..], &mut out).unwrap();
+        assert_eq!(n1, 1);
+        assert_eq!(out[0], &[0xBB, 0xBB, 0xBB, 0xBB][..]);
     }
 
     #[test]

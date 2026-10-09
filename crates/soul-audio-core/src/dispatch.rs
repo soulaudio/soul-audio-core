@@ -11,9 +11,10 @@ use crate::decoder::{DecodeError, Decoder, SeekableDecoder};
 use crate::demux::adts::AdtsReader;
 use crate::demux::mp4::{Mp4Codec, Mp4Reader};
 use crate::demux::ogg::OggReader;
+use crate::formats::opus::multistream::MultistreamOpusDecoder;
+use crate::formats::opus::{OpusDecoder, open_opus_headers};
 use crate::formats::{
-    aac::AacDecoder, alac::AlacDecoder, flac::FlacDecoder, mp3::Mp3Decoder, opus::OpusDecoder,
-    wav::WavDecoder,
+    aac::AacDecoder, alac::AlacDecoder, flac::FlacDecoder, mp3::Mp3Decoder, wav::WavDecoder,
 };
 use crate::io::BufSource;
 use crate::model::{Format, StreamInfo};
@@ -43,6 +44,10 @@ pub enum AnyDecoder<S> {
     /// Opus table is RFC-fixed (no per-file setup), so it needs no
     /// caller-provided arena and is a normal by-value variant here.
     Opus(OpusDecoder<S>),
+    /// Multichannel (surround) Opus — RFC 7845 mapping family 1/255. A separate,
+    /// larger decoder (one core per stream); decode-only (no seek / declared
+    /// length), so its `total_frames`/`seek_to` arms report `None`/`Unsupported`.
+    OpusMs(MultistreamOpusDecoder<S>),
 }
 
 impl<S: crate::io::SeekSource> AnyDecoder<S> {
@@ -68,6 +73,8 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::Alac(d) => d.total_frames(),
             AnyDecoder::Aac(d) => d.total_frames(),
             AnyDecoder::Opus(d) => d.total_frames(),
+            // Surround Opus is decode-only; no declared length.
+            AnyDecoder::OpusMs(_) => None,
         }
     }
 
@@ -90,6 +97,8 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::Alac(d) => d.seek_to(sample),
             AnyDecoder::Aac(d) => d.seek_to(sample),
             AnyDecoder::Opus(d) => d.seek_to(sample),
+            // Surround Opus seeking (per-stream pre-roll) is not implemented.
+            AnyDecoder::OpusMs(_) => Err(DecodeError::Unsupported),
         }
     }
 
@@ -110,6 +119,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::Aac(d) => d.seek_to_time(secs),
             // Opus always decodes at 48 kHz; convert seconds at that rate.
             AnyDecoder::Opus(d) => d.seek_to(crate::decoder::secs_to_samples(secs, 48_000)),
+            AnyDecoder::OpusMs(_) => Err(DecodeError::Unsupported),
         }
     }
 }
@@ -133,6 +143,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::Alac(d) => d.stream_info(),
             AnyDecoder::Aac(d) => d.stream_info(),
             AnyDecoder::Opus(d) => d.stream_info(),
+            AnyDecoder::OpusMs(d) => d.stream_info(),
         }
     }
 
@@ -145,6 +156,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::Alac(d) => d.decode_into(out),
             AnyDecoder::Aac(d) => d.decode_into(out),
             AnyDecoder::Opus(d) => d.decode_into(out),
+            AnyDecoder::OpusMs(d) => d.decode_into(out),
         }
     }
 }
@@ -186,9 +198,17 @@ pub fn open<S: BufSource>(mut src: S) -> Result<AnyDecoder<S>, DecodeError> {
         // in `AnyDecoder`").
         Format::Vorbis => Err(DecodeError::Unsupported),
         // Opus has no per-file setup (every RFC 6716 table is fixed-capacity),
-        // so — unlike Vorbis — it needs no caller-provided arena and is a
-        // normal `AnyDecoder` variant.
-        Format::Opus => OpusDecoder::new(src).map(AnyDecoder::Opus),
+        // so — unlike Vorbis — it needs no caller-provided arena. Parse the
+        // header once and branch on the channel-mapping family: 0 = mono/stereo
+        // (the single-stream decoder), 1/255 = multichannel surround.
+        Format::Opus => {
+            let (ogg, head) = open_opus_headers(src)?;
+            if head.mapping_family == 0 {
+                OpusDecoder::from_parts(ogg, head).map(AnyDecoder::Opus)
+            } else {
+                MultistreamOpusDecoder::from_parts(ogg, head).map(AnyDecoder::OpusMs)
+            }
+        }
     }
 }
 

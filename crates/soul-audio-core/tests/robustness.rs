@@ -378,6 +378,15 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
             "opus",
             include_bytes!("../../../testdata/tone.opus").to_vec(),
         ),
+        // Multichannel Opus (mapping family 1, 4 streams): mutations drive the
+        // OpusHead mapping-table parse, the per-stream self-delimiting split
+        // (`frames_self_delimited`), and the channel-map gather — a corrupt
+        // stream count / mapping index / sub-packet length must stay a bounded
+        // Err or short decode, never a panic or OOB.
+        (
+            "opus-5p1",
+            include_bytes!("../testdata/opus-5p1.opus").to_vec(),
+        ),
         (
             "vorbis-mono",
             include_bytes!("../testdata/tone-vorbis-mono.ogg").to_vec(),

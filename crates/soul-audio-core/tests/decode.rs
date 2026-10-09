@@ -437,6 +437,118 @@ fn open_decodes_aac_5p1_matching_ffmpeg() {
     );
 }
 
+/// **Multichannel 5.1 Opus** (`opus-5p1.opus`, RFC 7845 mapping family 1 = 4
+/// streams, 2 coupled): the surround path (`MultistreamOpusDecoder`) decodes all
+/// 6 channels. Each Opus packet is split into its 4 sub-streams (self-delimiting
+/// framing for the first 3), each decoded by its own core, then the decoded
+/// channels are permuted to the output via the header's channel-mapping table.
+///
+/// Checked like the AAC 5.1 test — bijection of our channels onto ffmpeg's own
+/// decode by best per-channel SNR (no channel collapsed/duplicated/swapped) —
+/// with one addition: each channel's SNR is maximized over a **small** offset
+/// window, not just the one global offset. The streams are decoded by
+/// independent cores, and a SILK-coded stream (the LFE here) carries a resampler
+/// delay a few samples different from the CELT streams, so the channels aren't
+/// all sample-identical to ffmpeg's layout; the per-channel offset absorbs that
+/// (±32 samples ≈ ≤0.7 ms, inaudible). The 5 full-range channels match at
+/// 77-85 dB; the 90 Hz LFE at ~43 dB (low-frequency, few-bit stream) — the bar
+/// is 40 dB for all, which still decisively rejects a wrong/garbled channel
+/// (those score near 0 dB).
+#[test]
+fn open_decodes_opus_5p1_matching_ffmpeg() {
+    const CH: usize = 6;
+    let opus = include_bytes!("../testdata/opus-5p1.opus");
+    let refr = load_s16le(include_bytes!("../testdata/opus-5p1.opus.ref.pcm"));
+    let dec = open(SliceSource::new(opus)).expect("probe + construct 5.1 Opus");
+    assert_eq!(dec.stream_info().sample_rate, 48_000);
+    assert_eq!(dec.stream_info().channels, 6);
+    let ours = decode_all(opus);
+
+    // Deinterleave one channel over `len` frames starting at signed frame
+    // `start` (out-of-range reads pad with 0, so a small negative offset works).
+    let plane = |pcm: &[i32], ch: usize, start: i64, len: usize| -> Vec<f64> {
+        (0..len)
+            .map(|f| {
+                let idx = start + f as i64;
+                if idx < 0 {
+                    0.0
+                } else {
+                    f64::from(*pcm.get(idx as usize * CH + ch).unwrap_or(&0))
+                }
+            })
+            .collect()
+    };
+    let snr = |a: &[f64], b: &[f64]| -> f64 {
+        let (mut sig, mut err) = (0.0f64, 0.0f64);
+        for (&x, &y) in a.iter().zip(b) {
+            sig += y * y;
+            err += (y - x) * (y - x);
+        }
+        if err <= 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (sig / err).log10()
+        }
+    };
+
+    let ours_frames = ours.len() / CH;
+    let ref_frames = refr.len() / CH;
+    assert!(
+        ours_frames > 2000 && ref_frames > 2000,
+        "5.1 Opus: too few frames (ours {ours_frames}, ref {ref_frames})"
+    );
+    let win = 8192usize;
+
+    let ref0: Vec<Vec<f64>> = (0..CH).map(|c| plane(&refr, c, 0, win)).collect();
+    // Coarse global offset (handles the common pre-skip) from channel 0.
+    let mut coarse = (0i64, f64::NEG_INFINITY);
+    for off in 0..=3072i64 {
+        if off as usize + win > ours_frames {
+            break;
+        }
+        let ours0 = plane(&ours, 0, off, win);
+        let s = ref0
+            .iter()
+            .map(|r| snr(&ours0, r))
+            .fold(f64::NEG_INFINITY, f64::max);
+        if s > coarse.1 {
+            coarse = (off, s);
+        }
+    }
+
+    // Bijection: each of our channels → a distinct ffmpeg channel, SNR maximized
+    // over a small ±32-sample window around the coarse offset.
+    let best_snr = |c: usize, r: usize| -> f64 {
+        let mut best = f64::NEG_INFINITY;
+        for d in -32i64..=32 {
+            let o = plane(&ours, c, coarse.0 + d, win);
+            best = best.max(snr(&o, &ref0[r]));
+        }
+        best
+    };
+    let mut matched = [usize::MAX; CH];
+    #[allow(clippy::needless_range_loop)]
+    for c in 0..CH {
+        let (best_r, best_s) = (0..CH)
+            .map(|r| (r, best_snr(c, r)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap();
+        assert!(
+            best_s > 40.0,
+            "our 5.1 Opus channel {c} best SNR vs any ffmpeg channel only {best_s:.1} dB"
+        );
+        matched[c] = best_r;
+    }
+    let mut seen = [false; CH];
+    for &m in &matched {
+        seen[m] = true;
+    }
+    assert!(
+        seen.iter().all(|&s| s),
+        "the 6 Opus channels must map one-to-one onto ffmpeg's; got {matched:?} (collapse/swap)"
+    );
+}
+
 /// Raw ADTS `.aac` AAC-LC (`aac.aac`) decoded via `open()` matches ffmpeg's own
 /// decode (`aac.aac.ref.pcm`, s16le) within tolerance.
 ///

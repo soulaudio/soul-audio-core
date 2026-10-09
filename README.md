@@ -28,7 +28,7 @@ allows, and the whole decode + seek surface is fuzzed for panic/hang safety.
 | **AAC** | **AAC-LC** (mono … 7.1, incl. 5.1 multichannel), **HE-AAC** (SBR), **HE-AACv2** (Parametric Stereo); MP4/M4A and raw ADTS (`.aac`); sample-accurate seeking |
 | **ALAC** | Apple Lossless, MP4/M4A container, sample-accurate seeking |
 | **Vorbis** | Ogg Vorbis, full decode (floor 1), up to 8 channels (5.1/7.1), page-granular seeking |
-| **Opus** | From-scratch RFC 6716 decoder — SILK, CELT, and hybrid modes; Ogg-encapsulated (RFC 7845), RFC 8251-conformant; sample-accurate seeking |
+| **Opus** | From-scratch RFC 6716 decoder — SILK, CELT, and hybrid modes; Ogg-encapsulated (RFC 7845), RFC 8251-conformant; mono/stereo sample-accurate seeking, plus multichannel surround (5.1/7.1, mapping family 1/255; decode-only) |
 | **DSD** | DSF and DFF/DSDIFF, DoP passthrough, decimation to PCM, DST decompression |
 
 Output is interleaved `i32` in the source's sample range (16/24/32-bit), matching

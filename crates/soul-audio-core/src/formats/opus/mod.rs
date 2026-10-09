@@ -29,6 +29,7 @@ pub mod celt;
 #[doc(hidden)]
 pub mod conformance;
 pub mod container;
+pub mod multistream;
 mod opus_tables;
 pub mod range;
 mod silk;
@@ -160,6 +161,38 @@ pub struct OpusDecoder<S> {
     pcm_pos: usize,
 }
 
+/// Open an Ogg-Opus stream: construct the Ogg packet reader and consume the two
+/// mandatory header packets (RFC 7845 §5) — the identification header
+/// (`OpusHead`, parsed) and the comment header (`OpusTags`, validated by magic
+/// and skipped). Returns the reader positioned at the first audio packet plus
+/// the parsed [`OpusHead`]. Shared by [`OpusDecoder::new`],
+/// [`multistream::MultistreamOpusDecoder::new`], and [`crate::dispatch`] (which
+/// parses the header once, then routes by mapping family).
+///
+/// # Errors
+/// Ogg framing errors ([`OggPackets::new`]/`next_packet`), [`OpusHead::parse`]
+/// validation, or [`DecodeError::Malformed`] if the second packet isn't
+/// `OpusTags`.
+pub(crate) fn open_opus_headers<S: Source>(
+    src: S,
+) -> Result<(OggPackets<S>, OpusHead), DecodeError> {
+    let mut ogg = OggPackets::new(src)?;
+
+    // Packet 1: identification header.
+    let mut id_buf = [0u8; ID_HEADER_BUF];
+    let n = ogg.next_packet(&mut id_buf)?;
+    let head = OpusHead::parse(&id_buf[..n])?;
+
+    // Packet 2: comment header ("OpusTags") — check the magic, discard the
+    // (possibly large) vendor/comment tail.
+    let mut tags_prefix = [0u8; TAGS_PREFIX_BUF];
+    let tn = ogg.read_packet_prefix(&mut tags_prefix)?;
+    if tn < TAGS_PREFIX_BUF || &tags_prefix[..TAGS_PREFIX_BUF] != b"OpusTags" {
+        return Err(DecodeError::Malformed);
+    }
+    Ok((ogg, head))
+}
+
 impl<S: Source> OpusDecoder<S> {
     /// Open an Ogg-Opus stream by consuming its two header packets (RFC 7845
     /// §5): the identification header (`OpusHead`) and the comment header
@@ -171,19 +204,23 @@ impl<S: Source> OpusDecoder<S> {
     /// [`OpusHead::parse`]'s validation errors. [`DecodeError::Malformed`] if
     /// the second packet isn't `OpusTags`.
     pub fn new(src: S) -> Result<Self, DecodeError> {
-        let mut ogg = OggPackets::new(src)?;
+        let (ogg, head) = open_opus_headers(src)?;
+        Self::from_parts(ogg, head)
+    }
 
-        // Packet 1: identification header.
-        let mut id_buf = [0u8; ID_HEADER_BUF];
-        let n = ogg.next_packet(&mut id_buf)?;
-        let head = OpusHead::parse(&id_buf[..n])?;
-
-        // Packet 2: comment header ("OpusTags") — check the magic, discard
-        // the (possibly large) vendor/comment tail.
-        let mut tags_prefix = [0u8; TAGS_PREFIX_BUF];
-        let tn = ogg.read_packet_prefix(&mut tags_prefix)?;
-        if tn < TAGS_PREFIX_BUF || &tags_prefix[..TAGS_PREFIX_BUF] != b"OpusTags" {
-            return Err(DecodeError::Malformed);
+    /// Build a **single-stream** Opus decoder from an already-opened Ogg reader
+    /// (positioned at the first audio packet) and its parsed [`OpusHead`]. Split
+    /// out of [`Self::new`] so [`crate::dispatch`] can parse the header once and
+    /// route by mapping family — family 0 here, families 1/255 to
+    /// [`MultistreamOpusDecoder`](multistream::MultistreamOpusDecoder).
+    ///
+    /// # Errors
+    /// [`DecodeError::Unsupported`] for a non-zero mapping family (this type only
+    /// decodes mono/stereo family 0; multichannel is the multistream decoder's
+    /// job).
+    pub(crate) fn from_parts(ogg: OggPackets<S>, head: OpusHead) -> Result<Self, DecodeError> {
+        if head.mapping_family != 0 {
+            return Err(DecodeError::Unsupported);
         }
 
         let stream_info = StreamInfo {
@@ -381,7 +418,12 @@ fn emit_silence(pcm_buf: &mut [i32], pcm_len: &mut usize, count: usize) {
 /// `[start, end)` sub-range of the frame to emit — empty when the frame is
 /// wholly below `skip_to` (pre-skip / seek run-in) or wholly past the granule
 /// ceiling (final-page end-trim).
-fn trim_frame(granule: &mut u64, skip_to: u64, page_granule: u64, per_ch: usize) -> (usize, usize) {
+pub(crate) fn trim_frame(
+    granule: &mut u64,
+    skip_to: u64,
+    page_granule: u64,
+    per_ch: usize,
+) -> (usize, usize) {
     let frame_start = *granule;
     let frame_end = frame_start + per_ch as u64;
     *granule = frame_end;
