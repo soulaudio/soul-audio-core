@@ -446,14 +446,19 @@ fn open_decodes_aac_5p1_matching_ffmpeg() {
 /// Checked like the AAC 5.1 test — bijection of our channels onto ffmpeg's own
 /// decode by best per-channel SNR (no channel collapsed/duplicated/swapped) —
 /// with one addition: each channel's SNR is maximized over a **small** offset
-/// window, not just the one global offset. The streams are decoded by
-/// independent cores, and a SILK-coded stream (the LFE here) carries a resampler
-/// delay a few samples different from the CELT streams, so the channels aren't
-/// all sample-identical to ffmpeg's layout; the per-channel offset absorbs that
-/// (±32 samples ≈ ≤0.7 ms, inaudible). The 5 full-range channels match at
-/// 77-85 dB; the 90 Hz LFE at ~43 dB (low-frequency, few-bit stream) — the bar
-/// is 40 dB for all, which still decisively rejects a wrong/garbled channel
-/// (those score near 0 dB).
+/// window, not just the one global offset. libopus encodes this stream as 3
+/// CELT-only streams (the 5 full-range channels) plus one **Hybrid** stream for
+/// the 90 Hz LFE, and the Hybrid low band is SILK-resampled: our decoder
+/// transcribes SILK's resampler bit-exactly (vs libopus) but ffmpeg's native
+/// Opus decoder substitutes libswresample, whose group delay differs by a couple
+/// of samples — exactly the ffmpeg-vs-libopus ceiling the `hybrid-mono` golden
+/// above documents (where native-ffmpeg vs libopus itself only reaches ~24 dB).
+/// So the per-channel offset absorbs that sub-sample resampler delay, and the
+/// LFE caps lower against ffmpeg than the CELT channels — not a decode error.
+/// The 5 full-range (CELT) channels match at 77-85 dB; the Hybrid LFE at ~43 dB
+/// (a 90 Hz tone is almost all low band, so it clears 40 handily despite the
+/// resampler mismatch). The 40 dB bar still decisively rejects a wrong/garbled
+/// or mis-mapped channel (those score near 0 dB).
 #[test]
 fn open_decodes_opus_5p1_matching_ffmpeg() {
     const CH: usize = 6;
