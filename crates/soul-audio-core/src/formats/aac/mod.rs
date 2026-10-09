@@ -331,6 +331,18 @@ impl<S: Source> AacDecoder<S> {
         self.total_samples
     }
 
+    /// Gapless encoder delay (leading priming, per-channel samples) from the
+    /// MP4 `elst` edit list; `0` for raw ADTS (no container edit list) or an MP4
+    /// without one. The decoder emits the full decode — a player trims this many
+    /// samples off the front for gapless playback.
+    #[must_use]
+    pub fn encoder_delay(&self) -> u64 {
+        match &self.src {
+            FrameSrc::Mp4(r) => r.encoder_delay(),
+            FrameSrc::Adts(_) => 0,
+        }
+    }
+
     /// Decode the next access unit into `self.pcm`, looping past any audio-less
     /// blocks. `Ok(false)` at end of stream.
     fn fill_next_frame(&mut self) -> Result<bool, DecodeError> {

@@ -290,6 +290,11 @@ fn open_decodes_aac_mp4_matching_ffmpeg_within_tolerance() {
     let dec = open(SliceSource::new(m4a)).expect("probe + construct AAC/MP4");
     assert_eq!(dec.stream_info().sample_rate, 44_100);
     assert_eq!(dec.stream_info().channels, 2);
+    // The MP4 `elst` edit list surfaces as the gapless encoder delay (AAC-LC
+    // priming): `open()` exposes it via `AnyDecoder::encoder_delay`. Decode is
+    // still the full (untrimmed) span — hence the priming offset the SNR search
+    // below finds; a player trims `encoder_delay` frames off the front.
+    assert_eq!(dec.encoder_delay(), 1024);
     let ours = decode_all(m4a);
     let (off, snr) = best_align_segsnr(&ours, &refr, 2);
     assert!(
