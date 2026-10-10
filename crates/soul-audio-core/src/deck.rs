@@ -104,9 +104,15 @@ struct Track<D> {
     /// Source→canonical scale (`2^(24-bits)`).
     norm: f32,
     rate: u32,
-    /// Per-channel source frames consumed so far (playback position).
+    /// Per-channel source frames consumed so far (playback position), counted
+    /// from the first *playable* frame (after the gapless encoder-delay skip).
     pos: u64,
     total: Option<u64>,
+    /// Gapless encoder-delay frames still to discard before emitting output —
+    /// the leading priming the decoder reports via [`Decoder::encoder_delay`].
+    /// `0` once drained (or for a delay-free track). Draining it at each track's
+    /// first block is what makes lossy track boundaries gapless.
+    skip_remaining: u64,
     /// Decoder hit end of stream.
     eof: bool,
     /// Remaining silence-fed pumps to drain the resampler tail after `eof`.
@@ -182,8 +188,15 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             SampleFormat::Int { bits } | SampleFormat::Float { bits } => bits,
             SampleFormat::Dsd { .. } => return Err(DeckError::ChannelMismatch),
         };
+        // Gapless: the playable length is the stream minus its leading encoder
+        // delay (the decoder reports the delay but emits the full stream; the
+        // deck discards the delay below). Trailing padding is not yet modeled.
+        let encoder_delay = decoder.encoder_delay();
+        let total = decoder
+            .total_frames()
+            .map(|t| t.saturating_sub(encoder_delay));
         Ok(Track {
-            total: decoder.total_frames(),
+            total,
             decoder,
             resampler,
             channels: ch,
@@ -191,6 +204,7 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             norm: libm_exp2(f32::from(CANONICAL_BITS as i16 - i16::from(bits))),
             rate: si.sample_rate,
             pos: 0,
+            skip_remaining: encoder_delay,
             eof: false,
             drain: 0,
         })
@@ -377,9 +391,41 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         }
     }
 
+    /// Discard the current track's gapless encoder-delay (leading priming)
+    /// source frames before any output is produced. A no-op after the first
+    /// block, for a delay-free track, or once the decoder hits EOF. Decodes into
+    /// `in_buf` and throws the frames away, so the first emitted sample is the
+    /// track's first *playable* sample — which is what makes a lossy track
+    /// boundary (where the next track was preloaded) gapless.
+    fn drain_encoder_delay(&mut self) -> Result<(), DeckError> {
+        let track = self.current.as_mut().unwrap();
+        if track.skip_remaining == 0 || track.eof {
+            return Ok(());
+        }
+        let ch = track.channels;
+        while track.skip_remaining > 0 && !track.eof {
+            // Bounded by `in_buf`'s frame capacity; a large delay drains over
+            // several decode calls.
+            let want = track.skip_remaining.min(IN_FIFO as u64) as usize;
+            let n = track
+                .decoder
+                .decode_into(&mut self.in_buf[..want * ch])
+                .map_err(DeckError::Decode)?;
+            if n == 0 {
+                // Track shorter than its declared delay (degenerate/truncated):
+                // nothing left to play.
+                track.eof = true;
+                break;
+            }
+            track.skip_remaining -= (n / ch) as u64;
+        }
+        Ok(())
+    }
+
     /// Produce and write one output block from the current track. Returns `true`
     /// when the track has fully finished (decoder EOF + resampler tail drained).
     fn produce_block(&mut self) -> Result<bool, DeckError> {
+        self.drain_encoder_delay()?;
         let sink_ch = self.sink_channels;
         // Decide the resampled/plain source block and how many frames it yields.
         let (out_frames, finished) = if self.current.as_ref().unwrap().resampler.is_some() {
@@ -529,6 +575,50 @@ mod tests {
         }
     }
 
+    /// Emits a per-channel ramp — sample value == the source frame index — at
+    /// 48 kHz, 24-bit (so the deck's normalization is the identity: norm
+    /// `2^(24-24) = 1`), reporting a gapless `encoder_delay`. Lets a test see
+    /// exactly which source frames the deck emitted: a value of `k` in the sink
+    /// is source frame `k`, so a skipped leading `delay` shows up as the first
+    /// emitted value being `delay`.
+    struct RampDecoder {
+        ch: usize,
+        frames: u64,
+        pos: u64,
+        delay: u64,
+    }
+    impl Decoder for RampDecoder {
+        fn stream_info(&self) -> StreamInfo {
+            StreamInfo {
+                sample_rate: 48_000,
+                channels: self.ch as u16,
+                format: SampleFormat::Int { bits: 24 },
+            }
+        }
+        fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {
+            let want = ((out.len() / self.ch) as u64).min(self.frames - self.pos) as usize;
+            for f in 0..want {
+                for c in 0..self.ch {
+                    out[f * self.ch + c] = (self.pos + f as u64) as i32;
+                }
+            }
+            self.pos += want as u64;
+            Ok(want * self.ch)
+        }
+        fn encoder_delay(&self) -> u64 {
+            self.delay
+        }
+    }
+    impl SeekableDecoder for RampDecoder {
+        fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+            self.pos = sample.min(self.frames);
+            Ok(self.pos)
+        }
+        fn total_frames(&self) -> Option<u64> {
+            Some(self.frames)
+        }
+    }
+
     struct MockSink {
         rate: u32,
         ch: usize,
@@ -594,6 +684,82 @@ mod tests {
         assert_eq!(deck.sink.written.len(), 1000);
         assert!(deck.sink.written.iter().all(|&s| s == 25_600));
         assert_eq!(deck.state(), DeckState::Ended);
+    }
+
+    #[test]
+    fn gapless_encoder_delay_trims_leading_priming() {
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 1,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
+        // 600-frame ramp with a 100-frame gapless encoder delay.
+        deck.load(RampDecoder {
+            ch: 1,
+            frames: 600,
+            pos: 0,
+            delay: 100,
+        })
+        .unwrap();
+        // Duration reflects the trimmed (playable) length, not the full stream.
+        assert_eq!(deck.duration_frames(), Some(500));
+        run(&mut deck);
+        let out = &deck.sink.written;
+        assert_eq!(
+            out.len(),
+            500,
+            "600 frames minus the 100-frame encoder delay"
+        );
+        assert_eq!(
+            out[0], 100,
+            "first emitted sample is source frame 100 — the 100-frame priming was skipped"
+        );
+        assert_eq!(
+            out[499], 599,
+            "last emitted sample is the final source frame"
+        );
+    }
+
+    #[test]
+    fn gapless_swap_trims_next_track_priming() {
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 1,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
+        // A: no delay, 300 frames (ramp 0..=299). B: 50-frame priming, 200 frames.
+        deck.load(RampDecoder {
+            ch: 1,
+            frames: 300,
+            pos: 0,
+            delay: 0,
+        })
+        .unwrap();
+        deck.preload(RampDecoder {
+            ch: 1,
+            frames: 200,
+            pos: 0,
+            delay: 50,
+        })
+        .unwrap();
+        let swaps = run(&mut deck);
+        assert_eq!(swaps, 1, "one gapless swap");
+        let out = &deck.sink.written;
+        // A: 300 frames (0..=299); B: 200-50 = 150 frames (50..=199). No gap.
+        assert_eq!(
+            out.len(),
+            450,
+            "A (300) + B trimmed (150), no silence between"
+        );
+        assert_eq!(out[299], 299, "A's final frame");
+        assert_eq!(
+            out[300], 50,
+            "B resumes at its first playable frame (50) — its priming was trimmed at the swap"
+        );
     }
 
     #[test]

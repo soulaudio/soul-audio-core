@@ -743,16 +743,6 @@ impl<S: Source> AlacDecoder<S> {
         }
     }
 
-    /// Gapless encoder delay (leading priming, per-channel samples) from the
-    /// MP4 `elst` edit list; `0` if the file declares none. The decoder emits
-    /// the full decode — a player trims this many samples off the front for
-    /// gapless playback. (ALAC is lossless and usually has no real delay, but a
-    /// container-level edit list is still honored when present.)
-    #[must_use]
-    pub fn encoder_delay(&self) -> u64 {
-        self.reader.encoder_delay()
-    }
-
     /// Refill the sliding input buffer and decode one packet into `scratch.out`.
     /// Returns `Ok(false)` at end of stream.
     fn decode_next_packet(&mut self) -> Result<bool, DecodeError> {
@@ -822,6 +812,13 @@ impl<S: Source> Decoder for AlacDecoder<S> {
             written += n;
         }
         Ok(written)
+    }
+
+    /// Gapless encoder delay from the MP4 `elst` edit list; `0` if none. ALAC is
+    /// lossless (no real encoder delay), but a container edit list is honored.
+    /// The [`Deck`](crate::deck::Deck) trims this many frames off the front.
+    fn encoder_delay(&self) -> u64 {
+        self.reader.encoder_delay()
     }
 }
 

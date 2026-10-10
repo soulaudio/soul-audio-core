@@ -44,6 +44,17 @@ pub trait Decoder {
     ///
     /// Returns the number of samples written; `Ok(0)` means end of stream.
     fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError>;
+
+    /// Gapless encoder delay: leading priming samples (per channel) to discard
+    /// from the front of the decode for gapless playback — e.g. the AAC-LC
+    /// priming from an MP4 `elst` edit list. The decoder itself does **not**
+    /// trim them (its output is the full stream); the [`Deck`](crate::deck::Deck)
+    /// discards this many frames at the start of each track. Defaults to `0`:
+    /// lossless formats have no delay, and Ogg (Opus/Vorbis) applies its granule
+    /// pre-skip inside the decoder already.
+    fn encoder_delay(&self) -> u64 {
+        0
+    }
 }
 
 /// A [`Decoder`] that can also seek and report its length — the capability the

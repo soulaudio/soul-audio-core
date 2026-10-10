@@ -333,10 +333,11 @@ impl<S: Source> AacDecoder<S> {
 
     /// Gapless encoder delay (leading priming, per-channel samples) from the
     /// MP4 `elst` edit list; `0` for raw ADTS (no container edit list) or an MP4
-    /// without one. The decoder emits the full decode — a player trims this many
-    /// samples off the front for gapless playback.
-    #[must_use]
-    pub fn encoder_delay(&self) -> u64 {
+    /// without one. The decoder emits the full decode — the [`Deck`] trims this
+    /// many samples off the front for gapless playback.
+    ///
+    /// [`Deck`]: crate::deck::Deck
+    fn mp4_encoder_delay(&self) -> u64 {
         match &self.src {
             FrameSrc::Mp4(r) => r.encoder_delay(),
             FrameSrc::Adts(_) => 0,
@@ -648,6 +649,10 @@ impl<S: Source> Decoder for AacDecoder<S> {
             written += n;
         }
         Ok(written)
+    }
+
+    fn encoder_delay(&self) -> u64 {
+        self.mp4_encoder_delay()
     }
 }
 

@@ -50,28 +50,6 @@ pub enum AnyDecoder<S> {
     OpusMs(MultistreamOpusDecoder<S>),
 }
 
-impl<S: crate::io::Source> AnyDecoder<S> {
-    /// Gapless **encoder delay**: leading priming samples (per channel) a player
-    /// trims off the front for gapless playback, from the MP4 `elst` edit list.
-    /// `0` for formats/containers without one (WAV/FLAC are lossless; raw ADTS
-    /// and Ogg have no edit list — Opus/Vorbis instead carry their own granule
-    /// pre-skip, already applied in-decoder). The decoded PCM itself is **not**
-    /// trimmed; this is the count the caller discards.
-    #[must_use]
-    pub fn encoder_delay(&self) -> u64 {
-        match self {
-            AnyDecoder::Alac(d) => d.encoder_delay(),
-            AnyDecoder::Aac(d) => d.encoder_delay(),
-            AnyDecoder::Wav(_)
-            | AnyDecoder::Flac(_)
-            | AnyDecoder::Mp3(_)
-            | AnyDecoder::OggFlac(_)
-            | AnyDecoder::Opus(_)
-            | AnyDecoder::OpusMs(_) => 0,
-        }
-    }
-}
-
 impl<S: crate::io::SeekSource> AnyDecoder<S> {
     /// Total per-channel frames, if the stream declares a length. `None` for a
     /// raw MP3 without a Xing/Info/VBRI header, or for an Opus stream with no
@@ -179,6 +157,23 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::Aac(d) => d.decode_into(out),
             AnyDecoder::Opus(d) => d.decode_into(out),
             AnyDecoder::OpusMs(d) => d.decode_into(out),
+        }
+    }
+
+    /// Gapless encoder delay (leading priming, per-channel samples). Non-zero
+    /// only for the MP4 codecs with an `elst` edit list (AAC/ALAC); every other
+    /// variant uses the `Decoder` default of 0 (lossless, or Ogg pre-skip
+    /// applied in-decoder).
+    fn encoder_delay(&self) -> u64 {
+        match self {
+            AnyDecoder::Alac(d) => d.encoder_delay(),
+            AnyDecoder::Aac(d) => d.encoder_delay(),
+            AnyDecoder::Wav(_)
+            | AnyDecoder::Flac(_)
+            | AnyDecoder::Mp3(_)
+            | AnyDecoder::OggFlac(_)
+            | AnyDecoder::Opus(_)
+            | AnyDecoder::OpusMs(_) => 0,
         }
     }
 }
