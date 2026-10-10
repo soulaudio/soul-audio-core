@@ -14,6 +14,12 @@ use crate::formats::mp3_codec::Mp3Codec;
 use crate::io::{SeekSource, Source};
 use crate::model::StreamInfo;
 
+/// MPEG Layer III decoder delay (per-channel samples): the subband-synthesis
+/// filterbank's group delay, present as leading output samples before the first
+/// true sample. Added to the LAME/Lavc encoder delay for the gapless leading
+/// skip, matching LAME's `DECODERDELAY` and ffmpeg's `528 + 1`.
+const MP3_DECODER_DELAY: u64 = 529;
+
 /// Largest MPEG frame we packetize/decode. The worst case is MPEG-1 Layer II at
 /// 384 kbps / 32 kHz = 1728 bytes (Layer III tops out at 1441); round up for
 /// headroom. Larger (free-format) frames are declined by the demuxer.
@@ -148,6 +154,23 @@ impl<S: Source> Decoder for Mp3Decoder<S> {
             w += 1;
         }
         Ok(w)
+    }
+
+    fn encoder_delay(&self) -> u64 {
+        // Gapless leading skip = the LAME/Lavc info-tag encoder delay plus the
+        // MPEG Layer III decoder delay (529 samples — the subband-synthesis
+        // filterbank group delay this decoder, like the reference, carries as
+        // leading output). Only applied when a recognized info tag declared a
+        // delay; a tagless stream reports 0 (no reliable gapless info, so no
+        // trim — the decoder-delay samples stay, as before). Verified against
+        // ffmpeg: LAME delay 576 + 529 = 1105, exactly ffmpeg's gapless leading
+        // skip on `vbr-44100-stereo.mp3`.
+        let enc = self.demux.encoder_delay();
+        if enc == 0 {
+            0
+        } else {
+            u64::from(enc) + MP3_DECODER_DELAY
+        }
     }
 }
 
@@ -1111,6 +1134,21 @@ mod tests {
                 "VBR TOC seek({target}) did not converge"
             );
         }
+    }
+
+    #[test]
+    fn mp3_vbr_reports_gapless_encoder_delay() {
+        // `vbr-44100-stereo.mp3` carries a Lavc info tag with encoder delay 576.
+        // The gapless leading skip is that plus the 529-sample MPEG decoder
+        // delay = 1105 — cross-checked against ffmpeg, whose gapless output is
+        // exactly this stream's decode shifted 1105 frames (8000/8000 samples).
+        let dec = Mp3Decoder::new(SliceSource::new(VBR_MP3)).unwrap();
+        assert_eq!(dec.encoder_delay(), 1105);
+        // The inline CBR clip is also a Lavc encode (Info tag, same 576 delay),
+        // so it reports the same 1105. (The no-tag → 0 path is covered by the
+        // `parse_lame_delay` unit test in the mp3 demuxer.)
+        let cbr = Mp3Decoder::new(SliceSource::new(STEREO_MP3)).unwrap();
+        assert_eq!(cbr.encoder_delay(), 1105);
     }
 
     #[test]

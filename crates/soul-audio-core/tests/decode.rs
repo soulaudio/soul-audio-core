@@ -2217,6 +2217,9 @@ fn open_surfaces_mp3_stream_info() {
     let mut dec = open(SliceSource::new(&bytes)).expect("probe + construct");
     assert_eq!(dec.stream_info().sample_rate, 44_100);
     assert_eq!(dec.stream_info().channels, 2);
+    // No Xing/Info tag → no gapless info → `AnyDecoder::encoder_delay` is 0 (the
+    // decoder-delay samples are not trimmed; a tagged stream reports delay+529).
+    assert_eq!(dec.encoder_delay(), 0);
     let mut out = [7i32; 8];
     let n = dec.decode_into(&mut out).unwrap();
     assert_eq!(n, 8);

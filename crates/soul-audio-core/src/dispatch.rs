@@ -161,16 +161,17 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
     }
 
     /// Gapless encoder delay (leading priming, per-channel samples). Non-zero
-    /// only for the MP4 codecs with an `elst` edit list (AAC/ALAC); every other
-    /// variant uses the `Decoder` default of 0 (lossless, or Ogg pre-skip
+    /// for the MP4 codecs with an `elst` edit list (AAC/ALAC) and for MP3 with a
+    /// LAME/Lavc info tag (its encoder delay + the MPEG decoder delay); every
+    /// other variant uses the `Decoder` default of 0 (lossless, or Ogg pre-skip
     /// applied in-decoder).
     fn encoder_delay(&self) -> u64 {
         match self {
             AnyDecoder::Alac(d) => d.encoder_delay(),
             AnyDecoder::Aac(d) => d.encoder_delay(),
+            AnyDecoder::Mp3(d) => d.encoder_delay(),
             AnyDecoder::Wav(_)
             | AnyDecoder::Flac(_)
-            | AnyDecoder::Mp3(_)
             | AnyDecoder::OggFlac(_)
             | AnyDecoder::Opus(_)
             | AnyDecoder::OpusMs(_) => 0,
