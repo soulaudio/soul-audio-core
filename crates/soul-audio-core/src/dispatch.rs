@@ -177,6 +177,23 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             | AnyDecoder::OpusMs(_) => 0,
         }
     }
+
+    /// Gapless playable length (frames to emit after the `encoder_delay` skip).
+    /// Currently non-`None` only for MP3 (LAME/Lavc padding); MP4 trailing trim
+    /// awaits the `elst` present-length (`mvhd`) parse, so AAC/ALAC are `None`
+    /// (leading-only). Every other variant uses the `Decoder` default (`None`).
+    fn playable_frames(&self) -> Option<u64> {
+        match self {
+            AnyDecoder::Mp3(d) => d.playable_frames(),
+            AnyDecoder::Wav(_)
+            | AnyDecoder::Flac(_)
+            | AnyDecoder::OggFlac(_)
+            | AnyDecoder::Alac(_)
+            | AnyDecoder::Aac(_)
+            | AnyDecoder::Opus(_)
+            | AnyDecoder::OpusMs(_) => None,
+        }
+    }
 }
 
 /// Probe `src`, then construct the matching PCM decoder.

@@ -67,6 +67,10 @@ struct VbrTag {
     /// delays field; `0` when no recognized info tag is present. The gapless
     /// leading skip the decoder reports is this plus the MPEG decoder delay.
     enc_delay: u32,
+    /// Encoder padding (per-channel trailing samples added to fill the last
+    /// frame) from the same delays field; `0` when none. Used to compute the
+    /// gapless playable length.
+    enc_padding: u32,
 }
 
 /// MP3 container parser over a byte [`Source`].
@@ -181,6 +185,14 @@ impl<S: Source> Mp3Demuxer<S> {
     #[must_use]
     pub fn encoder_delay(&self) -> u32 {
         self.vbr.map_or(0, |v| v.enc_delay)
+    }
+
+    /// Encoder padding (per-channel trailing samples) from the LAME/Lavc info
+    /// tag; `0` when none. The gapless trailing trim is this minus the MPEG
+    /// decoder delay.
+    #[must_use]
+    pub fn encoder_padding(&self) -> u32 {
+        self.vbr.map_or(0, |v| v.enc_padding)
     }
 
     /// Read the next frame header (resyncing past garbage). `Ok(None)` at EOF.
@@ -401,7 +413,7 @@ fn parse_vbr_tag(frame: &[u8], f: &Frame) -> Option<VbrTag> {
             // "encoder delays" field sits at offset 21: delay (12 bits) +
             // padding (12 bits). Guard on a recognized vendor so a bare Xing
             // tag (no extension) isn't misread as garbage delay.
-            let enc_delay = parse_lame_delay(frame, p);
+            let (enc_delay, enc_padding) = parse_lame_delays(frame, p);
             if total_frames > 0 {
                 return Some(VbrTag {
                     total_frames,
@@ -409,6 +421,7 @@ fn parse_vbr_tag(frame: &[u8], f: &Frame) -> Option<VbrTag> {
                     cbr,
                     toc,
                     enc_delay,
+                    enc_padding,
                 });
             }
         }
@@ -427,29 +440,31 @@ fn parse_vbr_tag(frame: &[u8], f: &Frame) -> Option<VbrTag> {
                 cbr: false,
                 toc: None,
                 enc_delay: 0, // VBRI has no LAME encoder-delay field
+                enc_padding: 0,
             });
         }
     }
     None
 }
 
-/// Read the encoder delay (per-channel priming samples) from a LAME/Lavc info
-/// tag whose 9-byte vendor string begins at `off` in `frame`. The "encoder
-/// delays" field is 3 bytes at offset 21 — `delay` is the high 12 bits. Returns
-/// `0` unless a recognized vendor (`LAME`/`Lavc`) is present with the full
-/// field in range (so a Xing tag without the extension, or an unknown encoder,
-/// yields no spurious delay). The trailing padding (low 12 bits) isn't returned
-/// — only the leading delay is applied for gapless.
-fn parse_lame_delay(frame: &[u8], off: usize) -> u32 {
+/// Read the encoder `(delay, padding)` (per-channel samples) from a LAME/Lavc
+/// info tag whose 9-byte vendor string begins at `off` in `frame`. The "encoder
+/// delays" field is 3 bytes at offset 21 — `delay` is the high 12 bits, padding
+/// the low 12. Returns `(0, 0)` unless a recognized vendor (`LAME`/`Lavc`) is
+/// present with the full field in range (so a Xing tag without the extension,
+/// or an unknown encoder, yields no spurious values).
+fn parse_lame_delays(frame: &[u8], off: usize) -> (u32, u32) {
     let tag = match frame.get(off..off + 24) {
         Some(t) => t,
-        None => return 0,
+        None => return (0, 0),
     };
     if &tag[0..4] != b"LAME" && &tag[0..4] != b"Lavc" {
-        return 0;
+        return (0, 0);
     }
     // bytes 21..24: delay(12) | padding(12).
-    (u32::from(tag[21]) << 4) | (u32::from(tag[22]) >> 4)
+    let delay = (u32::from(tag[21]) << 4) | (u32::from(tag[22]) >> 4);
+    let padding = ((u32::from(tag[22]) & 0xF) << 8) | u32::from(tag[23]);
+    (delay, padding)
 }
 
 /// Parse+validate a 4-byte MPEG Layer III frame header. `None` if not a valid L3
@@ -525,25 +540,25 @@ mod tests {
     use crate::io::SliceSource;
 
     #[test]
-    fn parse_lame_delay_reads_recognized_tag_and_rejects_others() {
+    fn parse_lame_delays_reads_recognized_tag_and_rejects_others() {
         // A LAME/Lavc info tag: 9-byte vendor, then the delays field at offset
-        // 21 (delay 12 bits | padding 12 bits). delay=576=0x240 → bytes 0x24,
-        // 0x0_ ; here 0x24,0x03,0xC0 → delay 0x240=576, padding 0x3C0=960.
+        // 21 (delay 12 bits | padding 12 bits). 0x24,0x03,0xC0 → delay 0x240 =
+        // 576, padding 0x3C0 = 960.
         let mut buf = [0u8; 40];
         buf[0..4].copy_from_slice(b"LAME");
         buf[21] = 0x24;
         buf[22] = 0x03;
         buf[23] = 0xC0;
-        assert_eq!(parse_lame_delay(&buf, 0), 576);
+        assert_eq!(parse_lame_delays(&buf, 0), (576, 960));
         buf[0..4].copy_from_slice(b"Lavc");
-        assert_eq!(parse_lame_delay(&buf, 0), 576);
+        assert_eq!(parse_lame_delays(&buf, 0), (576, 960));
 
-        // Unknown vendor → no gapless info → 0 (no spurious delay from a bare
-        // Xing tag or non-LAME encoder).
+        // Unknown vendor → no gapless info → (0, 0) (no spurious values from a
+        // bare Xing tag or non-LAME encoder).
         buf[0..4].copy_from_slice(b"XXXX");
-        assert_eq!(parse_lame_delay(&buf, 0), 0);
-        // Out of range (frame too short for the 24-byte tag) → 0.
-        assert_eq!(parse_lame_delay(&buf, 20), 0);
+        assert_eq!(parse_lame_delays(&buf, 0), (0, 0));
+        // Out of range (frame too short for the 24-byte tag) → (0, 0).
+        assert_eq!(parse_lame_delays(&buf, 20), (0, 0));
     }
 
     /// Build a 4-byte MPEG-1 Layer III header (stereo unless `mono`).

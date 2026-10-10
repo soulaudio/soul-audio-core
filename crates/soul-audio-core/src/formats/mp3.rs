@@ -177,6 +177,25 @@ impl<S: Source> Decoder for Mp3Decoder<S> {
             u64::from(self.demux.samples_per_frame()) + u64::from(enc) + MP3_DECODER_DELAY
         }
     }
+
+    fn playable_frames(&self) -> Option<u64> {
+        // Content length = the declared audio length (`total_samples`, which
+        // EXCLUDES the tag frame) minus the LAME/Lavc encoder delay and padding
+        // — the audio basis, kept separate from `encoder_delay`'s output basis
+        // (which adds the tag frame + decoder delay). For `vbr-44100-stereo`:
+        // 46080 − 576 − 1404 = 44100, exactly ffmpeg's gapless length. `None`
+        // without a recognized info tag (no trailing trim).
+        let enc = self.demux.encoder_delay();
+        if enc == 0 {
+            return None;
+        }
+        let total = self.demux.total_samples()?;
+        Some(
+            total
+                .saturating_sub(u64::from(enc))
+                .saturating_sub(u64::from(self.demux.encoder_padding())),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1151,6 +1170,11 @@ mod tests {
         // lossy ±1-LSB rounding between the two decoders).
         let dec = Mp3Decoder::new(SliceSource::new(VBR_MP3)).unwrap();
         assert_eq!(dec.encoder_delay(), 2257);
+        // Playable length = audio length − enc_delay − enc_padding =
+        // 46080 − 576 − 1404 = 44100 — exactly ffmpeg's gapless output length.
+        // (Audio basis: `total_samples` excludes the tag frame, so this is NOT
+        // `total − encoder_delay`.) The Deck emits this many frames then stops.
+        assert_eq!(dec.playable_frames(), Some(44_100));
         // The inline CBR clip is also a Lavc MPEG-1 encode (same spf + 576
         // delay), so it reports the same 2257. (The no-tag → 0 path is covered
         // by the `parse_lame_delay` unit test in the mp3 demuxer.)

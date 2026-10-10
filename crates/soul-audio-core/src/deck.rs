@@ -108,6 +108,11 @@ struct Track<D> {
     /// from the first *playable* frame (after the gapless encoder-delay skip).
     pos: u64,
     total: Option<u64>,
+    /// Gapless **playable length** — the number of post-skip frames to emit
+    /// before stopping, from [`Decoder::playable_frames`]. `Some` trims the
+    /// track's trailing encoder padding (so the next track abuts gaplessly);
+    /// `None` plays to the decoder's end. Counted against `pos`.
+    emit_cap: Option<u64>,
     /// Gapless encoder-delay frames still to discard before emitting output —
     /// the leading priming the decoder reports via [`Decoder::encoder_delay`].
     /// `0` once drained (or for a delay-free track). Draining it at each track's
@@ -188,13 +193,18 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             SampleFormat::Int { bits } | SampleFormat::Float { bits } => bits,
             SampleFormat::Dsd { .. } => return Err(DeckError::ChannelMismatch),
         };
-        // Gapless: the playable length is the stream minus its leading encoder
-        // delay (the decoder reports the delay but emits the full stream; the
-        // deck discards the delay below). Trailing padding is not yet modeled.
+        // Gapless: discard `encoder_delay` leading frames, then emit either the
+        // decoder's declared playable length (`playable_frames` — trims the
+        // trailing padding too) or, when it doesn't declare one, everything left
+        // after the delay. `total` (the reported duration) follows the same:
+        // the playable length if known, else the delay-trimmed stream length.
         let encoder_delay = decoder.encoder_delay();
-        let total = decoder
-            .total_frames()
-            .map(|t| t.saturating_sub(encoder_delay));
+        let emit_cap = decoder.playable_frames();
+        let total = emit_cap.or_else(|| {
+            decoder
+                .total_frames()
+                .map(|t| t.saturating_sub(encoder_delay))
+        });
         Ok(Track {
             total,
             decoder,
@@ -204,6 +214,7 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             norm: libm_exp2(f32::from(CANONICAL_BITS as i16 - i16::from(bits))),
             rate: si.sample_rate,
             pos: 0,
+            emit_cap,
             skip_remaining: encoder_delay,
             eof: false,
             drain: 0,
@@ -479,6 +490,20 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
                 have += n / ch;
             }
         }
+        // Gapless trailing trim: never feed past the playable length. Clamp the
+        // real frames to the remaining room and treat reaching the cap like EOF
+        // so the resampler drains its tail (then zero-pad as the EOF path does).
+        if let Some(cap) = track.emit_cap {
+            let room = cap.saturating_sub(track.pos);
+            if have as u64 > room {
+                have = room as usize;
+            }
+            if !track.eof && track.pos + have as u64 >= cap {
+                track.eof = true;
+                let lat = track.resampler.as_ref().unwrap().latency();
+                track.drain = lat / BLOCK + 2;
+            }
+        }
         for s in &mut self.in_buf[have * ch..need * ch] {
             *s = 0;
         }
@@ -513,8 +538,18 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             }
             have += n / ch;
         }
+        let mut finished = have < BLOCK; // decoder end of stream
+        // Gapless trailing trim: stop at the playable length, dropping the
+        // trailing padding (no resampler here, so finishing is immediate).
+        if let Some(cap) = track.emit_cap {
+            let room = cap.saturating_sub(track.pos);
+            if have as u64 >= room {
+                have = room as usize;
+                finished = true;
+            }
+        }
         track.pos += have as u64;
-        Ok((have, have < BLOCK))
+        Ok((have, finished))
     }
 }
 
@@ -586,6 +621,7 @@ mod tests {
         frames: u64,
         pos: u64,
         delay: u64,
+        playable: Option<u64>,
     }
     impl Decoder for RampDecoder {
         fn stream_info(&self) -> StreamInfo {
@@ -607,6 +643,9 @@ mod tests {
         }
         fn encoder_delay(&self) -> u64 {
             self.delay
+        }
+        fn playable_frames(&self) -> Option<u64> {
+            self.playable
         }
     }
     impl SeekableDecoder for RampDecoder {
@@ -701,6 +740,7 @@ mod tests {
             frames: 600,
             pos: 0,
             delay: 100,
+            playable: None,
         })
         .unwrap();
         // Duration reflects the trimmed (playable) length, not the full stream.
@@ -723,6 +763,88 @@ mod tests {
     }
 
     #[test]
+    fn gapless_trailing_padding_is_trimmed() {
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 1,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
+        // 600-frame ramp: 100-frame leading delay, playable length 400 → the
+        // 100 trailing frames (500..=599) are the padding and must be dropped.
+        deck.load(RampDecoder {
+            ch: 1,
+            frames: 600,
+            pos: 0,
+            delay: 100,
+            playable: Some(400),
+        })
+        .unwrap();
+        assert_eq!(
+            deck.duration_frames(),
+            Some(400),
+            "duration is the playable length"
+        );
+        run(&mut deck);
+        let out = &deck.sink.written;
+        assert_eq!(
+            out.len(),
+            400,
+            "emit exactly the playable length (100 trailing dropped)"
+        );
+        assert_eq!(out[0], 100, "starts after the leading skip");
+        assert_eq!(
+            out[399], 499,
+            "last emitted frame is 499 — source frames 500..=599 (trailing padding) dropped"
+        );
+    }
+
+    #[test]
+    fn gapless_swap_trims_both_ends() {
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 1,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
+        // A: delay 0, 300 frames, playable 250 → trailing 50 trimmed.
+        // B: delay 50, 200 frames, playable 100 → leading 50 + trailing 50 trimmed.
+        deck.load(RampDecoder {
+            ch: 1,
+            frames: 300,
+            pos: 0,
+            delay: 0,
+            playable: Some(250),
+        })
+        .unwrap();
+        deck.preload(RampDecoder {
+            ch: 1,
+            frames: 200,
+            pos: 0,
+            delay: 50,
+            playable: Some(100),
+        })
+        .unwrap();
+        let swaps = run(&mut deck);
+        assert_eq!(swaps, 1, "one gapless swap");
+        let out = &deck.sink.written;
+        // A: 250 (0..=249); B: 100 (50..=149). A's tail AND B's head trimmed.
+        assert_eq!(
+            out.len(),
+            350,
+            "A playable (250) + B playable (100), no gap"
+        );
+        assert_eq!(
+            out[249], 249,
+            "A's last playable frame (its 50-frame tail trimmed)"
+        );
+        assert_eq!(out[250], 50, "B resumes at its first playable frame");
+        assert_eq!(out[349], 149, "B's last playable frame (its tail trimmed)");
+    }
+
+    #[test]
     fn gapless_swap_trims_next_track_priming() {
         let sink = MockSink {
             rate: 48_000,
@@ -737,6 +859,7 @@ mod tests {
             frames: 300,
             pos: 0,
             delay: 0,
+            playable: None,
         })
         .unwrap();
         deck.preload(RampDecoder {
@@ -744,6 +867,7 @@ mod tests {
             frames: 200,
             pos: 0,
             delay: 50,
+            playable: None,
         })
         .unwrap();
         let swaps = run(&mut deck);

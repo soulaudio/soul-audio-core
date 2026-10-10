@@ -55,6 +55,23 @@ pub trait Decoder {
     fn encoder_delay(&self) -> u64 {
         0
     }
+
+    /// Gapless playable length: the number of real per-channel frames to
+    /// **emit** after the [`encoder_delay`](Self::encoder_delay) skip, i.e. the
+    /// true content length with the trailing encoder padding removed. The
+    /// [`Deck`](crate::deck::Deck) stops a track once it has emitted this many
+    /// frames (discarding the trailing padding) so the next track abuts without
+    /// a gap. `None` (the default) means "emit until the decoder ends" — no
+    /// trailing trim.
+    ///
+    /// This is deliberately a separate, self-contained count rather than
+    /// `delay + padding` arithmetic the Deck does: `encoder_delay` is in the
+    /// decoder's *output* basis (it can include format-specific leading frames
+    /// like MP3's header-frame silence) while this is the content basis, so
+    /// computing one from the other would mix bases and risk truncating audio.
+    fn playable_frames(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A [`Decoder`] that can also seek and report its length — the capability the
