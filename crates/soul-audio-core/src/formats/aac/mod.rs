@@ -344,6 +344,16 @@ impl<S: Source> AacDecoder<S> {
         }
     }
 
+    /// Gapless presented length (per-channel frames to emit after the delay)
+    /// from the MP4 `elst`; `None` for ADTS (no container edit list) or an MP4
+    /// without one.
+    fn mp4_playable_frames(&self) -> Option<u64> {
+        match &self.src {
+            FrameSrc::Mp4(r) => r.playable_frames(),
+            FrameSrc::Adts(_) => None,
+        }
+    }
+
     /// Decode the next access unit into `self.pcm`, looping past any audio-less
     /// blocks. `Ok(false)` at end of stream.
     fn fill_next_frame(&mut self) -> Result<bool, DecodeError> {
@@ -653,6 +663,10 @@ impl<S: Source> Decoder for AacDecoder<S> {
 
     fn encoder_delay(&self) -> u64 {
         self.mp4_encoder_delay()
+    }
+
+    fn playable_frames(&self) -> Option<u64> {
+        self.mp4_playable_frames()
     }
 }
 

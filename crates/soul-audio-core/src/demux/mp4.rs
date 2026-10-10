@@ -46,6 +46,10 @@ pub struct Mp4Reader<S> {
     /// player to trim; the decoders do not apply it themselves (decode output
     /// is the full `mdhd` span).
     encoder_delay: u64,
+    /// Gapless presented length (per-channel samples to emit after the delay)
+    /// from the `elst` `segment_duration`; `None` when no edit list. The player
+    /// trims trailing padding down to this.
+    present_frames: Option<u64>,
     /// Bytes left in the **current** `mdat`. In a fragmented file this is one
     /// fragment's `mdat`; [`Mp4Reader::read_audio`] advances to the next
     /// fragment's `mdat` (skipping its `moof`) when it hits 0.
@@ -138,6 +142,7 @@ impl<S: Source> Mp4Reader<S> {
         let mut codec: Option<Mp4Codec> = None;
         let mut total_samples: u64 = 0;
         let mut encoder_delay: u64 = 0;
+        let mut present_frames: Option<u64> = None;
         let mut fragmented = false;
         loop {
             let (len, fourcc, _) = box_header(&mut src)?;
@@ -147,6 +152,7 @@ impl<S: Source> Mp4Reader<S> {
                     codec = Some(info.codec);
                     total_samples = info.total_samples;
                     encoder_delay = info.encoder_delay;
+                    present_frames = info.present_frames;
                 }
                 // A movie fragment before the first `mdat`: the sample data is
                 // split across `moof`/`mdat` fragments (DASH/CMAF/streaming).
@@ -161,6 +167,7 @@ impl<S: Source> Mp4Reader<S> {
                         codec,
                         total_samples,
                         encoder_delay,
+                        present_frames,
                         mdat_remaining: len,
                         fragmented,
                         tables: None,
@@ -269,6 +276,14 @@ impl<S: Source> Mp4Reader<S> {
     pub fn encoder_delay(&self) -> u64 {
         self.encoder_delay
     }
+
+    /// Gapless presented length (per-channel samples to emit after the encoder
+    /// delay) from the `elst` edit list; `None` if the file declares none (or is
+    /// fragmented — no `moov` edit list). A player caps playback to this to trim
+    /// trailing padding.
+    pub fn playable_frames(&self) -> Option<u64> {
+        self.present_frames
+    }
     pub fn mdat_remaining(&self) -> u64 {
         self.mdat_remaining
     }
@@ -362,58 +377,127 @@ impl<S: crate::io::SeekSource> Mp4Reader<S> {
 /// declared length. See [`descend_for`] for the same invariant applied to a
 /// single "find one child" descent.
 fn parse_moov<S: Source>(src: &mut S, len: u64) -> Result<MoovInfo, DecodeError> {
-    descend_for(src, len, b"trak", |src, len| {
-        // Walk the `trak`'s children to capture BOTH the edit list (`edts`→
-        // `elst`, for the gapless encoder delay) and the media (`mdia`). Same
-        // exact-consumption loop as `parse_mdia` below.
-        let mut encoder_delay = 0u64;
-        let mut codec = None;
-        let mut total = 0u64;
-        let mut consumed = 0u64;
-        loop {
-            let remaining = len.checked_sub(consumed).ok_or(DecodeError::Malformed)?;
-            if remaining < 8 {
-                if remaining > 0 {
-                    skip(src, remaining)?;
-                }
-                break;
+    // Walk the `moov`'s children to capture the movie timescale (`mvhd`, needed
+    // to convert the edit list's presented duration to media samples) and the
+    // (first) `trak`. Same exact-consumption loop used at the `trak`/`mdia`
+    // levels — each visited box consumes exactly its declared length.
+    let mut movie_ts = 0u32;
+    let mut trak: Option<TrakInfo> = None;
+    let mut consumed = 0u64;
+    loop {
+        let remaining = len.checked_sub(consumed).ok_or(DecodeError::Malformed)?;
+        if remaining < 8 {
+            if remaining > 0 {
+                skip(src, remaining)?;
             }
-            let (l, f, box_total) = child_header(src, remaining)?;
-            match &f {
-                b"edts" => encoder_delay = descend_for(src, l, b"elst", parse_elst)?,
-                b"mdia" => {
-                    let (c, t) = parse_mdia(src, l)?;
-                    codec = Some(c);
-                    total = t;
-                }
-                _ => skip(src, l)?,
-            }
-            consumed = consumed
-                .checked_add(box_total)
-                .ok_or(DecodeError::Malformed)?;
+            break;
         }
-        let codec = codec.ok_or(DecodeError::Unsupported)?;
-        Ok(MoovInfo {
-            codec,
-            total_samples: total,
-            encoder_delay,
-        })
+        let (l, f, box_total) = child_header(src, remaining)?;
+        match &f {
+            b"mvhd" => movie_ts = parse_mvhd(src, l)?,
+            // First `trak` only (audio); a later one (e.g. video) is skipped.
+            b"trak" if trak.is_none() => trak = Some(parse_trak(src, l)?),
+            _ => skip(src, l)?,
+        }
+        consumed = consumed
+            .checked_add(box_total)
+            .ok_or(DecodeError::Malformed)?;
+    }
+    let t = trak.ok_or(DecodeError::Unsupported)?;
+
+    // Gapless presented length: the edit list's `segment_duration` (movie
+    // timescale) converted to media (per-channel) samples. `None` unless a
+    // normal edit and both timescales are present. u128 intermediate avoids
+    // overflow on the `seg * media_ts` product.
+    let present_frames = if t.segment_duration > 0 && movie_ts > 0 {
+        let media = u128::from(t.segment_duration) * u128::from(t.media_ts) / u128::from(movie_ts);
+        u64::try_from(media).ok()
+    } else {
+        None
+    };
+
+    Ok(MoovInfo {
+        codec: t.codec,
+        total_samples: t.total_samples,
+        encoder_delay: t.encoder_delay,
+        present_frames,
+    })
+}
+
+/// What [`parse_trak`] extracts from a `trak`: codec + `mdhd` sample count and
+/// timescale, plus the `elst` edit list's gapless `media_time`/`segment_duration`.
+struct TrakInfo {
+    codec: Mp4Codec,
+    total_samples: u64,
+    media_ts: u32,
+    encoder_delay: u64,
+    /// `elst` presented duration in the MOVIE timescale (0 = no edit list).
+    segment_duration: u64,
+}
+
+/// Walk a `trak`'s children for the edit list (`edts`→`elst`) and media
+/// (`mdia`). Same exact-consumption loop as [`parse_mdia`].
+fn parse_trak<S: Source>(src: &mut S, len: u64) -> Result<TrakInfo, DecodeError> {
+    let mut encoder_delay = 0u64;
+    let mut segment_duration = 0u64;
+    let mut codec = None;
+    let mut total = 0u64;
+    let mut media_ts = 0u32;
+    let mut consumed = 0u64;
+    loop {
+        let remaining = len.checked_sub(consumed).ok_or(DecodeError::Malformed)?;
+        if remaining < 8 {
+            if remaining > 0 {
+                skip(src, remaining)?;
+            }
+            break;
+        }
+        let (l, f, box_total) = child_header(src, remaining)?;
+        match &f {
+            b"edts" => {
+                let (delay, seg) = descend_for(src, l, b"elst", parse_elst)?;
+                encoder_delay = delay;
+                segment_duration = seg;
+            }
+            b"mdia" => {
+                let (c, t, ts) = parse_mdia(src, l)?;
+                codec = Some(c);
+                total = t;
+                media_ts = ts;
+            }
+            _ => skip(src, l)?,
+        }
+        consumed = consumed
+            .checked_add(box_total)
+            .ok_or(DecodeError::Malformed)?;
+    }
+    let codec = codec.ok_or(DecodeError::Unsupported)?;
+    Ok(TrakInfo {
+        codec,
+        total_samples: total,
+        media_ts,
+        encoder_delay,
+        segment_duration,
     })
 }
 
 /// What [`parse_moov`] extracts from an MP4 `moov`: the codec config, the
-/// `mdhd` per-channel sample count, and the gapless encoder delay (the `elst`
-/// edit list's `media_time` — leading priming samples a player skips).
+/// `mdhd` per-channel sample count, the gapless encoder delay (the `elst`
+/// `media_time`), and the gapless presented length (`elst` `segment_duration`
+/// converted to media samples via the movie/media timescales).
 struct MoovInfo {
     codec: Mp4Codec,
     total_samples: u64,
     encoder_delay: u64,
+    present_frames: Option<u64>,
 }
 
-/// Walk an `mdia` container's children for the `mdhd` (sample count) and the
-/// codec config (`minf`→`stbl`→`stsd`). Returns `(codec, total_samples)`.
-fn parse_mdia<S: Source>(src: &mut S, len: u64) -> Result<(Mp4Codec, u64), DecodeError> {
+/// Walk an `mdia` container's children for the `mdhd` (timescale + sample count)
+/// and the codec config (`minf`→`stbl`→`stsd`). Returns
+/// `(codec, total_samples, media_timescale)`.
+fn parse_mdia<S: Source>(src: &mut S, len: u64) -> Result<(Mp4Codec, u64, u32), DecodeError> {
     let mut total = 0u64;
+    let mut media_ts = 0u32;
     let mut codec = None;
     let mut consumed = 0u64;
     loop {
@@ -429,7 +513,11 @@ fn parse_mdia<S: Source>(src: &mut S, len: u64) -> Result<(Mp4Codec, u64), Decod
         }
         let (l, f, box_total) = child_header(src, remaining)?;
         match &f {
-            b"mdhd" => total = parse_mdhd(src, l)?,
+            b"mdhd" => {
+                let (ts, dur) = parse_mdhd(src, l)?;
+                media_ts = ts;
+                total = dur;
+            }
             b"minf" => {
                 codec = Some(descend_for(src, l, b"stbl", |src, len| {
                     descend_for(src, len, b"stsd", parse_stsd)
@@ -442,48 +530,52 @@ fn parse_mdia<S: Source>(src: &mut S, len: u64) -> Result<(Mp4Codec, u64), Decod
             .ok_or(DecodeError::Malformed)?;
     }
     let codec = codec.ok_or(DecodeError::Unsupported)?;
-    Ok((codec, total))
+    Ok((codec, total, media_ts))
 }
 
 /// `elst` (edit list, ISO/IEC 14496-12 §8.6.6): version(1)+flags(3),
 /// entry_count(4), then per entry `segment_duration` + `media_time` +
 /// `media_rate` (32-bit fields for v0, 64-bit durations/times for v1). Returns
-/// the **encoder delay** = the `media_time` of the first normal edit (the
-/// leading media samples a player trims for gapless playback). An empty edit
-/// (`media_time == -1`, used to insert initial silence) is skipped; `0` is
-/// returned if the list is empty or all-empty. `media_time` is in the media
-/// timescale (= the audio sample rate), so it IS a per-channel sample count —
-/// no timescale conversion needed.
-fn parse_elst<S: Source>(src: &mut S, len: u64) -> Result<u64, DecodeError> {
+/// the first normal edit's `(media_time, segment_duration)` — the **encoder
+/// delay** (leading media samples a player trims) and the **presented duration**
+/// (in the *movie* timescale, which the caller converts to media samples for the
+/// gapless playable length). An empty edit (`media_time == -1`, used to insert
+/// initial silence) is skipped; `(0, 0)` is returned if the list is empty or
+/// all-empty. `media_time` is in the media timescale (= the audio sample rate),
+/// so it IS a per-channel sample count — no conversion needed.
+fn parse_elst<S: Source>(src: &mut S, len: u64) -> Result<(u64, u64), DecodeError> {
     let head: [u8; 8] = read_exact(src)?; // version+flags(4) + entry_count(4)
     let version = head[0];
     let entry_count = be32(&head[4..8]);
     let entry_len: u64 = if version == 1 { 20 } else { 12 };
     let mut consumed = 8u64;
     let mut delay = 0u64;
+    let mut segment_duration = 0u64;
     let mut found = false;
     for _ in 0..entry_count {
         if len.checked_sub(consumed).ok_or(DecodeError::Malformed)? < entry_len {
             break;
         }
-        let media_time: i64 = if version == 1 {
+        let (seg_dur, media_time): (u64, i64) = if version == 1 {
             let e: [u8; 16] = read_exact(src)?; // seg_dur u64 + media_time i64
-            be64(&e[8..16]) as i64
+            (be64(&e[0..8]), be64(&e[8..16]) as i64)
         } else {
             let e: [u8; 8] = read_exact(src)?; // seg_dur u32 + media_time i32
-            i64::from(be32(&e[4..8]) as i32)
+            (u64::from(be32(&e[0..4])), i64::from(be32(&e[4..8]) as i32))
         };
         skip(src, 4)?; // media_rate (int16 + frac16)
         consumed += entry_len;
-        // First non-empty edit: its media_time is the encoder delay.
+        // First non-empty edit: its media_time is the encoder delay, its
+        // segment_duration the presented length.
         if !found && media_time >= 0 {
             delay = media_time as u64;
+            segment_duration = seg_dur;
             found = true;
         }
     }
     let remainder = len.checked_sub(consumed).ok_or(DecodeError::Malformed)?;
     skip(src, remainder)?;
-    Ok(delay)
+    Ok((delay, segment_duration))
 }
 
 /// Read one child box header bounded by `remaining` bytes left in the parent
@@ -550,22 +642,44 @@ where
 /// `mdhd`: version(1)+flags(3), then (v0) creation/mod u32 + timescale u32 +
 /// duration u32, or (v1) u64 times + timescale u32 + duration u64. Returns the
 /// duration in timescale units (== per-channel sample count for audio).
-fn parse_mdhd<S: Source>(src: &mut S, len: u64) -> Result<u64, DecodeError> {
+fn parse_mdhd<S: Source>(src: &mut S, len: u64) -> Result<(u32, u64), DecodeError> {
     let head: [u8; 4] = read_exact(src)?;
     let version = head[0];
     if version == 1 {
         let b: [u8; 28] = read_exact(src)?; // 8+8 times, 4 timescale, 8 duration
+        let timescale = be32(&b[16..20]);
         let duration = be64(&b[20..28]);
         let remainder = len.checked_sub(4 + 28).ok_or(DecodeError::Malformed)?;
         skip(src, remainder)?;
-        Ok(duration)
+        Ok((timescale, duration))
     } else {
         let b: [u8; 16] = read_exact(src)?; // 4+4 times, 4 timescale, 4 duration
+        let timescale = be32(&b[8..12]);
         let duration = u64::from(be32(&b[12..16]));
         let remainder = len.checked_sub(4 + 16).ok_or(DecodeError::Malformed)?;
         skip(src, remainder)?;
-        Ok(duration)
+        Ok((timescale, duration))
     }
+}
+
+/// `mvhd` (movie header, ISO/IEC 14496-12 §8.2.2): version+flags(4), then the
+/// two creation/modification times (`u32×2` for v0, `u64×2` for v1) followed by
+/// the `u32` timescale. Returns the **movie timescale** — the unit of the `elst`
+/// edit list's `segment_duration`, which the gapless present-length conversion
+/// divides by.
+fn parse_mvhd<S: Source>(src: &mut S, len: u64) -> Result<u32, DecodeError> {
+    let head: [u8; 4] = read_exact(src)?;
+    // Read through the timescale: it's at offset 8 (v0: creation/mod u32×2) or
+    // 16 (v1: u64×2) in the post-header bytes; 20 bytes covers both.
+    let b: [u8; 20] = read_exact(src)?;
+    let timescale = if head[0] == 1 {
+        be32(&b[16..20])
+    } else {
+        be32(&b[8..12])
+    };
+    let remainder = len.checked_sub(4 + 20).ok_or(DecodeError::Malformed)?;
+    skip(src, remainder)?;
+    Ok(timescale)
 }
 
 /// `stsd`: version+flags(4) + entry_count(4), then the sample entry. Both
@@ -1138,11 +1252,18 @@ mod tests {
         let alac = Mp4Reader::new(SliceSource::new(ALAC)).expect("parse alac mp4");
         assert_eq!(alac.encoder_delay(), 0); // media_time == 0, no priming
         assert_eq!(alac.total_samples(), 13_230); // unchanged by the edts walk
+        // Presented length = segment_duration(300, movie ts 1000) × mdhd ts
+        // 44100 / 1000 = 13230 = full (delay 0, lossless, no padding).
+        assert_eq!(alac.playable_frames(), Some(13_230));
 
         let aac = include_bytes!("../../testdata/aac.m4a");
         let r = Mp4Reader::new(SliceSource::new(aac)).expect("parse aac mp4");
         assert_eq!(r.encoder_delay(), 1024);
         assert_eq!(r.total_samples(), 23_074); // unchanged by the edts walk
+        // Presented length = segment_duration(500, movie ts 1000) × 44100/1000
+        // = 22050 (the 0.5 s of content); skip 1024 + emit 22050 = 23074 = mdhd,
+        // dropping the 478-sample last-AU padding.
+        assert_eq!(r.playable_frames(), Some(22_050));
     }
 
     /// A faststart file without an `edts`/`elst` reports zero delay (and still

@@ -295,6 +295,10 @@ fn open_decodes_aac_mp4_matching_ffmpeg_within_tolerance() {
     // still the full (untrimmed) span — hence the priming offset the SNR search
     // below finds; a player trims `encoder_delay` frames off the front.
     assert_eq!(dec.encoder_delay(), 1024);
+    // ...and the `elst` presented length (0.5 s = 22050 frames) drives the
+    // Deck's trailing-padding trim: the player emits frames 1024..=23073 and
+    // drops the last-AU padding.
+    assert_eq!(dec.playable_frames(), Some(22_050));
     let ours = decode_all(m4a);
     let (off, snr) = best_align_segsnr(&ours, &refr, 2);
     assert!(

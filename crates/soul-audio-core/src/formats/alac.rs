@@ -820,6 +820,10 @@ impl<S: Source> Decoder for AlacDecoder<S> {
     fn encoder_delay(&self) -> u64 {
         self.reader.encoder_delay()
     }
+
+    fn playable_frames(&self) -> Option<u64> {
+        self.reader.playable_frames()
+    }
 }
 
 impl<S: SeekSource> AlacDecoder<S> {
