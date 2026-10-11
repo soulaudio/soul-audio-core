@@ -47,9 +47,16 @@ impl AudioPlayer {
         let library = Arc::new(Mutex::new(library));
         let loader_lib = Arc::clone(&library);
 
+        // 64 MiB: the pump owns a `Player` holding several `OwnedDecoder`
+        // preload slots, and `OwnedDecoder` embeds the large by-value
+        // `AnyDecoder` enum (~320 KiB — sized by its multichannel AAC / surround
+        // Opus variants). Debug-build moves through the nested Player/Engine/Deck
+        // construction multiply that well past the former 16 MiB; 64 MiB leaves
+        // headroom as decoder variants grow. (Release move-elision needs far
+        // less; see the `anydecoder-size-stack` note.)
         let pump = thread::Builder::new()
             .name("player-pump".into())
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(move || pump_thread(make_sink, cmd_rx, loader_lib, on_event))
             .expect("spawn pump thread");
 
@@ -132,9 +139,11 @@ fn pump_thread<K, Mk, Ev>(
     let (res_tx, res_rx) = mpsc::channel::<(u32, anyhow::Result<OwnedDecoder>)>();
     let loader = {
         let lib = Arc::clone(&library);
+        // Same 64 MiB rationale as the pump: `open_track` builds an
+        // `OwnedDecoder` (the big `AnyDecoder`) here, off the pump thread.
         thread::Builder::new()
             .name("player-loader".into())
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(move || loader_thread(req_rx, res_tx, lib))
             .expect("spawn loader thread")
     };

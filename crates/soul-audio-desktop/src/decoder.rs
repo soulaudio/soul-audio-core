@@ -57,14 +57,15 @@ pub fn vorbis_arena() -> Box<[u8]> {
 /// (DSD64 → 352.8 kHz 24-bit) and the deck then resamples it to the device
 /// rate like any other source.
 ///
-/// The PCM variant is `AnyDecoder` (~180 KiB by value, FLAC-dominated); the
-/// desktop-profile `Vorbis` variant is larger still (~350 KiB — its per-frame
-/// DSP scratch, spectrum/residue/overlap, is sized for an 8192-sample long
-/// block at a 4-channel cap) and now dominates `OwnedDecoder`'s size — but the
-/// deck holds decoders by value on a big-stack thread by design (matching the
-/// core's no-alloc `AnyDecoder` and `VorbisDecoder`), so the size gap is
-/// accepted rather than boxed. A test (`owned_decoder_size_is_bounded`) guards
-/// against this growing further unnoticed.
+/// The PCM variant is `AnyDecoder` (~315 KiB by value — now multichannel-sized
+/// after AAC 5.1/7.1 and Opus surround multistream landed); the desktop-profile
+/// `Vorbis` variant is larger still (~668 KiB — its per-frame DSP scratch,
+/// spectrum/residue/overlap, is sized for an 8192-sample long block at the full
+/// profile's 8-channel cap) and dominates `OwnedDecoder`'s size — but the deck
+/// holds decoders by value on a big-stack thread by design (matching the core's
+/// no-alloc `AnyDecoder` and `VorbisDecoder`), so the size gap is accepted
+/// rather than boxed. A test (`owned_decoder_size_is_bounded`) guards against
+/// this growing further unnoticed.
 #[allow(clippy::large_enum_variant)]
 pub enum OwnedDecoder {
     Pcm(AnyDecoder<Src>),
@@ -181,18 +182,21 @@ mod tests {
             .expect("decode thread panicked");
     }
 
-    /// `OwnedDecoder`'s size is dominated by whichever variant is largest
-    /// (Task 11: the desktop-profile `Vorbis` variant, ~330 KiB at the
-    /// 4-channel/8192-block cap — see the type's doc comment). Bounded here so
-    /// a future profile change that silently balloons it further gets caught
-    /// as a test failure instead of a surprise stack overflow three call
-    /// frames away (the bug this same change already triggered once — see
-    /// `soul-audio-cli`'s worker/loader thread `stack_size` comments).
+    /// `OwnedDecoder`'s size is dominated by whichever variant is largest: the
+    /// desktop-profile `Vorbis` variant, ~668 KiB at the 8-channel/8192-block
+    /// cap (its per-frame DSP scratch — spectrum/residue/overlap — scales with
+    /// the channel cap, which is 8 in the full profile; see the type's doc
+    /// comment). Bounded here so a future profile change that silently balloons
+    /// it further gets caught as a test failure instead of a surprise stack
+    /// overflow three call frames away (the bug this same growth already
+    /// triggered once — see `soul-audio-cli`'s worker/loader thread
+    /// `stack_size` comments). The runtime worker threads carry 16–64 MiB
+    /// stacks, so this is far from an overflow; the bound is a drift tripwire.
     #[test]
     fn owned_decoder_size_is_bounded() {
         let size = std::mem::size_of::<OwnedDecoder>();
         assert!(
-            size < 512 * 1024,
+            size < 768 * 1024,
             "OwnedDecoder grew to {size} bytes — bump the CLI/driver worker \
              thread stack sizes (and this bound) if that's intentional"
         );
