@@ -122,6 +122,82 @@ fn open_decodes_aifc_sowt_bit_exact_vs_wav() {
     );
 }
 
+/// IEEE-float WAV (`pcm_f32le`) decodes end-to-end through `open()` and
+/// reconstructs the **exact source signal** at full 32-bit scale. `tone-f32.wav`
+/// is `tone.wav` (16-bit) re-encoded to float, so the decoded full-scale i32,
+/// shifted back down by 16 bits, must equal the original 16-bit samples to
+/// within rounding (±2). This is the independent signal-correctness oracle that
+/// anchors the CAF/AIFF float cross-checks below: it proves the float→i32 math
+/// is *correct*, not merely self-consistent. Also asserts the decode actually
+/// reaches full scale (so a silent/half-scale regression can't pass).
+#[test]
+fn open_decodes_wav_float_reconstructs_signal_full_scale() {
+    let flt = decode_all(include_bytes!("../../../testdata/tone-f32.wav"));
+    let src = decode_all(include_bytes!("../../../testdata/tone.wav"));
+    assert_eq!(
+        flt.len(),
+        src.len(),
+        "float/16-bit WAV sample counts differ"
+    );
+    // The tone peaks at 0.5 amplitude, so a correct full-scale float decode peaks
+    // at ≈ 2^30; a regression that left samples in 16-bit range would peak near
+    // 2^14. `> 2^29` cleanly separates the two.
+    let peak = flt.iter().map(|s| s.unsigned_abs()).max().unwrap();
+    assert!(
+        peak > (1 << 29),
+        "float decode is not full-scale (peak {peak}) — scaling regression"
+    );
+    let max_diff = flt
+        .iter()
+        .zip(&src)
+        .map(|(f, s)| ((f >> 16) - s).unsigned_abs())
+        .max()
+        .unwrap();
+    assert!(
+        max_diff <= 2,
+        "float decode doesn't reconstruct the 16-bit signal (max |Δ| = {max_diff} > 2)"
+    );
+}
+
+/// AIFF-C `fl32` (big-endian IEEE float) decodes **bit-identical** to the
+/// little-endian `tone-f32.wav` — both carry the same float samples, so the
+/// shared `float_to_i32` (after the AIFF big-endian byteswap) must land on the
+/// same full-scale i32. Covers the AIFF-C float `compressionType` branch, which
+/// no other e2e test reached. (`tone-f32.wav` itself is validated correct by
+/// `open_decodes_wav_float_reconstructs_signal_full_scale`.)
+#[test]
+fn open_decodes_aiff_float_matches_wav_float() {
+    let aiff = decode_all(include_bytes!("../../../testdata/tone-aiff-fl32.aifc"));
+    let wav = decode_all(include_bytes!("../../../testdata/tone-f32.wav"));
+    assert_eq!(
+        aiff.len(),
+        wav.len(),
+        "AIFF-fl32/WAV-float sample counts differ"
+    );
+    assert_eq!(
+        fnv1a(&aiff),
+        fnv1a(&wav),
+        "AIFF-C fl32 decode != LE float WAV (same samples)"
+    );
+}
+
+/// AIFF-C `ulaw` (G.711 µ-law companding) decodes **bit-exact** to ffmpeg's own
+/// µ-law decode. µ-law is lossy *encoding*, but *decoding* is a fixed table, so
+/// our `mulaw_to_i16` must match ffmpeg's G.711 table exactly. Covers the AIFF
+/// companding branch end-to-end (unit-tested in `wav.rs`, but never through the
+/// AIFF container + `open()` before).
+#[test]
+fn open_decodes_aiff_mulaw_matches_ffmpeg() {
+    let aiff = decode_all(include_bytes!("../../../testdata/tone-aiff-ulaw.aifc"));
+    let refr = load_s16le(include_bytes!("../../../testdata/tone-aiff-ulaw.ref.pcm"));
+    assert_eq!(aiff.len(), refr.len(), "AIFF-ulaw/ref sample counts differ");
+    assert_eq!(
+        fnv1a(&aiff),
+        fnv1a(&refr),
+        "AIFF-C µ-law decode != ffmpeg G.711 table"
+    );
+}
+
 /// FLAC-in-Matroska (`.mka`) decodes **bit-exact** to the native `tone.flac` —
 /// both carry the identical FLAC frames (the `.mka` is `tone.flac` remuxed with
 /// `-c:a copy`). Proves the EBML/`SimpleBlock` demux and the `MatroskaFlacReader`
@@ -240,6 +316,35 @@ fn open_decodes_wavpack_int32_bit_exact() {
     assert_eq!(fnv1a(&wv), fnv1a(&refr), "int32 WavPack decode != ffmpeg");
 }
 
+/// WavPack with **genuine 24-bit magnitude** (`INT32_INFO zeros=8`, peak ≈ 2^30)
+/// decodes bit-exact to ffmpeg. `tone-24.wv` above is a 16-bit source zero-padded
+/// to int32 (`zeros=16`), so its residuals never exceed 16-bit magnitude — the
+/// large-residual entropy coding (`LIMIT_ONES` escape, wide decorrelation
+/// weights) and the `zeros=8` int32 restore were never exercised by a valid
+/// stream until this fixture. Asserts both the bit-exact match and that the
+/// content truly uses > 16 significant bits (so a silent fall-back to the
+/// 16-bit-magnitude path can't pass).
+#[test]
+fn open_decodes_wavpack_24bit_magnitude_bit_exact() {
+    let wv = decode_all(include_bytes!("../../../testdata/tone-wv24.wv"));
+    let refr = load_s32le(include_bytes!("../../../testdata/tone-wv24.wv.ref.pcm"));
+    assert_eq!(
+        wv.len(),
+        refr.len(),
+        "24-bit WavPack length differs from ffmpeg"
+    );
+    let peak = wv.iter().map(|s| s.unsigned_abs()).max().unwrap();
+    assert!(
+        peak > (1 << 23),
+        "fixture isn't genuine >16-bit (peak {peak} ≤ 2^23) — weak coverage"
+    );
+    assert_eq!(
+        fnv1a(&wv),
+        fnv1a(&refr),
+        "24-bit-magnitude WavPack decode != ffmpeg"
+    );
+}
+
 /// AAC-in-Matroska decodes vs ffmpeg's own decode of the same file. The frames
 /// are the identical AAC access units as `tone-aac.m4a` (remuxed `-c:a copy`);
 /// the config comes from the `CodecPrivate` AudioSpecificConfig. Same 45 dB bar
@@ -277,6 +382,44 @@ fn open_decodes_caf_alac_bit_exact_vs_wav() {
     let wav = decode_all(include_bytes!("../../../testdata/tone.wav"));
     assert_eq!(caf.len(), wav.len(), "CAF-ALAC/WAV sample counts differ");
     assert_eq!(fnv1a(&caf), fnv1a(&wav), "CAF-ALAC decode != source WAV");
+}
+
+/// CAF `lpcm` with the **little-endian** format flag decodes bit-exact to the
+/// source WAV. The existing CAF-PCM fixture is big-endian (CAF's default), so the
+/// `kAudioFormatFlagIsBigEndian`-clear branch — the byte order most CAF files on
+/// Apple hardware actually use — had no valid-decode coverage until now.
+#[test]
+fn open_decodes_caf_pcm_little_endian_bit_exact_vs_wav() {
+    let caf = decode_all(include_bytes!("../../../testdata/tone-caf-le.caf"));
+    let wav = decode_all(include_bytes!("../../../testdata/tone.wav"));
+    assert_eq!(caf.len(), wav.len(), "CAF-PCM-LE/WAV sample counts differ");
+    assert_eq!(
+        fnv1a(&caf),
+        fnv1a(&wav),
+        "CAF-PCM little-endian decode != source WAV"
+    );
+}
+
+/// CAF `lpcm` with the **IEEE-float** format flag decodes bit-identical to the
+/// little-endian float WAV (`tone-f32.wav`) — same float samples through the
+/// shared `float_to_i32`. Covers CAF's `kAudioFormatFlagIsFloat` branch, which no
+/// other e2e test reached. (`tone-f32.wav` is validated correct by
+/// `open_decodes_wav_float_reconstructs_signal_full_scale`, so this transitively
+/// proves the CAF-float decode is correct, not merely self-consistent.)
+#[test]
+fn open_decodes_caf_float_matches_wav_float() {
+    let caf = decode_all(include_bytes!("../../../testdata/tone-caf-f32.caf"));
+    let wav = decode_all(include_bytes!("../../../testdata/tone-f32.wav"));
+    assert_eq!(
+        caf.len(),
+        wav.len(),
+        "CAF-float/WAV-float sample counts differ"
+    );
+    assert_eq!(
+        fnv1a(&caf),
+        fnv1a(&wav),
+        "CAF IEEE-float decode != LE float WAV"
+    );
 }
 
 /// Open a Matroska stream, seek to per-channel `target`, and decode the tail.

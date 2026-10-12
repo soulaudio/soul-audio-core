@@ -14,8 +14,11 @@ right = 659.25 Hz (E5), −6 dB, with 50 ms in/out fades. So:
 | File | Format |
 |------|--------|
 | `tone.wav`  | RIFF/WAVE PCM (the reference) |
+| `tone-f32.wav` | IEEE-float WAV — re-encodes `tone.wav`; full-scale float→i32 decode reconstructs the 16-bit signal (±2). Shared float golden for CAF/AIFF float |
 | `tone-aiff.aiff` | AIFF (big-endian PCM) — lossless, decodes bit-exact vs `tone.wav` |
 | `tone-aifc-sowt.aifc` | AIFF-C `sowt` (little-endian PCM) — lossless, bit-exact vs `tone.wav` |
+| `tone-aiff-fl32.aifc` | AIFF-C `fl32` (big-endian IEEE float) — bit-identical to `tone-f32.wav` |
+| `tone-aiff-ulaw.aifc` | AIFF-C `ulaw` (G.711 µ-law) — bit-exact vs `tone-aiff-ulaw.ref.pcm` (ffmpeg s16le) |
 | `tone.flac` | native FLAC |
 | `tone-flac.mka` | FLAC in Matroska (`-c:a copy` of `tone.flac`) — bit-exact vs native FLAC |
 | `tone-opus.webm` | Opus in WebM/Matroska (`-c:a copy` of `tone.opus`) — SNR vs `tone-opus.webm.ref.pcm` |
@@ -23,8 +26,11 @@ right = 659.25 Hz (E5), −6 dB, with 50 ms in/out fades. So:
 | `tone-vorbis.mka` | Vorbis in Matroska (`-c:a copy` of `tone-vorbis.ogg`) — bit-exact prefix vs the Ogg decode |
 | `tone.wv` | WavPack lossless, stereo 16-bit (joint + cross decorrelation) — bit-exact vs `tone.wav` |
 | `tone-mono.wv` | WavPack lossless, mono — bit-exact vs `tone-mono.wv.ref.pcm` |
-| `tone-24.wv` | WavPack lossless, 32-bit `INT32_DATA` — bit-exact vs `tone-24.wv.ref.pcm` (s32le) |
+| `tone-24.wv` | WavPack lossless, 32-bit `INT32_DATA` from a 16-bit source (`zeros=16`, 16-bit magnitude) — bit-exact vs `tone-24.wv.ref.pcm` (s32le) |
+| `tone-wv24.wv` | WavPack lossless, **genuine 24-bit magnitude** (`zeros=8`, peak ≈ 2^30) — exercises the large-residual entropy path; bit-exact vs `tone-wv24.wv.ref.pcm` (s32le) |
 | `tone.caf` | Apple CAF `lpcm` (big-endian PCM) — bit-exact vs `tone.wav` |
+| `tone-caf-le.caf` | Apple CAF `lpcm` little-endian — bit-exact vs `tone.wav` (byte-order flag branch) |
+| `tone-caf-f32.caf` | Apple CAF `lpcm` IEEE-float — bit-identical to `tone-f32.wav` (float flag branch) |
 | `tone-alac.caf` | Apple CAF `alac` (Apple Lossless) — bit-exact vs `tone.wav` |
 | `tone.mp3`  | MPEG Layer III |
 | `tone.mp2`  | MPEG Layer II |

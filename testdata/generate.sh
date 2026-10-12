@@ -16,11 +16,23 @@ GRAPH="aevalsrc=exprs=0.5*sin(2*PI*440*t)|0.5*sin(2*PI*659.25*t):s=44100:d=2:c=s
 
 ffmpeg -y -hide_banner -loglevel error -f lavfi -i "$GRAPH" -c:a pcm_s16le tone.wav
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a flac tone.flac
+# IEEE-float WAV golden — `tone.wav` re-encoded to 32-bit float. Shared by the
+# WAV-float / CAF-float / AIFF-fl32 e2e tests: the decoder converts float to
+# full-scale i32, and this file re-encodes the exact 16-bit signal, so the
+# round-trip is verifiable (shift back by 16 ⇒ the original samples).
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a pcm_f32le tone-f32.wav
 # AIFF (big-endian PCM) and AIFF-C `sowt` (little-endian PCM) — both lossless
 # 16-bit, so each decodes bit-exact vs tone.wav (core + CLI e2e). `-f aiff` with a
 # little-endian PCM codec makes ffmpeg emit AIFF-C with the `sowt` compression type.
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a pcm_s16be tone-aiff.aiff
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a pcm_s16le -f aiff tone-aifc-sowt.aifc
+# AIFF-C `fl32` (big-endian IEEE float) and `ulaw` (G.711 µ-law) — exercise the
+# float and companding compressionType branches end-to-end. fl32 is bit-identical
+# to tone-f32.wav; µ-law decode is a fixed table, so it matches ffmpeg's own
+# decode (s16le golden) bit-exact.
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a pcm_f32be -f aiff tone-aiff-fl32.aifc
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a pcm_mulaw -f aiff tone-aiff-ulaw.aifc
+ffmpeg -y -hide_banner -loglevel error -i tone-aiff-ulaw.aifc -f s16le tone-aiff-ulaw.ref.pcm
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a libmp3lame -b:a 192k tone.mp3
 # MPEG Layer II (the MP3 decoder also handles L2/L1; this gives L2 a playback-tier
 # render golden, not just the kjmp2 decode vectors). No `tone.mp1` — ffmpeg has no
@@ -83,10 +95,23 @@ ffmpeg -y -hide_banner -loglevel error -i tone.wav -ac 1 -c:a wavpack tone-mono.
 ffmpeg -y -hide_banner -loglevel error -i tone-mono.wv -f s16le tone-mono.wv.ref.pcm
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -af aformat=sample_fmts=s32 -c:a wavpack tone-24.wv
 ffmpeg -y -hide_banner -loglevel error -i tone-24.wv -f s32le tone-24.wv.ref.pcm
+# Genuine 24-bit-magnitude WavPack: synthesize the tone directly at 24-bit so the
+# content actually uses ~24 significant bits (INT32_INFO zeros=8, peak ≈ 2^30) —
+# unlike tone-24.wv, whose 16-bit source gives zeros=16 (16-bit magnitude). This
+# exercises the large-residual entropy path + the zeros=8 int32 restore.
+ffmpeg -y -hide_banner -loglevel error -f lavfi -i "$GRAPH" -c:a pcm_s24le tone24.wav
+ffmpeg -y -hide_banner -loglevel error -i tone24.wav -c:a wavpack tone-wv24.wv
+ffmpeg -y -hide_banner -loglevel error -i tone-wv24.wv -f s32le tone-wv24.wv.ref.pcm
+rm -f tone24.wav
 
 # Apple CAF: lpcm (big-endian PCM) and alac (Apple Lossless). Both lossless →
 # bit-exact vs tone.wav.
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a pcm_s16be -f caf tone.caf
+# CAF lpcm little-endian (clears the big-endian flag → bit-exact vs tone.wav) and
+# IEEE-float (sets the float flag → bit-identical to tone-f32.wav). Cover CAF's
+# byte-order and float format-flag branches.
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a pcm_s16le -f caf tone-caf-le.caf
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a pcm_f32le -f caf tone-caf-f32.caf
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a alac -f caf tone-alac.caf
 
 # FLAC with an embedded cover picture: exercises embedded-art extraction. A tiny
@@ -106,4 +131,4 @@ python3 generate_dsd.py tone-dsd512.dsf 22579200 0.1  # DSD512 DSF (0.1 s, size)
 python3 generate_dsd.py tone.dff                      # DSD64  DSDIFF/raw (0.5 s)
 
 echo "generated:"
-ls -la tone.wav tone-aiff.aiff tone-aifc-sowt.aifc tone.flac tone-flac.mka tone-aac.mka tone-vorbis.mka tone.wv tone-mono.wv tone-24.wv tone.caf tone-alac.caf tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus tone-opus.webm arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1
+ls -la tone.wav tone-f32.wav tone-aiff.aiff tone-aifc-sowt.aifc tone-aiff-fl32.aifc tone-aiff-ulaw.aifc tone.flac tone-flac.mka tone-aac.mka tone-vorbis.mka tone.wv tone-mono.wv tone-24.wv tone-wv24.wv tone.caf tone-caf-le.caf tone-caf-f32.caf tone-alac.caf tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus tone-opus.webm arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1
