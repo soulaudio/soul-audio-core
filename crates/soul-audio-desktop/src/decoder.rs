@@ -8,8 +8,10 @@ use std::path::Path;
 
 use anyhow::{Result, anyhow};
 use embedded_io_adapters::std::FromStd;
+use soul_audio_core::demux::MatroskaDemuxer;
 use soul_audio_core::formats::dff::DffDecoder;
 use soul_audio_core::formats::dsf::DsfDecoder;
+use soul_audio_core::formats::matroska::{MatroskaDecoder, MatroskaVorbisOgg};
 use soul_audio_core::formats::vorbis::VorbisDecoder;
 use soul_audio_core::{
     AnyDecoder, DecimateAdapter, DecodeError, Decoder, Format, SeekableDecoder, StreamInfo, open,
@@ -70,6 +72,9 @@ pub fn vorbis_arena() -> Box<[u8]> {
 pub enum OwnedDecoder {
     Pcm(AnyDecoder<Src>),
     Vorbis(VorbisDecoder<Src, Box<[u8]>>),
+    /// Vorbis inside Matroska/WebM — also arena-backed (consumer-dispatched like
+    /// bare Vorbis), over the Ogg-synthesizing [`MatroskaVorbisOgg`] adapter.
+    MatroskaVorbis(VorbisDecoder<MatroskaVorbisOgg<Src>, Box<[u8]>>),
     Dsf(DecimateAdapter<DsfDecoder<Src>>),
     Dff(DecimateAdapter<DffDecoder<Src>>),
 }
@@ -79,6 +84,7 @@ impl Decoder for OwnedDecoder {
         match self {
             OwnedDecoder::Pcm(d) => d.stream_info(),
             OwnedDecoder::Vorbis(d) => d.stream_info(),
+            OwnedDecoder::MatroskaVorbis(d) => d.stream_info(),
             OwnedDecoder::Dsf(d) => d.stream_info(),
             OwnedDecoder::Dff(d) => d.stream_info(),
         }
@@ -87,6 +93,7 @@ impl Decoder for OwnedDecoder {
         match self {
             OwnedDecoder::Pcm(d) => d.decode_into(out),
             OwnedDecoder::Vorbis(d) => d.decode_into(out),
+            OwnedDecoder::MatroskaVorbis(d) => d.decode_into(out),
             OwnedDecoder::Dsf(d) => d.decode_into(out),
             OwnedDecoder::Dff(d) => d.decode_into(out),
         }
@@ -98,6 +105,10 @@ impl SeekableDecoder for OwnedDecoder {
         match self {
             OwnedDecoder::Pcm(d) => d.seek_to(sample),
             OwnedDecoder::Vorbis(d) => d.seek_to(sample),
+            // Vorbis-in-Matroska seeks over a synthesized Ogg stream whose byte
+            // offsets don't map to the container, so the Ogg granule bisection
+            // can't apply — seeking is a follow-up.
+            OwnedDecoder::MatroskaVorbis(_) => Err(DecodeError::Unsupported),
             // The decimator's PCM frame ↔ DSD sample mapping lives in its inherent
             // `seek_to_frame`.
             OwnedDecoder::Dsf(d) => d.seek_to_frame(sample),
@@ -108,6 +119,7 @@ impl SeekableDecoder for OwnedDecoder {
         match self {
             OwnedDecoder::Pcm(d) => d.total_frames(),
             OwnedDecoder::Vorbis(d) => d.total_frames(),
+            OwnedDecoder::MatroskaVorbis(_) => None,
             // DSD: the decimator reports the decimated PCM frame count from the
             // container's declared DSD sample count (`None` if not declared).
             OwnedDecoder::Dsf(d) => d.total_frames(),
@@ -139,6 +151,27 @@ pub fn open_track(path: &Path) -> Result<OwnedDecoder> {
             VorbisDecoder::new(src, vorbis_arena())
                 .map_err(|e| anyhow!("Vorbis {}: {e:?}", path.display()))?,
         )),
+        // Matroska/WebM: peek the track codec. `A_VORBIS` needs the arena (like
+        // bare Vorbis), so it's built here over the Ogg-synthesizing adapter;
+        // Opus/FLAC/AAC ride the arena-free `AnyDecoder::Matroska` path, built
+        // from the same already-parsed demuxer (no re-read).
+        Format::Matroska => {
+            let demux = MatroskaDemuxer::new(src)
+                .map_err(|e| anyhow!("Matroska {}: {e:?}", path.display()))?;
+            if demux.codec_id() == b"A_VORBIS" {
+                let adapter = MatroskaVorbisOgg::new(demux)
+                    .map_err(|e| anyhow!("Vorbis-in-Matroska {}: {e:?}", path.display()))?;
+                Ok(OwnedDecoder::MatroskaVorbis(
+                    VorbisDecoder::new(adapter, vorbis_arena())
+                        .map_err(|e| anyhow!("Vorbis-in-Matroska {}: {e:?}", path.display()))?,
+                ))
+            } else {
+                Ok(OwnedDecoder::Pcm(AnyDecoder::Matroska(
+                    MatroskaDecoder::from_demuxer(demux)
+                        .map_err(|e| anyhow!("Matroska {}: {e:?}", path.display()))?,
+                )))
+            }
+        }
         // WAV/FLAC/MP3/Ogg-FLAC — `open` re-probes (cheap) and builds the codec.
         _ => {
             Ok(OwnedDecoder::Pcm(open(src).map_err(|e| {
@@ -182,11 +215,47 @@ mod tests {
             .expect("decode thread panicked");
     }
 
+    /// Vorbis-in-Matroska through `open_track` — guards the consumer-dispatch
+    /// path that peeks the Matroska track codec and routes `A_VORBIS` to the
+    /// arena-backed Ogg-synthesizing adapter (the core suite builds this
+    /// directly; only the shell wires the arena + codec peek).
+    #[test]
+    fn open_track_decodes_vorbis_in_matroska() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tone-vorbis.mka");
+        // 64 MiB: building `VorbisDecoder<MatroskaVorbisOgg<Src>>` (~712 KiB by
+        // value) multiplies through many debug-build move frames, like the
+        // runtime pump/loader threads (`soul-audio-service`/CLI) carry.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let mut d = open_track(&path).expect("open Vorbis-in-Matroska fixture");
+                assert_eq!(d.stream_info().channels, 2);
+                let mut buf = [0i32; 4096];
+                let mut total = 0usize;
+                loop {
+                    let n = d
+                        .decode_into(&mut buf)
+                        .expect("decode Vorbis-in-mka packet");
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                }
+                assert!(total > 0, "decoded no samples from Vorbis-in-Matroska");
+            })
+            .expect("spawn decode thread")
+            .join()
+            .expect("decode thread panicked");
+    }
+
     /// `OwnedDecoder`'s size is dominated by whichever variant is largest: the
-    /// desktop-profile `Vorbis` variant, ~668 KiB at the 8-channel/8192-block
-    /// cap (its per-frame DSP scratch — spectrum/residue/overlap — scales with
-    /// the channel cap, which is 8 in the full profile; see the type's doc
-    /// comment). Bounded here so a future profile change that silently balloons
+    /// desktop-profile Vorbis decoder, ~668 KiB at the 8-channel/8192-block cap
+    /// (its per-frame DSP scratch — spectrum/residue/overlap — scales with the
+    /// channel cap, which is 8 in the full profile; see the type's doc comment).
+    /// The `MatroskaVorbis` variant is that plus the ~48 KiB Ogg-synthesizing
+    /// adapter (~712 KiB), so it is now the ceiling. Bounded here so a future
+    /// profile change that silently balloons
     /// it further gets caught as a test failure instead of a surprise stack
     /// overflow three call frames away (the bug this same growth already
     /// triggered once — see `soul-audio-cli`'s worker/loader thread

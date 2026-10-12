@@ -8,10 +8,12 @@
 //! [`MatroskaFlacReader`] byte adapter (the same trick
 //! [`OggReader`](crate::demux::ogg::OggReader) uses for FLAC-in-Ogg); AAC feeds
 //! [`AacDecoder`] one access unit per block with the `CodecPrivate`
-//! `AudioSpecificConfig`. Vorbis (`A_VORBIS`) is a follow-up — it needs the
-//! consumer-dispatch arena path, like bare Ogg-Vorbis. Seeking restarts at the
-//! first cluster and decode-discards forward (sample-accurate, linear; a Cues
-//! index would make it O(log n) — a follow-up).
+//! `AudioSpecificConfig`. Vorbis (`A_VORBIS`) decodes too, but — needing a
+//! caller-provided arena — it is **consumer-dispatched** (built by the
+//! desktop/CLI, not through `AnyDecoder`) over the [`MatroskaVorbisOgg`]
+//! Ogg-synthesizing adapter, exactly like bare Ogg-Vorbis. Seeking restarts at
+//! the first cluster and decode-discards forward (sample-accurate, linear; a
+//! Cues index would make it O(log n) — a follow-up).
 
 use embedded_io::{ErrorType, Read};
 
@@ -68,7 +70,18 @@ impl<S: Source> MatroskaDecoder<S> {
     /// [`DecodeError::Unsupported`] for a non-audio / unsupported `CodecID`
     /// (only Opus and FLAC in v1), plus the demuxer's own errors.
     pub fn new(src: S) -> Result<Self, DecodeError> {
-        let demux = MatroskaDemuxer::new(src)?;
+        Self::from_demuxer(MatroskaDemuxer::new(src)?)
+    }
+
+    /// Build from an already-parsed demuxer — lets a consumer peek
+    /// [`MatroskaDemuxer::codec_id`] (e.g. to route `A_VORBIS` to the arena-backed
+    /// Vorbis path) and hand the demuxer here for everything else, without
+    /// re-reading the container.
+    ///
+    /// # Errors
+    /// [`DecodeError::Unsupported`] for an unsupported `CodecID` — including
+    /// `A_VORBIS`, which is consumer-dispatched via [`MatroskaVorbisOgg`].
+    pub fn from_demuxer(demux: MatroskaDemuxer<S>) -> Result<Self, DecodeError> {
         match demux.codec_id() {
             b"A_OPUS" => {
                 let head = OpusHead::parse(demux.codec_private())?;
@@ -382,6 +395,231 @@ impl<S: Source> Read for MatroskaFlacReader<S> {
             buf[w..w + take].copy_from_slice(&self.frame[self.frame_pos..self.frame_pos + take]);
             self.frame_pos += take;
             w += take;
+        }
+        Ok(w)
+    }
+}
+
+// --- Vorbis-in-Matroska (A_VORBIS) -----------------------------------------
+
+/// Largest Vorbis audio packet (one `SimpleBlock`) we reassemble.
+const MAX_VORBIS_PACKET: usize = 16 * 1024;
+/// Largest `CodecPrivate` we copy (matches the demuxer's own cap).
+const MAX_CODEC_PRIVATE: usize = 16 * 1024;
+/// Ogg page header (27 bytes) + the maximum 255-entry segment table.
+const OGG_PAGE_SCRATCH: usize = 27 + 255;
+
+/// Where the current synthesized Ogg packet body comes from.
+#[derive(Clone, Copy)]
+enum Body {
+    /// A slice of the `CodecPrivate` header blob (`offset`, `len`).
+    Header(usize, usize),
+    /// The current audio `SimpleBlock` staged in `audio` (`len`).
+    Audio(usize),
+}
+
+/// An [`embedded_io::Read`] adapter presenting an `A_VORBIS` Matroska track as a
+/// native **Ogg-Vorbis** bitstream, so the arena-backed
+/// [`VorbisDecoder`](crate::formats::vorbis::VorbisDecoder) decodes it unchanged
+/// (the same trick [`MatroskaFlacReader`] / [`OggReader`](crate::demux::ogg::OggReader)
+/// use). One synthesized Ogg page per packet: the three `CodecPrivate` setup
+/// headers (Xiph-laced) first, then one per `SimpleBlock`. Every page carries the
+/// `-1` granule sentinel, so `VorbisDecoder`'s Ogg end-trim is a no-op (Matroska
+/// handles trailing padding via block durations — not parsed here). Because the
+/// arena is caller-provided, Vorbis-in-Matroska is **consumer-dispatched** (built
+/// by the desktop/CLI with an arena), exactly like bare Ogg-Vorbis.
+pub struct MatroskaVorbisOgg<S> {
+    demux: MatroskaDemuxer<S>,
+    /// The `CodecPrivate` blob (the 3 Xiph-laced Vorbis setup headers).
+    cp: [u8; MAX_CODEC_PRIVATE],
+    /// `(offset, len)` of each setup header within `cp`.
+    headers: [(usize, usize); 3],
+    header_count: usize,
+    /// Which packet we're emitting next (0..header_count = headers, then audio).
+    pkt_index: usize,
+    seq: u32,
+    /// The current page's header+segment-table bytes.
+    page: [u8; OGG_PAGE_SCRATCH],
+    page_len: usize,
+    page_pos: usize,
+    /// The current packet body + cursor.
+    body: Option<Body>,
+    body_pos: usize,
+    audio: [u8; MAX_VORBIS_PACKET],
+    eos: bool,
+}
+
+impl<S: Source> MatroskaVorbisOgg<S> {
+    /// Build over a Matroska demuxer positioned at the first audio block, parsing
+    /// the Xiph-laced `CodecPrivate` into the three Vorbis setup headers.
+    ///
+    /// # Errors
+    /// [`DecodeError::Unsupported`] for a malformed / oversized `CodecPrivate`.
+    pub fn new(demux: MatroskaDemuxer<S>) -> Result<Self, DecodeError> {
+        let src = demux.codec_private();
+        if src.is_empty() || src.len() > MAX_CODEC_PRIVATE {
+            return Err(DecodeError::Unsupported);
+        }
+        let mut cp = [0u8; MAX_CODEC_PRIVATE];
+        cp[..src.len()].copy_from_slice(src);
+        let (headers, header_count) = parse_xiph_lacing(&cp[..src.len()])?;
+        Ok(Self {
+            demux,
+            cp,
+            headers,
+            header_count,
+            pkt_index: 0,
+            seq: 0,
+            page: [0; OGG_PAGE_SCRATCH],
+            page_len: 0,
+            page_pos: 0,
+            body: None,
+            body_pos: 0,
+            audio: [0; MAX_VORBIS_PACKET],
+            eos: false,
+        })
+    }
+
+    /// Stage the next packet (header or audio block) and synthesize its Ogg page
+    /// header into `page`. Returns `false` at end of stream.
+    fn next_page(&mut self) -> Result<bool, DecodeError> {
+        let (body, body_len) = if self.pkt_index < self.header_count {
+            let (off, len) = self.headers[self.pkt_index];
+            (Body::Header(off, len), len)
+        } else {
+            match self.demux.next_packet(&mut self.audio)? {
+                Some(p) => {
+                    let len = p.data.len();
+                    (Body::Audio(len), len)
+                }
+                None => {
+                    self.eos = true;
+                    return Ok(false);
+                }
+            }
+        };
+        let bos = self.pkt_index == 0;
+        self.synthesize_page(bos, body_len);
+        self.body = Some(body);
+        self.body_pos = 0;
+        self.pkt_index += 1;
+        Ok(true)
+    }
+
+    /// Build an Ogg page header + segment table for a single packet of
+    /// `body_len` bytes into `page` (one packet per page; the `-1` granule
+    /// sentinel disables end-trim).
+    fn synthesize_page(&mut self, bos: bool, body_len: usize) {
+        let full = body_len / 255;
+        let last = (body_len % 255) as u8;
+        let nsegs = (full + 1) as u8;
+        let mut h = [0u8; 27];
+        h[0..4].copy_from_slice(b"OggS");
+        h[4] = 0; // stream structure version
+        h[5] = if bos { 0x02 } else { 0x00 }; // header type (BOS on the first page)
+        h[6..14].copy_from_slice(&[0xFF; 8]); // granule = -1 (no end-trim ceiling)
+        h[14..18].copy_from_slice(&1u32.to_le_bytes()); // serial
+        h[18..22].copy_from_slice(&self.seq.to_le_bytes()); // page sequence
+        // h[22..26] CRC left 0 (OggPackets does not verify it)
+        h[26] = nsegs;
+        self.page[0..27].copy_from_slice(&h);
+        for i in 0..full {
+            self.page[27 + i] = 255;
+        }
+        self.page[27 + full] = last;
+        self.page_len = 27 + full + 1;
+        self.page_pos = 0;
+        self.seq = self.seq.wrapping_add(1);
+    }
+
+    fn body_byte(&self, i: usize) -> u8 {
+        match self.body {
+            Some(Body::Header(off, _)) => self.cp[off + i],
+            Some(Body::Audio(_)) => self.audio[i],
+            None => 0,
+        }
+    }
+
+    fn body_len(&self) -> usize {
+        match self.body {
+            Some(Body::Header(_, len) | Body::Audio(len)) => len,
+            None => 0,
+        }
+    }
+}
+
+/// Parse Matroska Vorbis `CodecPrivate` Xiph lacing: `[count-1][lace lengths…]
+/// [packets…]`. Returns each header's `(offset, len)` within `cp` and the count.
+fn parse_xiph_lacing(cp: &[u8]) -> Result<([(usize, usize); 3], usize), DecodeError> {
+    if cp.is_empty() {
+        return Err(DecodeError::Unsupported);
+    }
+    let count = usize::from(cp[0]) + 1;
+    if count != 3 {
+        return Err(DecodeError::Unsupported); // Vorbis has exactly 3 setup headers
+    }
+    let mut p = 1usize;
+    let mut lens = [0usize; 3];
+    // The first (count-1) lengths are Xiph-laced; the last is the remainder.
+    for len in lens.iter_mut().take(count - 1) {
+        let mut l = 0usize;
+        loop {
+            let b = *cp.get(p).ok_or(DecodeError::Unsupported)?;
+            p += 1;
+            l += usize::from(b);
+            if b != 255 {
+                break;
+            }
+        }
+        *len = l;
+    }
+    let consumed: usize = p + lens[..count - 1].iter().sum::<usize>();
+    if consumed > cp.len() {
+        return Err(DecodeError::Unsupported);
+    }
+    lens[count - 1] = cp.len() - consumed;
+    let mut headers = [(0usize, 0usize); 3];
+    let mut off = p;
+    for i in 0..count {
+        headers[i] = (off, lens[i]);
+        off += lens[i];
+    }
+    Ok((headers, count))
+}
+
+impl<S: Source> ErrorType for MatroskaVorbisOgg<S> {
+    type Error = embedded_io::ErrorKind;
+}
+
+impl<S: Source> Read for MatroskaVorbisOgg<S> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        let mut w = 0;
+        while w < buf.len() {
+            if self.page_pos < self.page_len {
+                let take = (self.page_len - self.page_pos).min(buf.len() - w);
+                buf[w..w + take].copy_from_slice(&self.page[self.page_pos..self.page_pos + take]);
+                self.page_pos += take;
+                w += take;
+                continue;
+            }
+            if self.body_pos < self.body_len() {
+                let take = (self.body_len() - self.body_pos).min(buf.len() - w);
+                for b in buf[w..w + take].iter_mut() {
+                    *b = self.body_byte(self.body_pos);
+                    self.body_pos += 1;
+                }
+                w += take;
+                continue;
+            }
+            if self.eos {
+                break;
+            }
+            if !self
+                .next_page()
+                .map_err(|_| embedded_io::ErrorKind::Other)?
+            {
+                break;
+            }
         }
         Ok(w)
     }

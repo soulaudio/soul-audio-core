@@ -70,6 +70,7 @@ ffmpeg -y -hide_banner -loglevel error -i tone.opus -c:a copy -f webm tone-opus.
 ffmpeg -y -hide_banner -loglevel error -i tone.flac -c:a copy -f matroska tone-flac.mka
 ffmpeg -y -hide_banner -loglevel error -i tone-aac.m4a -c:a copy -f matroska tone-aac.mka
 ffmpeg -y -hide_banner -loglevel error -i tone-aac.mka -f s16le tone-aac.mka.ref.pcm
+ffmpeg -y -hide_banner -loglevel error -i tone-vorbis.ogg -c:a copy -f matroska tone-vorbis.mka
 # Opus-in-WebM reference (ffmpeg's own decode) for the segmental-SNR e2e.
 ffmpeg -y -hide_banner -loglevel error -i tone-opus.webm -f s16le -c:a pcm_s16le tone-opus.webm.ref.pcm
 
@@ -105,4 +106,4 @@ python3 generate_dsd.py tone-dsd512.dsf 22579200 0.1  # DSD512 DSF (0.1 s, size)
 python3 generate_dsd.py tone.dff                      # DSD64  DSDIFF/raw (0.5 s)
 
 echo "generated:"
-ls -la tone.wav tone-aiff.aiff tone-aifc-sowt.aifc tone.flac tone-flac.mka tone-aac.mka tone.wv tone-mono.wv tone-24.wv tone.caf tone-alac.caf tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus tone-opus.webm arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1
+ls -la tone.wav tone-aiff.aiff tone-aifc-sowt.aifc tone.flac tone-flac.mka tone-aac.mka tone-vorbis.mka tone.wv tone-mono.wv tone-24.wv tone.caf tone-alac.caf tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus tone-opus.webm arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1

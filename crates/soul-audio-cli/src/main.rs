@@ -18,8 +18,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
+use soul_audio_core::demux::MatroskaDemuxer;
+use soul_audio_core::formats::matroska::{MatroskaDecoder, MatroskaVorbisOgg};
 use soul_audio_core::formats::vorbis::VorbisDecoder;
-use soul_audio_core::{DecodeError, Decoder, Format, open, probe};
+use soul_audio_core::{AnyDecoder, DecodeError, Decoder, Format, open, probe};
 
 #[derive(Parser)]
 #[command(name = "soul-audio-cli", about = "soul-audio-core desktop harness")]
@@ -114,16 +116,33 @@ fn decode(input: &Path, out: &Path) -> Result<()> {
     // through to `open`'s own internal probe for every other outcome —
     // including a probe failure — reproduces the exact original dispatch and
     // error message for every non-Vorbis input, unchanged.
-    if probe(&mut source) == Ok(Format::Vorbis) {
-        let mut decoder = VorbisDecoder::new(source, soul_audio_desktop::vorbis_arena())
-            .map_err(|e| anyhow!("cannot decode {}: {e:?}", input.display()))?;
-        stream_pcm(&mut decoder, &mut w)
-            .map_err(|e| anyhow!("cannot decode {}: {e:?}", input.display()))?;
-    } else {
-        let mut decoder =
-            open(source).map_err(|e| anyhow!("cannot decode {}: {e:?}", input.display()))?;
-        stream_pcm(&mut decoder, &mut w)
-            .map_err(|e| anyhow!("cannot decode {}: {e:?}", input.display()))?;
+    let fail = |e| anyhow!("cannot decode {}: {e:?}", input.display());
+    match probe(&mut source) {
+        Ok(Format::Vorbis) => {
+            let mut decoder =
+                VorbisDecoder::new(source, soul_audio_desktop::vorbis_arena()).map_err(fail)?;
+            stream_pcm(&mut decoder, &mut w).map_err(fail)?;
+        }
+        // Matroska: `A_VORBIS` needs the arena (consumer-dispatched like bare
+        // Vorbis), so peek the track codec and route it over the Ogg-synthesizing
+        // adapter; Opus/FLAC/AAC build from the same demuxer via `AnyDecoder`.
+        Ok(Format::Matroska) => {
+            let demux = MatroskaDemuxer::new(source).map_err(fail)?;
+            if demux.codec_id() == b"A_VORBIS" {
+                let adapter = MatroskaVorbisOgg::new(demux).map_err(fail)?;
+                let mut decoder = VorbisDecoder::new(adapter, soul_audio_desktop::vorbis_arena())
+                    .map_err(fail)?;
+                stream_pcm(&mut decoder, &mut w).map_err(fail)?;
+            } else {
+                let mut decoder =
+                    AnyDecoder::Matroska(MatroskaDecoder::from_demuxer(demux).map_err(fail)?);
+                stream_pcm(&mut decoder, &mut w).map_err(fail)?;
+            }
+        }
+        _ => {
+            let mut decoder = open(source).map_err(fail)?;
+            stream_pcm(&mut decoder, &mut w).map_err(fail)?;
+        }
     }
     w.flush()?;
     println!("decoded {} → {}", input.display(), out.display());

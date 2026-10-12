@@ -534,6 +534,22 @@ fn real_wavpack_decodes_losslessly_vs_wav() {
 }
 
 #[test]
+fn real_matroska_vorbis_matches_ogg_vorbis() {
+    // Vorbis-in-Matroska carries the identical packets as tone-vorbis.ogg; the
+    // CLI consumer-dispatch path (peek codec → Ogg-synth adapter → arena Vorbis)
+    // must reproduce the Ogg decode. The mka omits the Ogg end-trim, so it may
+    // carry up to one extra block — check the Ogg bytes are a prefix.
+    let mka = decode_fixture("tone-vorbis.mka");
+    let ogg = decode_fixture("tone-vorbis.ogg");
+    assert!(mka.len() >= ogg.len(), "mka shorter than ogg");
+    assert_eq!(
+        &mka[..ogg.len()],
+        &ogg[..],
+        "Vorbis-in-mka decode differs from Ogg-Vorbis through the CLI"
+    );
+}
+
+#[test]
 fn real_matroska_opus_decodes_to_plausible_audio() {
     let pcm = decode_fixture("tone-opus.webm");
     let samples: Vec<i32> = pcm

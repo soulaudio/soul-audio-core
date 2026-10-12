@@ -20,6 +20,7 @@ right = 659.25 Hz (E5), −6 dB, with 50 ms in/out fades. So:
 | `tone-flac.mka` | FLAC in Matroska (`-c:a copy` of `tone.flac`) — bit-exact vs native FLAC |
 | `tone-opus.webm` | Opus in WebM/Matroska (`-c:a copy` of `tone.opus`) — SNR vs `tone-opus.webm.ref.pcm` |
 | `tone-aac.mka` | AAC-LC in Matroska (`-c:a copy` of `tone-aac.m4a`) — SNR vs `tone-aac.mka.ref.pcm` |
+| `tone-vorbis.mka` | Vorbis in Matroska (`-c:a copy` of `tone-vorbis.ogg`) — bit-exact prefix vs the Ogg decode |
 | `tone.wv` | WavPack lossless, stereo 16-bit (joint + cross decorrelation) — bit-exact vs `tone.wav` |
 | `tone-mono.wv` | WavPack lossless, mono — bit-exact vs `tone-mono.wv.ref.pcm` |
 | `tone-24.wv` | WavPack lossless, 32-bit `INT32_DATA` — bit-exact vs `tone-24.wv.ref.pcm` (s32le) |

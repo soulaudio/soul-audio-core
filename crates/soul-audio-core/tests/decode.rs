@@ -1,6 +1,8 @@
 //! Integration tests exercising the public decode API end-to-end.
 
+use soul_audio_core::demux::MatroskaDemuxer;
 use soul_audio_core::demux::ogg_packets::OggPackets;
+use soul_audio_core::formats::matroska::MatroskaVorbisOgg;
 use soul_audio_core::formats::opus::toc::{self, Mode};
 use soul_audio_core::formats::vorbis::VorbisDecoder;
 use soul_audio_core::{DecodeError, Decoder, SeekableDecoder, SliceSource, open};
@@ -265,6 +267,55 @@ fn matroska_seek_tail(bytes: &'static [u8], target: u64) -> (u16, u64, Vec<i32>)
             .join()
             .expect("decode thread panicked")
     })
+}
+
+/// Decode a full Vorbis-in-Matroska stream through the consumer-dispatch path
+/// (the Ogg-synthesizing [`MatroskaVorbisOgg`] adapter + arena-backed
+/// `VorbisDecoder`), the way the desktop/CLI shells build it.
+fn decode_matroska_vorbis_all(bytes: &'static [u8]) -> Vec<i32> {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let storage = vec![0u8; 256 * 1024];
+            let demux = MatroskaDemuxer::new(SliceSource::new(bytes)).expect("mka demux");
+            let adapter = MatroskaVorbisOgg::new(demux).expect("vorbis-in-mka adapter");
+            let mut dec = VorbisDecoder::new(adapter, storage).expect("open vorbis-in-mka");
+            let mut out = Vec::new();
+            let mut buf = [0i32; 4096];
+            loop {
+                let n = dec.decode_into(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            out
+        })
+        .expect("spawn")
+        .join()
+        .expect("decode thread panicked")
+}
+
+/// Vorbis-in-Matroska decodes **bit-identically** (for the overlapping prefix)
+/// to the Ogg-Vorbis it was remuxed from. The adapter synthesizes Ogg framing
+/// around the same Vorbis packets, so `VorbisDecoder` produces the same PCM; the
+/// mka path omits the Ogg granule end-trim, so it may carry up to one extra
+/// block of tail (checked by the `>=` length + exact-prefix assertions).
+#[test]
+fn open_decodes_matroska_vorbis_matches_ogg() {
+    let mka = decode_matroska_vorbis_all(include_bytes!("../../../testdata/tone-vorbis.mka"));
+    let ogg = decode_vorbis_all(include_bytes!("../../../testdata/tone-vorbis.ogg"));
+    assert!(
+        mka.len() >= ogg.len(),
+        "Vorbis-in-mka shorter than Ogg: {} < {}",
+        mka.len(),
+        ogg.len()
+    );
+    assert_eq!(
+        &mka[..ogg.len()],
+        &ogg[..],
+        "Vorbis-in-mka prefix != Ogg-Vorbis decode"
+    );
 }
 
 /// Matroska seek lands exactly and the decoded tail is **bit-identical** to the
