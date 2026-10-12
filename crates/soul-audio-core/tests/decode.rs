@@ -389,6 +389,59 @@ fn matroska_aac_seek_tail_matches_full_decode() {
     assert_eq!(tail, &full[base..], "post-seek AAC tail != full decode");
 }
 
+/// CAF seeks through `open()`/`AnyDecoder` for both payloads: the seek lands
+/// exactly and the decoded tail is **bit-identical** to the full decode (both
+/// lpcm and alac are lossless — PCM seeks by byte offset, ALAC rewinds +
+/// decode-discards).
+fn caf_seek_tail(bytes: &'static [u8], target: u64) -> (u16, u64, Vec<i32>) {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn_scoped(scope, || {
+                let mut dec = open(SliceSource::new(bytes)).expect("open caf");
+                let ch = dec.stream_info().channels;
+                let landed = dec.seek_to(target).expect("seek");
+                let mut tail = Vec::new();
+                let mut buf = [0i32; 4096];
+                loop {
+                    let n = dec.decode_into(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    tail.extend_from_slice(&buf[..n]);
+                }
+                (ch, landed, tail)
+            })
+            .expect("spawn")
+            .join()
+            .expect("decode thread panicked")
+    })
+}
+
+#[test]
+fn caf_pcm_seek_tail_matches_full_decode() {
+    let caf: &'static [u8] = include_bytes!("../../../testdata/tone.caf");
+    let full = decode_all(caf);
+    let (ch, landed, tail) = caf_seek_tail(caf, 25_000);
+    assert_eq!(landed, 25_000, "CAF-PCM seek is sample-accurate");
+    let base = 25_000usize * usize::from(ch);
+    assert_eq!(tail, &full[base..], "post-seek CAF-PCM tail != full decode");
+}
+
+#[test]
+fn caf_alac_seek_tail_matches_full_decode() {
+    let caf: &'static [u8] = include_bytes!("../../../testdata/tone-alac.caf");
+    let full = decode_all(caf);
+    let (ch, landed, tail) = caf_seek_tail(caf, 25_000);
+    assert_eq!(landed, 25_000, "CAF-ALAC seek is sample-accurate");
+    let base = 25_000usize * usize::from(ch);
+    assert_eq!(
+        tail,
+        &full[base..],
+        "post-seek CAF-ALAC tail != full decode"
+    );
+}
+
 /// Ogg-FLAC seeks sample-accurately through `open()`/`AnyDecoder` (the tail is
 /// bit-identical to a from-start decode — FLAC-in-Ogg is lossless with
 /// independent frames). This fixture's STREAMINFO declares no total, so

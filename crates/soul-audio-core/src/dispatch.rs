@@ -125,7 +125,8 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             // WavPack rewind + forward decode-discard (block-index O(log n) is a
             // follow-up).
             AnyDecoder::WavPack(d) => d.seek_to(sample),
-            AnyDecoder::Caf(_) => Err(DecodeError::Unsupported),
+            // CAF: PCM is a direct byte offset; ALAC rewinds + decode-discards.
+            AnyDecoder::Caf(d) => d.seek_to(sample),
         }
     }
 
@@ -150,7 +151,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::OpusMs(_) => Err(DecodeError::Unsupported),
             AnyDecoder::Matroska(d) => d.seek_to_time(secs),
             AnyDecoder::WavPack(d) => d.seek_to_time(secs),
-            AnyDecoder::Caf(_) => Err(DecodeError::Unsupported),
+            AnyDecoder::Caf(d) => d.seek_to_time(secs),
         }
     }
 }

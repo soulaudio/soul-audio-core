@@ -11,10 +11,12 @@
 //! (`chan`, `info`, `pakt`, …) are skipped. A `data` chunk may declare size −1
 //! ("to end of file"); we then read until EOF.
 
+use embedded_io::SeekFrom;
+
 use crate::decoder::{DecodeError, Decoder};
 use crate::formats::alac::{self, AlacCfg, PACKET_CAP, Scratch};
 use crate::formats::wav::convert_samples;
-use crate::io::Source;
+use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
 
 /// `kCAFLinearPCMFormatFlagIsFloat`.
@@ -138,13 +140,17 @@ impl<S: Source> CafDecoder<S> {
         if &hdr[0..4] != b"caff" {
             return Err(DecodeError::Malformed);
         }
-        // Walk chunks for `desc`, optional `kuki`, up to `data`.
+        // Walk chunks for `desc`, optional `kuki`, up to `data`. `pos` tracks the
+        // absolute byte offset so the `data` body's start can be recorded for
+        // seeking (the 8-byte `caff` header is already consumed).
         let mut desc: Option<Desc> = None;
         let mut kuki = [0u8; 64];
         let mut kuki_len = 0usize;
+        let mut pos: u64 = 8;
         loop {
             let mut ch = [0u8; 12];
             read_exact(&mut src, &mut ch)?;
+            pos += 12;
             let ty = [ch[0], ch[1], ch[2], ch[3]];
             let size = be_i64(&ch[4..12]);
             match &ty {
@@ -155,6 +161,7 @@ impl<S: Source> CafDecoder<S> {
                     let mut d = [0u8; 32];
                     read_exact(&mut src, &mut d)?;
                     skip(&mut src, size as u64 - 32)?;
+                    pos += size as u64;
                     desc = Some(Desc {
                         sample_rate: f64_be(&d[0..8]) as u32,
                         format_id: [d[8], d[9], d[10], d[11]],
@@ -172,6 +179,7 @@ impl<S: Source> CafDecoder<S> {
                     let take = (size as usize).min(kuki.len());
                     read_exact(&mut src, &mut kuki[..take])?;
                     skip(&mut src, size as u64 - take as u64)?;
+                    pos += size as u64;
                     kuki_len = take;
                 }
                 b"data" => {
@@ -179,27 +187,39 @@ impl<S: Source> CafDecoder<S> {
                     // The `data` body begins with a 4-byte edit count.
                     let mut edit = [0u8; 4];
                     read_exact(&mut src, &mut edit)?;
+                    let data_start = pos + 4; // past the edit count = first sample byte
                     let data_bytes = if size < 0 {
                         u64::MAX // "to end of file"
                     } else {
                         (size as u64).saturating_sub(4)
                     };
-                    return Self::build(src, desc, &kuki[..kuki_len], data_bytes);
+                    return Self::build(src, desc, &kuki[..kuki_len], data_bytes, data_start);
                 }
                 _ => {
                     if size < 0 {
                         return Err(DecodeError::Malformed); // only `data` may be unsized
                     }
                     skip(&mut src, size as u64)?;
+                    pos += size as u64;
                 }
             }
         }
     }
 
-    fn build(src: S, desc: Desc, kuki: &[u8], data_bytes: u64) -> Result<Self, DecodeError> {
+    fn build(
+        src: S,
+        desc: Desc,
+        kuki: &[u8],
+        data_bytes: u64,
+        data_start: u64,
+    ) -> Result<Self, DecodeError> {
         match &desc.format_id {
-            b"lpcm" => Ok(CafDecoder::Pcm(CafPcm::new(src, &desc, data_bytes)?)),
-            b"alac" => Ok(CafDecoder::Alac(CafAlac::new(src, kuki, data_bytes)?)),
+            b"lpcm" => Ok(CafDecoder::Pcm(CafPcm::new(
+                src, &desc, data_bytes, data_start,
+            )?)),
+            b"alac" => Ok(CafDecoder::Alac(CafAlac::new(
+                src, kuki, data_bytes, data_start,
+            )?)),
             _ => Err(DecodeError::Unsupported),
         }
     }
@@ -210,6 +230,29 @@ impl<S: Source> CafDecoder<S> {
             CafDecoder::Pcm(d) => d.total_frames,
             CafDecoder::Alac(_) => None, // needs the `pakt` table — a follow-up
         }
+    }
+}
+
+impl<S: SeekSource> CafDecoder<S> {
+    /// Seek to per-channel `sample`: PCM is a direct byte offset; ALAC rewinds
+    /// and decode-discards forward.
+    ///
+    /// # Errors
+    /// Propagates the seek + forward-decode errors.
+    pub fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        match self {
+            CafDecoder::Pcm(d) => d.seek_to(sample),
+            CafDecoder::Alac(d) => d.seek_to(sample),
+        }
+    }
+
+    /// Seek to `secs` seconds (convenience over [`Self::seek_to`]).
+    ///
+    /// # Errors
+    /// As [`Self::seek_to`].
+    pub fn seek_to_time(&mut self, secs: f64) -> Result<u64, DecodeError> {
+        let rate = self.stream_info().sample_rate.max(1);
+        self.seek_to(crate::decoder::secs_to_samples(secs, rate))
     }
 }
 
@@ -238,11 +281,16 @@ pub struct CafPcm<S> {
     bits: u8,
     float: bool,
     big_endian: bool,
+    /// Interleaved-frame byte stride (`bytes_per_packet`), for the seek offset.
+    block_align: u64,
+    /// Absolute byte offset of the first sample, and the total sample-data size.
+    data_start: u64,
+    data_total: u64,
     data_remaining: u64,
 }
 
 impl<S: Source> CafPcm<S> {
-    fn new(src: S, desc: &Desc, data_bytes: u64) -> Result<Self, DecodeError> {
+    fn new(src: S, desc: &Desc, data_bytes: u64, data_start: u64) -> Result<Self, DecodeError> {
         if desc.channels == 0 || desc.frames_per_packet != 1 {
             return Err(DecodeError::Unsupported);
         }
@@ -284,6 +332,13 @@ impl<S: Source> CafPcm<S> {
             bits,
             float,
             big_endian,
+            block_align,
+            data_start,
+            data_total: if data_bytes == u64::MAX {
+                u64::MAX
+            } else {
+                total_frames.unwrap() * block_align
+            },
             data_remaining: if data_bytes == u64::MAX {
                 u64::MAX
             } else {
@@ -337,6 +392,23 @@ impl<S: Source> CafPcm<S> {
     }
 }
 
+impl<S: SeekSource> CafPcm<S> {
+    /// Seek to per-channel `sample` — PCM is constant-rate, so this is a direct
+    /// byte offset (clamped to the data region). Returns the frame landed on.
+    ///
+    /// # Errors
+    /// [`DecodeError::Io`] if the underlying seek fails.
+    fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        let frame = self.total_frames.map_or(sample, |t| sample.min(t));
+        let byte = self.data_start + frame * self.block_align;
+        self.src
+            .seek(SeekFrom::Start(byte))
+            .map_err(|_| DecodeError::Io)?;
+        self.data_remaining = self.data_total.saturating_sub(frame * self.block_align);
+        Ok(frame)
+    }
+}
+
 /// `alac` CAF: drive the shared ALAC [`decode_packet`] core over the `data`
 /// chunk's self-delimiting packets, with the `kuki` config.
 pub struct CafAlac<S> {
@@ -347,6 +419,10 @@ pub struct CafAlac<S> {
     inbuf: [u8; PACKET_CAP],
     filled: usize,
     used: usize,
+    /// Absolute offset of the first packet + the total sample-data size (for the
+    /// restart-based seek).
+    data_start: u64,
+    data_total: u64,
     data_remaining: u64,
     out_len: usize,
     out_pos: usize,
@@ -354,7 +430,7 @@ pub struct CafAlac<S> {
 }
 
 impl<S: Source> CafAlac<S> {
-    fn new(src: S, kuki: &[u8], data_bytes: u64) -> Result<Self, DecodeError> {
+    fn new(src: S, kuki: &[u8], data_bytes: u64, data_start: u64) -> Result<Self, DecodeError> {
         let (cfg, sample_rate) = parse_alac_cookie(kuki)?;
         if cfg.channels == 0 || cfg.channels > alac::MAX_CHANNELS {
             return Err(DecodeError::Unsupported);
@@ -379,6 +455,8 @@ impl<S: Source> CafAlac<S> {
             inbuf: [0; PACKET_CAP],
             filled: 0,
             used: 0,
+            data_start,
+            data_total: data_bytes,
             data_remaining: data_bytes,
             out_len: 0,
             out_pos: 0,
@@ -449,6 +527,40 @@ impl<S: Source> CafAlac<S> {
             written += take;
         }
         Ok(written)
+    }
+}
+
+impl<S: SeekSource> CafAlac<S> {
+    /// Seek to per-channel `sample` by rewinding to the first packet and
+    /// decode-discarding forward (ALAC packets self-delimit but CAF carries no
+    /// per-packet size table here — a `pakt` scan would make it O(log n), a
+    /// follow-up). Returns the frame landed on.
+    ///
+    /// # Errors
+    /// [`DecodeError::Io`] on seek failure, plus the forward-decode errors.
+    fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        self.src
+            .seek(SeekFrom::Start(self.data_start))
+            .map_err(|_| DecodeError::Io)?;
+        self.scratch = Scratch::new();
+        self.filled = 0;
+        self.used = 0;
+        self.out_len = 0;
+        self.out_pos = 0;
+        self.eof = false;
+        self.data_remaining = self.data_total;
+        let ch = self.cfg.channels.max(1);
+        let mut landed = 0u64;
+        while landed < sample {
+            if self.out_pos >= self.out_len && !self.decode_next_packet()? {
+                break;
+            }
+            let avail = (self.out_len - self.out_pos) / ch;
+            let take = avail.min((sample - landed) as usize);
+            self.out_pos += take * ch;
+            landed += take as u64;
+        }
+        Ok(landed)
     }
 }
 
