@@ -174,6 +174,43 @@ fn open_decodes_wavpack_bit_exact_vs_wav() {
     assert_eq!(fnv1a(&wv), fnv1a(&wav), "WavPack decode != source WAV");
 }
 
+/// WavPack seeks via `open()`/`AnyDecoder`: the seek lands exactly and the
+/// decoded tail is **bit-identical** to the full decode from that point (WavPack
+/// is lossless and blocks are independent). `total_frames` comes from the header.
+#[test]
+fn wavpack_seek_tail_matches_full_decode() {
+    let wv: &'static [u8] = include_bytes!("../../../testdata/tone.wv");
+    let full = decode_all(wv);
+    let (ch, landed, tail) = {
+        // Reuse the Matroska helper's open/seek/drain shape on a big stack.
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn_scoped(scope, || {
+                    let mut dec = open(SliceSource::new(wv)).expect("open wavpack");
+                    let ch = dec.stream_info().channels;
+                    let landed = dec.seek_to(30_000).expect("seek");
+                    let mut tail = Vec::new();
+                    let mut buf = [0i32; 4096];
+                    loop {
+                        let n = dec.decode_into(&mut buf).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        tail.extend_from_slice(&buf[..n]);
+                    }
+                    (ch, landed, tail)
+                })
+                .expect("spawn")
+                .join()
+                .expect("decode thread panicked")
+        })
+    };
+    assert_eq!(landed, 30_000, "WavPack seek is sample-accurate");
+    let base = 30_000usize * usize::from(ch);
+    assert_eq!(tail, &full[base..], "post-seek WavPack tail != full decode");
+}
+
 /// Mono WavPack decodes bit-exact to ffmpeg's own decode — exercises the mono
 /// decorrelation path (distinct from the stereo joint/cross terms).
 #[test]

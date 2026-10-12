@@ -122,8 +122,9 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::OpusMs(_) => Err(DecodeError::Unsupported),
             // Matroska restart + forward decode-discard (Opus/FLAC/AAC).
             AnyDecoder::Matroska(d) => d.seek_to(sample),
-            // WavPack block-index seeking is a follow-up.
-            AnyDecoder::WavPack(_) => Err(DecodeError::Unsupported),
+            // WavPack rewind + forward decode-discard (block-index O(log n) is a
+            // follow-up).
+            AnyDecoder::WavPack(d) => d.seek_to(sample),
             AnyDecoder::Caf(_) => Err(DecodeError::Unsupported),
         }
     }
@@ -148,7 +149,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::Opus(d) => d.seek_to(crate::decoder::secs_to_samples(secs, 48_000)),
             AnyDecoder::OpusMs(_) => Err(DecodeError::Unsupported),
             AnyDecoder::Matroska(d) => d.seek_to_time(secs),
-            AnyDecoder::WavPack(_) => Err(DecodeError::Unsupported),
+            AnyDecoder::WavPack(d) => d.seek_to_time(secs),
             AnyDecoder::Caf(_) => Err(DecodeError::Unsupported),
         }
     }

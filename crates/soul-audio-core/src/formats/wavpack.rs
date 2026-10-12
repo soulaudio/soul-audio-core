@@ -4,8 +4,9 @@
 //! stereo, and the full decorrelation term set (including the negative
 //! cross-channel terms). Hybrid (lossy), float, DSD, >2-channel block
 //! stitching, and the `wvc`/`wvx` correction/extension streams are out of scope
-//! and decline as [`DecodeError::Unsupported`]. Seeking (by block index) is a
-//! follow-up; `total_frames` comes from the stream header.
+//! and decline as [`DecodeError::Unsupported`]. Seeking rewinds and
+//! decode-discards forward (a block-index scan would make it O(log n) — a
+//! follow-up); `total_frames` comes from the stream header.
 //!
 //! A WavPack file is a sequence of blocks; each block carries a 32-byte header,
 //! a run of metadata sub-blocks (decorrelation terms/weights/samples, entropy
@@ -15,8 +16,10 @@
 //! bit-exact to the original PCM. All integer math wraps (two's complement),
 //! matching the reference C.
 
+use embedded_io::SeekFrom;
+
 use crate::decoder::{DecodeError, Decoder};
-use crate::io::Source;
+use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
 
 // ---- flags (WavpackHeader.flags) ------------------------------------------
@@ -965,6 +968,46 @@ impl<S: Source> WavpackDecoder<S> {
             self.pcm_pos = 0;
             return Ok(true);
         }
+    }
+}
+
+impl<S: SeekSource> WavpackDecoder<S> {
+    /// Seek to per-channel `sample` by rewinding to the stream start and
+    /// decode-discarding forward (blocks decode sequentially; a block-index
+    /// scan would make it O(log n) — a follow-up). Returns the frame landed on.
+    ///
+    /// # Errors
+    /// [`DecodeError::Io`] on seek failure, plus the forward-decode errors.
+    pub fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        self.src
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| DecodeError::Io)?;
+        self.eof = false;
+        self.pcm_len = 0;
+        self.pcm_pos = 0;
+        let ch = self.channels.max(1);
+        let mut landed = 0u64;
+        while landed < sample {
+            if self.pcm_pos >= self.pcm_len && !self.decode_block()? {
+                break;
+            }
+            let avail = (self.pcm_len - self.pcm_pos) / ch;
+            let take = avail.min((sample - landed) as usize);
+            self.pcm_pos += take * ch;
+            landed += take as u64;
+        }
+        Ok(landed)
+    }
+
+    /// Seek to `secs` seconds (convenience over [`Self::seek_to`]).
+    ///
+    /// # Errors
+    /// As [`Self::seek_to`].
+    pub fn seek_to_time(&mut self, secs: f64) -> Result<u64, DecodeError> {
+        self.seek_to(crate::decoder::secs_to_samples(
+            secs,
+            self.info.sample_rate.max(1),
+        ))
     }
 }
 
