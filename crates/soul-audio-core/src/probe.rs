@@ -31,6 +31,10 @@ fn identify(head: &[u8]) -> Option<Format> {
     if head.len() >= 12 && &head[0..4] == b"FORM" && matches!(&head[8..12], b"AIFF" | b"AIFC") {
         return Some(Format::Aiff);
     }
+    // Matroska / WebM: the EBML header magic 0x1A45DFA3.
+    if head.len() >= 4 && head[0..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+        return Some(Format::Matroska);
+    }
     if head.len() >= 4 {
         match &head[0..4] {
             b"fLaC" => return Some(Format::Flac),
@@ -94,6 +98,10 @@ mod tests {
         assert_eq!(probe_bytes(b"RIFF\0\0\0\0WAVEfmt ").unwrap(), Format::Wav);
         assert_eq!(probe_bytes(b"FORM\0\0\0\0AIFFCOMM").unwrap(), Format::Aiff);
         assert_eq!(probe_bytes(b"FORM\0\0\0\0AIFCFVER").unwrap(), Format::Aiff);
+        assert_eq!(
+            probe_bytes(&[0x1A, 0x45, 0xDF, 0xA3, 0x01, 0x00]).unwrap(),
+            Format::Matroska
+        );
         assert_eq!(probe_bytes(b"fLaC\0\0\0\0").unwrap(), Format::Flac);
         assert_eq!(probe_bytes(b"DSD \0\0\0\0").unwrap(), Format::Dsf);
         assert_eq!(probe_bytes(b"FRM8\0\0\0\0").unwrap(), Format::Dff);

@@ -62,6 +62,15 @@ ffmpeg -y -hide_banner -loglevel error -i tone.wav -t 0.2 -c:a flac \
 # There is otherwise NO .opus fixture (tone.ogg is FLAC-in-Ogg).
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a libopus -b:a 96k tone.opus
 
+# Matroska / WebM: remux the EXISTING Opus and FLAC streams with `-c:a copy`, so
+# the contained frames are byte-identical to tone.opus / tone.flac. That lets the
+# Matroska decode be checked bit-exact (FLAC) / same-SNR (Opus) against the Ogg
+# path — proving the EBML demux + codec seam, not a fresh encode.
+ffmpeg -y -hide_banner -loglevel error -i tone.opus -c:a copy -f webm tone-opus.webm
+ffmpeg -y -hide_banner -loglevel error -i tone.flac -c:a copy -f matroska tone-flac.mka
+# Opus-in-WebM reference (ffmpeg's own decode) for the segmental-SNR e2e.
+ffmpeg -y -hide_banner -loglevel error -i tone-opus.webm -f s16le -c:a pcm_s16le tone-opus.webm.ref.pcm
+
 # FLAC with an embedded cover picture: exercises embedded-art extraction. A tiny
 # solid-red 16x16 PNG is attached as the front cover.
 ffmpeg -y -hide_banner -loglevel error -f lavfi -i color=c=red:s=16x16:d=1 -frames:v 1 _cover.png
@@ -79,4 +88,4 @@ python3 generate_dsd.py tone-dsd512.dsf 22579200 0.1  # DSD512 DSF (0.1 s, size)
 python3 generate_dsd.py tone.dff                      # DSD64  DSDIFF/raw (0.5 s)
 
 echo "generated:"
-ls -la tone.wav tone-aiff.aiff tone-aifc-sowt.aifc tone.flac tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1
+ls -la tone.wav tone-aiff.aiff tone-aifc-sowt.aifc tone.flac tone-flac.mka tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus tone-opus.webm arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1

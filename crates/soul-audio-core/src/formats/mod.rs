@@ -18,6 +18,7 @@ pub mod dff;
 pub mod dsf;
 pub mod dst;
 pub mod flac;
+pub mod matroska;
 pub mod mp3;
 pub mod mp3_codec;
 pub mod mp3_l12;

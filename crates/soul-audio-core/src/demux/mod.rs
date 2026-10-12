@@ -10,7 +10,9 @@ use crate::model::StreamInfo;
 
 pub mod adts;
 pub mod aiff;
+pub mod ebml;
 pub mod flac;
+pub mod matroska;
 pub mod mp3;
 pub mod mp4;
 pub mod ogg;
@@ -19,6 +21,7 @@ pub mod wav;
 
 pub use aiff::AiffDemuxer;
 pub use flac::FlacDemuxer;
+pub use matroska::MatroskaDemuxer;
 pub use mp3::Mp3Demuxer;
 pub use wav::WavDemuxer;
 

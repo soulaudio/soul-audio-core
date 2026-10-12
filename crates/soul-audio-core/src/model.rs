@@ -124,6 +124,11 @@ pub enum Format {
     /// [`AnyDecoder`](crate::dispatch::AnyDecoder) variant (see
     /// `formats::opus::OpusDecoder`).
     Opus,
+    /// Matroska / WebM (EBML). A container carrying an audio track whose own
+    /// codec decodes the frames — v1 dispatches `A_OPUS` and `A_FLAC` (see
+    /// `formats::matroska::MatroskaDecoder`); other codecs are
+    /// [`DecodeError::Unsupported`](crate::DecodeError::Unsupported).
+    Matroska,
 }
 
 /// Explicit DSD output mode chosen by the caller. Selects which path a native

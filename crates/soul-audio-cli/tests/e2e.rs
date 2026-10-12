@@ -511,6 +511,37 @@ fn real_aifc_sowt_decodes_losslessly_vs_wav() {
 }
 
 #[test]
+fn real_matroska_flac_decodes_losslessly_vs_flac() {
+    // FLAC-in-Matroska carries the identical frames as tone.flac; the full CLI
+    // pipeline (probe → open_track → OwnedDecoder::Pcm → decode) must reproduce
+    // the native FLAC decode bit-for-bit, with no Matroska-specific shell code.
+    assert_eq!(
+        decode_fixture("tone-flac.mka"),
+        decode_fixture("tone.flac"),
+        "Matroska-FLAC decode differs from native FLAC through the CLI"
+    );
+}
+
+#[test]
+fn real_matroska_opus_decodes_to_plausible_audio() {
+    let pcm = decode_fixture("tone-opus.webm");
+    let samples: Vec<i32> = pcm
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    // ~2 s stereo @ 48 kHz = 192_000 samples, ± Opus pre-skip/padding.
+    assert!(
+        (samples.len() as i64 - 192_000).abs() < 10_000,
+        "unexpected Matroska-Opus length: {}",
+        samples.len()
+    );
+    assert!(
+        samples.iter().any(|&s| s.abs() > 1000),
+        "Matroska-Opus decoded to silence"
+    );
+}
+
+#[test]
 fn real_mp3_decodes_to_plausible_audio() {
     let pcm = decode_fixture("tone.mp3");
     let samples: Vec<i32> = pcm

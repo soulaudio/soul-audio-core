@@ -120,6 +120,46 @@ fn open_decodes_aifc_sowt_bit_exact_vs_wav() {
     );
 }
 
+/// FLAC-in-Matroska (`.mka`) decodes **bit-exact** to the native `tone.flac` —
+/// both carry the identical FLAC frames (the `.mka` is `tone.flac` remuxed with
+/// `-c:a copy`). Proves the EBML/`SimpleBlock` demux and the `MatroskaFlacReader`
+/// native-stream adapter that lets `FlacDecoder` decode it unchanged.
+#[test]
+fn open_decodes_matroska_flac_bit_exact_vs_native() {
+    let mka = decode_all(include_bytes!("../../../testdata/tone-flac.mka"));
+    let flac = decode_all(include_bytes!("../../../testdata/tone.flac"));
+    assert_eq!(
+        mka.len(),
+        flac.len(),
+        "Matroska-FLAC/native sample counts differ"
+    );
+    assert_eq!(
+        fnv1a(&mka),
+        fnv1a(&flac),
+        "Matroska-FLAC decode != native FLAC"
+    );
+}
+
+/// Opus-in-WebM (Matroska) decodes correctly vs ffmpeg's own decode of the same
+/// file. The frames are the identical Opus packets as `tone.opus` (remuxed with
+/// `-c:a copy`), driven through the shared Opus core from `SimpleBlock`s — so
+/// this proves the EBML demux plus the Opus packet seam (pre-skip + gain) end to
+/// end. Same 60 dB bar as the Ogg CELT golden (same decoder core).
+#[test]
+fn open_decodes_matroska_opus_matching_ffmpeg() {
+    let webm = include_bytes!("../../../testdata/tone-opus.webm");
+    let refr = load_s16le(include_bytes!("../../../testdata/tone-opus.webm.ref.pcm"));
+    let dec = open(SliceSource::new(webm)).expect("probe + construct Matroska-Opus");
+    assert_eq!(dec.stream_info().sample_rate, 48_000);
+    assert_eq!(dec.stream_info().channels, 2);
+    let ours = decode_all(webm);
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 60.0,
+        "Matroska-Opus SNR vs ffmpeg too low: {snr:.1} dB (offset {off} frames)"
+    );
+}
+
 /// Ogg-FLAC seeks sample-accurately through `open()`/`AnyDecoder` (the tail is
 /// bit-identical to a from-start decode — FLAC-in-Ogg is lossless with
 /// independent frames). This fixture's STREAMINFO declares no total, so

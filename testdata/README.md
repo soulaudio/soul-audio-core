@@ -17,6 +17,8 @@ right = 659.25 Hz (E5), −6 dB, with 50 ms in/out fades. So:
 | `tone-aiff.aiff` | AIFF (big-endian PCM) — lossless, decodes bit-exact vs `tone.wav` |
 | `tone-aifc-sowt.aifc` | AIFF-C `sowt` (little-endian PCM) — lossless, bit-exact vs `tone.wav` |
 | `tone.flac` | native FLAC |
+| `tone-flac.mka` | FLAC in Matroska (`-c:a copy` of `tone.flac`) — bit-exact vs native FLAC |
+| `tone-opus.webm` | Opus in WebM/Matroska (`-c:a copy` of `tone.opus`) — SNR vs `tone-opus.webm.ref.pcm` |
 | `tone.mp3`  | MPEG Layer III |
 | `tone.mp2`  | MPEG Layer II |
 | `tone-layer1.mp1` | MPEG Layer I (conformance vector; ffmpeg has no L1 encoder, so not the shared tone) |

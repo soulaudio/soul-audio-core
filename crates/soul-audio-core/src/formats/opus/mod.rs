@@ -82,6 +82,18 @@ const MAX_PACKET_SAMPLES: usize = 5760 * 2;
 /// (`6.488_141e-4` is libopus's `6.48814081e-4f` at f32 precision.)
 const OUTPUT_GAIN_SCALE: f32 = 6.488_141e-4;
 
+/// The linear output-gain multiplier for an `OpusHead` Q7.8-dB gain. `0` is an
+/// exact `1.0` pass-through (avoiding the `celt_exp2` cubic's ~0.0075% bias on
+/// the common path); otherwise `celt_exp2(gain_q8 · OUTPUT_GAIN_SCALE)`. Shared
+/// by the Ogg [`OpusDecoder`] and the Matroska Opus path.
+pub(crate) fn linear_output_gain(output_gain_q8: i16) -> f32 {
+    if output_gain_q8 == 0 {
+        1.0
+    } else {
+        celt_exp2(f32::from(output_gain_q8) * OUTPUT_GAIN_SCALE)
+    }
+}
+
 /// Minimum per-channel run-in (48 kHz samples) decoded and discarded ahead of a
 /// seek target so the CELT/SILK cross-frame state (MDCT overlap, energy
 /// predictor, LPC/LTP filter memory, resampler delay lines) reconverges before
@@ -234,11 +246,7 @@ impl<S: Source> OpusDecoder<S> {
         // (`if (st->decode_gain)` in `opus_decode_frame`); a zero gain — the
         // common case — is an exact 1.0 pass-through, NOT `celt_exp2(0)` (whose
         // cubic approximation is 0.9999252, a ~0.0075% systematic attenuation).
-        let output_gain = if head.output_gain_q8 == 0 {
-            1.0
-        } else {
-            celt_exp2(f32::from(head.output_gain_q8) * OUTPUT_GAIN_SCALE)
-        };
+        let output_gain = linear_output_gain(head.output_gain_q8);
 
         Ok(Self {
             ogg: RefCell::new(ogg),
