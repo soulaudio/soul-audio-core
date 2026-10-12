@@ -14,6 +14,7 @@ use crate::demux::ogg::OggReader;
 use crate::formats::matroska::MatroskaDecoder;
 use crate::formats::opus::multistream::MultistreamOpusDecoder;
 use crate::formats::opus::{OpusDecoder, open_opus_headers};
+use crate::formats::wavpack::WavpackDecoder;
 use crate::formats::{
     aac::AacDecoder, aiff::AiffDecoder, alac::AlacDecoder, flac::FlacDecoder, mp3::Mp3Decoder,
     wav::WavDecoder,
@@ -56,6 +57,9 @@ pub enum AnyDecoder<S> {
     /// contained codec decodes the frames; decode-only for now (Cues seeking is
     /// a follow-up), so `total_frames`/`seek_to` report `None`/`Unsupported`.
     Matroska(MatroskaDecoder<S>),
+    /// WavPack (`.wv`) lossless. Length comes from the stream header; block-index
+    /// seeking is a follow-up, so `seek_to` reports `Unsupported`.
+    WavPack(WavpackDecoder<S>),
 }
 
 impl<S: crate::io::SeekSource> AnyDecoder<S> {
@@ -85,6 +89,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             // Surround Opus is decode-only; no declared length.
             AnyDecoder::OpusMs(_) => None,
             AnyDecoder::Matroska(d) => d.total_frames(),
+            AnyDecoder::WavPack(d) => d.total_frames(),
         }
     }
 
@@ -111,6 +116,8 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             // Surround Opus seeking (per-stream pre-roll) is not implemented.
             AnyDecoder::OpusMs(_) => Err(DecodeError::Unsupported),
             AnyDecoder::Matroska(d) => d.seek_to(sample),
+            // WavPack block-index seeking is a follow-up.
+            AnyDecoder::WavPack(_) => Err(DecodeError::Unsupported),
         }
     }
 
@@ -134,6 +141,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::Opus(d) => d.seek_to(crate::decoder::secs_to_samples(secs, 48_000)),
             AnyDecoder::OpusMs(_) => Err(DecodeError::Unsupported),
             AnyDecoder::Matroska(d) => d.seek_to_time(secs),
+            AnyDecoder::WavPack(_) => Err(DecodeError::Unsupported),
         }
     }
 }
@@ -160,6 +168,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::Opus(d) => d.stream_info(),
             AnyDecoder::OpusMs(d) => d.stream_info(),
             AnyDecoder::Matroska(d) => d.stream_info(),
+            AnyDecoder::WavPack(d) => d.stream_info(),
         }
     }
 
@@ -175,6 +184,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::Opus(d) => d.decode_into(out),
             AnyDecoder::OpusMs(d) => d.decode_into(out),
             AnyDecoder::Matroska(d) => d.decode_into(out),
+            AnyDecoder::WavPack(d) => d.decode_into(out),
         }
     }
 
@@ -194,7 +204,8 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             | AnyDecoder::OggFlac(_)
             | AnyDecoder::Opus(_)
             | AnyDecoder::OpusMs(_)
-            | AnyDecoder::Matroska(_) => 0,
+            | AnyDecoder::Matroska(_)
+            | AnyDecoder::WavPack(_) => 0,
         }
     }
 
@@ -213,7 +224,8 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             | AnyDecoder::OggFlac(_)
             | AnyDecoder::Opus(_)
             | AnyDecoder::OpusMs(_)
-            | AnyDecoder::Matroska(_) => None,
+            | AnyDecoder::Matroska(_)
+            | AnyDecoder::WavPack(_) => None,
         }
     }
 }
@@ -270,6 +282,8 @@ pub fn open<S: BufSource>(mut src: S) -> Result<AnyDecoder<S>, DecodeError> {
         // Matroska / WebM: parse the container, then build the contained codec's
         // decoder (Opus/FLAC in v1) — see `MatroskaDecoder::new`.
         Format::Matroska => MatroskaDecoder::new(src).map(AnyDecoder::Matroska),
+        // WavPack lossless (.wv).
+        Format::WavPack => WavpackDecoder::new(src).map(AnyDecoder::WavPack),
     }
 }
 

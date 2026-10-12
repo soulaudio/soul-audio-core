@@ -129,6 +129,10 @@ pub enum Format {
     /// `formats::matroska::MatroskaDecoder`); other codecs are
     /// [`DecodeError::Unsupported`](crate::DecodeError::Unsupported).
     Matroska,
+    /// WavPack (`.wv`) — lossless (hybrid/float/DSD unsupported). A normal
+    /// [`AnyDecoder`](crate::dispatch::AnyDecoder) variant (see
+    /// `formats::wavpack::WavpackDecoder`).
+    WavPack,
 }
 
 /// Explicit DSD output mode chosen by the caller. Selects which path a native

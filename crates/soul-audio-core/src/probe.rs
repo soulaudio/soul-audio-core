@@ -35,6 +35,10 @@ fn identify(head: &[u8]) -> Option<Format> {
     if head.len() >= 4 && head[0..4] == [0x1A, 0x45, 0xDF, 0xA3] {
         return Some(Format::Matroska);
     }
+    // WavPack: "wvpk" block magic.
+    if head.len() >= 4 && &head[0..4] == b"wvpk" {
+        return Some(Format::WavPack);
+    }
     if head.len() >= 4 {
         match &head[0..4] {
             b"fLaC" => return Some(Format::Flac),
@@ -102,6 +106,7 @@ mod tests {
             probe_bytes(&[0x1A, 0x45, 0xDF, 0xA3, 0x01, 0x00]).unwrap(),
             Format::Matroska
         );
+        assert_eq!(probe_bytes(b"wvpk\0\0\0\0").unwrap(), Format::WavPack);
         assert_eq!(probe_bytes(b"fLaC\0\0\0\0").unwrap(), Format::Flac);
         assert_eq!(probe_bytes(b"DSD \0\0\0\0").unwrap(), Format::Dsf);
         assert_eq!(probe_bytes(b"FRM8\0\0\0\0").unwrap(), Format::Dff);

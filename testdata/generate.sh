@@ -71,6 +71,16 @@ ffmpeg -y -hide_banner -loglevel error -i tone.flac -c:a copy -f matroska tone-f
 # Opus-in-WebM reference (ffmpeg's own decode) for the segmental-SNR e2e.
 ffmpeg -y -hide_banner -loglevel error -i tone-opus.webm -f s16le -c:a pcm_s16le tone-opus.webm.ref.pcm
 
+# WavPack (.wv) lossless — stereo (joint + cross decorrelation), mono, and a
+# 32-bit INT32_DATA stream (ffmpeg promotes the 16-bit source to s32 with 16
+# trailing zero bits). Each decodes bit-exact: stereo vs tone.wav, mono/int32 vs
+# the ffmpeg s16le/s32le reference decodes.
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a wavpack tone.wv
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -ac 1 -c:a wavpack tone-mono.wv
+ffmpeg -y -hide_banner -loglevel error -i tone-mono.wv -f s16le tone-mono.wv.ref.pcm
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -af aformat=sample_fmts=s32 -c:a wavpack tone-24.wv
+ffmpeg -y -hide_banner -loglevel error -i tone-24.wv -f s32le tone-24.wv.ref.pcm
+
 # FLAC with an embedded cover picture: exercises embedded-art extraction. A tiny
 # solid-red 16x16 PNG is attached as the front cover.
 ffmpeg -y -hide_banner -loglevel error -f lavfi -i color=c=red:s=16x16:d=1 -frames:v 1 _cover.png
@@ -88,4 +98,4 @@ python3 generate_dsd.py tone-dsd512.dsf 22579200 0.1  # DSD512 DSF (0.1 s, size)
 python3 generate_dsd.py tone.dff                      # DSD64  DSDIFF/raw (0.5 s)
 
 echo "generated:"
-ls -la tone.wav tone-aiff.aiff tone-aifc-sowt.aifc tone.flac tone-flac.mka tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus tone-opus.webm arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1
+ls -la tone.wav tone-aiff.aiff tone-aifc-sowt.aifc tone.flac tone-flac.mka tone.wv tone-mono.wv tone-24.wv tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus tone-opus.webm arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1

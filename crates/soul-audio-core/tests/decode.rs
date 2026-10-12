@@ -160,6 +160,47 @@ fn open_decodes_matroska_opus_matching_ffmpeg() {
     );
 }
 
+/// WavPack (`.wv`) decodes **bit-exact** to the WAV it was encoded from — it is
+/// a lossless codec and `tone.wv` / `tone.wav` carry the same 16-bit stereo
+/// signal. Exercises the from-scratch block parse, adaptive-median entropy
+/// decoder, decorrelation passes, and joint-stereo un-mix end to end.
+#[test]
+fn open_decodes_wavpack_bit_exact_vs_wav() {
+    let wv = decode_all(include_bytes!("../../../testdata/tone.wv"));
+    let wav = decode_all(include_bytes!("../../../testdata/tone.wav"));
+    assert_eq!(wv.len(), wav.len(), "WavPack/WAV sample counts differ");
+    assert_eq!(fnv1a(&wv), fnv1a(&wav), "WavPack decode != source WAV");
+}
+
+/// Mono WavPack decodes bit-exact to ffmpeg's own decode — exercises the mono
+/// decorrelation path (distinct from the stereo joint/cross terms).
+#[test]
+fn open_decodes_wavpack_mono_bit_exact() {
+    let wv = decode_all(include_bytes!("../../../testdata/tone-mono.wv"));
+    let refr = load_s16le(include_bytes!("../../../testdata/tone-mono.wv.ref.pcm"));
+    assert_eq!(
+        wv.len(),
+        refr.len(),
+        "mono WavPack length differs from ffmpeg"
+    );
+    assert_eq!(fnv1a(&wv), fnv1a(&refr), "mono WavPack decode != ffmpeg");
+}
+
+/// 32-bit (`INT32_DATA`) WavPack decodes bit-exact to ffmpeg's `s32le` decode —
+/// exercises the `bytes_per_sample=4` path and the int32 redundant-bit restore
+/// (this fixture carries 16 trailing zero bits, so decode left-shifts by 16).
+#[test]
+fn open_decodes_wavpack_int32_bit_exact() {
+    let wv = decode_all(include_bytes!("../../../testdata/tone-24.wv"));
+    let refr = load_s32le(include_bytes!("../../../testdata/tone-24.wv.ref.pcm"));
+    assert_eq!(
+        wv.len(),
+        refr.len(),
+        "int32 WavPack length differs from ffmpeg"
+    );
+    assert_eq!(fnv1a(&wv), fnv1a(&refr), "int32 WavPack decode != ffmpeg");
+}
+
 /// Ogg-FLAC seeks sample-accurately through `open()`/`AnyDecoder` (the tail is
 /// bit-identical to a from-start decode — FLAC-in-Ogg is lossless with
 /// independent frames). This fixture's STREAMINFO declares no total, so
@@ -290,6 +331,15 @@ fn load_s16le(bytes: &[u8]) -> Vec<i32> {
     bytes
         .chunks_exact(2)
         .map(|c| i32::from(i16::from_le_bytes([c[0], c[1]])))
+        .collect()
+}
+
+/// Interpret a little-endian signed-32-bit PCM blob (ffmpeg's `-f s32le`
+/// output) as interleaved `i32` samples.
+fn load_s32le(bytes: &[u8]) -> Vec<i32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
 

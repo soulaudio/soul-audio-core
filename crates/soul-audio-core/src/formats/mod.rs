@@ -25,6 +25,7 @@ pub mod mp3_l12;
 pub mod opus;
 pub mod vorbis;
 pub mod wav;
+pub mod wavpack;
 
 /// Maximum DSD channels for the DSF planar reader (up to 6 — SACD's multichannel
 /// maximum). The `channels × 4096`-byte planar block-row buffer is sized from

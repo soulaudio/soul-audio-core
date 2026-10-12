@@ -523,6 +523,17 @@ fn real_matroska_flac_decodes_losslessly_vs_flac() {
 }
 
 #[test]
+fn real_wavpack_decodes_losslessly_vs_wav() {
+    // WavPack is lossless; the full CLI pipeline must reproduce the WAV decode
+    // bit-for-bit through the from-scratch decoder.
+    assert_eq!(
+        decode_fixture("tone.wv"),
+        decode_fixture("tone.wav"),
+        "WavPack decode is not lossless vs the reference WAV through the CLI"
+    );
+}
+
+#[test]
 fn real_matroska_opus_decodes_to_plausible_audio() {
     let pcm = decode_fixture("tone-opus.webm");
     let samples: Vec<i32> = pcm
