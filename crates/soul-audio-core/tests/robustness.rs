@@ -13,13 +13,18 @@
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use soul_audio_core::demux::MatroskaDemuxer;
+use soul_audio_core::formats::aiff::AiffDecoder;
+use soul_audio_core::formats::caf::CafDecoder;
 use soul_audio_core::formats::dff::DffDecoder;
 use soul_audio_core::formats::dsf::DsfDecoder;
 use soul_audio_core::formats::flac::FlacDecoder;
+use soul_audio_core::formats::matroska::{MatroskaDecoder, MatroskaVorbisOgg};
 use soul_audio_core::formats::mp3::Mp3Decoder;
 use soul_audio_core::formats::opus::OpusDecoder;
 use soul_audio_core::formats::vorbis::VorbisDecoder;
 use soul_audio_core::formats::wav::WavDecoder;
+use soul_audio_core::formats::wavpack::WavpackDecoder;
 use soul_audio_core::{
     DecimateAdapter, Decoder, DopAdapter, DsdDecoder, DsdSeek, SeekableDecoder, SliceSource, open,
 };
@@ -165,6 +170,44 @@ fn drive_all(bytes: &[u8]) -> Result<(), &'static str> {
     if let Ok(mut d) = VorbisDecoder::new(SliceSource::new(bytes), vec![0u8; 128 * 1024]) {
         if !drain_pcm(&mut d, len) {
             return Err("vorbis");
+        }
+    }
+    // AIFF: FORM/COMM/SSND walk + the 80-bit extended-rate decode + PCM widen.
+    if let Ok(mut d) = AiffDecoder::new(SliceSource::new(bytes)) {
+        if !drain_pcm(&mut d, len) {
+            return Err("aiff");
+        }
+    }
+    // WavPack: the block parser + adaptive-median entropy decoder + decorrelation.
+    if let Ok(mut d) = WavpackDecoder::new(SliceSource::new(bytes)) {
+        if !drain_pcm(&mut d, len) {
+            return Err("wavpack");
+        }
+    }
+    // CAF: the chunk walk + lpcm/ALAC seams (the ALAC `kuki` cookie parse).
+    if let Ok(mut d) = CafDecoder::new(SliceSource::new(bytes)) {
+        if !drain_pcm(&mut d, len) {
+            return Err("caf");
+        }
+    }
+    // Matroska: the EBML tiling + cluster/SimpleBlock walk + lacing, feeding the
+    // Opus/FLAC/AAC seams. (Reached via `open` too, but this hits the decoder even
+    // when a mutation breaks the EBML magic that `probe` keys on.)
+    if let Ok(mut d) = MatroskaDecoder::new(SliceSource::new(bytes)) {
+        if !drain_pcm(&mut d, len) {
+            return Err("matroska");
+        }
+    }
+    // Vorbis-in-Matroska: the consumer-dispatch path `open` can't build — the
+    // Ogg-synthesizing adapter (Xiph-lacing unpack + page synthesis) feeding
+    // `VorbisDecoder`. A corrupt CodecPrivate / SimpleBlock must stay Err/short.
+    if let Ok(demux) = MatroskaDemuxer::new(SliceSource::new(bytes)) {
+        if let Ok(adapter) = MatroskaVorbisOgg::new(demux) {
+            if let Ok(mut d) = VorbisDecoder::new(adapter, vec![0u8; 128 * 1024]) {
+                if !drain_pcm(&mut d, len) {
+                    return Err("mkv-vorbis");
+                }
+            }
         }
     }
 
@@ -401,6 +444,51 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
             "ogg-flac-multipage",
             include_bytes!("../testdata/flac-in-ogg-multipage.ogg").to_vec(),
         ),
+        // AIFF: mutations drive the FORM/COMM/SSND chunk walk + the 80-bit
+        // extended sample-rate decode (a bad chunk size / channel count / bit
+        // depth must stay a bounded Err, never a panic or OOB).
+        (
+            "aiff",
+            include_bytes!("../../../testdata/tone-aiff.aiff").to_vec(),
+        ),
+        // WavPack: mutations drive the block header + metadata tiling, the
+        // adaptive-median entropy decoder, the decorrelation passes, and the
+        // int32/shift fixup — every malformed bitstream must stay Err/short, not
+        // panic (two's-complement wrapping is deliberate, so no debug overflow).
+        (
+            "wavpack",
+            include_bytes!("../../../testdata/tone.wv").to_vec(),
+        ),
+        (
+            "wavpack-mono",
+            include_bytes!("../../../testdata/tone-mono.wv").to_vec(),
+        ),
+        // CAF: mutations drive the chunk walk (desc/kuki/data, incl. the −1
+        // "to EOF" size) and the ALAC kuki magic-cookie parse.
+        (
+            "caf-alac",
+            include_bytes!("../../../testdata/tone-alac.caf").to_vec(),
+        ),
+        // Matroska / WebM: mutations drive the EBML vint/tiling, the
+        // cluster/SimpleBlock walk + lacing, and the per-codec seams — Opus,
+        // FLAC (native-stream adapter), AAC (raw access units), Vorbis
+        // (Ogg-synth adapter, via the direct drive below).
+        (
+            "mkv-opus",
+            include_bytes!("../../../testdata/tone-opus.webm").to_vec(),
+        ),
+        (
+            "mkv-flac",
+            include_bytes!("../../../testdata/tone-flac.mka").to_vec(),
+        ),
+        (
+            "mkv-aac",
+            include_bytes!("../../../testdata/tone-aac.mka").to_vec(),
+        ),
+        (
+            "mkv-vorbis",
+            include_bytes!("../../../testdata/tone-vorbis.mka").to_vec(),
+        ),
     ];
 
     // Genuine valid-baseline PS fuzz, local-only: the license-restricted
@@ -434,6 +522,11 @@ const MAGICS: &[&[u8]] = &[
     b"\x00\x00\x00\x18ftypM4A ", // MP4/M4A (ALAC/AAC) — 4-byte box size then `ftyp`
     b"\xff\xf1\x50\x80",         // ADTS AAC-LC, MPEG-4 ID, no CRC (44.1 kHz stereo)
     b"\xff\xf9\x50\x80",         // ADTS AAC-LC, MPEG-2 ID, no CRC (44.1 kHz stereo)
+    b"FORM\x00\x00\x00\x00AIFF", // AIFF
+    b"FORM\x00\x00\x00\x00AIFC", // AIFF-C
+    b"wvpk",                     // WavPack block
+    b"caff\x00\x01\x00\x00",     // Apple CAF
+    b"\x1a\x45\xdf\xa3",         // Matroska / WebM (EBML)
 ];
 
 fn run_sweep() -> Vec<Failure> {
@@ -513,11 +606,14 @@ fn decoders_never_panic_or_hang_on_malformed_input() {
         LAST_LOC.with(|l| *l.borrow_mut() = loc);
     }));
 
-    // Run on a large stack: the FLAC variant of AnyDecoder is big (multichannel
-    // planar buffers), so a corrupt high-channel header could otherwise overflow
-    // the default test-thread stack — a false positive unrelated to robustness.
+    // Run on a large stack: the by-value decoders are big (AnyDecoder's FLAC
+    // planar buffers, the WavPack block buffer, and especially the arena-backed
+    // `VorbisDecoder<MatroskaVorbisOgg>` at ~712 KiB), and debug-build moves
+    // through their construction multiply that — 64 MiB matches the runtime
+    // pump/loader threads so a deep construction can't overflow (a false
+    // positive unrelated to robustness).
     let handle = std::thread::Builder::new()
-        .stack_size(16 * 1024 * 1024)
+        .stack_size(64 * 1024 * 1024)
         .spawn(run_sweep)
         .unwrap();
     let failures = handle.join().expect("sweep thread panicked");

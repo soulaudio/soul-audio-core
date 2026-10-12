@@ -181,10 +181,14 @@ fn read_code<S: Source>(bs: &mut WvBits<S>, maxcode: u32) -> u32 {
         return if maxcode != 0 { bs.getbit() } else { 0 };
     }
     let bitcount = count_bits(maxcode);
-    let extras = (1u32 << bitcount) - maxcode - 1;
+    // `1 << bitcount` is computed in `u64` so a crafted `maxcode` with
+    // `bitcount == 32` can't overflow the shift; the rest wraps like the C.
+    let extras = ((1u64 << bitcount) as u32)
+        .wrapping_sub(maxcode)
+        .wrapping_sub(1);
     let mut code = bs.getbits(bitcount - 1);
     if code >= extras {
-        code = (code << 1) - extras + bs.getbit();
+        code = (code << 1).wrapping_sub(extras).wrapping_add(bs.getbit());
     }
     code
 }
@@ -196,17 +200,26 @@ struct Chan {
     median: [u32; 3],
 }
 
+// The reference decoder's median registers are `uint32_t`; a malformed
+// bitstream can drive them (and the `low`/`high` span derived from them) to the
+// top of the range, where the C silently wraps. These helpers wrap to match —
+// valid streams keep the medians small (sample magnitudes), so the wrap never
+// triggers there; it only turns a crafted-input debug overflow panic into the
+// same bounded garbage the C produces (which then decodes to `Err`/junk, not a
+// crash — the robustness-sweep invariant).
 impl Chan {
     fn get_med(&self, k: usize) -> u32 {
-        (self.median[k] >> 4) + 1
+        (self.median[k] >> 4).wrapping_add(1)
     }
     fn inc_med(&mut self, k: usize) {
         let d = [128u32, 64, 32][k];
-        self.median[k] += ((self.median[k] + d) / d) * 5;
+        let step = (self.median[k].wrapping_add(d) / d).wrapping_mul(5);
+        self.median[k] = self.median[k].wrapping_add(step);
     }
     fn dec_med(&mut self, k: usize) {
         let (d, sub) = [(128u32, 126u32), (64, 62), (32, 30)][k];
-        self.median[k] -= ((self.median[k] + sub) / d) * 2;
+        let step = (self.median[k].wrapping_add(sub) / d).wrapping_mul(2);
+        self.median[k] = self.median[k].wrapping_sub(step);
     }
 }
 
@@ -333,33 +346,36 @@ fn get_words_lossless<S: Source>(
         ones_count = (ones_count >> 1) + low_bit;
 
         // Map ones_count → [low, high] via the three medians of channel `ci`.
+        // Wrapping throughout: on malformed input the medians (and this span)
+        // can reach the top of `u32`, where the reference C wraps; valid streams
+        // keep these small, so the wrap only tames crafted-input overflow.
         let c = &mut w.c[ci];
         let (mut low, high);
         if ones_count == 0 {
             low = 0;
-            high = c.get_med(0) - 1;
+            high = c.get_med(0).wrapping_sub(1);
             c.dec_med(0);
         } else {
             low = c.get_med(0);
             c.inc_med(0);
             if ones_count == 1 {
-                high = low + c.get_med(1) - 1;
+                high = low.wrapping_add(c.get_med(1)).wrapping_sub(1);
                 c.dec_med(1);
             } else {
-                low += c.get_med(1);
+                low = low.wrapping_add(c.get_med(1));
                 c.inc_med(1);
                 if ones_count == 2 {
-                    high = low + c.get_med(2) - 1;
+                    high = low.wrapping_add(c.get_med(2)).wrapping_sub(1);
                     c.dec_med(2);
                 } else {
-                    low += (ones_count - 2) * c.get_med(2);
-                    high = low + c.get_med(2) - 1;
+                    low = low.wrapping_add(ones_count.wrapping_sub(2).wrapping_mul(c.get_med(2)));
+                    high = low.wrapping_add(c.get_med(2)).wrapping_sub(1);
                     c.inc_med(2);
                 }
             }
         }
 
-        low += read_code(bs, high - low);
+        low = low.wrapping_add(read_code(bs, high.wrapping_sub(low)));
         let sign = bs.getbit();
         buffer[cs] = if sign != 0 { !(low as i32) } else { low as i32 };
         cs += 1;
@@ -374,6 +390,16 @@ fn get_words_lossless<S: Source>(
 /// (`wavpack_local.h:apply_weight`), 64-bit-exact with wrapping.
 fn apply_weight(weight: i32, sample: i32) -> i32 {
     ((i64::from(weight) * i64::from(sample) + 512) >> 10) as i32
+}
+
+/// Term-17 linear extrapolation `2·s0 − s1`, and term-18 `(3·s0 − s1) >> 1`.
+/// The reference's predictions are `int32_t` and wrap; a malformed stream can
+/// feed huge history samples, so these wrap to match (never a debug overflow).
+fn predict17(s0: i32, s1: i32) -> i32 {
+    s0.wrapping_mul(2).wrapping_sub(s1)
+}
+fn predict18(s0: i32, s1: i32) -> i32 {
+    s0.wrapping_mul(3).wrapping_sub(s1) >> 1
 }
 
 /// Positive-term weight update (`wavpack_local.h:update_weight`).
@@ -414,9 +440,9 @@ impl DecorrPass {
             17 | 18 => {
                 for x in buf.iter_mut() {
                     let sam = if self.term == 17 {
-                        2 * a0 - a1
+                        predict17(a0, a1)
                     } else {
-                        (3 * a0 - a1) >> 1
+                        predict18(a0, a1)
                     };
                     a1 = a0;
                     let out = apply_weight(self.weight_a, sam).wrapping_add(*x);
@@ -455,9 +481,9 @@ impl DecorrPass {
                 let (mut b0, mut b1) = (self.samples_b[0], self.samples_b[1]);
                 for i in 0..n {
                     let sl = if self.term == 17 {
-                        2 * a0 - a1
+                        predict17(a0, a1)
                     } else {
-                        (3 * a0 - a1) >> 1
+                        predict18(a0, a1)
                     };
                     a1 = a0;
                     let ol = apply_weight(self.weight_a, sl).wrapping_add(buf[2 * i]);
@@ -466,9 +492,9 @@ impl DecorrPass {
                     buf[2 * i] = ol;
 
                     let sr = if self.term == 17 {
-                        2 * b0 - b1
+                        predict17(b0, b1)
                     } else {
-                        (3 * b0 - b1) >> 1
+                        predict18(b0, b1)
                     };
                     b1 = b0;
                     let or_ = apply_weight(self.weight_b, sr).wrapping_add(buf[2 * i + 1]);
@@ -735,14 +761,14 @@ impl<S: Source> WavpackDecoder<S> {
             while body_remaining >= 2 && !decoded {
                 let mut idb = [0u8; 2];
                 read_exact(&mut self.src, &mut idb)?;
-                body_remaining -= 2;
+                body_remaining = body_remaining.saturating_sub(2);
                 let mut id = idb[0];
                 let mut byte_length = u64::from(idb[1]) << 1;
                 if id & ID_LARGE != 0 {
                     id &= !ID_LARGE;
                     let mut ext = [0u8; 2];
                     read_exact(&mut self.src, &mut ext)?;
-                    body_remaining -= 2;
+                    body_remaining = body_remaining.saturating_sub(2);
                     byte_length += (u64::from(ext[0]) << 9) + (u64::from(ext[1]) << 17);
                 }
                 let odd = id & ID_ODD_SIZE != 0;
@@ -823,7 +849,7 @@ impl<S: Source> WavpackDecoder<S> {
                         );
                         bits.drain()?;
                         skip(&mut self.src, pad)?;
-                        body_remaining -= payload + pad;
+                        body_remaining = body_remaining.saturating_sub(payload + pad);
                         decoded = true;
                     }
                     _ => {
@@ -836,7 +862,7 @@ impl<S: Source> WavpackDecoder<S> {
                     }
                 }
                 if id != ID_WV_BITSTREAM {
-                    body_remaining -= payload + pad;
+                    body_remaining = body_remaining.saturating_sub(payload + pad);
                 }
             }
 
@@ -855,14 +881,16 @@ impl<S: Source> WavpackDecoder<S> {
                 }
             }
 
-            // Joint-stereo un-mix.
+            // Joint-stereo un-mix (wrapping i32, per the reference — a malformed
+            // stream can decorrelate to out-of-range samples that must stay
+            // bounded garbage, not a debug overflow panic).
             if joint && !decode_mono {
                 for i in 0..n_samples / 2 {
                     let s = self.pcm[2 * i];
                     let d = self.pcm[2 * i + 1];
-                    let r = d - (s >> 1);
+                    let r = d.wrapping_sub(s >> 1);
                     self.pcm[2 * i + 1] = r;
-                    self.pcm[2 * i] = s + r;
+                    self.pcm[2 * i] = s.wrapping_add(r);
                 }
             }
 
@@ -877,24 +905,30 @@ impl<S: Source> WavpackDecoder<S> {
                     return Err(DecodeError::Unsupported); // needs the wvx extension stream
                 }
                 if zeros | ones | dups != 0 {
+                    // Shift amounts come from the (possibly corrupt) int32 info;
+                    // `wrapping_shl` masks them to < 32 and the ±1 wraps, so a
+                    // crafted value can't panic (the reference's int32 math wraps).
+                    let (zeros, ones, dups) = (u32::from(zeros), u32::from(ones), u32::from(dups));
                     for v in self.pcm[..n_samples].iter_mut() {
                         if zeros != 0 {
-                            *v <<= zeros;
+                            *v = v.wrapping_shl(zeros);
                         } else if ones != 0 {
-                            *v = ((*v + 1) << ones) - 1;
+                            *v = v.wrapping_add(1).wrapping_shl(ones).wrapping_sub(1);
                         } else if dups != 0 {
                             let b = *v & 1;
-                            *v = ((*v + b) << dups) - b;
+                            *v = v.wrapping_add(b).wrapping_shl(dups).wrapping_sub(b);
                         }
                     }
                 } else {
-                    shift += u32::from(zeros + sent + ones + dups);
+                    // u32 sum: the four bytes can each be up to 255 on malformed
+                    // input, which would overflow a u8 add.
+                    shift += u32::from(zeros) + u32::from(sent) + u32::from(ones) + u32::from(dups);
                 }
             }
             let shift = shift & 0x1f;
             if shift != 0 {
                 for v in self.pcm[..n_samples].iter_mut() {
-                    *v <<= shift;
+                    *v = v.wrapping_shl(shift);
                 }
             }
 
@@ -911,7 +945,7 @@ impl<S: Source> WavpackDecoder<S> {
             if self.channels == 0 {
                 self.channels = out_channels;
                 self.shift = shift;
-                let bits = (bytes_per_sample * 8) as u8 - shift as u8;
+                let bits = ((bytes_per_sample * 8) as u8).saturating_sub(shift as u8);
                 self.info = StreamInfo {
                     sample_rate: SAMPLE_RATES.get(srate_idx).copied().unwrap_or(44_100),
                     channels: out_channels as u16,
