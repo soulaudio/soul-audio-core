@@ -634,6 +634,41 @@ mod tests {
         v
     }
 
+    /// Wrap a raw SimpleBlock body (track vint + int16 ts + flags + lacing +
+    /// frames) into a minimal Matroska, for the lacing tests.
+    fn mkv_with_sb(sb_body: &[u8]) -> Vec<u8> {
+        let audio = {
+            let mut a = Vec::new();
+            a.extend_from_slice(&elem(ID_SAMPLING_FREQUENCY, &48_000.0f32.to_be_bytes()));
+            a.extend_from_slice(&elem(ID_CHANNELS, &[2]));
+            a
+        };
+        let mut te = Vec::new();
+        te.extend_from_slice(&elem(ID_TRACK_NUMBER, &[1]));
+        te.extend_from_slice(&elem(ID_TRACK_TYPE, &[TRACK_TYPE_AUDIO as u8]));
+        te.extend_from_slice(&elem(ID_CODEC_ID, b"A_OPUS"));
+        te.extend_from_slice(&elem(ID_AUDIO, &audio));
+        let tracks = elem(ID_TRACKS, &elem(ID_TRACK_ENTRY, &te));
+        let mut cluster_body = elem(ID_TIMESTAMP, &[0]);
+        cluster_body.extend_from_slice(&elem(ID_SIMPLE_BLOCK, sb_body));
+        let mut segment = tracks;
+        segment.extend_from_slice(&elem(ID_CLUSTER, &cluster_body));
+        let mut v = elem(ID_EBML_HEADER, b"\x42\x82\x84webm");
+        v.extend_from_slice(&elem(ID_SEGMENT, &segment));
+        v
+    }
+
+    /// Drain every frame the demuxer yields, as owned byte vecs.
+    fn drain_frames(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut d = MatroskaDemuxer::new(SliceSource::new(bytes)).unwrap();
+        let mut scratch = [0u8; 256];
+        let mut out = Vec::new();
+        while let Some(p) = d.next_packet(&mut scratch).unwrap() {
+            out.push(p.data.to_vec());
+        }
+        out
+    }
+
     #[test]
     fn parses_track_and_yields_frame() {
         let frame = [0x11, 0x22, 0x33, 0x44];
@@ -647,6 +682,52 @@ mod tests {
         let pkt = d.next_packet(&mut scratch).unwrap().unwrap();
         assert_eq!(pkt.data, &frame);
         assert!(d.next_packet(&mut scratch).unwrap().is_none());
+    }
+
+    /// Xiph lacing (flags bit pattern `01`): a count byte, then `(count-1)`
+    /// Xiph-coded sizes (255-runs + final byte), then the concatenated frames;
+    /// the last frame's size is the remainder.
+    #[test]
+    fn xiph_lacing_splits_frames() {
+        let (a, b, c) = ([0x11; 3], [0x22; 5], [0x33; 4]);
+        let mut sb = vec![0x81, 0x00, 0x00, 0x02]; // track 1, ts 0, flags = Xiph
+        sb.push(2); // frame count − 1
+        sb.extend_from_slice(&[3, 5]); // Xiph sizes of frames 0 and 1
+        sb.extend_from_slice(&a);
+        sb.extend_from_slice(&b);
+        sb.extend_from_slice(&c);
+        let frames = drain_frames(&mkv_with_sb(&sb));
+        assert_eq!(frames, vec![a.to_vec(), b.to_vec(), c.to_vec()]);
+    }
+
+    /// Fixed lacing (`10`): a count byte, then equal-size frames (no size table).
+    #[test]
+    fn fixed_lacing_splits_frames() {
+        let data: Vec<u8> = (0..12).collect(); // 3 frames × 4 bytes
+        let mut sb = vec![0x81, 0x00, 0x00, 0x04]; // flags = fixed
+        sb.push(2); // count − 1
+        sb.extend_from_slice(&data);
+        let frames = drain_frames(&mkv_with_sb(&sb));
+        assert_eq!(
+            frames,
+            vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]]
+        );
+    }
+
+    /// EBML lacing (`11`): a count byte, the first size as an unsigned vint, then
+    /// signed-vint deltas; the last frame's size is the remainder.
+    #[test]
+    fn ebml_lacing_splits_frames() {
+        let (a, b, c) = ([0x41; 4], [0x42; 6], [0x43; 5]);
+        let mut sb = vec![0x81, 0x00, 0x00, 0x06]; // flags = EBML
+        sb.push(2); // count − 1
+        sb.push(0x84); // first size = 4 (1-byte vint)
+        sb.push(0xC1); // delta +2 (signed vint: 2 + bias 63 = 65 = 0x41 | 0x80)
+        sb.extend_from_slice(&a);
+        sb.extend_from_slice(&b);
+        sb.extend_from_slice(&c);
+        let frames = drain_frames(&mkv_with_sb(&sb));
+        assert_eq!(frames, vec![a.to_vec(), b.to_vec(), c.to_vec()]);
     }
 
     #[test]
