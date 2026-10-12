@@ -33,6 +33,11 @@ ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a pcm_s16le -f aiff tone-a
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a pcm_f32be -f aiff tone-aiff-fl32.aifc
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a pcm_mulaw -f aiff tone-aiff-ulaw.aifc
 ffmpeg -y -hide_banner -loglevel error -i tone-aiff-ulaw.aifc -f s16le tone-aiff-ulaw.ref.pcm
+# fl64 (BE 64-bit float, bit-identical to tone-f32.wav) and alaw (G.711 A-law,
+# bit-exact vs ffmpeg) complete the AIFF float + companding matrices.
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a pcm_f64be -f aiff tone-aiff-fl64.aifc
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a pcm_alaw -f aiff tone-aiff-alaw.aifc
+ffmpeg -y -hide_banner -loglevel error -i tone-aiff-alaw.aifc -f s16le tone-aiff-alaw.ref.pcm
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a libmp3lame -b:a 192k tone.mp3
 # MPEG Layer II (the MP3 decoder also handles L2/L1; this gives L2 a playback-tier
 # render golden, not just the kjmp2 decode vectors). No `tone.mp1` — ffmpeg has no
@@ -131,4 +136,4 @@ python3 generate_dsd.py tone-dsd512.dsf 22579200 0.1  # DSD512 DSF (0.1 s, size)
 python3 generate_dsd.py tone.dff                      # DSD64  DSDIFF/raw (0.5 s)
 
 echo "generated:"
-ls -la tone.wav tone-f32.wav tone-aiff.aiff tone-aifc-sowt.aifc tone-aiff-fl32.aifc tone-aiff-ulaw.aifc tone.flac tone-flac.mka tone-aac.mka tone-vorbis.mka tone.wv tone-mono.wv tone-24.wv tone-wv24.wv tone.caf tone-caf-le.caf tone-caf-f32.caf tone-alac.caf tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus tone-opus.webm arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1
+ls -la tone.wav tone-f32.wav tone-aiff.aiff tone-aifc-sowt.aifc tone-aiff-fl32.aifc tone-aiff-fl64.aifc tone-aiff-ulaw.aifc tone-aiff-alaw.aifc tone.flac tone-flac.mka tone-aac.mka tone-vorbis.mka tone.wv tone-mono.wv tone-24.wv tone-wv24.wv tone.caf tone-caf-le.caf tone-caf-f32.caf tone-alac.caf tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus tone-opus.webm arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1

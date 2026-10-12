@@ -18,7 +18,9 @@ right = 659.25 Hz (E5), −6 dB, with 50 ms in/out fades. So:
 | `tone-aiff.aiff` | AIFF (big-endian PCM) — lossless, decodes bit-exact vs `tone.wav` |
 | `tone-aifc-sowt.aifc` | AIFF-C `sowt` (little-endian PCM) — lossless, bit-exact vs `tone.wav` |
 | `tone-aiff-fl32.aifc` | AIFF-C `fl32` (big-endian IEEE float) — bit-identical to `tone-f32.wav` |
+| `tone-aiff-fl64.aifc` | AIFF-C `fl64` (big-endian 64-bit float) — bit-identical to `tone-f32.wav` |
 | `tone-aiff-ulaw.aifc` | AIFF-C `ulaw` (G.711 µ-law) — bit-exact vs `tone-aiff-ulaw.ref.pcm` (ffmpeg s16le) |
+| `tone-aiff-alaw.aifc` | AIFF-C `alaw` (G.711 A-law) — bit-exact vs `tone-aiff-alaw.ref.pcm` (ffmpeg s16le) |
 | `tone.flac` | native FLAC |
 | `tone-flac.mka` | FLAC in Matroska (`-c:a copy` of `tone.flac`) — bit-exact vs native FLAC |
 | `tone-opus.webm` | Opus in WebM/Matroska (`-c:a copy` of `tone.opus`) — SNR vs `tone-opus.webm.ref.pcm` |

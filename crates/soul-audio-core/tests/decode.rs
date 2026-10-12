@@ -198,6 +198,42 @@ fn open_decodes_aiff_mulaw_matches_ffmpeg() {
     );
 }
 
+/// AIFF-C `fl64` (big-endian 64-bit IEEE float) decodes bit-identical to the
+/// 32-bit float WAV — the 16-bit source values are exactly representable in both
+/// f32 and f64 and scale through the same f64 `float_to_i32`, so they land on the
+/// same i32. Completes the AIFF float matrix (fl32 above + fl64 here).
+#[test]
+fn open_decodes_aiff_float64_matches_wav_float() {
+    let aiff = decode_all(include_bytes!("../../../testdata/tone-aiff-fl64.aifc"));
+    let wav = decode_all(include_bytes!("../../../testdata/tone-f32.wav"));
+    assert_eq!(
+        aiff.len(),
+        wav.len(),
+        "AIFF-fl64/WAV-float sample counts differ"
+    );
+    assert_eq!(
+        fnv1a(&aiff),
+        fnv1a(&wav),
+        "AIFF-C fl64 decode != float WAV (same samples)"
+    );
+}
+
+/// AIFF-C `alaw` (G.711 A-law companding) decodes bit-exact to ffmpeg's own
+/// A-law decode — the companion to the µ-law test, completing the AIFF
+/// companding matrix. A-law decode is a fixed table, so `alaw_to_i16` must match
+/// ffmpeg's G.711 table exactly.
+#[test]
+fn open_decodes_aiff_alaw_matches_ffmpeg() {
+    let aiff = decode_all(include_bytes!("../../../testdata/tone-aiff-alaw.aifc"));
+    let refr = load_s16le(include_bytes!("../../../testdata/tone-aiff-alaw.ref.pcm"));
+    assert_eq!(aiff.len(), refr.len(), "AIFF-alaw/ref sample counts differ");
+    assert_eq!(
+        fnv1a(&aiff),
+        fnv1a(&refr),
+        "AIFF-C A-law decode != ffmpeg G.711 table"
+    );
+}
+
 /// FLAC-in-Matroska (`.mka`) decodes **bit-exact** to the native `tone.flac` —
 /// both carry the identical FLAC frames (the `.mka` is `tone.flac` remuxed with
 /// `-c:a copy`). Proves the EBML/`SimpleBlock` demux and the `MatroskaFlacReader`
