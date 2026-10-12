@@ -23,6 +23,8 @@ right = 659.25 Hz (E5), −6 dB, with 50 ms in/out fades. So:
 | `tone.wv` | WavPack lossless, stereo 16-bit (joint + cross decorrelation) — bit-exact vs `tone.wav` |
 | `tone-mono.wv` | WavPack lossless, mono — bit-exact vs `tone-mono.wv.ref.pcm` |
 | `tone-24.wv` | WavPack lossless, 32-bit `INT32_DATA` — bit-exact vs `tone-24.wv.ref.pcm` (s32le) |
+| `tone.caf` | Apple CAF `lpcm` (big-endian PCM) — bit-exact vs `tone.wav` |
+| `tone-alac.caf` | Apple CAF `alac` (Apple Lossless) — bit-exact vs `tone.wav` |
 | `tone.mp3`  | MPEG Layer III |
 | `tone.mp2`  | MPEG Layer II |
 | `tone-layer1.mp1` | MPEG Layer I (conformance vector; ffmpeg has no L1 encoder, so not the shared tone) |

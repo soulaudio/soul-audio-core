@@ -39,6 +39,10 @@ fn identify(head: &[u8]) -> Option<Format> {
     if head.len() >= 4 && &head[0..4] == b"wvpk" {
         return Some(Format::WavPack);
     }
+    // Apple CAF: "caff" header magic.
+    if head.len() >= 4 && &head[0..4] == b"caff" {
+        return Some(Format::Caf);
+    }
     if head.len() >= 4 {
         match &head[0..4] {
             b"fLaC" => return Some(Format::Flac),
@@ -107,6 +111,7 @@ mod tests {
             Format::Matroska
         );
         assert_eq!(probe_bytes(b"wvpk\0\0\0\0").unwrap(), Format::WavPack);
+        assert_eq!(probe_bytes(b"caff\0\x01\0\0").unwrap(), Format::Caf);
         assert_eq!(probe_bytes(b"fLaC\0\0\0\0").unwrap(), Format::Flac);
         assert_eq!(probe_bytes(b"DSD \0\0\0\0").unwrap(), Format::Dsf);
         assert_eq!(probe_bytes(b"FRM8\0\0\0\0").unwrap(), Format::Dff);

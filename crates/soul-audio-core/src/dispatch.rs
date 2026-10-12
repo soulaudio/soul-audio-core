@@ -11,6 +11,7 @@ use crate::decoder::{DecodeError, Decoder, SeekableDecoder};
 use crate::demux::adts::AdtsReader;
 use crate::demux::mp4::{Mp4Codec, Mp4Reader};
 use crate::demux::ogg::OggReader;
+use crate::formats::caf::CafDecoder;
 use crate::formats::matroska::MatroskaDecoder;
 use crate::formats::opus::multistream::MultistreamOpusDecoder;
 use crate::formats::opus::{OpusDecoder, open_opus_headers};
@@ -60,6 +61,9 @@ pub enum AnyDecoder<S> {
     /// WavPack (`.wv`) lossless. Length comes from the stream header; block-index
     /// seeking is a follow-up, so `seek_to` reports `Unsupported`.
     WavPack(WavpackDecoder<S>),
+    /// Apple CAF carrying `lpcm` or `alac`; decode-only for now (seeking is a
+    /// follow-up), so `seek_to` reports `Unsupported`.
+    Caf(CafDecoder<S>),
 }
 
 impl<S: crate::io::SeekSource> AnyDecoder<S> {
@@ -90,6 +94,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::OpusMs(_) => None,
             AnyDecoder::Matroska(d) => d.total_frames(),
             AnyDecoder::WavPack(d) => d.total_frames(),
+            AnyDecoder::Caf(d) => d.total_frames(),
         }
     }
 
@@ -118,6 +123,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::Matroska(d) => d.seek_to(sample),
             // WavPack block-index seeking is a follow-up.
             AnyDecoder::WavPack(_) => Err(DecodeError::Unsupported),
+            AnyDecoder::Caf(_) => Err(DecodeError::Unsupported),
         }
     }
 
@@ -142,6 +148,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::OpusMs(_) => Err(DecodeError::Unsupported),
             AnyDecoder::Matroska(d) => d.seek_to_time(secs),
             AnyDecoder::WavPack(_) => Err(DecodeError::Unsupported),
+            AnyDecoder::Caf(_) => Err(DecodeError::Unsupported),
         }
     }
 }
@@ -169,6 +176,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::OpusMs(d) => d.stream_info(),
             AnyDecoder::Matroska(d) => d.stream_info(),
             AnyDecoder::WavPack(d) => d.stream_info(),
+            AnyDecoder::Caf(d) => d.stream_info(),
         }
     }
 
@@ -185,6 +193,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::OpusMs(d) => d.decode_into(out),
             AnyDecoder::Matroska(d) => d.decode_into(out),
             AnyDecoder::WavPack(d) => d.decode_into(out),
+            AnyDecoder::Caf(d) => d.decode_into(out),
         }
     }
 
@@ -205,7 +214,8 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             | AnyDecoder::Opus(_)
             | AnyDecoder::OpusMs(_)
             | AnyDecoder::Matroska(_)
-            | AnyDecoder::WavPack(_) => 0,
+            | AnyDecoder::WavPack(_)
+            | AnyDecoder::Caf(_) => 0,
         }
     }
 
@@ -225,7 +235,8 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             | AnyDecoder::Opus(_)
             | AnyDecoder::OpusMs(_)
             | AnyDecoder::Matroska(_)
-            | AnyDecoder::WavPack(_) => None,
+            | AnyDecoder::WavPack(_)
+            | AnyDecoder::Caf(_) => None,
         }
     }
 }
@@ -284,6 +295,8 @@ pub fn open<S: BufSource>(mut src: S) -> Result<AnyDecoder<S>, DecodeError> {
         Format::Matroska => MatroskaDecoder::new(src).map(AnyDecoder::Matroska),
         // WavPack lossless (.wv).
         Format::WavPack => WavpackDecoder::new(src).map(AnyDecoder::WavPack),
+        // Apple CAF (lpcm / alac).
+        Format::Caf => CafDecoder::new(src).map(AnyDecoder::Caf),
     }
 }
 

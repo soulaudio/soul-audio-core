@@ -101,8 +101,8 @@ use crate::demux::mp4::Mp4Reader;
 use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
 
-const MAX_CHANNELS: usize = 2; // v1: mono + stereo
-const MAX_FRAME: usize = 4096; // frameLength cap
+pub(crate) const MAX_CHANNELS: usize = 2; // v1: mono + stereo
+pub(crate) const MAX_FRAME: usize = 4096; // frameLength cap
 const QBSHIFT: u32 = 9;
 const QB: i32 = 1 << QBSHIFT; // 512
 const MMULSHIFT: u32 = 2;
@@ -118,7 +118,7 @@ const N_MAX_MEAN_CLAMP: u32 = 0xFFFF;
 /// 3 bytes/sample): `MAX_FRAME * channels * 3` bytes of samples plus a little
 /// element-header overhead. Sizing for 3 bytes/sample keeps 20/24-bit verbatim
 /// frames from overflowing the buffer (a 2-byte cap silently desynced them).
-const PACKET_CAP: usize = MAX_FRAME * MAX_CHANNELS * 3 + 1024;
+pub(crate) const PACKET_CAP: usize = MAX_FRAME * MAX_CHANNELS * 3 + 1024;
 
 /// `lead(x)` == number of leading zero bits (`lead(0) == 32`, matching the
 /// reference's `lead()`).
@@ -337,24 +337,38 @@ fn unpc_block(
 
 /// Immutable per-stream ALAC parameters, threaded into the packet decode.
 #[derive(Clone, Copy)]
-struct AlacCfg {
-    bit_depth: u32,
-    channels: usize,
-    pb: u32,
-    mb: u32,
-    kb: u32,
-    frame_length: usize,
+pub(crate) struct AlacCfg {
+    pub(crate) bit_depth: u32,
+    pub(crate) channels: usize,
+    pub(crate) pb: u32,
+    pub(crate) mb: u32,
+    pub(crate) kb: u32,
+    pub(crate) frame_length: usize,
 }
 
 /// Fixed-size decode scratch (no allocation): the two predictor output buffers,
 /// the residual buffer, the wasted-bits ("shift") buffer, and the interleaved
 /// output buffer handed to the caller.
-struct Scratch {
+pub(crate) struct Scratch {
     mix_u: [i32; MAX_FRAME],
     mix_v: [i32; MAX_FRAME],
     resid: [i32; MAX_FRAME],
     shift: [u16; MAX_FRAME * MAX_CHANNELS],
-    out: [i32; MAX_FRAME * MAX_CHANNELS],
+    /// Interleaved decoded output; valid range `[0, samples × channels)`.
+    pub(crate) out: [i32; MAX_FRAME * MAX_CHANNELS],
+}
+
+impl Scratch {
+    /// A zeroed scratch (no allocation).
+    pub(crate) fn new() -> Self {
+        Self {
+            mix_u: [0; MAX_FRAME],
+            mix_v: [0; MAX_FRAME],
+            resid: [0; MAX_FRAME],
+            shift: [0; MAX_FRAME * MAX_CHANNELS],
+            out: [0; MAX_FRAME * MAX_CHANNELS],
+        }
+    }
 }
 
 /// Decode one SCE/LFE (`elem_ch == 1`) or CPE (`elem_ch == 2`) element into the
@@ -553,7 +567,11 @@ fn decode_channel_element(
 /// `(bytes_consumed, frames)` where `bytes_consumed` is the byte-aligned packet
 /// length (used to advance the sliding input buffer) and `frames` is the
 /// per-channel sample count produced.
-fn decode_packet(
+/// Decode one ALAC packet (self-delimiting) into `s.out`. Returns
+/// `(bytes_consumed, per_channel_samples)`; the interleaved output is
+/// `s.out[..samples × cfg.channels]`. Shared by the MP4 [`AlacDecoder`] and the
+/// CAF driver.
+pub(crate) fn decode_packet(
     data: &[u8],
     s: &mut Scratch,
     cfg: AlacCfg,
@@ -712,13 +730,7 @@ impl<S: Source> AlacDecoder<S> {
         };
         Ok(Self {
             reader,
-            scratch: Scratch {
-                mix_u: [0; MAX_FRAME],
-                mix_v: [0; MAX_FRAME],
-                resid: [0; MAX_FRAME],
-                shift: [0; MAX_FRAME * MAX_CHANNELS],
-                out: [0; MAX_FRAME * MAX_CHANNELS],
-            },
+            scratch: Scratch::new(),
             inbuf: [0; PACKET_CAP],
             filled: 0,
             used: 0,

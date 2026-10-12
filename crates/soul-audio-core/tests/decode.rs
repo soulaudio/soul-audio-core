@@ -219,6 +219,27 @@ fn open_decodes_matroska_aac_matching_ffmpeg() {
     );
 }
 
+/// CAF `lpcm` (big-endian PCM) decodes **bit-exact** to the source WAV. Covers
+/// the CAF container parse (`caff` → `desc`/`data` chunks) and the PCM path.
+#[test]
+fn open_decodes_caf_pcm_bit_exact_vs_wav() {
+    let caf = decode_all(include_bytes!("../../../testdata/tone.caf"));
+    let wav = decode_all(include_bytes!("../../../testdata/tone.wav"));
+    assert_eq!(caf.len(), wav.len(), "CAF-PCM/WAV sample counts differ");
+    assert_eq!(fnv1a(&caf), fnv1a(&wav), "CAF-PCM decode != source WAV");
+}
+
+/// CAF `alac` (Apple Lossless) decodes **bit-exact** to the source WAV — ALAC is
+/// lossless. Covers the `kuki` magic-cookie parse and the shared ALAC
+/// `decode_packet` core driven straight from the CAF `data` chunk.
+#[test]
+fn open_decodes_caf_alac_bit_exact_vs_wav() {
+    let caf = decode_all(include_bytes!("../../../testdata/tone-alac.caf"));
+    let wav = decode_all(include_bytes!("../../../testdata/tone.wav"));
+    assert_eq!(caf.len(), wav.len(), "CAF-ALAC/WAV sample counts differ");
+    assert_eq!(fnv1a(&caf), fnv1a(&wav), "CAF-ALAC decode != source WAV");
+}
+
 /// Ogg-FLAC seeks sample-accurately through `open()`/`AnyDecoder` (the tail is
 /// bit-identical to a from-start decode — FLAC-in-Ogg is lossless with
 /// independent frames). This fixture's STREAMINFO declares no total, so

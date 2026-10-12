@@ -133,6 +133,10 @@ pub enum Format {
     /// [`AnyDecoder`](crate::dispatch::AnyDecoder) variant (see
     /// `formats::wavpack::WavpackDecoder`).
     WavPack,
+    /// Apple CAF (Core Audio Format) — `lpcm` (PCM) and `alac` (Apple Lossless).
+    /// A normal [`AnyDecoder`](crate::dispatch::AnyDecoder) variant (see
+    /// `formats::caf::CafDecoder`).
+    Caf,
 }
 
 /// Explicit DSD output mode chosen by the caller. Selects which path a native

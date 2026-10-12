@@ -14,6 +14,7 @@
 pub mod aac;
 pub mod aiff;
 pub mod alac;
+pub mod caf;
 pub mod dff;
 pub mod dsf;
 pub mod dst;
