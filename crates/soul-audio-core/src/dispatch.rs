@@ -120,6 +120,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::Opus(d) => d.seek_to(sample),
             // Surround Opus seeking (per-stream pre-roll) is not implemented.
             AnyDecoder::OpusMs(_) => Err(DecodeError::Unsupported),
+            // Matroska restart + forward decode-discard (Opus/FLAC/AAC).
             AnyDecoder::Matroska(d) => d.seek_to(sample),
             // WavPack block-index seeking is a follow-up.
             AnyDecoder::WavPack(_) => Err(DecodeError::Unsupported),

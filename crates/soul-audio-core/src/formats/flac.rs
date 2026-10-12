@@ -749,6 +749,31 @@ impl<S: SeekSource> SeekableDecoder for FlacDecoder<OggReader<S>> {
     }
 }
 
+impl<S: SeekSource> SeekableDecoder
+    for FlacDecoder<crate::formats::matroska::MatroskaFlacReader<S>>
+{
+    /// Seek **FLAC-in-Matroska** to per-channel `sample`: the Matroska reader
+    /// rewinds to the first cluster ([`MatroskaFlacReader::restart`]), then the
+    /// FLAC decoder decode-discards forward, anchoring its absolute position from
+    /// the first frame's coded number — the same contract as the FLAC-in-Ogg
+    /// seek, minus the Ogg granule bisection (linear; a Cues index would make it
+    /// O(log n), a follow-up).
+    ///
+    /// # Errors
+    /// Propagates the container restart + forward-decode errors.
+    fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        let target = self.total_samples.map_or(sample, |t| sample.min(t));
+        self.demux.src_mut().restart()?;
+        self.reset_stream_state(0);
+        self.anchor_pending = true;
+        self.decode_discard_to(target)
+    }
+
+    fn total_frames(&self) -> Option<u64> {
+        self.total_samples
+    }
+}
+
 impl<S: Source> Decoder for FlacDecoder<S> {
     fn stream_info(&self) -> StreamInfo {
         self.demux.stream_info()

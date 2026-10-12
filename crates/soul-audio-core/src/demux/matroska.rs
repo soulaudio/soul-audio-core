@@ -9,10 +9,12 @@
 //! the first audio track; no-lacing and all three lacing modes (Xiph / fixed /
 //! EBML). Cues-based seeking is a follow-up — this is the forward demuxer.
 
+use embedded_io::SeekFrom;
+
 use super::ebml::{read_float, read_id, read_uint, read_vint};
 use super::{Demuxer, Packet, read_exact, skip};
 use crate::decoder::DecodeError;
-use crate::io::Source;
+use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
 
 // EBML / Matroska element IDs (as [`read_id`] returns them — marker bit kept).
@@ -62,6 +64,9 @@ pub struct MatroskaDemuxer<S> {
     segment_end: u64,
     /// Absolute byte offset where the current Cluster's data ends, if inside one.
     cluster_end: Option<u64>,
+    /// Absolute byte offset of the first Cluster's header — the rewind point for
+    /// [`Self::restart`] (seeking is a restart + forward decode-discard).
+    first_cluster_offset: u64,
     /// Absolute read position (every byte consumed is accounted here).
     pos: u64,
     /// Pending laced frames in the current block: their byte sizes and how many
@@ -133,6 +138,7 @@ impl<S: Source> MatroskaDemuxer<S> {
             track_number: 0,
             segment_end,
             cluster_end: None,
+            first_cluster_offset: 0,
             pos,
             lace_sizes: [0; MAX_LACE],
             lace_count: 0,
@@ -154,6 +160,7 @@ impl<S: Source> MatroskaDemuxer<S> {
                     if me.track_number == 0 {
                         return Err(DecodeError::Unsupported); // reached audio data with no track
                     }
+                    me.first_cluster_offset = me.pos - el.header_len;
                     me.cluster_end = el.size.map(|s| me.pos + s);
                     return Ok(me);
                 }
@@ -507,6 +514,25 @@ impl<S: Source> MatroskaDemuxer<S> {
         self.pos += n as u64;
         self.lace_idx += 1;
         Ok(n)
+    }
+}
+
+impl<S: SeekSource> MatroskaDemuxer<S> {
+    /// Rewind to the first Cluster (the seek rewind point) and reset the
+    /// cluster-walk + lacing state, so the next [`Self::next_packet`] re-reads
+    /// from the start of the audio. The parsed track config is retained.
+    ///
+    /// # Errors
+    /// [`DecodeError::Io`] if the underlying seek fails.
+    pub(crate) fn restart(&mut self) -> Result<(), DecodeError> {
+        self.src
+            .seek(SeekFrom::Start(self.first_cluster_offset))
+            .map_err(|_| DecodeError::Io)?;
+        self.pos = self.first_cluster_offset;
+        self.cluster_end = None;
+        self.lace_count = 0;
+        self.lace_idx = 0;
+        Ok(())
     }
 }
 

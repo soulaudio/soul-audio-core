@@ -9,13 +9,13 @@
 //! [`OggReader`](crate::demux::ogg::OggReader) uses for FLAC-in-Ogg); AAC feeds
 //! [`AacDecoder`] one access unit per block with the `CodecPrivate`
 //! `AudioSpecificConfig`. Vorbis (`A_VORBIS`) is a follow-up — it needs the
-//! consumer-dispatch arena path, like bare Ogg-Vorbis. Cues-based seeking is
-//! likewise deferred: this forward decoder reports no length and declines
-//! `seek_to`.
+//! consumer-dispatch arena path, like bare Ogg-Vorbis. Seeking restarts at the
+//! first cluster and decode-discards forward (sample-accurate, linear; a Cues
+//! index would make it O(log n) — a follow-up).
 
 use embedded_io::{ErrorType, Read};
 
-use crate::decoder::{DecodeError, Decoder};
+use crate::decoder::{DecodeError, Decoder, SeekableDecoder};
 use crate::demux::mp4::parse_audio_specific_config;
 use crate::demux::{Demuxer, MatroskaDemuxer};
 use crate::formats::aac::AacDecoder;
@@ -24,7 +24,7 @@ use crate::formats::opus::conformance::OpusFrameDecoder;
 use crate::formats::opus::container::OpusHead;
 use crate::formats::opus::linear_output_gain;
 use crate::formats::opus::toc;
-use crate::io::Source;
+use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
 
 /// Opus always decodes at 48 kHz (RFC 6716 §2).
@@ -93,26 +93,34 @@ impl<S: Source> MatroskaDecoder<S> {
         }
     }
 
-    /// Seek is not yet implemented for Matroska (Cues parsing is a follow-up).
-    ///
-    /// # Errors
-    /// Always [`DecodeError::Unsupported`].
-    pub fn seek_to(&mut self, _sample: u64) -> Result<u64, DecodeError> {
-        Err(DecodeError::Unsupported)
-    }
-
-    /// Seconds variant of [`Self::seek_to`]; likewise unsupported.
-    ///
-    /// # Errors
-    /// Always [`DecodeError::Unsupported`].
-    pub fn seek_to_time(&mut self, _secs: f64) -> Result<u64, DecodeError> {
-        Err(DecodeError::Unsupported)
-    }
-
     /// No declared length yet (needs the Info `Duration` / Cues — a follow-up).
     #[must_use]
     pub fn total_frames(&self) -> Option<u64> {
         None
+    }
+}
+
+impl<S: SeekSource> MatroskaDecoder<S> {
+    /// Seek to per-channel `sample` (restart at the first cluster + forward
+    /// decode-discard; linear for now, Cues indexing is a follow-up).
+    ///
+    /// # Errors
+    /// Propagates the container restart + forward-decode errors.
+    pub fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        match self {
+            MatroskaDecoder::Opus(d) => d.seek_to(sample),
+            MatroskaDecoder::Flac(d) => SeekableDecoder::seek_to(d, sample),
+            MatroskaDecoder::Aac(d) => d.seek_to(sample),
+        }
+    }
+
+    /// Seek to `secs` seconds (convenience over [`Self::seek_to`]).
+    ///
+    /// # Errors
+    /// As [`Self::seek_to`].
+    pub fn seek_to_time(&mut self, secs: f64) -> Result<u64, DecodeError> {
+        let rate = self.stream_info().sample_rate.max(1);
+        self.seek_to(crate::decoder::secs_to_samples(secs, rate))
     }
 }
 
@@ -144,6 +152,8 @@ pub struct MatroskaOpus<S> {
     core: OpusFrameDecoder,
     channels: usize,
     output_gain: f32,
+    /// The stream's `OpusHead` pre-skip (re-applied from the start after a seek).
+    pre_skip: u64,
     /// Per-channel samples still to discard as leading pre-skip (RFC 7845 §4.2).
     skip_remaining: u64,
     packet: [u8; MAX_OPUS_PACKET],
@@ -160,6 +170,7 @@ impl<S: Source> MatroskaOpus<S> {
             core: OpusFrameDecoder::new(channels),
             channels,
             output_gain: linear_output_gain(head.output_gain_q8),
+            pre_skip: u64::from(head.pre_skip),
             skip_remaining: u64::from(head.pre_skip),
             packet: [0; MAX_OPUS_PACKET],
             pcm: [0; MAX_OPUS_PCM],
@@ -247,6 +258,34 @@ impl<S: Source> MatroskaOpus<S> {
     }
 }
 
+impl<S: SeekSource> MatroskaOpus<S> {
+    /// Seek to per-channel `sample` by restarting at the first cluster and
+    /// decode-discarding forward (linear; a Cues index would make it O(log n) —
+    /// a follow-up). The full run-in from the stream start converges the Opus
+    /// cross-frame state. Returns the frame landed on.
+    fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        self.demux.restart()?;
+        self.core = OpusFrameDecoder::new(self.channels);
+        self.skip_remaining = self.pre_skip;
+        self.pcm_len = 0;
+        self.pcm_pos = 0;
+        let mut landed = 0u64;
+        while landed < sample {
+            if self.pcm_pos >= self.pcm_len {
+                self.fill()?;
+                if self.pcm_len == 0 {
+                    break;
+                }
+            }
+            let avail = (self.pcm_len - self.pcm_pos) / self.channels;
+            let take = avail.min((sample - landed) as usize);
+            self.pcm_pos += take * self.channels;
+            landed += take as u64;
+        }
+        Ok(landed)
+    }
+}
+
 /// An [`embedded_io::Read`] adapter presenting an `A_FLAC` Matroska track as a
 /// native FLAC byte stream: the `CodecPrivate` (`fLaC` magic + STREAMINFO …)
 /// first, then the concatenated `SimpleBlock` frame bytes. [`FlacDecoder`]
@@ -298,6 +337,21 @@ impl<S: Source> MatroskaFlacReader<S> {
                 Ok(false)
             }
         }
+    }
+}
+
+impl<S: SeekSource> MatroskaFlacReader<S> {
+    /// Rewind to the first cluster for a seek. The `CodecPrivate` (native FLAC
+    /// header) is **not** re-emitted — the [`FlacDemuxer`](crate::demux::FlacDemuxer)
+    /// already consumed it; the FLAC decoder re-syncs on the frame sync code
+    /// (matching [`OggReader::restart_audio`](crate::demux::ogg::OggReader)).
+    pub(crate) fn restart(&mut self) -> Result<(), DecodeError> {
+        self.demux.restart()?;
+        self.cp_pos = self.cp_len; // header already consumed; stream frames only
+        self.frame_len = 0;
+        self.frame_pos = 0;
+        self.eos = false;
+        Ok(())
     }
 }
 

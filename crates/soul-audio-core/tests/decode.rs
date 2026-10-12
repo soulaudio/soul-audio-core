@@ -240,6 +240,67 @@ fn open_decodes_caf_alac_bit_exact_vs_wav() {
     assert_eq!(fnv1a(&caf), fnv1a(&wav), "CAF-ALAC decode != source WAV");
 }
 
+/// Open a Matroska stream, seek to per-channel `target`, and decode the tail.
+/// Returns `(channels, landed, tail)`. Runs on a big stack (`AnyDecoder`).
+fn matroska_seek_tail(bytes: &'static [u8], target: u64) -> (u16, u64, Vec<i32>) {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn_scoped(scope, || {
+                let mut dec = open(SliceSource::new(bytes)).expect("probe + construct");
+                let channels = dec.stream_info().channels;
+                let landed = dec.seek_to(target).expect("seek");
+                let mut tail = Vec::new();
+                let mut buf = [0i32; 4096];
+                loop {
+                    let n = dec.decode_into(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    tail.extend_from_slice(&buf[..n]);
+                }
+                (channels, landed, tail)
+            })
+            .expect("spawn")
+            .join()
+            .expect("decode thread panicked")
+    })
+}
+
+/// Matroska seek lands exactly and the decoded tail is **bit-identical** to the
+/// full decode from that point — the seek restarts at the first cluster and
+/// decode-discards, so the decoder state equals the full-decode state. Covers
+/// Opus (WebM), FLAC, and AAC in Matroska.
+#[test]
+fn matroska_opus_seek_tail_matches_full_decode() {
+    let webm: &'static [u8] = include_bytes!("../../../testdata/tone-opus.webm");
+    let full = decode_all(webm);
+    let (ch, landed, tail) = matroska_seek_tail(webm, 24_000); // 0.5 s @ 48 kHz
+    assert_eq!(landed, 24_000, "Opus-in-mka seek is sample-accurate");
+    let base = 24_000usize * usize::from(ch);
+    assert_eq!(tail, &full[base..], "post-seek Opus tail != full decode");
+}
+
+#[test]
+fn matroska_flac_seek_tail_matches_full_decode() {
+    let mka: &'static [u8] = include_bytes!("../../../testdata/tone-flac.mka");
+    let full = decode_all(mka);
+    let (ch, landed, tail) = matroska_seek_tail(mka, 20_000);
+    assert_eq!(landed, 20_000, "FLAC-in-mka seek is sample-accurate");
+    let base = 20_000usize * usize::from(ch);
+    assert_eq!(tail, &full[base..], "post-seek FLAC tail != full decode");
+}
+
+#[test]
+fn matroska_aac_seek_tail_matches_full_decode() {
+    let mka: &'static [u8] = include_bytes!("../../../testdata/tone-aac.mka");
+    let full = decode_all(mka);
+    let (ch, landed, tail) = matroska_seek_tail(mka, 20_000);
+    assert_eq!(landed, 20_000, "AAC-in-mka seek is sample-accurate");
+    let base = 20_000usize * usize::from(ch);
+    assert_eq!(tail, &full[base..], "post-seek AAC tail != full decode");
+}
+
 /// Ogg-FLAC seeks sample-accurately through `open()`/`AnyDecoder` (the tail is
 /// bit-identical to a from-start decode — FLAC-in-Ogg is lossless with
 /// independent frames). This fixture's STREAMINFO declares no total, so

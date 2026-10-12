@@ -543,9 +543,7 @@ impl<S: SeekSource> AacDecoder<S> {
         match &self.src {
             FrameSrc::Mp4(_) => self.seek_to_mp4(sample),
             FrameSrc::Adts(_) => self.seek_to_adts(sample),
-            // Matroska seeking is handled at the container level (a follow-up);
-            // the AAC decoder itself doesn't seek a Matroska source.
-            FrameSrc::Matroska(_) => Err(DecodeError::Unsupported),
+            FrameSrc::Matroska(_) => self.seek_to_matroska(sample),
         }
     }
 
@@ -655,6 +653,24 @@ impl<S: SeekSource> AacDecoder<S> {
             FrameSrc::Mp4(_) | FrameSrc::Matroska(_) => unreachable!("adts seek path"),
         }
         self.reset_decode_state();
+        self.discard_to(sample)
+    }
+
+    fn seek_to_matroska(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        // Matroska: restart at the first cluster, reset, decode-discard forward
+        // (linear; a Cues index would make it O(log n) — a follow-up).
+        match &mut self.src {
+            FrameSrc::Matroska(d) => d.restart()?,
+            FrameSrc::Mp4(_) | FrameSrc::Adts(_) => unreachable!("matroska seek path"),
+        }
+        self.reset_decode_state();
+        self.discard_to(sample)
+    }
+
+    /// Decode-discard per-channel output samples up to `sample`, positioning the
+    /// emit cursor exactly. Returns the frame landed on (clamped at EOF). Shared
+    /// by the ADTS and Matroska seeks (both container formats carry no index).
+    fn discard_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
         let mut passed = 0u64; // per-channel output samples discarded so far
         while passed < sample {
             if !self.fill_next_frame()? {
