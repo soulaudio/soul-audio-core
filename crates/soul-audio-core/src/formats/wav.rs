@@ -306,26 +306,15 @@ impl<S: Source> Decoder for WavDecoder<S> {
                 break;
             }
             let samples = n / bps;
-            for i in 0..samples {
-                let raw = &buf[i * bps..i * bps + bps];
-                // RIFX stores samples big-endian; reverse to the LE the widen/
-                // float helpers expect. (No swap for 1-byte or companded samples.)
-                let mut swapped = [0u8; 8];
-                let sample = if self.big_endian && bps > 1 {
-                    for (d, s) in swapped[..bps].iter_mut().zip(raw.iter().rev()) {
-                        *d = *s;
-                    }
-                    &swapped[..bps]
-                } else {
-                    raw
-                };
-                out[produced + i] = match self.companding {
-                    Some(Companding::ALaw) => i32::from(alaw_to_i16(sample[0])),
-                    Some(Companding::MuLaw) => i32::from(mulaw_to_i16(sample[0])),
-                    None if self.float => float_to_i32(sample, self.bits),
-                    None => widen(sample, self.bits),
-                };
-            }
+            convert_samples(
+                &buf[..n],
+                bps,
+                self.bits,
+                self.float,
+                self.companding,
+                self.big_endian,
+                &mut out[produced..produced + samples],
+            );
             produced += samples;
             if n < cap {
                 break; // end of data (or a short final read)
@@ -334,6 +323,45 @@ impl<S: Source> Decoder for WavDecoder<S> {
         self.sample_pos += produced as u64;
         Ok(produced)
     }
+}
+
+/// Convert `buf.len() / bps` interleaved raw PCM samples into `i32` at
+/// `out[..samples]`, applying bit-width widening, IEEE-float scaling, or G.711
+/// companding. `big_endian` reverses each multi-byte sample to the little-endian
+/// order the widen/float helpers expect (AIFF and RIFX store samples big-endian;
+/// WAV `sowt`/canonical are little-endian). Shared by [`WavDecoder`] and
+/// [`crate::formats::aiff::AiffDecoder`] — the one place PCM sample bytes become
+/// `i32`. Returns the number of samples written.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn convert_samples(
+    buf: &[u8],
+    bps: usize,
+    bits: u8,
+    float: bool,
+    companding: Option<Companding>,
+    big_endian: bool,
+    out: &mut [i32],
+) -> usize {
+    let samples = (buf.len() / bps).min(out.len());
+    for (i, slot) in out[..samples].iter_mut().enumerate() {
+        let raw = &buf[i * bps..i * bps + bps];
+        let mut swapped = [0u8; 8];
+        let sample = if big_endian && bps > 1 {
+            for (d, s) in swapped[..bps].iter_mut().zip(raw.iter().rev()) {
+                *d = *s;
+            }
+            &swapped[..bps]
+        } else {
+            raw
+        };
+        *slot = match companding {
+            Some(Companding::ALaw) => i32::from(alaw_to_i16(sample[0])),
+            Some(Companding::MuLaw) => i32::from(mulaw_to_i16(sample[0])),
+            None if float => float_to_i32(sample, bits),
+            None => widen(sample, bits),
+        };
+    }
+    samples
 }
 
 /// Widen one little-endian integer PCM sample to `i32`, preserving true depth

@@ -490,6 +490,27 @@ fn real_ogg_flac_decodes_losslessly_vs_wav() {
 }
 
 #[test]
+fn real_aiff_decodes_losslessly_vs_wav() {
+    // AIFF is lossless big-endian PCM of the same signal; the full CLI pipeline
+    // (probe → open_track → OwnedDecoder::Pcm → decode) must reproduce the WAV
+    // bit-for-bit, with no AIFF-specific wiring in the desktop/CLI layers.
+    assert_eq!(
+        decode_fixture("tone-aiff.aiff"),
+        decode_fixture("tone.wav"),
+        "AIFF decode is not lossless vs the reference WAV"
+    );
+}
+
+#[test]
+fn real_aifc_sowt_decodes_losslessly_vs_wav() {
+    assert_eq!(
+        decode_fixture("tone-aifc-sowt.aifc"),
+        decode_fixture("tone.wav"),
+        "AIFF-C sowt decode is not lossless vs the reference WAV"
+    );
+}
+
+#[test]
 fn real_mp3_decodes_to_plausible_audio() {
     let pcm = decode_fixture("tone.mp3");
     let samples: Vec<i32> = pcm

@@ -95,6 +95,31 @@ fn open_decodes_native_flac_bit_exact_vs_wav() {
     );
 }
 
+/// AIFF (big-endian PCM) decodes **bit-exact** to the WAV it was encoded from —
+/// both are the same lossless 16-bit PCM from `tone.wav`. Covers the big-endian
+/// `SSND` path and the probe → `AnyDecoder::Aiff` → decode route end-to-end.
+#[test]
+fn open_decodes_aiff_bit_exact_vs_wav() {
+    let aiff = decode_all(include_bytes!("../../../testdata/tone-aiff.aiff"));
+    let wav = decode_all(include_bytes!("../../../testdata/tone.wav"));
+    assert_eq!(aiff.len(), wav.len(), "AIFF/WAV sample counts differ");
+    assert_eq!(fnv1a(&aiff), fnv1a(&wav), "AIFF decode != source WAV");
+}
+
+/// AIFF-C `sowt` (little-endian PCM) decodes bit-exact to the same source WAV —
+/// exercises the AIFF-C `compressionType` branch and the no-byteswap path.
+#[test]
+fn open_decodes_aifc_sowt_bit_exact_vs_wav() {
+    let aifc = decode_all(include_bytes!("../../../testdata/tone-aifc-sowt.aifc"));
+    let wav = decode_all(include_bytes!("../../../testdata/tone.wav"));
+    assert_eq!(aifc.len(), wav.len(), "AIFF-C/WAV sample counts differ");
+    assert_eq!(
+        fnv1a(&aifc),
+        fnv1a(&wav),
+        "AIFF-C sowt decode != source WAV"
+    );
+}
+
 /// Ogg-FLAC seeks sample-accurately through `open()`/`AnyDecoder` (the tail is
 /// bit-identical to a from-start decode — FLAC-in-Ogg is lossless with
 /// independent frames). This fixture's STREAMINFO declares no total, so

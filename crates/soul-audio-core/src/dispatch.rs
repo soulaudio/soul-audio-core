@@ -14,7 +14,8 @@ use crate::demux::ogg::OggReader;
 use crate::formats::opus::multistream::MultistreamOpusDecoder;
 use crate::formats::opus::{OpusDecoder, open_opus_headers};
 use crate::formats::{
-    aac::AacDecoder, alac::AlacDecoder, flac::FlacDecoder, mp3::Mp3Decoder, wav::WavDecoder,
+    aac::AacDecoder, aiff::AiffDecoder, alac::AlacDecoder, flac::FlacDecoder, mp3::Mp3Decoder,
+    wav::WavDecoder,
 };
 use crate::io::BufSource;
 use crate::model::{Format, StreamInfo};
@@ -30,6 +31,8 @@ use crate::probe::probe;
 pub enum AnyDecoder<S> {
     /// RIFF/WAVE.
     Wav(WavDecoder<S>),
+    /// AIFF / AIFF-C (big-endian PCM, plus `sowt`, IEEE float, and G.711).
+    Aiff(AiffDecoder<S>),
     /// Native FLAC.
     Flac(FlacDecoder<S>),
     /// MPEG Layer III.
@@ -67,6 +70,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
     pub fn total_frames(&self) -> Option<u64> {
         match self {
             AnyDecoder::Wav(d) => d.total_frames(),
+            AnyDecoder::Aiff(d) => d.total_frames(),
             AnyDecoder::Flac(d) => d.total_frames(),
             AnyDecoder::Mp3(d) => d.total_frames(),
             AnyDecoder::OggFlac(d) => d.total_frames(),
@@ -89,6 +93,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
     pub fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
         match self {
             AnyDecoder::Wav(d) => d.seek_to(sample),
+            AnyDecoder::Aiff(d) => d.seek_to(sample),
             AnyDecoder::Flac(d) => d.seek_to(sample),
             AnyDecoder::Mp3(d) => d.seek_to(sample),
             // FLAC-in-Ogg seeks via its SeekableDecoder impl (its source isn't a
@@ -109,6 +114,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
     pub fn seek_to_time(&mut self, secs: f64) -> Result<u64, DecodeError> {
         match self {
             AnyDecoder::Wav(d) => d.seek_to_time(secs),
+            AnyDecoder::Aiff(d) => d.seek_to_time(secs),
             AnyDecoder::Flac(d) => d.seek_to_time(secs),
             AnyDecoder::Mp3(d) => d.seek_to_time(secs),
             AnyDecoder::OggFlac(d) => {
@@ -137,6 +143,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
     fn stream_info(&self) -> StreamInfo {
         match self {
             AnyDecoder::Wav(d) => d.stream_info(),
+            AnyDecoder::Aiff(d) => d.stream_info(),
             AnyDecoder::Flac(d) => d.stream_info(),
             AnyDecoder::Mp3(d) => d.stream_info(),
             AnyDecoder::OggFlac(d) => d.stream_info(),
@@ -150,6 +157,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
     fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {
         match self {
             AnyDecoder::Wav(d) => d.decode_into(out),
+            AnyDecoder::Aiff(d) => d.decode_into(out),
             AnyDecoder::Flac(d) => d.decode_into(out),
             AnyDecoder::Mp3(d) => d.decode_into(out),
             AnyDecoder::OggFlac(d) => d.decode_into(out),
@@ -171,6 +179,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::Aac(d) => d.encoder_delay(),
             AnyDecoder::Mp3(d) => d.encoder_delay(),
             AnyDecoder::Wav(_)
+            | AnyDecoder::Aiff(_)
             | AnyDecoder::Flac(_)
             | AnyDecoder::OggFlac(_)
             | AnyDecoder::Opus(_)
@@ -188,6 +197,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::Alac(d) => d.playable_frames(),
             AnyDecoder::Aac(d) => d.playable_frames(),
             AnyDecoder::Wav(_)
+            | AnyDecoder::Aiff(_)
             | AnyDecoder::Flac(_)
             | AnyDecoder::OggFlac(_)
             | AnyDecoder::Opus(_)
@@ -205,6 +215,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
 pub fn open<S: BufSource>(mut src: S) -> Result<AnyDecoder<S>, DecodeError> {
     match probe(&mut src)? {
         Format::Wav => WavDecoder::new(src).map(AnyDecoder::Wav),
+        Format::Aiff => AiffDecoder::new(src).map(AnyDecoder::Aiff),
         Format::Flac => FlacDecoder::new(src).map(AnyDecoder::Flac),
         Format::Mp3 => Mp3Decoder::new(src).map(AnyDecoder::Mp3),
         Format::OggFlac => FlacDecoder::new(OggReader::new(src)?).map(AnyDecoder::OggFlac),

@@ -14,6 +14,8 @@ right = 659.25 Hz (E5), −6 dB, with 50 ms in/out fades. So:
 | File | Format |
 |------|--------|
 | `tone.wav`  | RIFF/WAVE PCM (the reference) |
+| `tone-aiff.aiff` | AIFF (big-endian PCM) — lossless, decodes bit-exact vs `tone.wav` |
+| `tone-aifc-sowt.aifc` | AIFF-C `sowt` (little-endian PCM) — lossless, bit-exact vs `tone.wav` |
 | `tone.flac` | native FLAC |
 | `tone.mp3`  | MPEG Layer III |
 | `tone.mp2`  | MPEG Layer II |

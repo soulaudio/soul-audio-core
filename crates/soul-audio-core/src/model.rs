@@ -93,6 +93,11 @@ impl StreamInfo {
 pub enum Format {
     /// RIFF/WAVE.
     Wav,
+    /// AIFF / AIFF-C (`FORM`…`AIFF`/`AIFC`). Big-endian PCM, plus AIFF-C `sowt`
+    /// (little-endian), `fl32`/`fl64` (IEEE float), and `ulaw`/`alaw`. A normal
+    /// [`AnyDecoder`](crate::dispatch::AnyDecoder) variant (see
+    /// `formats::aiff::AiffDecoder`).
+    Aiff,
     /// Native FLAC.
     Flac,
     /// MPEG-1/2 Audio Layer III.

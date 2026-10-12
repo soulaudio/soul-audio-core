@@ -5,13 +5,14 @@
 //! [`open`](crate::open) dispatches to the right one via
 //! [`AnyDecoder`](crate::dispatch::AnyDecoder).
 //!
-//! - PCM formats implement [`crate::Decoder`]: [`wav`], [`flac`] (incl.
-//!   FLAC-in-Ogg), [`mp3`] (Layers I/II/III), [`aac`] (AAC-LC, HE-AAC/SBR,
-//!   HE-AACv2/PS), [`alac`], [`vorbis`], [`opus`].
+//! - PCM formats implement [`crate::Decoder`]: [`wav`], [`aiff`] (AIFF/AIFF-C),
+//!   [`flac`] (incl. FLAC-in-Ogg), [`mp3`] (Layers I/II/III), [`aac`] (AAC-LC,
+//!   HE-AAC/SBR, HE-AACv2/PS), [`alac`], [`vorbis`], [`opus`].
 //! - DSD containers ([`dsf`], [`dff`]) implement [`crate::DsdDecoder`]; [`dst`]
 //!   is the lossless DSD-stream decompressor they feed through.
 
 pub mod aac;
+pub mod aiff;
 pub mod alac;
 pub mod dff;
 pub mod dsf;

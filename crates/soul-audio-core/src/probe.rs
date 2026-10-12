@@ -27,6 +27,10 @@ fn identify(head: &[u8]) -> Option<Format> {
     if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WAVE" {
         return Some(Format::Wav);
     }
+    // AIFF / AIFF-C: "FORM" at 0 and "AIFF" or "AIFC" at 8.
+    if head.len() >= 12 && &head[0..4] == b"FORM" && matches!(&head[8..12], b"AIFF" | b"AIFC") {
+        return Some(Format::Aiff);
+    }
     if head.len() >= 4 {
         match &head[0..4] {
             b"fLaC" => return Some(Format::Flac),
@@ -88,6 +92,8 @@ mod tests {
     #[test]
     fn identifies_each_container() {
         assert_eq!(probe_bytes(b"RIFF\0\0\0\0WAVEfmt ").unwrap(), Format::Wav);
+        assert_eq!(probe_bytes(b"FORM\0\0\0\0AIFFCOMM").unwrap(), Format::Aiff);
+        assert_eq!(probe_bytes(b"FORM\0\0\0\0AIFCFVER").unwrap(), Format::Aiff);
         assert_eq!(probe_bytes(b"fLaC\0\0\0\0").unwrap(), Format::Flac);
         assert_eq!(probe_bytes(b"DSD \0\0\0\0").unwrap(), Format::Dsf);
         assert_eq!(probe_bytes(b"FRM8\0\0\0\0").unwrap(), Format::Dff);

@@ -16,6 +16,11 @@ GRAPH="aevalsrc=exprs=0.5*sin(2*PI*440*t)|0.5*sin(2*PI*659.25*t):s=44100:d=2:c=s
 
 ffmpeg -y -hide_banner -loglevel error -f lavfi -i "$GRAPH" -c:a pcm_s16le tone.wav
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a flac tone.flac
+# AIFF (big-endian PCM) and AIFF-C `sowt` (little-endian PCM) — both lossless
+# 16-bit, so each decodes bit-exact vs tone.wav (core + CLI e2e). `-f aiff` with a
+# little-endian PCM codec makes ffmpeg emit AIFF-C with the `sowt` compression type.
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a pcm_s16be tone-aiff.aiff
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a pcm_s16le -f aiff tone-aifc-sowt.aifc
 ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a libmp3lame -b:a 192k tone.mp3
 # MPEG Layer II (the MP3 decoder also handles L2/L1; this gives L2 a playback-tier
 # render golden, not just the kjmp2 decode vectors). No `tone.mp1` — ffmpeg has no
@@ -74,4 +79,4 @@ python3 generate_dsd.py tone-dsd512.dsf 22579200 0.1  # DSD512 DSF (0.1 s, size)
 python3 generate_dsd.py tone.dff                      # DSD64  DSDIFF/raw (0.5 s)
 
 echo "generated:"
-ls -la tone.wav tone.flac tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1
+ls -la tone.wav tone-aiff.aiff tone-aifc-sowt.aifc tone.flac tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1
