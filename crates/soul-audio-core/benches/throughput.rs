@@ -10,7 +10,9 @@
 
 use std::time::{Duration, Instant};
 
+use soul_audio_core::demux::MatroskaDemuxer;
 use soul_audio_core::formats::dsf::DsfDecoder;
+use soul_audio_core::formats::matroska::MatroskaVorbisOgg;
 use soul_audio_core::formats::vorbis::VorbisDecoder;
 use soul_audio_core::{DecimateAdapter, Decoder, Quality, Resampler, SliceSource, open};
 
@@ -99,6 +101,23 @@ fn vorbis_decode(bytes: &'static [u8]) -> (usize, u32, u16) {
     (total, si.sample_rate, si.channels)
 }
 
+fn matroska_vorbis_decode(bytes: &'static [u8]) -> (usize, u32, u16) {
+    let demux = MatroskaDemuxer::new(SliceSource::new(bytes)).expect("mka demux");
+    let adapter = MatroskaVorbisOgg::new(demux).expect("vorbis-mka adapter");
+    let mut d = VorbisDecoder::new(adapter, vec![0u8; 256 * 1024]).expect("vorbis-in-mka");
+    let si = d.stream_info();
+    let mut total = 0usize;
+    let mut buf = [0i32; 8192];
+    loop {
+        let n = d.decode_into(&mut buf).expect("decode");
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    (total, si.sample_rate, si.channels)
+}
+
 fn dsd_decode(bytes: &'static [u8]) -> (usize, u32, u16) {
     let dsf = DsfDecoder::new(SliceSource::new(bytes)).expect("dsf");
     let mut d = DecimateAdapter::new(dsf);
@@ -162,9 +181,30 @@ fn main() {
     bench("alac", || {
         open_decode(include_bytes!("../testdata/alac.m4a"))
     });
+    bench("aiff", || {
+        open_decode(include_bytes!("../../../testdata/tone-aiff.aiff"))
+    });
+    bench("wavpack", || {
+        open_decode(include_bytes!("../../../testdata/tone.wv"))
+    });
+    bench("caf (alac)", || {
+        open_decode(include_bytes!("../../../testdata/tone-alac.caf"))
+    });
+    bench("mka-opus", || {
+        open_decode(include_bytes!("../../../testdata/tone-opus.webm"))
+    });
+    bench("mka-flac", || {
+        open_decode(include_bytes!("../../../testdata/tone-flac.mka"))
+    });
+    bench("mka-aac", || {
+        open_decode(include_bytes!("../../../testdata/tone-aac.mka"))
+    });
     // Consumer-dispatched codecs (not via open).
     bench("vorbis", || {
         vorbis_decode(include_bytes!("../testdata/tone-vorbis-stereo.ogg"))
+    });
+    bench("mka-vorbis", || {
+        matroska_vorbis_decode(include_bytes!("../../../testdata/tone-vorbis.mka"))
     });
     bench("dsd (dsf→pcm)", || {
         dsd_decode(include_bytes!("../../../testdata/tone.dsf"))
