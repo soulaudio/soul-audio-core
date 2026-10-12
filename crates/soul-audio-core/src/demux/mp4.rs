@@ -933,7 +933,7 @@ fn read_sample_rate(r: &mut AscBits) -> Result<u32, DecodeError> {
 /// signalling isn't parsed (the explicit AOT-5 form above covers the shipped
 /// fixtures; implicit ADTS-style discovery via the fill element still works for
 /// anything else).
-fn parse_audio_specific_config(data: &[u8]) -> Result<AacConfig, DecodeError> {
+pub(crate) fn parse_audio_specific_config(data: &[u8]) -> Result<AacConfig, DecodeError> {
     let mut r = AscBits::new(data);
     let aot = read_object_type(&mut r)?;
 

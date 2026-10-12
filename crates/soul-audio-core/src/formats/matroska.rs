@@ -1,20 +1,24 @@
 //! Matroska / WebM decoder: the [`MatroskaDemuxer`] container feeding the
 //! existing per-codec decoders, selected by `CodecID`.
 //!
-//! v1 supports the dominant `.webm`/`.mka` audio: **Opus** (`A_OPUS`) and
-//! **FLAC** (`A_FLAC`). Opus drives the shared [`OpusFrameDecoder`] core per
-//! `SimpleBlock` (the GREEN packet-in/PCM-out seam), applying the `OpusHead`
+//! Supports the common `.webm`/`.mka` audio codecs: **Opus** (`A_OPUS`), **FLAC**
+//! (`A_FLAC`), and **AAC** (`A_AAC`). Opus drives the shared [`OpusFrameDecoder`]
+//! core per `SimpleBlock` (the packet-in/PCM-out seam), applying the `OpusHead`
 //! pre-skip and output gain; FLAC reuses [`FlacDecoder`] unchanged over a
-//! [`MatroskaFlacReader`] byte adapter — the same trick
-//! [`OggReader`](crate::demux::ogg::OggReader) uses for FLAC-in-Ogg. AAC and
-//! Vorbis in Matroska are follow-ups (see the codec-seam notes); Cues-based
-//! seeking is likewise deferred — this forward decoder reports no length and
-//! declines `seek_to`.
+//! [`MatroskaFlacReader`] byte adapter (the same trick
+//! [`OggReader`](crate::demux::ogg::OggReader) uses for FLAC-in-Ogg); AAC feeds
+//! [`AacDecoder`] one access unit per block with the `CodecPrivate`
+//! `AudioSpecificConfig`. Vorbis (`A_VORBIS`) is a follow-up — it needs the
+//! consumer-dispatch arena path, like bare Ogg-Vorbis. Cues-based seeking is
+//! likewise deferred: this forward decoder reports no length and declines
+//! `seek_to`.
 
 use embedded_io::{ErrorType, Read};
 
 use crate::decoder::{DecodeError, Decoder};
+use crate::demux::mp4::parse_audio_specific_config;
 use crate::demux::{Demuxer, MatroskaDemuxer};
+use crate::formats::aac::AacDecoder;
 use crate::formats::flac::FlacDecoder;
 use crate::formats::opus::conformance::OpusFrameDecoder;
 use crate::formats::opus::container::OpusHead;
@@ -52,6 +56,9 @@ pub enum MatroskaDecoder<S> {
     Opus(MatroskaOpus<S>),
     /// `A_FLAC` — [`FlacDecoder`] over a native-FLAC byte adapter.
     Flac(FlacDecoder<MatroskaFlacReader<S>>),
+    /// `A_AAC` — [`AacDecoder`] fed one `SimpleBlock` (= raw access unit) at a
+    /// time; config from the `CodecPrivate` `AudioSpecificConfig`.
+    Aac(AacDecoder<S>),
 }
 
 impl<S: Source> MatroskaDecoder<S> {
@@ -75,6 +82,12 @@ impl<S: Source> MatroskaDecoder<S> {
             b"A_FLAC" => {
                 let reader = MatroskaFlacReader::new(demux)?;
                 Ok(MatroskaDecoder::Flac(FlacDecoder::new(reader)?))
+            }
+            b"A_AAC" => {
+                let config = parse_audio_specific_config(demux.codec_private())?;
+                Ok(MatroskaDecoder::Aac(AacDecoder::new_matroska(
+                    demux, config,
+                )?))
             }
             _ => Err(DecodeError::Unsupported),
         }
@@ -108,6 +121,7 @@ impl<S: Source> Decoder for MatroskaDecoder<S> {
         match self {
             MatroskaDecoder::Opus(d) => d.stream_info(),
             MatroskaDecoder::Flac(d) => d.stream_info(),
+            MatroskaDecoder::Aac(d) => d.stream_info(),
         }
     }
 
@@ -115,6 +129,7 @@ impl<S: Source> Decoder for MatroskaDecoder<S> {
         match self {
             MatroskaDecoder::Opus(d) => d.decode_into(out),
             MatroskaDecoder::Flac(d) => d.decode_into(out),
+            MatroskaDecoder::Aac(d) => d.decode_into(out),
         }
     }
 }

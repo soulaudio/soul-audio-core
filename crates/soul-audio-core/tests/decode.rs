@@ -201,6 +201,24 @@ fn open_decodes_wavpack_int32_bit_exact() {
     assert_eq!(fnv1a(&wv), fnv1a(&refr), "int32 WavPack decode != ffmpeg");
 }
 
+/// AAC-in-Matroska decodes vs ffmpeg's own decode of the same file. The frames
+/// are the identical AAC access units as `tone-aac.m4a` (remuxed `-c:a copy`);
+/// the config comes from the `CodecPrivate` AudioSpecificConfig. Same 45 dB bar
+/// as the MP4-AAC golden (our AAC decoder vs ffmpeg on the same frames).
+#[test]
+fn open_decodes_matroska_aac_matching_ffmpeg() {
+    let mka = include_bytes!("../../../testdata/tone-aac.mka");
+    let refr = load_s16le(include_bytes!("../../../testdata/tone-aac.mka.ref.pcm"));
+    let dec = open(SliceSource::new(mka)).expect("probe + construct Matroska-AAC");
+    assert_eq!(dec.stream_info().channels, 2);
+    let ours = decode_all(mka);
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 45.0,
+        "Matroska-AAC SNR vs ffmpeg too low: {snr:.1} dB (offset {off} frames)"
+    );
+}
+
 /// Ogg-FLAC seeks sample-accurately through `open()`/`AnyDecoder` (the tail is
 /// bit-identical to a from-start decode — FLAC-in-Ogg is lossless with
 /// independent frames). This fixture's STREAMINFO declares no total, so

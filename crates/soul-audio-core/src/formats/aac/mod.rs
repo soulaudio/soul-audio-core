@@ -25,6 +25,7 @@ mod tables;
 use crate::decoder::{DecodeError, Decoder, SeekableDecoder};
 use crate::demux::adts::{AacConfig, AdtsReader};
 use crate::demux::mp4::{Mp4Codec, Mp4Reader};
+use crate::demux::{Demuxer, MatroskaDemuxer};
 use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
 
@@ -205,11 +206,19 @@ fn decode_rdb(
 
 /// The frame-source seam: yields the next access unit's `raw_data_block` bytes
 /// plus (at construction) the stream config, over either container.
+///
+/// The `Matroska` variant embeds a `MatroskaDemuxer` (which carries an inline
+/// `CodecPrivate` buffer), so it is larger than the MP4/ADTS readers; boxing is
+/// impossible under `#![no_std]`, so the size gap is accepted.
+#[allow(clippy::large_enum_variant)]
 enum FrameSrc<S> {
     /// MP4/`.m4a` — access units concatenated in `mdat`, framed by decode.
     Mp4(Mp4Reader<S>),
     /// Raw ADTS `.aac` — each frame's `raw_data_block` framed by its header.
     Adts(AdtsReader<S>),
+    /// Matroska / WebM — each `SimpleBlock` is one `raw_data_block` (no ADTS
+    /// header); the config comes from the track's `CodecPrivate` (ASC).
+    Matroska(MatroskaDemuxer<S>),
 }
 
 /// A streaming AAC-LC decoder over an MP4/`.m4a` or raw ADTS [`Source`],
@@ -282,6 +291,18 @@ impl<S: Source> AacDecoder<S> {
         Self::build(FrameSrc::Adts(reader), config, None)
     }
 
+    /// Build over a Matroska/WebM demuxer positioned at the first audio block.
+    /// `config` is the track's `AudioSpecificConfig` (from `CodecPrivate`, parsed
+    /// by [`crate::demux::mp4::parse_audio_specific_config`]). Each `SimpleBlock`
+    /// is one raw access unit; no declared length ([`Self::total_frames`] =
+    /// `None`), mirroring ADTS.
+    ///
+    /// # Errors
+    /// As [`Self::new_mp4`] (config validation).
+    pub fn new_matroska(demux: MatroskaDemuxer<S>, config: AacConfig) -> Result<Self, DecodeError> {
+        Self::build(FrameSrc::Matroska(demux), config, None)
+    }
+
     fn build(
         src: FrameSrc<S>,
         config: AacConfig,
@@ -340,7 +361,7 @@ impl<S: Source> AacDecoder<S> {
     fn mp4_encoder_delay(&self) -> u64 {
         match &self.src {
             FrameSrc::Mp4(r) => r.encoder_delay(),
-            FrameSrc::Adts(_) => 0,
+            FrameSrc::Adts(_) | FrameSrc::Matroska(_) => 0,
         }
     }
 
@@ -350,7 +371,7 @@ impl<S: Source> AacDecoder<S> {
     fn mp4_playable_frames(&self) -> Option<u64> {
         match &self.src {
             FrameSrc::Mp4(r) => r.playable_frames(),
-            FrameSrc::Adts(_) => None,
+            FrameSrc::Adts(_) | FrameSrc::Matroska(_) => None,
         }
     }
 
@@ -377,6 +398,7 @@ impl<S: Source> AacDecoder<S> {
         match &self.src {
             FrameSrc::Mp4(_) => self.decode_next_rdb_mp4(),
             FrameSrc::Adts(_) => self.decode_next_rdb_adts(),
+            FrameSrc::Matroska(_) => self.decode_next_rdb_matroska(),
         }
     }
 
@@ -401,7 +423,9 @@ impl<S: Source> AacDecoder<S> {
             let n = {
                 let reader = match &mut self.src {
                     FrameSrc::Mp4(r) => r,
-                    FrameSrc::Adts(_) => unreachable!("dispatched by decode_next_rdb"),
+                    FrameSrc::Adts(_) | FrameSrc::Matroska(_) => {
+                        unreachable!("dispatched by decode_next_rdb")
+                    }
                 };
                 reader.read_audio(&mut self.inbuf[start..])?
             };
@@ -436,10 +460,42 @@ impl<S: Source> AacDecoder<S> {
         let len = {
             let reader = match &mut self.src {
                 FrameSrc::Adts(r) => r,
-                FrameSrc::Mp4(_) => unreachable!("dispatched by decode_next_rdb"),
+                FrameSrc::Mp4(_) | FrameSrc::Matroska(_) => {
+                    unreachable!("dispatched by decode_next_rdb")
+                }
             };
             match reader.next_frame(&mut self.inbuf)? {
                 Some(rdb) => rdb.len(),
+                None => return Ok(None),
+            }
+        };
+        let (samples, _consumed, sbr_applied) = decode_rdb(
+            &self.inbuf[..len],
+            self.config,
+            self.sfi,
+            &mut self.fb,
+            &mut self.sbr,
+            &mut self.sbr_out,
+            self.output_rate,
+            &mut self.pcm,
+        )?;
+        if sbr_applied {
+            self.sbr_confirmed = true;
+            self.promote_channels_if_ps();
+        }
+        Ok(Some(samples))
+    }
+
+    /// Matroska path: each `SimpleBlock` is one `raw_data_block` (no ADTS
+    /// header), pulled straight into `inbuf`.
+    fn decode_next_rdb_matroska(&mut self) -> Result<Option<usize>, DecodeError> {
+        let len = {
+            let demux = match &mut self.src {
+                FrameSrc::Matroska(d) => d,
+                _ => unreachable!("dispatched by decode_next_rdb"),
+            };
+            match demux.next_packet(&mut self.inbuf)? {
+                Some(pkt) => pkt.data.len(),
                 None => return Ok(None),
             }
         };
@@ -487,6 +543,9 @@ impl<S: SeekSource> AacDecoder<S> {
         match &self.src {
             FrameSrc::Mp4(_) => self.seek_to_mp4(sample),
             FrameSrc::Adts(_) => self.seek_to_adts(sample),
+            // Matroska seeking is handled at the container level (a follow-up);
+            // the AAC decoder itself doesn't seek a Matroska source.
+            FrameSrc::Matroska(_) => Err(DecodeError::Unsupported),
         }
     }
 
@@ -531,7 +590,7 @@ impl<S: SeekSource> AacDecoder<S> {
     fn mp4_reader(&mut self) -> &mut Mp4Reader<S> {
         match &mut self.src {
             FrameSrc::Mp4(r) => r,
-            FrameSrc::Adts(_) => unreachable!("mp4 seek path"),
+            FrameSrc::Adts(_) | FrameSrc::Matroska(_) => unreachable!("mp4 seek path"),
         }
     }
 
@@ -593,7 +652,7 @@ impl<S: SeekSource> AacDecoder<S> {
         // samples until the target (O(target), but correct across LC/SBR/PS).
         match &mut self.src {
             FrameSrc::Adts(r) => r.rewind()?,
-            FrameSrc::Mp4(_) => unreachable!("adts seek path"),
+            FrameSrc::Mp4(_) | FrameSrc::Matroska(_) => unreachable!("adts seek path"),
         }
         self.reset_decode_state();
         let mut passed = 0u64; // per-channel output samples discarded so far
