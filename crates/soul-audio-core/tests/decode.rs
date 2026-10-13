@@ -661,6 +661,116 @@ fn aac_48k_matches_ffmpeg() {
     );
 }
 
+// ===========================================================================
+// REAL MUSIC (`realmusic.wav`): a 4 s CD-quality clip of the CC0 / public-domain
+// "Open Goldberg Variations" (Kimiko Ishizaka, Bach BWV 988 — solo piano; the
+// Aria). This is the one thing no synthetic signal (tone / chirp / noise) covers:
+// genuine musical structure — note onsets (transients → short blocks), harmonic
+// partials, pedal/decay tails, real stereo imaging and dynamics. Every codec is
+// exercised on it (lossless bit-exact; lossy SNR vs ffmpeg). CC0 source, so the
+// clip is committable (credited in testdata/README.md).
+// ===========================================================================
+
+#[test]
+fn realmusic_flac_bit_exact() {
+    let flac = decode_all(include_bytes!("../../../testdata/realmusic.flac"));
+    let wav = decode_all(include_bytes!("../../../testdata/realmusic.wav"));
+    assert_eq!(
+        flac.len(),
+        wav.len(),
+        "FLAC/WAV length differs (real music)"
+    );
+    assert_eq!(
+        fnv1a(&flac),
+        fnv1a(&wav),
+        "FLAC not bit-exact on real music"
+    );
+}
+
+#[test]
+fn realmusic_alac_bit_exact() {
+    let alac = decode_all(include_bytes!("../../../testdata/realmusic-alac.m4a"));
+    let wav = decode_all(include_bytes!("../../../testdata/realmusic.wav"));
+    assert_eq!(
+        alac.len(),
+        wav.len(),
+        "ALAC/WAV length differs (real music)"
+    );
+    assert_eq!(
+        fnv1a(&alac),
+        fnv1a(&wav),
+        "ALAC not bit-exact on real music"
+    );
+}
+
+#[test]
+fn realmusic_wavpack_bit_exact() {
+    let wv = decode_all(include_bytes!("../../../testdata/realmusic.wv"));
+    let wav = decode_all(include_bytes!("../../../testdata/realmusic.wav"));
+    assert_eq!(
+        wv.len(),
+        wav.len(),
+        "WavPack/WAV length differs (real music)"
+    );
+    assert_eq!(
+        fnv1a(&wv),
+        fnv1a(&wav),
+        "WavPack not bit-exact on real music"
+    );
+}
+
+#[test]
+fn realmusic_mp3_matches_ffmpeg() {
+    let ours = decode_all(include_bytes!("../../../testdata/realmusic.mp3"));
+    let refr = load_s16le(include_bytes!("../../../testdata/realmusic.mp3.ref.pcm"));
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 55.0,
+        "real-music MP3 SNR vs ffmpeg {snr:.1} dB (offset {off})"
+    );
+}
+
+#[test]
+fn realmusic_vorbis_matches_ffmpeg() {
+    let ours = decode_ogg_vorbis_all(include_bytes!("../../../testdata/realmusic-vorbis.ogg"));
+    let refr = load_s16le(include_bytes!(
+        "../../../testdata/realmusic-vorbis.ogg.ref.pcm"
+    ));
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 55.0,
+        "real-music Vorbis SNR vs ffmpeg {snr:.1} dB (offset {off})"
+    );
+}
+
+#[test]
+fn realmusic_opus_matches_ffmpeg() {
+    let ours = decode_all(include_bytes!("../../../testdata/realmusic.opus"));
+    let refr = load_s16le(include_bytes!("../../../testdata/realmusic.opus.ref.pcm"));
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 55.0,
+        "real-music Opus SNR vs ffmpeg {snr:.1} dB (offset {off})"
+    );
+}
+
+/// Real-music AAC vs ffmpeg. Piano is largely tonal, so PNS (decoder-specific
+/// noise fill) is minimal here — unlike pure noise — keeping it SNR-matchable.
+/// (The two-independent-decoder cross-check — float vs fixed-point — is already
+/// established by `stress_aac_short_blocks_match_ffmpeg`, so this uses one ref.)
+#[test]
+fn realmusic_aac_matches_ffmpeg() {
+    let ours = decode_all(include_bytes!("../../../testdata/realmusic-aac.m4a"));
+    let refr = load_s16le(include_bytes!(
+        "../../../testdata/realmusic-aac.m4a.ref.pcm"
+    ));
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 50.0,
+        "real-music AAC SNR vs ffmpeg {snr:.1} dB (offset {off})"
+    );
+}
+
 /// AAC-LC on a full-band **chirp** (`chirp.wav`, 50 Hz→18 kHz sweep) — its rapid
 /// spectral motion forces the encoder into EIGHT_SHORT transient windows, so this
 /// exercises the short-block grouping / de-interleave / 8×128 IMDCT path the

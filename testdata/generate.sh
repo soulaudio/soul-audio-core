@@ -210,3 +210,23 @@ ls -la tone.wav tone-f32.wav tone-aiff.aiff tone-aifc-sowt.aifc tone-aiff-fl32.a
   complex.wav complex.flac complex-alac.m4a complex.wv complex.mp3 complex-vorbis.ogg complex.opus chirp.wav chirp-aac.m4a \
   fullscale.wav fullscale.flac fullscale.wv fullscale-alac.m4a antiphase.wav antiphase.flac antiphase.wv \
   mp3-mpeg2-22k.mp3 mp3-mpeg25-11k.mp3 mp3-mono.mp3 complex24.wav complex24.flac complex24-alac.m4a chirp-aac-48k.m4a
+
+# Real-music fixtures. realmusic.wav is a committed 4 s CD-quality clip of the
+# CC0 / public-domain "Open Goldberg Variations" (Kimiko Ishizaka, Bach BWV 988,
+# Aria) — a real recording no ffmpeg synth can reproduce, so it is committed and
+# the codec variants below are derived from it. Genuine musical structure (note
+# onsets → short blocks, harmonics, decay tails, stereo imaging) that no tone/
+# chirp/noise fixture covers. Lossless = bit-exact; lossy = SNR vs ffmpeg.
+if [ -f realmusic.wav ]; then
+  ffmpeg -y -hide_banner -loglevel error -i realmusic.wav -c:a flac realmusic.flac
+  ffmpeg -y -hide_banner -loglevel error -i realmusic.wav -c:a alac -movflags +faststart realmusic-alac.m4a
+  ffmpeg -y -hide_banner -loglevel error -i realmusic.wav -c:a wavpack realmusic.wv
+  ffmpeg -y -hide_banner -loglevel error -i realmusic.wav -c:a libmp3lame -b:a 192k realmusic.mp3
+  ffmpeg -y -hide_banner -loglevel error -i realmusic.mp3 -f s16le realmusic.mp3.ref.pcm
+  ffmpeg -y -hide_banner -loglevel error -i realmusic.wav -c:a aac -b:a 192k -movflags +faststart realmusic-aac.m4a
+  ffmpeg -y -hide_banner -loglevel error -i realmusic-aac.m4a -f s16le realmusic-aac.m4a.ref.pcm
+  ffmpeg -y -hide_banner -loglevel error -i realmusic.wav -c:a libvorbis -q:a 5 realmusic-vorbis.ogg
+  ffmpeg -y -hide_banner -loglevel error -i realmusic-vorbis.ogg -f s16le realmusic-vorbis.ogg.ref.pcm
+  ffmpeg -y -hide_banner -loglevel error -i realmusic.wav -c:a libopus -b:a 128k realmusic.opus
+  ffmpeg -y -hide_banner -loglevel error -i realmusic.opus -f s16le realmusic.opus.ref.pcm
+fi

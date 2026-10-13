@@ -164,3 +164,20 @@ Measured: **Layer III (MPEG-1 & MPEG-2) is ISO full-accuracy** (max |Δ| ≤ 1 L
 113–117 dB PSNR); Layer I/II track the ISO reference only to ~42–64 dB, the
 by-design limited accuracy of the kjmp2 decoder our Layer I/II is a bit-exact
 port of.
+
+## Real-music fixtures (CC0)
+
+`realmusic.wav` is a 4-second, CD-quality (44.1 kHz/16-bit stereo) excerpt of the
+**Open Goldberg Variations** — Kimiko Ishizaka playing J.S. Bach's Goldberg
+Variations BWV 988 (the Aria), released **CC0 / public domain** by the Open
+Goldberg project (opengoldbergvariations.org; source: archive.org
+`OpenGoldbergVariations`). CC0 means it is freely committable. It is the one test
+signal with genuine musical structure — note onsets (transients → short blocks),
+harmonic partials, pedal/decay tails, real stereo imaging and dynamics — that the
+synthetic tone/chirp/noise fixtures cannot provide. The codec variants
+(`realmusic.flac` / `-alac.m4a` / `.wv` / `.mp3` / `-aac.m4a` / `-vorbis.ogg` /
+`.opus`, + lossy `.ref.pcm`) are derived from it: lossless decode bit-exact, lossy
+SNR vs ffmpeg (`tests/decode.rs` `realmusic_*`). Native-DSD real music is not
+committed — no CC0 native-DSD recording exists (2L/NativeDSD/Blue Coast are
+commercial); the DSD decode path is covered by the synthetic `tone.dsf`/`.dff`
+and the `dst-slice.dff` conformance slice.
