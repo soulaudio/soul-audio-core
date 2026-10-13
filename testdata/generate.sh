@@ -165,6 +165,7 @@ ffmpeg -y -hide_banner -loglevel error -filter_complex \
 -map "[a]" -c:a pcm_s16le chirp.wav
 ffmpeg -y -hide_banner -loglevel error -i chirp.wav -c:a aac -b:a 192k -movflags +faststart chirp-aac.m4a
 ffmpeg -y -hide_banner -loglevel error -i chirp-aac.m4a -f s16le chirp-aac.m4a.ref.pcm
+ffmpeg -y -hide_banner -loglevel error -c:a aac_fixed -i chirp-aac.m4a -f s16le chirp-aac.m4a.fixed.pcm
 
 # Full-scale (0 dBFS) edge signals — the lossless integer predictors/entropy
 # coders are stressed hardest at the top of the sample range (largest residuals,

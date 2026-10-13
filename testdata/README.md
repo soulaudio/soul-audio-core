@@ -20,7 +20,7 @@ exercises the hard codec paths. These demanding signals do.
 | `complex.wav` | 3 s stereo stress reference — L a 50 Hz→18 kHz chirp (sweeps every band), R pink noise (high-entropy, L≠R). The lossless/MP3/Vorbis/Opus stress tests decode against this |
 | `complex.flac` / `complex-alac.m4a` / `complex.wv` | lossless of `complex.wav` — must decode **bit-exact** (any deviation = a real decoder bug the tone hides) |
 | `complex.mp3` / `complex-vorbis.ogg` / `complex.opus` (+ `.ref.pcm`) | lossy of `complex.wav` — SNR vs ffmpeg on broadband content |
-| `chirp.wav` / `chirp-aac.m4a` (+ `.ref.pcm`) | L=R full-band chirp → forces AAC EIGHT_SHORT transient windows (the short-block path the tone never hits) without triggering PNS; AAC SNR vs ffmpeg ~64 dB |
+| `chirp.wav` / `chirp-aac.m4a` (+ `.ref.pcm` float, `.fixed.pcm` fixed-point) | L=R full-band chirp → forces AAC EIGHT_SHORT transient windows without triggering PNS; cross-checked vs BOTH ffmpeg AAC decoders (independent float `aac` + fixed-point `aac_fixed`) |
 | `fullscale.wav` + `fullscale.flac` / `.wv` / `-alac.m4a` | 0 dBFS independent-L/R white noise → max residual magnitude; lossless must decode **bit-exact** (guards integer predictor/entropy overflow at the range edge) |
 | `antiphase.wav` + `antiphase.flac` / `.wv` | R = −L full-scale white noise (mid=0, side=max) → the FLAC mid-side / WavPack joint-stereo decorrelation extreme; bit-exact |
 | `mp3-mpeg2-22k.mp3` / `mp3-mpeg25-11k.mp3` / `mp3-mono.mp3` (+ `.ref.pcm`) | MP3 MPEG-2 LSF (22 kHz) / MPEG-2.5 (11 kHz) / mono — the halved-granule + LSF-scalefactor + mono paths no 44.1 kHz MPEG-1 stereo fixture reaches; SNR vs ffmpeg |

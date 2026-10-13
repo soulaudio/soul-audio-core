@@ -679,12 +679,28 @@ fn aac_48k_matches_ffmpeg() {
 #[test]
 fn stress_aac_short_blocks_match_ffmpeg() {
     let ours = decode_all(include_bytes!("../../../testdata/chirp-aac.m4a"));
-    let refr = load_s16le(include_bytes!("../../../testdata/chirp-aac.m4a.ref.pcm"));
-    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
-    assert!(
-        snr > 55.0,
-        "AAC chirp (short-block) SNR vs ffmpeg {snr:.1} dB (offset {off})"
-    );
+    // Checked against BOTH of ffmpeg's independent AAC decoders: the default
+    // float `aac` and the separate fixed-point `aac_fixed` (a distinct DSP core).
+    // AAC was the only lossy codec validated against a single reference; matching
+    // two independent implementations (beyond the shared bitstream parse) gives it
+    // the same multi-reference footing as MP3 (ISO vectors) / Opus (RFC) / Vorbis
+    // (libvorbis). Both references must clear the bar.
+    for (label, refr) in [
+        (
+            "aac (float)",
+            load_s16le(include_bytes!("../../../testdata/chirp-aac.m4a.ref.pcm")),
+        ),
+        (
+            "aac_fixed",
+            load_s16le(include_bytes!("../../../testdata/chirp-aac.m4a.fixed.pcm")),
+        ),
+    ] {
+        let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+        assert!(
+            snr > 55.0,
+            "AAC chirp (short-block) SNR vs ffmpeg {label} {snr:.1} dB (offset {off})"
+        );
+    }
 }
 
 #[test]
