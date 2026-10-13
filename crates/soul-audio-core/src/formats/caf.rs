@@ -66,6 +66,25 @@ fn skip<S: Source>(src: &mut S, mut n: u64) -> Result<(), DecodeError> {
     Ok(())
 }
 
+/// Read a 12-byte chunk header (type + i64 size). `Ok(false)` at a clean EOF
+/// (nothing read), so a chunk walk can stop when it runs off the end.
+fn read_chunk_header<S: Source>(src: &mut S, buf: &mut [u8; 12]) -> Result<bool, DecodeError> {
+    let mut n = 0;
+    while n < 12 {
+        match src.read(&mut buf[n..]) {
+            Ok(0) => {
+                if n == 0 {
+                    return Ok(false);
+                }
+                return Err(DecodeError::UnexpectedEof);
+            }
+            Ok(k) => n += k,
+            Err(_) => return Err(DecodeError::Io),
+        }
+    }
+    Ok(true)
+}
+
 /// Parse the `ALACSpecificConfig` (24 bytes, big-endian) out of a CAF `kuki`
 /// magic cookie — either the bare config or wrapped in `frma`/`alac` format
 /// atoms (`[size:u32][type:4][body]`). Returns the config + sample rate.
@@ -531,36 +550,132 @@ impl<S: Source> CafAlac<S> {
 }
 
 impl<S: SeekSource> CafAlac<S> {
-    /// Seek to per-channel `sample` by rewinding to the first packet and
-    /// decode-discarding forward (ALAC packets self-delimit but CAF carries no
-    /// per-packet size table here — a `pakt` scan would make it O(log n), a
-    /// follow-up). Returns the frame landed on.
+    /// Seek to per-channel `sample`. Fast path: the CAF `pakt` chunk lists each
+    /// packet's byte size, and ALAC packets are a constant `frame_length` frames
+    /// and independently decodable — so packet `k` begins at exactly
+    /// `k * frame_length` output samples. We sum the byte sizes of the packets
+    /// before the target packet (O(packets) tiny reads, no entropy decode), jump
+    /// straight to that packet, decode it, and discard the within-packet head —
+    /// sample-accurate with no rounding. Falls back to a linear decode-discard
+    /// from the first packet when no `pakt` is reachable (e.g. a `data` chunk
+    /// sized to EOF, or a non-standard chunk order). Returns the frame landed on.
     ///
     /// # Errors
     /// [`DecodeError::Io`] on seek failure, plus the forward-decode errors.
     fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+        let fl = self.cfg.frame_length as u64;
+        if fl != 0 {
+            if let Some(offset) = self.pakt_offset_for_packet(sample / fl)? {
+                self.src
+                    .seek(SeekFrom::Start(self.data_start + offset))
+                    .map_err(|_| DecodeError::Io)?;
+                self.reset_for_seek();
+                self.data_remaining = self.data_total.saturating_sub(offset);
+                return self.discard_forward(sample / fl * fl, sample);
+            }
+        }
+        // Fallback: rewind to the first packet and decode-discard forward.
         self.src
             .seek(SeekFrom::Start(self.data_start))
             .map_err(|_| DecodeError::Io)?;
+        self.reset_for_seek();
+        self.data_remaining = self.data_total;
+        self.discard_forward(0, sample)
+    }
+
+    /// Reset the decode buffers/EOF flag after a seek repositions the source.
+    fn reset_for_seek(&mut self) {
         self.scratch = Scratch::new();
         self.filled = 0;
         self.used = 0;
         self.out_len = 0;
         self.out_pos = 0;
         self.eof = false;
-        self.data_remaining = self.data_total;
+    }
+
+    /// Decode and discard from a position whose first decoded sample is `base`
+    /// up to `target`, returning the frame actually landed on (clamped at EOF).
+    fn discard_forward(&mut self, base: u64, target: u64) -> Result<u64, DecodeError> {
         let ch = self.cfg.channels.max(1);
-        let mut landed = 0u64;
-        while landed < sample {
+        let mut landed = base;
+        while landed < target {
             if self.out_pos >= self.out_len && !self.decode_next_packet()? {
                 break;
             }
             let avail = (self.out_len - self.out_pos) / ch;
-            let take = avail.min((sample - landed) as usize);
+            let take = avail.min((target - landed) as usize);
             self.out_pos += take * ch;
             landed += take as u64;
         }
         Ok(landed)
+    }
+
+    /// Sum the byte sizes of the first `target_packet` packets from the `pakt`
+    /// chunk (located after the sized `data` chunk), giving the byte offset of
+    /// that packet within the data region. Packet sizes are base-128 MSB-first
+    /// variable-length integers. Returns `None` — so the caller falls back to a
+    /// linear seek — when there is no reachable `pakt`, the `data` chunk runs to
+    /// EOF, or `target_packet` is past the table. O(`target_packet`) small reads.
+    fn pakt_offset_for_packet(&mut self, target_packet: u64) -> Result<Option<u64>, DecodeError> {
+        if target_packet == 0 {
+            return Ok(Some(0));
+        }
+        if self.data_total == u64::MAX {
+            return Ok(None); // data runs to EOF — no pakt can follow
+        }
+        self.src
+            .seek(SeekFrom::Start(self.data_start + self.data_total))
+            .map_err(|_| DecodeError::Io)?;
+        loop {
+            let mut ch = [0u8; 12];
+            if !read_chunk_header(&mut self.src, &mut ch)? {
+                return Ok(None); // ran off the end without a pakt
+            }
+            let size = be_i64(&ch[4..12]);
+            if &ch[0..4] == b"pakt" {
+                if size < 24 {
+                    return Ok(None);
+                }
+                let mut h = [0u8; 24];
+                read_exact(&mut self.src, &mut h)?;
+                let num_packets = be_i64(&h[0..8]);
+                if num_packets < 0 || target_packet >= num_packets as u64 {
+                    // At/past the last packet: `packet_index * frame_length` can
+                    // exceed the true total (the last packet may be short), so let
+                    // the linear path decode-discard and clamp to the real end.
+                    return Ok(None);
+                }
+                let mut table_left = size as u64 - 24;
+                let mut offset = 0u64;
+                let mut cur = 0u64;
+                let mut done = 0u64;
+                let mut buf = [0u8; 256];
+                while done < target_packet {
+                    if table_left == 0 {
+                        return Ok(None); // truncated size table
+                    }
+                    let want = table_left.min(buf.len() as u64) as usize;
+                    read_exact(&mut self.src, &mut buf[..want])?;
+                    table_left -= want as u64;
+                    for &byte in &buf[..want] {
+                        cur = (cur << 7) | u64::from(byte & 0x7f);
+                        if byte & 0x80 == 0 {
+                            offset += cur;
+                            cur = 0;
+                            done += 1;
+                            if done == target_packet {
+                                break;
+                            }
+                        }
+                    }
+                }
+                return Ok(Some(offset));
+            }
+            if size < 0 {
+                return Ok(None); // only `data` may be unsized; bail to linear
+            }
+            skip(&mut self.src, size as u64)?;
+        }
     }
 }
 

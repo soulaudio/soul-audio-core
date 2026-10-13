@@ -592,8 +592,8 @@ fn matroska_aac_seek_tail_matches_full_decode() {
 
 /// CAF seeks through `open()`/`AnyDecoder` for both payloads: the seek lands
 /// exactly and the decoded tail is **bit-identical** to the full decode (both
-/// lpcm and alac are lossless — PCM seeks by byte offset, ALAC rewinds +
-/// decode-discards).
+/// lpcm and alac are lossless — PCM seeks by byte offset, ALAC jumps via the
+/// `pakt` packet-size table to the containing packet).
 fn caf_seek_tail(bytes: &'static [u8], target: u64) -> (u16, u64, Vec<i32>) {
     std::thread::scope(|scope| {
         std::thread::Builder::new()
@@ -629,17 +629,36 @@ fn caf_pcm_seek_tail_matches_full_decode() {
     assert_eq!(tail, &full[base..], "post-seek CAF-PCM tail != full decode");
 }
 
+/// CAF-ALAC seeks via the `pakt` packet-size walk. ALAC packets are a constant
+/// 4096 frames, so targets land in different packets: 25 000 in packet 6, 70 000
+/// in packet 17 — each jumped to directly (prior packets' bytes summed from
+/// `pakt`, not decoded). Exact landing guards the packet-offset arithmetic; the
+/// bit-identical tail proves standalone packet decode, and the beyond-end seek
+/// exercises the past-the-table fallback that clamps to the total.
 #[test]
 fn caf_alac_seek_tail_matches_full_decode() {
     let caf: &'static [u8] = include_bytes!("../../../testdata/tone-alac.caf");
     let full = decode_all(caf);
-    let (ch, landed, tail) = caf_seek_tail(caf, 25_000);
-    assert_eq!(landed, 25_000, "CAF-ALAC seek is sample-accurate");
-    let base = 25_000usize * usize::from(ch);
-    assert_eq!(
-        tail,
-        &full[base..],
-        "post-seek CAF-ALAC tail != full decode"
+    let ch = usize::from(caf_seek_tail(caf, 0).0);
+    for target in [0u64, 25_000, 49_152, 70_000] {
+        let (_, landed, tail) = caf_seek_tail(caf, target);
+        assert_eq!(
+            landed, target,
+            "CAF-ALAC seek to {target} not sample-accurate"
+        );
+        let base = target as usize * ch;
+        assert_eq!(
+            tail,
+            &full[base..],
+            "post-seek CAF-ALAC tail != full decode (target {target})"
+        );
+    }
+    let total = (full.len() / ch) as u64;
+    let (_, landed, tail) = caf_seek_tail(caf, total + 5_000);
+    assert_eq!(landed, total, "beyond-end CAF-ALAC seek clamps to total");
+    assert!(
+        tail.is_empty(),
+        "beyond-end CAF-ALAC seek yields no samples"
     );
 }
 
