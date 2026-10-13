@@ -626,6 +626,79 @@ fn stress_opus_matches_ffmpeg_on_broadband() {
     );
 }
 
+// --- Full-scale (0 dBFS) overflow stress for the lossless integer decoders ----
+// The broadband signals above are ~−8 dB; `fullscale.wav` is independent L/R
+// white noise clipped to ±full-scale, so predictor residuals and entropy codes
+// hit their largest magnitudes — the regime where an unguarded i32 multiply/add
+// overflows (the class of bug the earlier WavPack fuzz sweep found 55 of). A
+// lossless decoder must reproduce it bit-exact; a debug build would panic on any
+// overflow before the hash even mismatched. `antiphase.wav` (R = −L) pins the
+// mid=0/side=max corner of FLAC mid-side / WavPack joint-stereo decorrelation.
+
+#[test]
+fn stress_flac_fullscale_bit_exact() {
+    let flac = decode_all(include_bytes!("../../../testdata/fullscale.flac"));
+    let wav = decode_all(include_bytes!("../../../testdata/fullscale.wav"));
+    assert_eq!(
+        flac.len(),
+        wav.len(),
+        "FLAC/WAV length differs at full scale"
+    );
+    assert_eq!(fnv1a(&flac), fnv1a(&wav), "FLAC not bit-exact at 0 dBFS");
+}
+
+#[test]
+fn stress_wavpack_fullscale_bit_exact() {
+    let wv = decode_all(include_bytes!("../../../testdata/fullscale.wv"));
+    let wav = decode_all(include_bytes!("../../../testdata/fullscale.wav"));
+    assert_eq!(
+        wv.len(),
+        wav.len(),
+        "WavPack/WAV length differs at full scale"
+    );
+    assert_eq!(fnv1a(&wv), fnv1a(&wav), "WavPack not bit-exact at 0 dBFS");
+}
+
+#[test]
+fn stress_alac_fullscale_bit_exact() {
+    let alac = decode_all(include_bytes!("../../../testdata/fullscale-alac.m4a"));
+    let wav = decode_all(include_bytes!("../../../testdata/fullscale.wav"));
+    assert_eq!(
+        alac.len(),
+        wav.len(),
+        "ALAC/WAV length differs at full scale"
+    );
+    assert_eq!(fnv1a(&alac), fnv1a(&wav), "ALAC not bit-exact at 0 dBFS");
+}
+
+#[test]
+fn stress_flac_antiphase_bit_exact() {
+    let flac = decode_all(include_bytes!("../../../testdata/antiphase.flac"));
+    let wav = decode_all(include_bytes!("../../../testdata/antiphase.wav"));
+    assert_eq!(flac.len(), wav.len(), "FLAC/WAV length differs (antiphase)");
+    assert_eq!(
+        fnv1a(&flac),
+        fnv1a(&wav),
+        "FLAC not bit-exact on the mid=0/side=max extreme"
+    );
+}
+
+#[test]
+fn stress_wavpack_antiphase_bit_exact() {
+    let wv = decode_all(include_bytes!("../../../testdata/antiphase.wv"));
+    let wav = decode_all(include_bytes!("../../../testdata/antiphase.wav"));
+    assert_eq!(
+        wv.len(),
+        wav.len(),
+        "WavPack/WAV length differs (antiphase)"
+    );
+    assert_eq!(
+        fnv1a(&wv),
+        fnv1a(&wav),
+        "WavPack not bit-exact on the mid=0/side=max extreme"
+    );
+}
+
 /// Open a Matroska stream, seek to per-channel `target`, and decode the tail.
 /// Returns `(channels, landed, tail)`. Runs on a big stack (`AnyDecoder`).
 fn matroska_seek_tail(bytes: &'static [u8], target: u64) -> (u16, u64, Vec<i32>) {

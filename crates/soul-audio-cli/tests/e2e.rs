@@ -549,8 +549,13 @@ fn real_matroska_vorbis_matches_ogg_vorbis() {
     );
 }
 
+/// Matroska/WebM-container dispatch through the `decode` subcommand, validated
+/// for CONTENT (not just byte count): `tone-opus.webm` is the L=440 Hz / R=659.25
+/// Hz tone, decoded at Opus's native 48 kHz. Per-channel pitch pins that the
+/// WebM demux + Opus seam delivers the right samples to the right channel — a
+/// swap, mono-collapse, or wrong-track selection fails here.
 #[test]
-fn real_matroska_opus_decodes_to_plausible_audio() {
+fn real_matroska_opus_decodes_stereo_tones() {
     let pcm = decode_fixture("tone-opus.webm");
     let samples: Vec<i32> = pcm
         .chunks_exact(4)
@@ -562,14 +567,26 @@ fn real_matroska_opus_decodes_to_plausible_audio() {
         "unexpected Matroska-Opus length: {}",
         samples.len()
     );
+    let left = analyze(&channel_window(&samples, 2, 0, 4000, 16_384), 48_000);
+    let right = analyze(&channel_window(&samples, 2, 1, 4000, 16_384), 48_000);
     assert!(
-        samples.iter().any(|&s| s.abs() > 1000),
-        "Matroska-Opus decoded to silence"
+        (left.peak_hz - 440.0).abs() < 6.0,
+        "Matroska-Opus left tone {:.1} Hz, not 440",
+        left.peak_hz
+    );
+    assert!(
+        (right.peak_hz - 659.25).abs() < 6.0,
+        "Matroska-Opus right tone {:.1} Hz, not 659 (channel swap/collapse?)",
+        right.peak_hz
     );
 }
 
+/// MP3 (Layer III) through the `decode` subcommand, validated for CONTENT: the
+/// only CLI-layer MP3 coverage, so it carries the same per-channel pitch oracle
+/// as every other codec here (L=440 Hz, R=659.25 Hz at the native 44.1 kHz) —
+/// a channel swap or wrong resample can no longer pass as "plausible audio".
 #[test]
-fn real_mp3_decodes_to_plausible_audio() {
+fn real_mp3_decodes_stereo_tones() {
     let pcm = decode_fixture("tone.mp3");
     let samples: Vec<i32> = pcm
         .chunks_exact(4)
@@ -581,9 +598,17 @@ fn real_mp3_decodes_to_plausible_audio() {
         "unexpected MP3 length: {}",
         samples.len()
     );
+    let left = analyze(&channel_window(&samples, 2, 0, 4000, 16_384), 44_100);
+    let right = analyze(&channel_window(&samples, 2, 1, 4000, 16_384), 44_100);
     assert!(
-        samples.iter().any(|&s| s.abs() > 1000),
-        "MP3 decoded to silence"
+        (left.peak_hz - 440.0).abs() < 6.0,
+        "MP3 left tone {:.1} Hz, not 440",
+        left.peak_hz
+    );
+    assert!(
+        (right.peak_hz - 659.25).abs() < 6.0,
+        "MP3 right tone {:.1} Hz, not 659 (channel swap/wrong resample?)",
+        right.peak_hz
     );
 }
 
@@ -664,17 +689,23 @@ fn real_dff_decodes_and_preserves_stereo_tones() {
     );
 }
 
+/// DST (arithmetic-coded lossless DSD) end-to-end regression lock. `dst-slice.dff`
+/// is the committed FFmpeg FATE DST slice — real music, so there's no tone to
+/// detect, and (unlike every other codec here) DST has no external conformance
+/// reference reachable from this toolchain: no DST *encoder* exists to round-trip
+/// our own tone, and this build's ffmpeg rejects the slice outright. So this
+/// pins the FULL pipeline output (DST arithmetic decode → DSD → decimate →
+/// resample) to a known hash: a regression guard, not an independent conformance
+/// proof. DST *correctness* is carried by the decoder's own arithmetic
+/// encode↔decode symmetry unit tests (`formats/dst.rs`), which this complements
+/// by exercising the real frame parser + filter/Ptable path on genuine DST data.
 #[test]
-fn real_dst_compressed_dff_renders_nonsilent() {
-    // DST-compressed DSDIFF (the committed FFmpeg FATE slice) decodes through the
-    // arithmetic coder → DSD → decimate → resample without error, non-silent.
-    // The slice is a real-music fragment, so assert it renders + is non-silent
-    // rather than a specific pitch.
+fn real_dst_slice_decodes_to_stable_output() {
     let out = tmp("dst_out.pcm");
     Command::cargo_bin("soul-audio-cli")
         .unwrap()
         .args(["render"])
-        .arg(fixture("tone-dst.dff"))
+        .arg(fixture("dst-slice.dff"))
         .args(["--out"])
         .arg(&out)
         .args(["--rate", "48000", "--channels", "2"])
@@ -682,8 +713,20 @@ fn real_dst_compressed_dff_renders_nonsilent() {
         .success();
 
     let pcm = read_pcm(&out);
-    assert!(!pcm.is_empty(), "DST render produced no PCM");
+    assert_eq!(pcm.len(), 3072, "DST render length changed");
     assert!(pcm.iter().any(|&s| s.abs() > 1000), "DST render silent");
+    // Regression lock over the interleaved i32 LE PCM (fnv1a-64).
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &s in &pcm {
+        for b in s.to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    assert_eq!(
+        h, 0xd740_27c2_0c9a_a639,
+        "DST pipeline output changed (hash {h:#018x}) — a DST/decimate/resample regression"
+    );
 }
 
 #[test]

@@ -166,6 +166,25 @@ ffmpeg -y -hide_banner -loglevel error -filter_complex \
 ffmpeg -y -hide_banner -loglevel error -i chirp.wav -c:a aac -b:a 192k -movflags +faststart chirp-aac.m4a
 ffmpeg -y -hide_banner -loglevel error -i chirp-aac.m4a -f s16le chirp-aac.m4a.ref.pcm
 
+# Full-scale (0 dBFS) edge signals — the lossless integer predictors/entropy
+# coders are stressed hardest at the top of the sample range (largest residuals,
+# where an unguarded i32 multiply/add would overflow). fullscale.wav: independent
+# L/R white noise clipped to ±full-scale. antiphase.wav: R = −L white noise, the
+# mid=0/side=max extreme of FLAC mid-side / WavPack joint-stereo decorrelation.
+# All must decode bit-exact.
+ffmpeg -y -hide_banner -loglevel error -filter_complex \
+"anoisesrc=d=2:c=white:seed=11:a=1.0[l];anoisesrc=d=2:c=white:seed=22:a=1.0[r];[l][r]join=inputs=2:channel_layout=stereo[a]" \
+-map "[a]" -c:a pcm_s16le fullscale.wav
+ffmpeg -y -hide_banner -loglevel error -i fullscale.wav -c:a flac fullscale.flac
+ffmpeg -y -hide_banner -loglevel error -i fullscale.wav -c:a wavpack fullscale.wv
+ffmpeg -y -hide_banner -loglevel error -i fullscale.wav -c:a alac -movflags +faststart fullscale-alac.m4a
+ffmpeg -y -hide_banner -loglevel error -filter_complex \
+"anoisesrc=d=2:c=white:seed=33:a=1.0[m];[m]asplit=2[l][r0];[r0]volume=-1[r];[l][r]join=inputs=2:channel_layout=stereo[o]" \
+-map "[o]" -c:a pcm_s16le antiphase.wav
+ffmpeg -y -hide_banner -loglevel error -i antiphase.wav -c:a flac antiphase.flac
+ffmpeg -y -hide_banner -loglevel error -i antiphase.wav -c:a wavpack antiphase.wv
+
 echo "generated:"
 ls -la tone.wav tone-f32.wav tone-aiff.aiff tone-aifc-sowt.aifc tone-aiff-fl32.aifc tone-aiff-fl64.aifc tone-aiff-ulaw.aifc tone-aiff-alaw.aifc tone.flac tone-flac.mka tone-aac.mka tone-vorbis.mka tone.wv tone-mono.wv tone-24.wv tone-wv24.wv tone.caf tone-caf-le.caf tone-caf-f32.caf tone-alac.caf tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus tone-opus.webm arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1 \
-  complex.wav complex.flac complex-alac.m4a complex.wv complex.mp3 complex-vorbis.ogg complex.opus chirp.wav chirp-aac.m4a
+  complex.wav complex.flac complex-alac.m4a complex.wv complex.mp3 complex-vorbis.ogg complex.opus chirp.wav chirp-aac.m4a \
+  fullscale.wav fullscale.flac fullscale.wv fullscale-alac.m4a antiphase.wav antiphase.flac antiphase.wv

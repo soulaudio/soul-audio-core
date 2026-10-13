@@ -21,6 +21,8 @@ exercises the hard codec paths. These demanding signals do.
 | `complex.flac` / `complex-alac.m4a` / `complex.wv` | lossless of `complex.wav` — must decode **bit-exact** (any deviation = a real decoder bug the tone hides) |
 | `complex.mp3` / `complex-vorbis.ogg` / `complex.opus` (+ `.ref.pcm`) | lossy of `complex.wav` — SNR vs ffmpeg on broadband content |
 | `chirp.wav` / `chirp-aac.m4a` (+ `.ref.pcm`) | L=R full-band chirp → forces AAC EIGHT_SHORT transient windows (the short-block path the tone never hits) without triggering PNS; AAC SNR vs ffmpeg ~64 dB |
+| `fullscale.wav` + `fullscale.flac` / `.wv` / `-alac.m4a` | 0 dBFS independent-L/R white noise → max residual magnitude; lossless must decode **bit-exact** (guards integer predictor/entropy overflow at the range edge) |
+| `antiphase.wav` + `antiphase.flac` / `.wv` | R = −L full-scale white noise (mid=0, side=max) → the FLAC mid-side / WavPack joint-stereo decorrelation extreme; bit-exact |
 
 | File | Format |
 |------|--------|
@@ -59,7 +61,7 @@ exercises the hard codec paths. These demanding signals do.
 | `tone-dsd256.dsf` | DSD256 (Sony DSF), 0.1 s — decimation-rate e2e golden |
 | `tone-dsd512.dsf` | DSD512 (Sony DSF), 0.1 s — decimation-rate e2e golden |
 | `tone.dff`  | DSD64 (Philips DSDIFF, raw) — MSB-first/interleaved DFF + `DIIN` tags |
-| `tone-dst.dff` | DST-compressed DSDIFF (FFmpeg FATE slice) — lossless-DSD decode e2e |
+| `dst-slice.dff` | DST (arithmetic-coded lossless DSD) — the FFmpeg FATE slice (real music, not a tone). Full-pipeline regression-locked; DST *correctness* is in `formats/dst.rs`'s arithmetic encode↔decode unit tests (no DST encoder / ffmpeg can't decode it → no external conformance ref) |
 | `tagged.flac` | native FLAC with ID3-style tags (title/artist/album) — used by the library-scan `Some(tag)` test |
 
 DSD is 1-bit at 2.8 MHz, so `tone.dsf` is deliberately shorter (0.5 s) to keep
@@ -135,8 +137,9 @@ PCM→DSD, so a 2nd-order sigma-delta modulator turns the tone into a 1-bit stre
 wrapped in a Sony DSF (`.dsf`, LSB-first/planar) or Philips DSDIFF (`.dff`,
 MSB-first/interleaved) container (ffmpeg *can* decode both, for cross-checking):
 `generate_dsd.py <out> [rate_hz] [dur_secs]` picks the container by extension.
-`tone-dst.dff` is a copy of the committed DST FATE slice (DST has no open
-encoder).
+`dst-slice.dff` is the committed DST FATE slice (`crates/soul-audio-core/testdata/
+dst-64fs44-2ch.slice.dff`), copied here for the CLI e2e. DST has no open encoder,
+so there is no tone/round-trip fixture for it.
 
 > Minimal decode-correctness **vectors** (DSD/DST slice, IMA-ADPCM, MPEG
 > Layer I/II, VBR MP3, FLAC-in-Ogg, and a synthetic HE-AACv2/Parametric-Stereo
