@@ -733,6 +733,60 @@ fn qmf_synthesis_modulation() -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
     (c, s)
 }
 
+/// Fast-QMF (`qmf.rs`) FFT + rotation twiddles. Both banks reduce their direct
+/// O(N²) complex-exponential modulation to an `N`-point FFT with pre/post
+/// rotations (the MDCT→FFT trick): synthesis is a 128-pt inverse FFT of the
+/// pre-rotated 64 bands (zero-padded), analysis a 64-pt inverse FFT of the
+/// pre-rotated 64 `u[n]`. The FFT uses the `e^{+iθ}` kernel, so one shared
+/// twiddle table `QMF_FFT_TW[j] = (cos, sin)(2π·j/128)` serves both sizes (a
+/// length-`len` sub-DFT reads stride `128/len`). The reduction is validated
+/// against the direct modulation in `qmf.rs`'s `fast_*_reduction_*` tests.
+///
+/// Synthesis post-twiddle `e^{iπ(2n+1)/256}` is NOT emitted — it equals
+/// `(-QMF_SYN_COS[n][0], -QMF_SYN_SIN[n][0])`, read straight from the existing
+/// synthesis modulation table.
+fn qmf_fft_twiddles() -> Vec<[f32; 2]> {
+    // 64 entries: a length-`len` stage reads index `k·128/len`, always < 64.
+    (0..64usize)
+        .map(|j| {
+            let a = 2.0 * PI * j as f64 / 128.0;
+            [a.cos() as f32, a.sin() as f32]
+        })
+        .collect()
+}
+
+/// Synthesis pre-twiddle `W^k = e^{iπk/128}`, `k=0..63` (the odd-frequency
+/// shift that turns the `(2n+1)` modulation into a plain 128-pt FFT).
+fn qmf_syn_pre() -> Vec<[f32; 2]> {
+    (0..64usize)
+        .map(|k| {
+            let a = PI * k as f64 / 128.0;
+            [a.cos() as f32, a.sin() as f32]
+        })
+        .collect()
+}
+
+/// Analysis pre-twiddle `e^{iπ(2n−0.5)/128}`, `n=0..63`.
+fn qmf_ana_pre() -> Vec<[f32; 2]> {
+    (0..64usize)
+        .map(|n| {
+            let a = PI * (2.0 * n as f64 - 0.5) / 128.0;
+            [a.cos() as f32, a.sin() as f32]
+        })
+        .collect()
+}
+
+/// Analysis post-twiddle `2·e^{−iπk/128}`, `k=0..31` (folds in faad2's ×2
+/// analysis normalization).
+fn qmf_ana_post() -> Vec<[f32; 2]> {
+    (0..32usize)
+        .map(|k| {
+            let a = -PI * k as f64 / 128.0;
+            [2.0 * a.cos() as f32, 2.0 * a.sin() as f32]
+        })
+        .collect()
+}
+
 /// `log2(i)`, `i=0..64`; `[0]` is unused by section 3.3 (it only ever looks up
 /// `log2(k1/k0)` with `k1,k0 >= 1`) but stored as `0.0` rather than `-inf` so
 /// the const array stays a plain finite `f32` table.
@@ -779,6 +833,14 @@ fn emit(name: &str, t: &[f32], out: &mut String) {
         out.push('\n');
     }
     out.push_str("];\n");
+}
+
+/// Like [`emit2d`] but gates the table behind `#[cfg(test)]` — for a modulation
+/// table the fast (FFT) path no longer references in production, kept only as the
+/// test oracle's reference (so it adds no bytes to the release/embedded binary).
+fn emit2d_test(name: &str, t: &[Vec<f32>], out: &mut String) {
+    writeln!(out, "#[cfg(test)]").unwrap();
+    emit2d(name, t, out);
 }
 
 /// Same as [`emit`] for a rectangular `outer x inner` table (`Vec<Vec<f32>>`,
@@ -866,6 +928,29 @@ mod tests {
             assert!((f64::from(POW2_FRAC[i]) - 2f64.powf(i as f64 / 256.0)).abs() < 1e-5);
         }
     }
+    #[test]
+    fn fast_qmf_twiddles_match_closed_form() {
+        for j in 0..64usize {
+            let a = 2.0 * PI * j as f64 / 128.0;
+            assert!((f64::from(QMF_FFT_TW[j][0]) - a.cos()).abs() < 1e-5);
+            assert!((f64::from(QMF_FFT_TW[j][1]) - a.sin()).abs() < 1e-5);
+        }
+        for k in 0..64usize {
+            let a = PI * k as f64 / 128.0;
+            assert!((f64::from(QMF_SYN_PRE[k][0]) - a.cos()).abs() < 1e-5);
+            assert!((f64::from(QMF_SYN_PRE[k][1]) - a.sin()).abs() < 1e-5);
+        }
+        for n in 0..64usize {
+            let a = PI * (2.0 * n as f64 - 0.5) / 128.0;
+            assert!((f64::from(QMF_ANA_PRE[n][0]) - a.cos()).abs() < 1e-5);
+            assert!((f64::from(QMF_ANA_PRE[n][1]) - a.sin()).abs() < 1e-5);
+        }
+        for k in 0..32usize {
+            let a = -PI * k as f64 / 128.0;
+            assert!((f64::from(QMF_ANA_POST[k][0]) - 2.0 * a.cos()).abs() < 1e-5);
+            assert!((f64::from(QMF_ANA_POST[k][1]) - 2.0 * a.sin()).abs() < 1e-5);
+        }
+    }
 }
 "#;
 
@@ -894,15 +979,23 @@ fn generate() -> String {
 
     emit("QMF_PROTO", &qmf_proto_f32(), &mut out);
 
+    // The analysis modulation matrices are now only the FFT path's test oracle
+    // (production uses QMF_ANA_PRE/POST + the FFT), so gate them behind cfg(test).
     let (ana_cos, ana_sin) = qmf_analysis_modulation();
-    emit2d("QMF_ANA_COS", &ana_cos, &mut out);
-    emit2d("QMF_ANA_SIN", &ana_sin, &mut out);
+    emit2d_test("QMF_ANA_COS", &ana_cos, &mut out);
+    emit2d_test("QMF_ANA_SIN", &ana_sin, &mut out);
 
     let (syn_cos, syn_sin) = qmf_synthesis_modulation();
     emit2d("QMF_SYN_COS", &syn_cos, &mut out);
     emit2d("QMF_SYN_SIN", &syn_sin, &mut out);
 
     emit_pairs("V_NOISE", &v_noise_f32(), &mut out);
+
+    // Fast-QMF FFT + rotation twiddles (see qmf.rs).
+    emit_pairs("QMF_FFT_TW", &qmf_fft_twiddles(), &mut out);
+    emit_pairs("QMF_SYN_PRE", &qmf_syn_pre(), &mut out);
+    emit_pairs("QMF_ANA_PRE", &qmf_ana_pre(), &mut out);
+    emit_pairs("QMF_ANA_POST", &qmf_ana_post(), &mut out);
 
     emit("LOG2_INT", &log2_int(), &mut out);
     emit("POW2_FRAC", &pow2_frac(), &mut out);
