@@ -151,3 +151,16 @@ so there is no tone/round-trip fixture for it.
 > `ps-synth.aac` is our own tone encoded to HE-AACv2 by a from-source `fdk-aac`
 > build (AOT 29, mono core + PS) — committable, unlike the gitignored,
 > license-restricted `ps-local.*` Coding-Technologies conformance fixture.
+
+## ISO MPEG audio conformance (local-only)
+
+`tests/mp3_conformance.rs` validates the MPEG audio decoder against the
+authoritative **ISO/IEC 11172-4 / 13818-4 conformance vectors** (`.bit` +
+reference `.pcm`) — a decoder-independent check beyond the ffmpeg SNR
+cross-checks. The vectors are ISO-copyright, so (like `ps-local.*`) they are
+**not committed**: they live in a gitignored `testdata/mp3-conformance-local/`
+and the test skips when absent. Enable with `bash testdata/fetch-mp3-conformance.sh`.
+Measured: **Layer III (MPEG-1 & MPEG-2) is ISO full-accuracy** (max |Δ| ≤ 1 LSB,
+113–117 dB PSNR); Layer I/II track the ISO reference only to ~42–64 dB, the
+by-design limited accuracy of the kjmp2 decoder our Layer I/II is a bit-exact
+port of.

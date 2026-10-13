@@ -18,3 +18,7 @@
 # HE-AACv2/PS conformance fixture — license-restricted (Coding Technologies
 # DecoderCheck package), used for LOCAL PS dev verification only, NEVER committed.
 /crates/soul-audio-core/testdata/ps-local.*
+# ISO/IEC MPEG audio conformance vectors — ISO-copyright, used for LOCAL
+# conformance verification only (tests/mp3_conformance.rs skips when absent),
+# NEVER committed. Fetch with testdata/fetch-mp3-conformance.sh.
+/testdata/mp3-conformance-local/
