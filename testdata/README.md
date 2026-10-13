@@ -24,7 +24,7 @@ exercises the hard codec paths. These demanding signals do.
 | `fullscale.wav` + `fullscale.flac` / `.wv` / `-alac.m4a` | 0 dBFS independent-L/R white noise → max residual magnitude; lossless must decode **bit-exact** (guards integer predictor/entropy overflow at the range edge) |
 | `antiphase.wav` + `antiphase.flac` / `.wv` | R = −L full-scale white noise (mid=0, side=max) → the FLAC mid-side / WavPack joint-stereo decorrelation extreme; bit-exact |
 | `mp3-mpeg2-22k.mp3` / `mp3-mpeg25-11k.mp3` / `mp3-mono.mp3` (+ `.ref.pcm`) | MP3 MPEG-2 LSF (22 kHz) / MPEG-2.5 (11 kHz) / mono — the halved-granule + LSF-scalefactor + mono paths no 44.1 kHz MPEG-1 stereo fixture reaches; SNR vs ffmpeg |
-| `complex24.wav` + `complex24.flac` | 24-bit (hi-res) broadband → FLAC's wide-sample path; bit-exact |
+| `complex24.wav` + `complex24.flac` / `complex24-alac.m4a` | 24-bit (hi-res) broadband → FLAC + ALAC wide-sample paths; bit-exact |
 | `chirp-aac-48k.m4a` (+ `.ref.pcm`) | AAC-LC at 48 kHz — a different scalefactor-band table than the 44.1 kHz fixtures; SNR vs ffmpeg |
 
 | File | Format |

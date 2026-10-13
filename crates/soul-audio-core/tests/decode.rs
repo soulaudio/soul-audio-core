@@ -633,6 +633,18 @@ fn flac_24bit_bit_exact() {
     assert_eq!(fnv1a(&flac), fnv1a(&wav), "24-bit FLAC not bit-exact");
 }
 
+/// 24-bit ALAC (hi-res Apple Lossless) decodes **bit-exact** — the ALAC decoder
+/// supports 16/20/24-bit but only 16-bit was tested; 24-bit drives its wider
+/// sample-size / bit-shift path. Completes the hi-res lossless trio (FLAC-24 +
+/// WavPack-24 via `tone-wv24` + this).
+#[test]
+fn alac_24bit_bit_exact() {
+    let alac = decode_all(include_bytes!("../../../testdata/complex24-alac.m4a"));
+    let wav = decode_all(include_bytes!("../../../testdata/complex24.wav"));
+    assert_eq!(alac.len(), wav.len(), "24-bit ALAC/WAV length differs");
+    assert_eq!(fnv1a(&alac), fnv1a(&wav), "24-bit ALAC not bit-exact");
+}
+
 /// AAC-LC at **48 kHz** vs ffmpeg — a different `swb_offset_1024` scalefactor-band
 /// table than the 44.1 kHz fixtures, driven by the (short-block) chirp so it stays
 /// PNS-free and SNR-matchable.
