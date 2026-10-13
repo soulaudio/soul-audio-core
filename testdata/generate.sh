@@ -135,5 +135,37 @@ python3 generate_dsd.py tone-dsd256.dsf 11289600 0.1  # DSD256 DSF (0.1 s, size)
 python3 generate_dsd.py tone-dsd512.dsf 22579200 0.1  # DSD512 DSF (0.1 s, size)
 python3 generate_dsd.py tone.dff                      # DSD64  DSDIFF/raw (0.5 s)
 
+# ---------------------------------------------------------------------------
+# Broadband STRESS signals (tests/decode.rs `stress_*`). The 2-tone `tone.wav`
+# is near-silent in most bands and compresses trivially, so it never exercises
+# subframe-type/Rice selection (lossless) or bit-allocation/short-block/reservoir
+# (lossy). These demanding signals do.
+#
+# complex.wav: 3 s stereo — L a 50 Hz->18 kHz linear chirp (sweeps every band),
+# R pink noise (broadband, high-entropy, L!=R stressing stereo decorrelation).
+# Lossless (FLAC/ALAC/WavPack) must decode it bit-exact; MP3/Vorbis/Opus must
+# hold SNR vs ffmpeg on it.
+ffmpeg -y -hide_banner -loglevel error -filter_complex \
+"aevalsrc=exprs='0.6*sin(2*PI*(50*t+2991.67*t*t))':s=44100:d=3[c];anoisesrc=d=3:c=pink:seed=7:a=0.4[n];[c][n]join=inputs=2:channel_layout=stereo[a]" \
+-map "[a]" -c:a pcm_s16le complex.wav
+ffmpeg -y -hide_banner -loglevel error -i complex.wav -c:a flac complex.flac
+ffmpeg -y -hide_banner -loglevel error -i complex.wav -c:a alac -movflags +faststart complex-alac.m4a
+ffmpeg -y -hide_banner -loglevel error -i complex.wav -c:a wavpack complex.wv
+ffmpeg -y -hide_banner -loglevel error -i complex.wav -c:a libmp3lame -b:a 192k complex.mp3
+ffmpeg -y -hide_banner -loglevel error -i complex.mp3 -f s16le complex.mp3.ref.pcm
+ffmpeg -y -hide_banner -loglevel error -i complex.wav -c:a libvorbis -q:a 5 complex-vorbis.ogg
+ffmpeg -y -hide_banner -loglevel error -i complex-vorbis.ogg -f s16le complex-vorbis.ogg.ref.pcm
+ffmpeg -y -hide_banner -loglevel error -i complex.wav -c:a libopus -b:a 128k complex.opus
+ffmpeg -y -hide_banner -loglevel error -i complex.opus -f s16le complex.opus.ref.pcm
+# chirp.wav: L=R full-band chirp, no noise -> forces AAC EIGHT_SHORT transient
+# windows WITHOUT triggering PNS (which is decoder-specific random fill and
+# un-matchable to ffmpeg's PRNG on pure noise). The AAC stress gate uses this.
+ffmpeg -y -hide_banner -loglevel error -filter_complex \
+"aevalsrc=exprs='0.6*sin(2*PI*(50*t+2991.67*t*t))|0.6*sin(2*PI*(50*t+2991.67*t*t))':s=44100:d=3[a]" \
+-map "[a]" -c:a pcm_s16le chirp.wav
+ffmpeg -y -hide_banner -loglevel error -i chirp.wav -c:a aac -b:a 192k -movflags +faststart chirp-aac.m4a
+ffmpeg -y -hide_banner -loglevel error -i chirp-aac.m4a -f s16le chirp-aac.m4a.ref.pcm
+
 echo "generated:"
-ls -la tone.wav tone-f32.wav tone-aiff.aiff tone-aifc-sowt.aifc tone-aiff-fl32.aifc tone-aiff-fl64.aifc tone-aiff-ulaw.aifc tone-aiff-alaw.aifc tone.flac tone-flac.mka tone-aac.mka tone-vorbis.mka tone.wv tone-mono.wv tone-24.wv tone-wv24.wv tone.caf tone-caf-le.caf tone-caf-f32.caf tone-alac.caf tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus tone-opus.webm arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1
+ls -la tone.wav tone-f32.wav tone-aiff.aiff tone-aifc-sowt.aifc tone-aiff-fl32.aifc tone-aiff-fl64.aifc tone-aiff-ulaw.aifc tone-aiff-alaw.aifc tone.flac tone-flac.mka tone-aac.mka tone-vorbis.mka tone.wv tone-mono.wv tone-24.wv tone-wv24.wv tone.caf tone-caf-le.caf tone-caf-f32.caf tone-alac.caf tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus tone-opus.webm arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1 \
+  complex.wav complex.flac complex-alac.m4a complex.wv complex.mp3 complex-vorbis.ogg complex.opus chirp.wav chirp-aac.m4a

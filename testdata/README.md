@@ -11,6 +11,17 @@ right = 659.25 Hz (E5), −6 dB, with 50 ms in/out fades. So:
   chord (gapless), and
 - 44.1 kHz on a 48 kHz device exercises the resampler.
 
+**Broadband stress fixtures** (`tests/decode.rs` `stress_*`): the 2-tone
+`tone.wav` is near-silent in most bands and compresses trivially, so it never
+exercises the hard codec paths. These demanding signals do.
+
+| File | Format |
+|------|--------|
+| `complex.wav` | 3 s stereo stress reference — L a 50 Hz→18 kHz chirp (sweeps every band), R pink noise (high-entropy, L≠R). The lossless/MP3/Vorbis/Opus stress tests decode against this |
+| `complex.flac` / `complex-alac.m4a` / `complex.wv` | lossless of `complex.wav` — must decode **bit-exact** (any deviation = a real decoder bug the tone hides) |
+| `complex.mp3` / `complex-vorbis.ogg` / `complex.opus` (+ `.ref.pcm`) | lossy of `complex.wav` — SNR vs ffmpeg on broadband content |
+| `chirp.wav` / `chirp-aac.m4a` (+ `.ref.pcm`) | L=R full-band chirp → forces AAC EIGHT_SHORT transient windows (the short-block path the tone never hits) without triggering PNS; AAC SNR vs ffmpeg ~64 dB |
+
 | File | Format |
 |------|--------|
 | `tone.wav`  | RIFF/WAVE PCM (the reference) |

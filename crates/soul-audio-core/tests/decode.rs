@@ -480,6 +480,152 @@ fn open_decodes_caf_float_matches_wav_float() {
     );
 }
 
+// ===========================================================================
+// Broadband STRESS conformance (not the 2-tone `tone.wav`). `complex.wav` is a
+// 3 s stereo signal — L a 50 Hz→18 kHz linear chirp (sweeps every critical band,
+// forcing lossy block/window switching), R pink noise (broadband, high-entropy,
+// L≠R stressing stereo decorrelation). This exercises the codec paths a near-
+// silent two-tone sine never reaches: FLAC/ALAC/WavPack subframe-type and
+// Rice/escape selection, AAC/MP3/Vorbis bit allocation + the reservoir + short
+// blocks. Lossless MUST stay bit-exact (any deviation is a real decoder bug the
+// tone hid); lossy must hold its decoder-vs-ffmpeg SNR on the harder content.
+// ===========================================================================
+
+/// Decode a bare Ogg-Vorbis stream via the consumer-dispatch arena path (`open()`
+/// can't — Vorbis needs a caller arena). Big stack for the decoder's DSP scratch.
+fn decode_ogg_vorbis_all(bytes: &'static [u8]) -> Vec<i32> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn_scoped(scope, || {
+                let mut dec = VorbisDecoder::new(SliceSource::new(bytes), vec![0u8; 128 * 1024])
+                    .expect("open ogg-vorbis");
+                let mut out = Vec::new();
+                let mut buf = [0i32; 8192];
+                loop {
+                    let n = dec.decode_into(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                }
+                out
+            })
+            .expect("spawn")
+            .join()
+            .expect("vorbis thread panicked")
+    })
+}
+
+#[test]
+fn stress_flac_bit_exact_on_broadband() {
+    let flac = decode_all(include_bytes!("../../../testdata/complex.flac"));
+    let wav = decode_all(include_bytes!("../../../testdata/complex.wav"));
+    assert_eq!(
+        flac.len(),
+        wav.len(),
+        "FLAC/WAV length differs on broadband"
+    );
+    assert_eq!(
+        fnv1a(&flac),
+        fnv1a(&wav),
+        "FLAC not bit-exact on chirp+noise (a subframe/Rice path the tone misses)"
+    );
+}
+
+#[test]
+fn stress_alac_bit_exact_on_broadband() {
+    let alac = decode_all(include_bytes!("../../../testdata/complex-alac.m4a"));
+    let wav = decode_all(include_bytes!("../../../testdata/complex.wav"));
+    assert_eq!(
+        alac.len(),
+        wav.len(),
+        "ALAC/WAV length differs on broadband"
+    );
+    assert_eq!(
+        fnv1a(&alac),
+        fnv1a(&wav),
+        "ALAC not bit-exact on chirp+noise (a predictor/partition path the tone misses)"
+    );
+}
+
+#[test]
+fn stress_wavpack_bit_exact_on_broadband() {
+    let wv = decode_all(include_bytes!("../../../testdata/complex.wv"));
+    let wav = decode_all(include_bytes!("../../../testdata/complex.wav"));
+    assert_eq!(
+        wv.len(),
+        wav.len(),
+        "WavPack/WAV length differs on broadband"
+    );
+    assert_eq!(
+        fnv1a(&wv),
+        fnv1a(&wav),
+        "WavPack not bit-exact on chirp+noise (an entropy/decorr path the tone misses)"
+    );
+}
+
+#[test]
+fn stress_mp3_matches_ffmpeg_on_broadband() {
+    let ours = decode_all(include_bytes!("../../../testdata/complex.mp3"));
+    let refr = load_s16le(include_bytes!("../../../testdata/complex.mp3.ref.pcm"));
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 55.0,
+        "MP3 broadband SNR vs ffmpeg {snr:.1} dB (offset {off})"
+    );
+}
+
+/// AAC-LC on a full-band **chirp** (`chirp.wav`, 50 Hz→18 kHz sweep) — its rapid
+/// spectral motion forces the encoder into EIGHT_SHORT transient windows, so this
+/// exercises the short-block grouping / de-interleave / 8×128 IMDCT path the
+/// steady two-tone sine never reaches, and still matches ffmpeg to ~64 dB.
+///
+/// The AAC stress signal is the chirp, NOT the pink-noise `complex.wav`, for a
+/// verified reason: pink noise drives the encoder to code bands as **PNS**
+/// (Perceptual Noise Substitution — energy only, filled with *decoder-specific*
+/// random noise), which is fundamentally un-matchable to ffmpeg's PRNG. Measured:
+/// pure-noise AAC SNR vs ffmpeg rises monotonically with bitrate (96k 11 dB →
+/// 192k 13 dB → 320k 31 dB — fewer PNS bands), the signature of PNS rather than a
+/// decode bug (a bug would be bitrate-independent). So AAC conformance on noisy
+/// content can only be checked structurally, not by SNR — the chirp is the
+/// demanding-but-deterministic case. (MP3/Vorbis/Opus have no un-matchable noise
+/// fill, so they stress against `complex.wav` directly.)
+#[test]
+fn stress_aac_short_blocks_match_ffmpeg() {
+    let ours = decode_all(include_bytes!("../../../testdata/chirp-aac.m4a"));
+    let refr = load_s16le(include_bytes!("../../../testdata/chirp-aac.m4a.ref.pcm"));
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 55.0,
+        "AAC chirp (short-block) SNR vs ffmpeg {snr:.1} dB (offset {off})"
+    );
+}
+
+#[test]
+fn stress_vorbis_matches_ffmpeg_on_broadband() {
+    let ours = decode_ogg_vorbis_all(include_bytes!("../../../testdata/complex-vorbis.ogg"));
+    let refr = load_s16le(include_bytes!(
+        "../../../testdata/complex-vorbis.ogg.ref.pcm"
+    ));
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 55.0,
+        "Vorbis broadband SNR vs ffmpeg {snr:.1} dB (offset {off})"
+    );
+}
+
+#[test]
+fn stress_opus_matches_ffmpeg_on_broadband() {
+    let ours = decode_all(include_bytes!("../../../testdata/complex.opus"));
+    let refr = load_s16le(include_bytes!("../../../testdata/complex.opus.ref.pcm"));
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 55.0,
+        "Opus broadband SNR vs ffmpeg {snr:.1} dB (offset {off})"
+    );
+}
+
 /// Open a Matroska stream, seek to per-channel `target`, and decode the tail.
 /// Returns `(channels, landed, tail)`. Runs on a big stack (`AnyDecoder`).
 fn matroska_seek_tail(bytes: &'static [u8], target: u64) -> (u16, u64, Vec<i32>) {
