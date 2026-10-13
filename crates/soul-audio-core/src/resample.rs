@@ -220,6 +220,28 @@ impl Resampler {
         }
     }
 
+    /// Accumulate `w · frame[di]` into every channel's `acc`. The source region
+    /// (current input / carried history / out-of-range zero) depends only on the
+    /// tap position `di`, not the channel, so the branch is resolved **once per
+    /// tap** here instead of once per channel inside [`Self::at`] — bit-identical
+    /// (same values, same order), it just drops the redundant per-channel branch
+    /// and index math from the resampler's innermost loop.
+    #[inline]
+    fn accumulate_tap(&self, input: &[i32], di: isize, w: f32, acc: &mut [f32]) {
+        if di >= 0 {
+            let base = di as usize * self.channels;
+            for (c, a) in acc.iter_mut().enumerate() {
+                *a += w * input[base + c] as f32;
+            }
+        } else if di >= -(self.hist_depth as isize) {
+            let row = (self.hist_depth as isize + di) as usize;
+            for (c, a) in acc.iter_mut().enumerate() {
+                *a += w * self.hist[c][row];
+            }
+        }
+        // else: out of range (older than history) contributes 0 — nothing to add.
+    }
+
     /// Reconstruct one output frame for **all** channels at position `i0 + eta`
     /// under input/output step `step`, writing `acc[0..channels]`.
     ///
@@ -246,9 +268,7 @@ impl Resampler {
         let mut di = i0;
         while fidx < half_f {
             let w = interp(sinc, fidx);
-            for (c, a) in acc[..ch].iter_mut().enumerate() {
-                *a += w * self.at(c, input, di);
-            }
+            self.accumulate_tap(input, di, w, &mut acc[..ch]);
             fidx += inc;
             di -= 1;
         }
@@ -257,9 +277,7 @@ impl Resampler {
         let mut di = i0 + 1;
         while fidx < half_f {
             let w = interp(sinc, fidx);
-            for (c, a) in acc[..ch].iter_mut().enumerate() {
-                *a += w * self.at(c, input, di);
-            }
+            self.accumulate_tap(input, di, w, &mut acc[..ch]);
             fidx += inc;
             di += 1;
         }
