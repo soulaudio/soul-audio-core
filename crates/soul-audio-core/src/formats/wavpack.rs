@@ -972,31 +972,74 @@ impl<S: Source> WavpackDecoder<S> {
 }
 
 impl<S: SeekSource> WavpackDecoder<S> {
-    /// Seek to per-channel `sample` by rewinding to the stream start and
-    /// decode-discarding forward (blocks decode sequentially; a block-index
-    /// scan would make it O(log n) — a follow-up). Returns the frame landed on.
+    /// Seek to per-channel `sample` by walking block **headers** (no entropy
+    /// decode) to the block that contains it, then decoding only that block and
+    /// discarding the within-block head. WavPack blocks are independently
+    /// decodable (decorrelation state resets per block, its seeds carried in the
+    /// block), so the target block decodes stand-alone bit-identically — and each
+    /// header carries an exact `block_index` (first per-channel sample), so the
+    /// landing stays sample-accurate with no time conversion. This is O(blocks)
+    /// 32-byte header reads + one block decode, versus decode-discarding every
+    /// prior block. Returns the frame landed on.
     ///
     /// # Errors
-    /// [`DecodeError::Io`] on seek failure, plus the forward-decode errors.
+    /// [`DecodeError::Io`] on seek failure, [`DecodeError::Malformed`] on a bad
+    /// block header, plus the forward-decode errors of the landing block.
     pub fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
-        self.src
-            .seek(SeekFrom::Start(0))
-            .map_err(|_| DecodeError::Io)?;
         self.eof = false;
         self.pcm_len = 0;
         self.pcm_pos = 0;
         let ch = self.channels.max(1);
-        let mut landed = 0u64;
-        while landed < sample {
-            if self.pcm_pos >= self.pcm_len && !self.decode_block()? {
-                break;
+        let mut pos = 0u64; // absolute offset of the header about to be read
+        let mut last_end = 0u64; // first sample past the last audio block seen
+        loop {
+            self.src
+                .seek(SeekFrom::Start(pos))
+                .map_err(|_| DecodeError::Io)?;
+            let mut hdr = [0u8; 32];
+            if !read_full_or_eof(&mut self.src, &mut hdr)? {
+                break; // ran past the last block — `sample` is at/after the end
             }
-            let avail = (self.pcm_len - self.pcm_pos) / ch;
-            let take = avail.min((sample - landed) as usize);
-            self.pcm_pos += take * ch;
-            landed += take as u64;
+            if &hdr[0..4] != b"wvpk" {
+                break; // trailing tag (e.g. APEv2) — treat as end
+            }
+            let ck_size = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+            if ck_size < 24 {
+                return Err(DecodeError::Malformed);
+            }
+            let full_block = 8 + u64::from(ck_size); // ckID+ckSize + body
+            let block_index = u64::from(u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]))
+                + (u64::from(hdr[10]) << 32);
+            let block_samples = u32::from_le_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]);
+            if block_samples == 0 {
+                // Metadata-only block (leading wrapper) — advance, no samples.
+                pos += full_block;
+                continue;
+            }
+            let block_end = block_index + u64::from(block_samples);
+            if sample < block_end {
+                // Target is in (or before) this block: decode it and discard the
+                // head. Seek back so `decode_block` re-reads the header.
+                self.src
+                    .seek(SeekFrom::Start(pos))
+                    .map_err(|_| DecodeError::Io)?;
+                if !self.decode_block()? {
+                    break;
+                }
+                let within = sample
+                    .saturating_sub(block_index)
+                    .min(u64::from(block_samples));
+                self.pcm_pos = within as usize * ch;
+                return Ok(block_index + within);
+            }
+            last_end = block_end;
+            pos += full_block;
         }
-        Ok(landed)
+        // `sample` is at or past the end — leave the decoder at a clean EOF.
+        self.eof = true;
+        self.pcm_len = 0;
+        self.pcm_pos = 0;
+        Ok(last_end)
     }
 
     /// Seek to `secs` seconds (convenience over [`Self::seek_to`]).
