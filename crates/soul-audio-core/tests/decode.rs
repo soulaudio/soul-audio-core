@@ -576,6 +576,79 @@ fn stress_mp3_matches_ffmpeg_on_broadband() {
     );
 }
 
+// --- MP3 non-MPEG-1 / non-stereo configs vs ffmpeg -------------------------
+// Every other MP3 fixture is 44.1 kHz MPEG-1 stereo, but the decoder has whole
+// code paths the real world uses heavily that none of them reach: MPEG-2 and
+// MPEG-2.5 Low Sampling Frequency (halved granules, the `scalefac_compress`→
+// `slen` LSF tables, MPEG-2 intensity-stereo sentinel) and mono. These decode
+// the broadband signal at the low rates; a wrong LSF scalefactor/granule or a
+// mono-path bug tanks the SNR vs ffmpeg decoding the same bitstream.
+
+#[test]
+fn mp3_mpeg2_lsf_22k_matches_ffmpeg() {
+    let ours = decode_all(include_bytes!("../../../testdata/mp3-mpeg2-22k.mp3"));
+    let refr = load_s16le(include_bytes!(
+        "../../../testdata/mp3-mpeg2-22k.mp3.ref.pcm"
+    ));
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 55.0,
+        "MPEG-2 LSF (22 kHz) SNR vs ffmpeg {snr:.1} dB (offset {off})"
+    );
+}
+
+#[test]
+fn mp3_mpeg25_11k_matches_ffmpeg() {
+    let ours = decode_all(include_bytes!("../../../testdata/mp3-mpeg25-11k.mp3"));
+    let refr = load_s16le(include_bytes!(
+        "../../../testdata/mp3-mpeg25-11k.mp3.ref.pcm"
+    ));
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 55.0,
+        "MPEG-2.5 (11 kHz) SNR vs ffmpeg {snr:.1} dB (offset {off})"
+    );
+}
+
+#[test]
+fn mp3_mono_matches_ffmpeg() {
+    let ours = decode_all(include_bytes!("../../../testdata/mp3-mono.mp3"));
+    let refr = load_s16le(include_bytes!("../../../testdata/mp3-mono.mp3.ref.pcm"));
+    let (off, snr) = best_align_segsnr(&ours, &refr, 1);
+    assert!(
+        snr > 55.0,
+        "mono MP3 SNR vs ffmpeg {snr:.1} dB (offset {off})"
+    );
+}
+
+/// 24-bit FLAC (hi-res) decodes **bit-exact** — every other FLAC fixture is
+/// 16-bit, so the wider sample path (3-byte output, larger LPC residuals / Rice
+/// parameters, any wasted-bits handling) was untested. `complex24.wav` is the
+/// broadband signal at 24-bit; decode must equal it exactly.
+#[test]
+fn flac_24bit_bit_exact() {
+    let flac = decode_all(include_bytes!("../../../testdata/complex24.flac"));
+    let wav = decode_all(include_bytes!("../../../testdata/complex24.wav"));
+    assert_eq!(flac.len(), wav.len(), "24-bit FLAC/WAV length differs");
+    assert_eq!(fnv1a(&flac), fnv1a(&wav), "24-bit FLAC not bit-exact");
+}
+
+/// AAC-LC at **48 kHz** vs ffmpeg — a different `swb_offset_1024` scalefactor-band
+/// table than the 44.1 kHz fixtures, driven by the (short-block) chirp so it stays
+/// PNS-free and SNR-matchable.
+#[test]
+fn aac_48k_matches_ffmpeg() {
+    let ours = decode_all(include_bytes!("../../../testdata/chirp-aac-48k.m4a"));
+    let refr = load_s16le(include_bytes!(
+        "../../../testdata/chirp-aac-48k.m4a.ref.pcm"
+    ));
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 55.0,
+        "AAC 48 kHz SNR vs ffmpeg {snr:.1} dB (offset {off})"
+    );
+}
+
 /// AAC-LC on a full-band **chirp** (`chirp.wav`, 50 Hz→18 kHz sweep) — its rapid
 /// spectral motion forces the encoder into EIGHT_SHORT transient windows, so this
 /// exercises the short-block grouping / de-interleave / 8×128 IMDCT path the

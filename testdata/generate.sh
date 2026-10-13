@@ -184,7 +184,27 @@ ffmpeg -y -hide_banner -loglevel error -filter_complex \
 ffmpeg -y -hide_banner -loglevel error -i antiphase.wav -c:a flac antiphase.flac
 ffmpeg -y -hide_banner -loglevel error -i antiphase.wav -c:a wavpack antiphase.wv
 
+# Config-matrix coverage — every other fixture is 44.1 kHz MPEG-1 stereo / 16-bit,
+# so these reach the decode paths real-world files use that nothing else does:
+# MP3 MPEG-2 LSF (22 kHz) + MPEG-2.5 (11 kHz) + mono (halved granules, LSF
+# scalefactor tables, mono path); 24-bit FLAC (hi-res wide-sample path); AAC at
+# 48 kHz (a different scalefactor-band table). Lossless = bit-exact; lossy = SNR
+# vs ffmpeg decoding the same bitstream.
+ffmpeg -y -hide_banner -loglevel error -i complex.wav -ar 22050 -c:a libmp3lame -b:a 128k mp3-mpeg2-22k.mp3
+ffmpeg -y -hide_banner -loglevel error -i mp3-mpeg2-22k.mp3 -f s16le mp3-mpeg2-22k.mp3.ref.pcm
+ffmpeg -y -hide_banner -loglevel error -i complex.wav -ar 11025 -c:a libmp3lame -b:a 64k mp3-mpeg25-11k.mp3
+ffmpeg -y -hide_banner -loglevel error -i mp3-mpeg25-11k.mp3 -f s16le mp3-mpeg25-11k.mp3.ref.pcm
+ffmpeg -y -hide_banner -loglevel error -i complex.wav -ac 1 -c:a libmp3lame -b:a 128k mp3-mono.mp3
+ffmpeg -y -hide_banner -loglevel error -i mp3-mono.mp3 -f s16le mp3-mono.mp3.ref.pcm
+ffmpeg -y -hide_banner -loglevel error -filter_complex \
+"aevalsrc=exprs='0.6*sin(2*PI*(50*t+2991.67*t*t))':s=44100:d=3[c];anoisesrc=d=3:c=pink:seed=7:a=0.4[n];[c][n]join=inputs=2:channel_layout=stereo[a]" \
+-map "[a]" -c:a pcm_s24le complex24.wav
+ffmpeg -y -hide_banner -loglevel error -i complex24.wav -c:a flac complex24.flac
+ffmpeg -y -hide_banner -loglevel error -i chirp.wav -ar 48000 -c:a aac -b:a 192k -movflags +faststart chirp-aac-48k.m4a
+ffmpeg -y -hide_banner -loglevel error -i chirp-aac-48k.m4a -f s16le chirp-aac-48k.m4a.ref.pcm
+
 echo "generated:"
 ls -la tone.wav tone-f32.wav tone-aiff.aiff tone-aifc-sowt.aifc tone-aiff-fl32.aifc tone-aiff-fl64.aifc tone-aiff-ulaw.aifc tone-aiff-alaw.aifc tone.flac tone-flac.mka tone-aac.mka tone-vorbis.mka tone.wv tone-mono.wv tone-24.wv tone-wv24.wv tone.caf tone-caf-le.caf tone-caf-f32.caf tone-alac.caf tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus tone-opus.webm arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1 \
   complex.wav complex.flac complex-alac.m4a complex.wv complex.mp3 complex-vorbis.ogg complex.opus chirp.wav chirp-aac.m4a \
-  fullscale.wav fullscale.flac fullscale.wv fullscale-alac.m4a antiphase.wav antiphase.flac antiphase.wv
+  fullscale.wav fullscale.flac fullscale.wv fullscale-alac.m4a antiphase.wav antiphase.flac antiphase.wv \
+  mp3-mpeg2-22k.mp3 mp3-mpeg25-11k.mp3 mp3-mono.mp3 complex24.wav complex24.flac chirp-aac-48k.m4a
