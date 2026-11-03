@@ -11,4 +11,4 @@ publish = false
 [dev-dependencies]
 soul-audio-core = { path = "../soul-audio-core" }
 embedded-io = { workspace = true }
-cargo_metadata = "0.18"
+cargo_metadata = "0.20"
