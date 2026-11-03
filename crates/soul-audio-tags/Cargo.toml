@@ -16,7 +16,7 @@ embedded-io = { workspace = true }
 [dev-dependencies]
 # Same version soul-audio-service uses in production (crates/soul-audio-service/Cargo.toml)
 # — the differential test in tests/differential.rs checks our reader against it.
-lofty = "0.22"
+lofty = "0.24"
 embedded-io-adapters = { workspace = true, features = ["std"] }
 
 # `differential` needs `std::fs::File` + lofty (via the dev-deps above), both
