@@ -319,8 +319,7 @@ lefthook binary and run `lefthook install` once.
 
 The STM32 discipline is enforced at several layers — the pinned `thumbv7em`
 toolchain target, a compile-time `no_std` gate, a runtime no-alloc proof, and a
-dependency-layering test — all run by `cargo xtask verify`. See
-`docs/superpowers/specs/` for the design specs of each subsystem.
+dependency-layering test — all run by `cargo xtask verify`.
 
 ## Credits & acknowledgements
 
