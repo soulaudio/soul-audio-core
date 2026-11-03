@@ -15,4 +15,4 @@ soul-audio-engine = { path = "../soul-audio-engine" }
 soul-audio-queue = { path = "../soul-audio-queue" }
 
 [dev-dependencies]
-heapless = "0.8"                              # test backings (QueueBuf impl is always available, un-feature-gated)
+heapless = "0.9"                              # test backings (QueueBuf impl is always available, un-feature-gated)

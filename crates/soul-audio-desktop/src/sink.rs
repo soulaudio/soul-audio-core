@@ -54,7 +54,7 @@ impl CpalSink {
         let sample_format = supported.sample_format();
         let config: StreamConfig = supported.config();
         let channels = config.channels;
-        let rate = config.sample_rate.0;
+        let rate = config.sample_rate; // cpal 0.18: SampleRate is a plain u32
 
         // ~200 ms of buffering. Deep enough to ride out pump-thread scheduling
         // jitter (the pump decodes well ahead of real-time, including DSD at
@@ -86,7 +86,7 @@ impl CpalSink {
                 let mut cur_gain = 1.0f32;
                 device
                     .build_output_stream(
-                        &config,
+                        config.clone(),
                         move |data: &mut [f32], _| {
                             if cb_flush.load(Ordering::Acquire) {
                                 cons.clear();
@@ -110,7 +110,7 @@ impl CpalSink {
                 let mut cur_gain = 1.0f32;
                 device
                     .build_output_stream(
-                        &config,
+                        config.clone(),
                         move |data: &mut [i16], _| {
                             if cb_flush.load(Ordering::Acquire) {
                                 cons.clear();

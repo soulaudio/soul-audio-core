@@ -20,9 +20,9 @@ default = []
 playback = ["dep:cpal", "dep:ringbuf"]
 
 [dependencies.cpal]
-version = "0.15"
+version = "0.18"
 optional = true
 
 [dependencies.ringbuf]
-version = "0.5.2"               # >=0.5.2 closes RUSTSEC-2026-0293
+version = "0.6"
 optional = true
