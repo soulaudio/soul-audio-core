@@ -1,0 +1,43 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so newly-disclosed advisories are caught even without a push.
+    - cron: '27 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo audit (RustSec advisories)
+    runs-on: ubuntu-latest
+    # Force the shim to the preinstalled stable: cargo-audit is a prebuilt binary
+    # (no compile), but the repo pins an older toolchain that can't build some
+    # tools — this keeps the audit independent of the project's pinned rustc.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+      # Prebuilt binary — avoids compiling cargo-audit (whose latest deps need a
+      # newer rustc than this repo's pinned toolchain).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Vulnerability scan
+        run: cargo audit
+
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate SBOM from Cargo.lock
+        uses: anchore/sbom-action@v0
+        with:
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          artifact-name: sbom.cdx.json

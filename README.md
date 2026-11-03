@@ -1,5 +1,9 @@
 # soul-audio-core
 
+[![CI](https://github.com/soulaudio/soul-audio-core/actions/workflows/ci-rust.yml/badge.svg)](https://github.com/soulaudio/soul-audio-core/actions/workflows/ci-rust.yml)
+[![Security](https://github.com/soulaudio/soul-audio-core/actions/workflows/ci-security.yml/badge.svg)](https://github.com/soulaudio/soul-audio-core/actions/workflows/ci-security.yml)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 A cross-platform, **`no_std` / no-alloc / `forbid(unsafe_code)`** audio
 **decode + resample + playback** library in Rust — one core that runs identically
 on the desktop and on an STM32H743 (bare-metal, Embassy).
