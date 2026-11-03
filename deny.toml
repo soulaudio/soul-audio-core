@@ -1,12 +1,27 @@
 # cargo-deny policy. Advisory (CVE) scanning is owned by the `cargo audit` job;
 # this gate enforces license compliance, dependency-source pinning, and ban
-# rules over the default feature graph.
+# rules across the full feature graph (the CI runs it with --all-features, so
+# the cpal audio backends on every platform are covered too).
 
 [licenses]
 version = 2
-# The dependency tree is entirely permissive (MIT / Apache-family, plus
-# Unicode-3.0 and Zlib). Anything outside this set must be reviewed.
-allow = ["MIT", "Apache-2.0", "Unicode-3.0", "Zlib"]
+# Permissive-only allow-list: everything the dependency tree uses is in the
+# MIT / Apache / BSD / ISC / Unicode / Zlib family. This deliberately blocks
+# copyleft (GPL/LGPL/MPL/...). Entries not actually present only warn, so the
+# list stays broad enough to cover every platform's audio backend deps.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "0BSD",
+  "CC0-1.0",
+]
 # Skip the workspace's own publish = false crates (xtask, architecture-tests).
 private = { ignore = true }
 
