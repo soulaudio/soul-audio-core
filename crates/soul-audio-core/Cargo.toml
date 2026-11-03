@@ -1,0 +1,40 @@
+[package]
+name = "soul-audio-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cross-platform no_std, no-alloc audio decode + resample + playback core (WAV/FLAC/MP3/DSD/ALAC/AAC/Vorbis/Opus)."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Embedded Vorbis profile (design spec `2026-09-05-vorbis-decoder-design.md`
+# "Profiles"; firmware wiring is issue #32): stereo channel cap + a 4096
+# maximum transform length, roughly halving the per-decode DSP scratch
+# (spectrum/residue/overlap buffers) for constrained SRAM. A stream needing
+# more than either cap is a graceful `DecodeError::Unsupported`, never a
+# panic. The default (no feature) is the desktop profile: the full Vorbis I
+# spec ceiling (8192-sample long blocks) and a 4-channel cap.
+vorbis-embedded-profile = []
+
+[dependencies]
+embedded-io = { workspace = true }
+
+# Host-only: FFT for the resampler's objective DSP-quality tests (alias/SNR
+# measurement). Never compiled into the no_std library or the firmware.
+[dev-dependencies]
+rustfft = "6"
+# For the I/O-error test harness (`tests/io_errors.rs`): implement a custom
+# `embedded_io::Read` source that returns a hard error mid-stream. Same
+# workspace version as the library dep above — no extra lock entry.
+embedded-io = { workspace = true }
+
+# Decode + resample throughput baseline / regression gate. Dependency-free
+# (hand-rolled timing, no criterion) to keep the dep tree minimal; runs on the
+# host only. `cargo bench -p soul-audio-core --bench throughput`.
+[[bench]]
+name = "throughput"
+harness = false

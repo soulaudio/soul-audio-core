@@ -1,0 +1,23 @@
+# The by-value `AnyDecoder` enum is large (~220 KiB — sized by its multichannel
+# AAC/FLAC variants), and debug-build moves through the `open()` construction
+# chain transiently need several times that. libtest runs each test on a thread
+# whose stack honours `RUST_MIN_STACK`; its 2 MiB default overflows on that
+# construction, so raise it to match the big-stack threads the library's own
+# decode paths (and the CLI) already use. Affects std-spawned threads only — the
+# no_std firmware build is unaffected.
+[env]
+RUST_MIN_STACK = "16777216"
+
+[alias]
+xtask = "run --package xtask --"
+# The firmware binary lives in the soul-dap-ng repo; this repo only proves the
+# library crates still build no_std for the STM32 target.
+check-embedded = "build --package soul-audio-core --target thumbv7em-none-eabihf --no-default-features"
+
+[target.thumbv7em-none-eabihf]
+runner = "probe-rs run --chip STM32H743ZITx"
+rustflags = [
+  "-C", "link-arg=--nmagic",
+  "-C", "link-arg=-Tlink.x",
+  "-C", "link-arg=-Tdefmt.x",
+]
