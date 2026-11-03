@@ -30,7 +30,7 @@ license = "MIT OR Apache-2.0"
 repository = "local"
 
 [workspace.dependencies]
-embedded-io = "0.6"
+embedded-io = "0.7"
 embedded-io-adapters = "0.6"
 
 [workspace.lints.clippy]
