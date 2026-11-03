@@ -1,0 +1,21 @@
+# cargo-deny policy. Advisory (CVE) scanning is owned by the `cargo audit` job;
+# this gate enforces license compliance, dependency-source pinning, and ban
+# rules over the default feature graph.
+
+[licenses]
+version = 2
+# The dependency tree is entirely permissive (MIT / Apache-family, plus
+# Unicode-3.0 and Zlib). Anything outside this set must be reviewed.
+allow = ["MIT", "Apache-2.0", "Unicode-3.0", "Zlib"]
+# Skip the workspace's own publish = false crates (xtask, architecture-tests).
+private = { ignore = true }
+
+[bans]
+# Duplicate versions are informational, not a hard failure.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+# Only crates.io. This library has no git dependencies; flag any that appear.
+unknown-registry = "deny"
+unknown-git = "deny"
