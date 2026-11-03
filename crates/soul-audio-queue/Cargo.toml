@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 soul-audio-engine = { path = "../soul-audio-engine" }
-heapless = "0.8"
+heapless = "0.9"
 
 [dev-dependencies]
 soul-audio-core = { path = "../soul-audio-core" }
