@@ -14,8 +14,8 @@ use soul_audio_core::formats::dsf::DsfDecoder;
 use soul_audio_core::formats::matroska::{MatroskaDecoder, MatroskaVorbisOgg};
 use soul_audio_core::formats::vorbis::VorbisDecoder;
 use soul_audio_core::{
-    AnyDecoder, DecimateAdapter, DecodeError, Decoder, Format, SeekableDecoder, StreamInfo, open,
-    probe,
+    AnyDecoder, DecimateAdapter, DecodeError, Decoder, Format, SeekableDecoder, StreamInfo,
+    open_seekable, probe,
 };
 
 /// A fully **owned**, `Send` byte source: std buffers the file, so the decoder
@@ -172,9 +172,11 @@ pub fn open_track(path: &Path) -> Result<OwnedDecoder> {
                 )))
             }
         }
-        // WAV/FLAC/MP3/Ogg-FLAC — `open` re-probes (cheap) and builds the codec.
+        // WAV/FLAC/MP3/Ogg-FLAC/AAC/ALAC — `open_seekable` re-probes (cheap) and
+        // builds the codec. Seekable (not plain `open`) so MP4/.m4a with `moov`
+        // after `mdat` — ffmpeg's default muxing — decodes, not just faststart.
         _ => {
-            Ok(OwnedDecoder::Pcm(open(src).map_err(|e| {
+            Ok(OwnedDecoder::Pcm(open_seekable(src).map_err(|e| {
                 anyhow!("decoding {}: {e:?}", path.display())
             })?))
         }

@@ -275,10 +275,21 @@ pub fn read_ogg<S: SeekSource>(
     {
         let mut walker = PageWalker::new(src);
 
-        // --- Packet 1: codec identification header (small, read in one shot). ---
-        let mut id_buf = [0u8; 32];
+        // --- Packet 1: codec identification header (small, read in one shot).
+        // 64 bytes so a FLAC-in-Ogg mapping packet (`0x7F"FLAC"` header + `fLaC`
+        // + a 34-byte STREAMINFO block = 51 bytes) fits whole, not just the
+        // ~30-byte Opus/Vorbis id headers.
+        let mut id_buf = [0u8; 64];
         let id_len = walker.read_packet(&mut id_buf)?;
         let id = &id_buf[..id_len];
+
+        // FLAC-in-Ogg has a different shape (metadata blocks as their own
+        // packets, not a single comment header), so branch off before the
+        // Opus/Vorbis codec match. STREAMINFO gives frame-exact facts, so that
+        // path returns directly without the granule tail-scan below.
+        if id.starts_with(b"\x7FFLAC") {
+            return read_flac_in_ogg(walker, id, scratch, sink);
+        }
 
         codec = if id.starts_with(b"OpusHead") {
             // OpusHead: magic(8) version(1) channels(1) pre-skip(2, LE)
@@ -337,6 +348,97 @@ pub fn read_ogg<S: SeekSource>(
     }
 
     Ok(facts)
+}
+
+/// Read facts + tags from a FLAC-in-Ogg stream. `id` is the fully-read first
+/// Ogg packet — the `\x7FFLAC` mapping header immediately followed by the
+/// native `fLaC` signature and the STREAMINFO block — and `walker` is
+/// positioned at the start of the second packet. Each subsequent packet
+/// carries exactly one FLAC metadata block (VORBIS_COMMENT, PICTURE, …) until
+/// one marks itself last. Only VORBIS_COMMENT is surfaced (text fields plus any
+/// `METADATA_BLOCK_PICTURE`); a native PICTURE block (type 6) would need
+/// Ogg-frame-aware offset handling the no-alloc art path doesn't model, so it
+/// is skipped. STREAMINFO supplies frame-exact facts.
+fn read_flac_in_ogg<S: SeekSource>(
+    mut walker: PageWalker<'_, S>,
+    id: &[u8],
+    scratch: &mut [u8],
+    sink: &mut impl TagSink,
+) -> Result<StreamFacts, TagError> {
+    let mut facts = StreamFacts::default();
+
+    // Packet 1: `0x7F"FLAC"`(5) major(1) minor(1) header_count(2 BE) `fLaC`(4)
+    // STREAMINFO header(4) STREAMINFO body(34). The 8 bytes at STREAMINFO body
+    // offset 10..18 pack sample_rate(20) | channels-1(3) | bps-1(5) |
+    // total_samples(36); that body starts at packet offset 17, so they are
+    // `id[27..35]`.
+    if id.len() >= 35 {
+        let si = &id[27..35];
+        facts.sample_rate =
+            Some((u32::from(si[0]) << 12) | (u32::from(si[1]) << 4) | (u32::from(si[2]) >> 4));
+        facts.channels = Some(u16::from(((si[2] >> 1) & 0x7) + 1));
+        facts.total_frames = Some(
+            (u64::from(si[3] & 0xF) << 32)
+                | u64::from(u32::from_be_bytes([si[4], si[5], si[6], si[7]])),
+        );
+    }
+
+    // Packets 2..: one FLAC metadata block each, until the last-block flag.
+    loop {
+        let mut packet = PacketReader::new(&mut walker);
+        let Some(hdr) = read_block_header(&mut packet)? else {
+            break; // stream ended before a last-block flag — tolerate it
+        };
+        let last = hdr[0] & 0x80 != 0;
+        let block_type = hdr[0] & 0x7F;
+        let body_len = (u32::from(hdr[1]) << 16) | (u32::from(hdr[2]) << 8) | u32::from(hdr[3]);
+        if block_type == 4 {
+            vorbis::read_comment_vector(&mut packet, body_len, scratch, sink)?;
+        }
+        // Drain the rest of this packet so the walker aligns on the next one.
+        drain_packet(&mut packet)?;
+        if last {
+            break;
+        }
+    }
+
+    // STREAMINFO's `total_samples` is 0 ("unknown") when a FLAC stream is muxed
+    // without a known length — exactly what ffmpeg writes for FLAC-in-Ogg. Fall
+    // back to the last page's granule (the decoded sample count at end of
+    // stream), which is frame-exact, just like the Vorbis path.
+    if facts.total_frames.is_none_or(|t| t == 0)
+        && let Some(granule) = last_page_granule(walker.src)
+    {
+        facts.total_frames = Some(granule);
+    }
+
+    Ok(facts)
+}
+
+/// Read a 4-byte FLAC metadata-block header from a packet stream. `Ok(None)` if
+/// the packet ended cleanly before any byte (no further metadata packets);
+/// [`TagError::Malformed`] on a partial header.
+fn read_block_header<R: embedded_io::Read>(r: &mut R) -> Result<Option<[u8; 4]>, TagError> {
+    let mut hdr = [0u8; 4];
+    let mut off = 0;
+    while off < 4 {
+        match r.read(&mut hdr[off..]).map_err(|_| TagError::Io)? {
+            0 => break,
+            n => off += n,
+        }
+    }
+    match off {
+        0 => Ok(None),
+        4 => Ok(Some(hdr)),
+        _ => Err(TagError::Malformed),
+    }
+}
+
+/// Read and discard the remainder of a packet stream to its end.
+fn drain_packet<R: embedded_io::Read>(r: &mut R) -> Result<(), TagError> {
+    let mut buf = [0u8; 256];
+    while r.read(&mut buf).map_err(|_| TagError::Io)? != 0 {}
+    Ok(())
 }
 
 /// Longest `METADATA_BLOCK_PICTURE` base64 value we'll materialize, ~4/3 of the
@@ -913,6 +1015,116 @@ mod tests {
             &vorbis_comment_header(&["TITLE=Song"]),
         ));
         bytes.extend(ogg_page(0x04, granule, 23, 2, &[0u8; 8]));
+
+        let mut src = SliceSource::new(&bytes);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        let facts = read_ogg(&mut src, &mut scratch, &mut c).unwrap();
+
+        assert_eq!(facts.sample_rate, Some(44_100));
+        assert_eq!(facts.total_frames, Some(granule));
+    }
+
+    /// 34-byte FLAC STREAMINFO body with the given facts (16-bit samples).
+    fn flac_streaminfo(sr: u32, ch: u32, total: u64) -> [u8; 34] {
+        let mut si = [0u8; 34];
+        let bps: u32 = 16;
+        si[10] = (sr >> 12) as u8;
+        si[11] = (sr >> 4) as u8;
+        si[12] =
+            (((sr & 0xF) as u8) << 4) | ((((ch - 1) & 0x7) as u8) << 1) | (((bps - 1) >> 4) as u8);
+        si[13] = ((((bps - 1) & 0xF) as u8) << 4) | (((total >> 32) & 0xF) as u8);
+        si[14] = (total >> 24) as u8;
+        si[15] = (total >> 16) as u8;
+        si[16] = (total >> 8) as u8;
+        si[17] = total as u8;
+        si
+    }
+
+    /// The FLAC-in-Ogg first packet: mapping header + `fLaC` + STREAMINFO block.
+    fn flac_ogg_packet1(sr: u32, ch: u32, total: u64) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.push(0x7F);
+        p.extend_from_slice(b"FLAC");
+        p.push(1); // major version
+        p.push(0); // minor version
+        p.extend_from_slice(&1u16.to_be_bytes()); // header packet count (advisory)
+        p.extend_from_slice(b"fLaC");
+        p.push(0x00); // STREAMINFO block header: type 0, not last
+        p.extend_from_slice(&[0, 0, 34]); // 24-bit BE length
+        p.extend_from_slice(&flac_streaminfo(sr, ch, total));
+        p
+    }
+
+    /// A FLAC VORBIS_COMMENT metadata block as its own (last) Ogg packet.
+    fn flac_ogg_comment_packet(comments: &[&str]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&6u32.to_le_bytes());
+        body.extend_from_slice(b"vendor");
+        body.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+        for c in comments {
+            body.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            body.extend_from_slice(c.as_bytes());
+        }
+        let mut p = Vec::new();
+        p.push(0x84); // last-block flag | type 4 (VORBIS_COMMENT)
+        p.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]); // 24-bit BE length
+        p.extend_from_slice(&body);
+        p
+    }
+
+    #[test]
+    fn flac_in_ogg_yields_title_and_streaminfo_facts() {
+        let mut bytes = Vec::new();
+        bytes.extend(ogg_page(
+            0x02,
+            0,
+            42,
+            0,
+            &flac_ogg_packet1(44_100, 2, 132_300),
+        )); // BOS
+        bytes.extend(ogg_page(
+            0x00,
+            132_300,
+            42,
+            1,
+            &flac_ogg_comment_packet(&["TITLE=Aria", "ARTIST=Kimiko"]),
+        ));
+
+        let mut src = SliceSource::new(&bytes);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        let facts = read_ogg(&mut src, &mut scratch, &mut c).unwrap();
+
+        // Facts come from STREAMINFO (frame-exact), not the granule tail-scan.
+        assert_eq!(facts.sample_rate, Some(44_100));
+        assert_eq!(facts.channels, Some(2));
+        assert_eq!(facts.total_frames, Some(132_300));
+        assert!(
+            c.fields
+                .contains(&(Some(Field::Title), "TITLE".into(), "Aria".into()))
+        );
+        assert!(
+            c.fields
+                .contains(&(Some(Field::Artist), "ARTIST".into(), "Kimiko".into()))
+        );
+    }
+
+    #[test]
+    fn flac_in_ogg_falls_back_to_granule_when_streaminfo_total_is_zero() {
+        // ffmpeg writes STREAMINFO total_samples = 0 for streamed FLAC-in-Ogg;
+        // the reader must recover the length from the last page's granule.
+        let granule: u64 = 264_600; // 6 s @ 44.1 kHz
+        let mut bytes = Vec::new();
+        bytes.extend(ogg_page(0x02, 0, 43, 0, &flac_ogg_packet1(44_100, 2, 0))); // total=0
+        bytes.extend(ogg_page(
+            0x00,
+            0,
+            43,
+            1,
+            &flac_ogg_comment_packet(&["TITLE=X"]),
+        ));
+        bytes.extend(ogg_page(0x04, granule, 43, 2, &[0u8; 8])); // EOS page
 
         let mut src = SliceSource::new(&bytes);
         let mut scratch = [0u8; 256];

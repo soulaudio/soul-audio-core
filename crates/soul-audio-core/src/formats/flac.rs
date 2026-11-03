@@ -51,6 +51,11 @@ pub struct FlacDecoder<S> {
     /// matches this and is used when the frame header defers to STREAMINFO.
     bits: u8,
     total_samples: Option<u64>,
+    /// Fallback length (per-channel frames) when STREAMINFO declares none
+    /// (`total_samples == None`). Set for FLAC-in-Ogg, whose STREAMINFO
+    /// `total_samples` is 0 when streamed — the real length is the last Ogg
+    /// page's granule, supplied by the dispatcher via [`Self::set_length_hint`].
+    length_hint: Option<u64>,
     decoded_per_ch: u64,
 
     // --- MSB-first bit reader over the raw audio byte stream ---
@@ -147,6 +152,7 @@ impl<S: Source> FlacDecoder<S> {
             channels: info.channels,
             bits,
             total_samples,
+            length_hint: None,
             decoded_per_ch: 0,
             bytes: [0; BYTE_BUF],
             byte_len: 0,
@@ -654,10 +660,22 @@ impl<S: Source> FlacDecoder<S> {
         self.decoded_per_ch - unemitted
     }
 
-    /// Total per-channel frames from STREAMINFO, if declared (0 = unknown → `None`).
+    /// Total per-channel frames from STREAMINFO, if declared (0 = unknown → `None`),
+    /// else the [`length_hint`](Self::length_hint) (FLAC-in-Ogg granule).
     #[must_use]
     pub fn total_frames(&self) -> Option<u64> {
-        self.total_samples
+        self.effective_total()
+    }
+
+    /// STREAMINFO length if known, otherwise the dispatcher-supplied hint.
+    fn effective_total(&self) -> Option<u64> {
+        self.total_samples.or(self.length_hint)
+    }
+
+    /// Supply a fallback length (per-channel frames) used only when STREAMINFO
+    /// declares none — see [`length_hint`](Self::length_hint).
+    pub fn set_length_hint(&mut self, hint: Option<u64>) {
+        self.length_hint = hint;
     }
 }
 
@@ -737,7 +755,7 @@ impl<S: SeekSource> SeekableDecoder for FlacDecoder<OggReader<S>> {
     /// # Errors
     /// Propagates the Ogg bisection + forward-decode errors.
     fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
-        let target = self.total_samples.map_or(sample, |t| sample.min(t));
+        let target = self.effective_total().map_or(sample, |t| sample.min(t));
         self.demux.src_mut().seek_to_granule(target)?;
         self.reset_stream_state(0);
         self.anchor_pending = true;
@@ -745,7 +763,7 @@ impl<S: SeekSource> SeekableDecoder for FlacDecoder<OggReader<S>> {
     }
 
     fn total_frames(&self) -> Option<u64> {
-        self.total_samples
+        self.effective_total()
     }
 }
 

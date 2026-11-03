@@ -99,6 +99,30 @@ story the rest of the table tells. It should still sound like the same chord
 by ear; only the automated checks are pitch-only, not bit-exact, for this pair
 (see below).
 
+## Cross-format metadata (`meta.*`)
+
+The same 1.5 s tone muxed into every container the tag reader supports, each
+carrying identical `TITLE=Aria` / `ARTIST=Kimiko Ishizaka` / `ALBUM=Open
+Goldberg Variations` (self-contained lavfi source in `generate.sh`).
+
+| File | What it exercises |
+|------|-------------------|
+| `meta.wav` | RIFF `LIST`/`INFO` tags (how ffmpeg tags WAV) |
+| `meta.flac` / `meta.ogg` / `meta.opus` | FLAC / Vorbis / Opus comment headers |
+| `meta.mp3` | ID3v2 |
+| `meta-aac.m4a` / `meta-alac.m4a` | MP4 `ilst`, with **`moov` after `mdat`** (ffmpeg default — no `+faststart`) |
+| `meta-oggflac.oga` | FLAC-in-Ogg — STREAMINFO `total_samples = 0`, duration recovered from the Ogg granule |
+| `meta.aiff` | AIFF `NAME` chunk (title only; ffmpeg writes no artist/album for AIFF) |
+| `meta.aac` | raw ADTS — no tag structure, facts only |
+
+`crates/soul-audio-tags/tests/cross_format_metadata.rs` reads each via
+`read_owned` and asserts consistent title/artist/album and a ~1.5 s duration.
+`crates/soul-audio-core/tests/decode.rs` additionally decodes the two
+moov-after-mdat `.m4a`s through `open_seekable` (ALAC bit-exact vs `meta.wav`) —
+the regression gate for the player's "AAC/ALAC doesn't start playing". Both are
+`std`-gated e2e tests (the tags one needs `--features std`), outside the default
+`cargo xtask verify` set.
+
 ## By-ear QA (one command)
 
 ```sh

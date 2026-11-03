@@ -303,6 +303,152 @@ pub fn open<S: BufSource>(mut src: S) -> Result<AnyDecoder<S>, DecodeError> {
     }
 }
 
+/// Like [`open`], but for a **seekable** source — so MP4/`.m4a` with `moov`
+/// *after* `mdat` (ffmpeg's default, non-faststart) is supported, not just the
+/// faststart layout [`open`]'s forward walk can handle. Every other format is
+/// constructed identically (they only need forward reads). Prefer this whenever
+/// the source can seek (files, slices); use [`open`] only for a forward-only
+/// stream (where non-faststart MP4 is inherently unreadable).
+pub fn open_seekable<S: BufSource + crate::io::SeekSource>(
+    mut src: S,
+) -> Result<AnyDecoder<S>, DecodeError> {
+    match probe(&mut src)? {
+        Format::Wav => WavDecoder::new(src).map(AnyDecoder::Wav),
+        Format::Aiff => AiffDecoder::new(src).map(AnyDecoder::Aiff),
+        Format::Flac => FlacDecoder::new(src).map(AnyDecoder::Flac),
+        Format::Mp3 => Mp3Decoder::new(src).map(AnyDecoder::Mp3),
+        Format::OggFlac => {
+            // FLAC-in-Ogg STREAMINFO often declares `total_samples = 0` (ffmpeg's
+            // streamed mux), so the decoder's length would be unknown. The real
+            // length is the last Ogg page's granule — peek it (seekable source)
+            // and hand it to the decoder as a fallback so `total_frames` (the
+            // progress-bar length) is right. Restores `src` to the start first.
+            let hint = ogg_last_granule(&mut src);
+            let mut dec = FlacDecoder::new(OggReader::new(src)?)?;
+            dec.set_length_hint(hint);
+            Ok(AnyDecoder::OggFlac(dec))
+        }
+        Format::Mp4 => {
+            // The only difference from `open`: accept any `moov`/`mdat` order.
+            let reader = Mp4Reader::new_seekable(src)?;
+            match reader.codec() {
+                Mp4Codec::Alac(_) => AlacDecoder::from_reader(reader).map(AnyDecoder::Alac),
+                Mp4Codec::Aac(_) => AacDecoder::new_mp4(reader).map(AnyDecoder::Aac),
+            }
+        }
+        Format::Adts => {
+            // Raw ADTS declares no length. On a seekable source, scan the frame
+            // headers for a total (frames × 1024, as the tag reader does) so the
+            // playback progress bar has a length. Restores `src` to the start.
+            let hint = adts_total_frames(&mut src);
+            let mut dec = AacDecoder::new_adts(AdtsReader::new(src)?)?;
+            dec.set_length_hint(hint);
+            Ok(AnyDecoder::Aac(dec))
+        }
+        Format::Dsf | Format::Dff => Err(DecodeError::Unsupported),
+        Format::Vorbis => Err(DecodeError::Unsupported),
+        Format::Opus => {
+            let (ogg, head) = open_opus_headers(src)?;
+            if head.mapping_family == 0 {
+                OpusDecoder::from_parts(ogg, head).map(AnyDecoder::Opus)
+            } else {
+                MultistreamOpusDecoder::from_parts(ogg, head).map(AnyDecoder::OpusMs)
+            }
+        }
+        Format::Matroska => MatroskaDecoder::new(src).map(AnyDecoder::Matroska),
+        Format::WavPack => WavpackDecoder::new(src).map(AnyDecoder::WavPack),
+        Format::Caf => CafDecoder::new(src).map(AnyDecoder::Caf),
+    }
+}
+
+/// Count raw-ADTS frames on a seekable source and return total per-channel
+/// samples (`frames × 1024`, matching the tag reader's duration), restoring
+/// `src` to the start. Each frame's 13-bit `aac_frame_length` (header bytes
+/// 3..6) is the stride; a non-sync/short header ends the count. `None` if no
+/// frame is found.
+fn adts_total_frames<S: crate::io::SeekSource>(src: &mut S) -> Option<u64> {
+    use embedded_io::SeekFrom;
+    src.seek(SeekFrom::Start(0)).ok()?;
+    let mut frames: u64 = 0;
+    let mut h = [0u8; 7];
+    loop {
+        let mut off = 0;
+        while off < 7 {
+            match src.read(&mut h[off..]).ok()? {
+                0 => break,
+                n => off += n,
+            }
+        }
+        if off < 7 {
+            break; // clean end (or truncated tail)
+        }
+        // ADTS syncword 0xFFF + layer 00 (the 0x06 mask rules out an MP3 frame).
+        if h[0] != 0xFF || (h[1] & 0xF6) != 0xF0 {
+            break;
+        }
+        let frame_len =
+            ((u32::from(h[3]) & 0x03) << 11) | (u32::from(h[4]) << 3) | (u32::from(h[5]) >> 5);
+        if frame_len < 7 {
+            break;
+        }
+        frames += 1;
+        if src
+            .seek(SeekFrom::Current(i64::from(frame_len) - 7))
+            .is_err()
+        {
+            break;
+        }
+    }
+    src.seek(SeekFrom::Start(0)).ok()?;
+    (frames > 0).then_some(frames * 1024)
+}
+
+/// Granule position of the last real Ogg page — for FLAC-in-Ogg the decoded
+/// per-channel sample count at end of stream. Scans only a bounded tail window
+/// (an Ogg page tops out ~64 KiB) backward for the final `OggS` whose granule
+/// is a real end-of-packet value (not `0` = a header page, nor `u64::MAX` = no
+/// packet finished). Restores `src` to the start so the caller's header parse
+/// sees it unmoved. `None` on any I/O failure or if no such page is found —
+/// the length then simply stays unknown rather than erroring.
+fn ogg_last_granule<S: crate::io::SeekSource>(src: &mut S) -> Option<u64> {
+    use embedded_io::SeekFrom;
+    const WINDOW: usize = 65536;
+    let len = src.seek(SeekFrom::End(0)).ok()?;
+    let mut found = None;
+    let window = len.min(WINDOW as u64) as usize;
+    if window >= 14 {
+        src.seek(SeekFrom::Start(len - window as u64)).ok()?;
+        let mut buf = [0u8; WINDOW];
+        let mut off = 0;
+        while off < window {
+            match src.read(&mut buf[off..window]).ok()? {
+                0 => break,
+                n => off += n,
+            }
+        }
+        let b = &buf[..off];
+        if b.len() >= 14 {
+            let mut idx = b.len() - 14;
+            loop {
+                if &b[idx..idx + 4] == b"OggS" {
+                    let g = u64::from_le_bytes(b[idx + 6..idx + 14].try_into().unwrap());
+                    if g != u64::MAX && g != 0 {
+                        found = Some(g);
+                        break;
+                    }
+                }
+                if idx == 0 {
+                    break;
+                }
+                idx -= 1;
+            }
+        }
+    }
+    // Rewind for the subsequent `OggReader::new` header parse (probe left us at 0).
+    src.seek(SeekFrom::Start(0)).ok()?;
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

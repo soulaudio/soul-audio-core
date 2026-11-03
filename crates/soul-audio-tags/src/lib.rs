@@ -15,6 +15,7 @@ pub use base64::decode_into;
 pub use owned::{Tags, read_owned, read_picture_bytes};
 
 mod adts;
+mod aiff;
 mod base64;
 mod dff;
 mod dsf;
@@ -118,6 +119,7 @@ pub fn read<S: SeekSource>(
         locate::Container::Flac => vorbis::read_flac(src, scratch, sink),
         locate::Container::Id3 => id3v2::read_mp3(src, scratch, sink),
         locate::Container::Wav => riff::read_wav(src, scratch, sink),
+        locate::Container::Aiff => aiff::read_aiff(src, scratch, sink),
         locate::Container::Dsf => dsf::read_dsf(src, scratch, sink),
         locate::Container::Dff => dff::read_dff(src, scratch, sink),
         locate::Container::Adts => adts::read_adts(src, scratch, sink),

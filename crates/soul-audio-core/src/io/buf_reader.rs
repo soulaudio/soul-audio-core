@@ -63,10 +63,19 @@ impl<S: Source> BufRead for BufReader<'_, S> {
 
 impl<S: Source + Seek> Seek for BufReader<'_, S> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
+        // The inner source has been read `filled` bytes ahead of where our
+        // logical cursor sits (`pos`), so it is `filled - pos` bytes past our
+        // position. A relative (`Current`) seek must be rebased onto the logical
+        // position, or it would move relative to the buffered-ahead inner cursor.
+        // Absolute (`Start`/`End`) seeks need no adjustment.
+        let target = match pos {
+            SeekFrom::Current(n) => SeekFrom::Current(n - (self.filled - self.pos) as i64),
+            other => other,
+        };
         // Buffered bytes belong to the old position — drop them before moving.
         self.filled = 0;
         self.pos = 0;
-        self.inner.seek(pos)
+        self.inner.seek(target)
     }
 }
 
@@ -126,5 +135,32 @@ mod tests {
         fn requires_seek<S: SeekSource>() {}
         requires_buf::<BufReader<'static, SliceSource<'static>>>();
         requires_seek::<BufReader<'static, SliceSource<'static>>>();
+    }
+
+    #[test]
+    fn bufreader_current_seek_accounts_for_buffered_bytes() {
+        // Regression: a relative (`Current`) seek must rebase onto the logical
+        // read cursor, not the buffered-ahead inner position. (This bug surfaced
+        // as `Unsupported`/`Malformed` for MP4 with `moov` after `mdat`, whose
+        // reader uses `Current(0)` to capture the `mdat` offset.)
+        let data: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let mut scratch = [0u8; 8]; // buffers ahead of the logical cursor
+        let mut r = BufReader::new(SliceSource::new(&data), &mut scratch);
+
+        let mut b = [0u8; 3];
+        assert_eq!(r.read(&mut b).unwrap(), 3);
+        assert_eq!(b, [0, 1, 2]); // logical pos = 3; inner buffered to 8
+
+        // `Current(0)` must report the LOGICAL position (3), not the inner's 8.
+        assert_eq!(r.seek(SeekFrom::Current(0)).unwrap(), 3);
+        let mut b2 = [0u8; 2];
+        assert_eq!(r.read(&mut b2).unwrap(), 2);
+        assert_eq!(b2, [3, 4]); // continues from 3, not 8
+
+        // `Current(+2)` from logical pos 5 -> 7.
+        assert_eq!(r.seek(SeekFrom::Current(2)).unwrap(), 7);
+        let mut b3 = [0u8; 1];
+        assert_eq!(r.read(&mut b3).unwrap(), 1);
+        assert_eq!(b3, [7]);
     }
 }

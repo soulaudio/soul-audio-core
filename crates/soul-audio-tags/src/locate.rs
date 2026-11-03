@@ -8,6 +8,7 @@ pub enum Container {
     Ogg,
     Id3,
     Wav,
+    Aiff,
     Mp4,
     Dsf,
     Dff,
@@ -29,6 +30,11 @@ pub fn sniff<S: SeekSource>(src: &mut S) -> Result<Container, TagError> {
         Container::Id3
     } else if h.starts_with(b"RIFF") && h.len() >= 12 && &h[8..12] == b"WAVE" {
         Container::Wav
+    } else if h.starts_with(b"FORM")
+        && h.len() >= 12
+        && (&h[8..12] == b"AIFF" || &h[8..12] == b"AIFC")
+    {
+        Container::Aiff
     } else if h.len() >= 8 && &h[4..8] == b"ftyp" {
         Container::Mp4
     } else if h.starts_with(b"DSD ") {
@@ -75,6 +81,8 @@ mod tests {
         assert_eq!(sniff_bytes(b"OggS"), Container::Ogg);
         assert_eq!(sniff_bytes(b"ID3\x03"), Container::Id3);
         assert_eq!(sniff_bytes(b"RIFF\0\0\0\0WAVE"), Container::Wav);
+        assert_eq!(sniff_bytes(b"FORM\0\0\0\0AIFF"), Container::Aiff);
+        assert_eq!(sniff_bytes(b"FORM\0\0\0\0AIFC"), Container::Aiff);
         assert_eq!(sniff_bytes(b"\0\0\0\x20ftypM4A "), Container::Mp4);
         assert_eq!(sniff_bytes(b"DSD \0\0\0\0"), Container::Dsf);
         assert_eq!(sniff_bytes(b"FRM8\0\0\0\0\0\0\0\0DSD "), Container::Dff);
