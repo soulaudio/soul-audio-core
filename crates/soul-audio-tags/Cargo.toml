@@ -1,0 +1,36 @@
+[package]
+name = "soul-audio-tags"
+version = "0.1.0"
+edition = "2024"
+description = "no_std, no-alloc audio tag + cover-art reader (ID3v2, VorbisComment, MP4 ilst)."
+
+[features]
+default = []
+alloc = []
+std = ["alloc"]
+
+[dependencies]
+soul-audio-core = { path = "../soul-audio-core" }
+embedded-io = { workspace = true }
+
+[dev-dependencies]
+# Same version soul-audio-service uses in production (crates/soul-audio-service/Cargo.toml)
+# — the differential test in tests/differential.rs checks our reader against it.
+lofty = "0.22"
+embedded-io-adapters = { workspace = true, features = ["std"] }
+
+# `differential` needs `std::fs::File` + lofty (via the dev-deps above), both
+# only meaningful under `feature = "std"`. `required-features` makes Cargo
+# skip building this test target entirely without it, so a plain `cargo test`
+# (what `cargo xtask verify` runs) never touches `lofty` — the file itself is
+# additionally `#![cfg(feature = "std")]`-gated as a second line of defense.
+[[test]]
+name = "differential"
+required-features = ["std"]
+
+# `dump` is a debug/verify tool that reads real files via `read_owned` (the
+# `alloc`/`std` surface), so it only builds with the feature — `cargo test`
+# without it (what `cargo xtask verify` runs) skips the example target.
+[[example]]
+name = "dump"
+required-features = ["std"]

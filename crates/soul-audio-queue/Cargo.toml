@@ -1,0 +1,29 @@
+[package]
+name = "soul-audio-queue"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Portable no_std two-level Up-Next playback queue (virtual context, keyed-permutation shuffle, history) implementing soul-audio-engine's Sequencer."
+
+[lints]
+workspace = true
+
+[dependencies]
+soul-audio-engine = { path = "../soul-audio-engine" }
+heapless = "0.8"
+
+[dev-dependencies]
+soul-audio-core = { path = "../soul-audio-core" }
+
+[features]
+default = []
+alloc = []
+std = ["alloc"]
+serde = ["dep:serde", "alloc"]
+
+[dependencies.serde]
+version = "1"
+optional = true
+default-features = false
+features = ["derive", "alloc"]

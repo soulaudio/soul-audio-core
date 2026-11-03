@@ -1,0 +1,17 @@
+# Normalize line endings: store text as LF in the repo, check out native.
+* text=auto eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+
+# Fixtures and other binaries must never be munged.
+*.wav binary
+*.m4a binary
+*.aac binary
+*.pcm binary
+*.flac binary
+*.mp3 binary
+*.dsf binary
+*.dff binary
+*.ogg binary

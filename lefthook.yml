@@ -1,0 +1,34 @@
+# lefthook.yml — git hooks for soul-audio-core.
+#
+# Requires the lefthook binary. Install one of:
+#   go install github.com/evilmartians/lefthook@latest
+#   npm i -D lefthook   |   scoop install lefthook   |   choco install lefthook
+#
+# Enable the hooks once per clone:  lefthook install
+# (If you use a global `core.hooksPath` dispatcher that delegates to lefthook,
+#  don't run `lefthook install` — it would target the global dir. See README.)
+
+# Fast checks — keep commits quick. Run whenever Rust/Cargo files are staged.
+pre-commit:
+  commands:
+    fmt:
+      glob: "*.{rs,toml}"
+      run: cargo fmt --all -- --check
+    clippy:
+      glob: "*.{rs,toml}"
+      run: cargo clippy --all-targets -- -D warnings
+
+# Commit-message policy: Conventional Commits + a clean history (no AI /
+# attribution trailers). Pure-Rust check so it behaves identically on every
+# platform — `{1}` is the path to the commit-message file git passes in.
+commit-msg:
+  commands:
+    policy:
+      run: cargo xtask check-commit-msg {1}
+
+# Full gate before pushing: fmt, clippy, host tests, and both STM32 builds
+# (core no_std + firmware) for thumbv7em.
+pre-push:
+  commands:
+    verify:
+      run: cargo xtask verify
