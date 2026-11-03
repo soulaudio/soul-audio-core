@@ -77,11 +77,11 @@ done
 
 ## Using the library
 
-The crate is not on crates.io yet; depend on it by path or git:
+The crate is not on crates.io yet; depend on it by git:
 
 ```toml
 [dependencies]
-soul-audio-core = { git = "https://…/soul-audio-core", package = "soul-audio-core" }
+soul-audio-core = { git = "https://github.com/soulaudio/soul-audio-core" }
 ```
 
 ### Decode a file to PCM
@@ -246,6 +246,13 @@ bytes ─▶ probe ─▶ Decoder ─▶ [Resampler] ─▶ normalize ─▶ Dec
   `Engine` above them are identical on both.
 - Async lives only in the firmware shell (Embassy, for DMA/I²S); the core stays
   runtime-agnostic.
+- The products built on this engine live in their own repositories — the
+  [desktop player][soul-player] (cpal sink + Tauri/Svelte UI) and the
+  [STM32 DAP firmware][soul-dap] (SAI/I²S DMA sink) — so this repo stays the
+  reusable, platform-agnostic core.
+
+[soul-player]: https://github.com/soulaudio/soul-player-ng
+[soul-dap]: https://github.com/soulaudio/soul-dap-ng
 
 ## Project layout
 
@@ -254,21 +261,29 @@ bytes ─▶ probe ─▶ Decoder ─▶ [Resampler] ─▶ normalize ─▶ Dec
 | `crates/soul-audio-core` | The library: decoders, resampler, `Sink` trait, `Deck`. `#![no_std]`, no-alloc, `forbid(unsafe_code)`. |
 | `crates/soul-audio-engine` | Portable playback queue (cursor + repeat + gapless) over a `Deck`. `#![no_std]`, depends only on core. |
 | `crates/soul-audio-queue` | Two-level queue: source context + Up-Next/history, shuffle/repeat (`#![no_std]`; `alloc` feature). |
-| `crates/soul-audio-control` | Portable no_std `Player` facade (transport intents, prev-3s rule) over engine + queue. |
+| `crates/soul-audio-control` | Portable `no_std` `Player` facade (transport intents, prev-3s rule) over engine + queue. |
+| `crates/soul-audio-tags` | `no_std` tag + cover-art reader (ID3v2, VorbisComment, MP4 `ilst`, RIFF `INFO`) with duration facts. |
 | `crates/soul-audio-desktop` | Desktop building blocks: owned file decoder + cpal `CpalSink` (behind the `playback` feature). |
-| `crates/soul-audio-service` | Headless backend service: app Command/Event DTOs, lofty library scan, `AudioPlayer` actor. Sink-generic, device-free. |
-| `crates/soul-audio-cli` | Desktop harness: `decode` + gapless `play` (cpal sink + threaded driver). |
-| `crates/soul-audio-firmware` | STM32H743 + Embassy shell (`thumbv7em-none-eabihf`). |
+| `crates/soul-audio-cli` | Desktop harness: `decode` / `render` / gapless `play` (cpal sink + threaded driver). |
 | `crates/architecture-tests` | Runtime no-alloc + dependency-layering invariants. |
-| `xtask` | Pure-Rust automation (`verify` / `gen-resample-tables`). |
+| `xtask` | Pure-Rust automation (`verify`, the commit-msg policy, generated-table checks). |
 | `testdata/` | Committed decode/resample fixtures. |
-| `app/` | **Desktop player UI** (Tauri 2 + Svelte 5) over `soul-audio-service` — isolated from the root workspace (see [`app/README.md`](app/README.md)). |
+
+### Related repositories
+
+This repo is the reusable engine; the products built on it live separately:
+
+- **[soul-player]** — the cross-platform **desktop player** (Tauri 2 + Svelte 5)
+  over the engine.
+- **[soul-dap]** — the **STM32H743 DAP firmware** (Embassy) that runs this same
+  `no_std` core on hardware.
+
 ## Building & developing
 
 ```sh
 cargo test                       # host tests: unit + integration + DSP + robustness
 cargo run -p soul-audio-cli --features playback -- play <file>...   # gapless
-cargo xtask verify               # full gate: fmt, clippy -D warnings, tests, both STM32 builds
+cargo xtask verify               # full gate: fmt, clippy -D warnings, tests, no_std cross-builds
 cargo build -p soul-audio-core --target thumbv7em-none-eabihf --no-default-features  # no_std gate
 ```
 
@@ -292,19 +307,61 @@ Ogg-FLAC, plus a DSD64 DSF decimated to PCM) with what to listen for, then a
 gapless WAV→FLAC queue. Needs the `playback` feature (pulled in automatically).
 See `testdata/README.md`.
 
-Git hooks (via [lefthook](https://github.com/evilmartians/lefthook)): pre-commit
-runs fmt + clippy on staged files; pre-push runs the full `cargo xtask verify`.
-Install the lefthook binary and run `lefthook install` once.
+Git hooks (via [lefthook](https://github.com/evilmartians/lefthook)): a
+`commit-msg` hook enforces [Conventional Commits](https://www.conventionalcommits.org)
+and a clean history (no tool-attribution trailers), pre-commit runs fmt + clippy
+on staged files, and pre-push runs the full `cargo xtask verify`. Install the
+lefthook binary and run `lefthook install` once.
 
-The STM32 build is enforced at five layers (toolchain target auto-install →
-compile-time no_std gate → runtime no-alloc proof → dependency-layering test →
-CI). See `docs/superpowers/specs/` for the design specs of each subsystem.
+The STM32 discipline is enforced at several layers — the pinned `thumbv7em`
+toolchain target, a compile-time `no_std` gate, a runtime no-alloc proof, and a
+dependency-layering test — all run by `cargo xtask verify`. See
+`docs/superpowers/specs/` for the design specs of each subsystem.
 
-## Credits
+## Credits & acknowledgements
 
-Algorithms ported from (and cross-checked against) minimp3 (MP3 Layer III), kjmp2
-(MP3 Layer I/II, Martin Fiedler), and the libsamplerate / CCRMA windowed-sinc
-resampling method. The AAC (LC/SBR/PS), Vorbis, and Opus decoders are written
-from scratch against their specifications (RFC 6716/7845/8251 for Opus) and
-cross-checked against ffmpeg and libopus; the Opus decoder additionally passes
-the RFC 8251 test vectors. Decode goldens generated with ffmpeg.
+Every codec here is a from-scratch Rust implementation, but it stands on decades
+of prior work. With thanks to:
+
+**Reference implementations** studied and cross-checked against:
+
+- [minimp3](https://github.com/lieff/minimp3) — the MP3 Layer III approach.
+- [kjmp2](https://keyj.emphy.de/kjmp2/) by Martin J. Fiedler — MP3 Layers I/II.
+- [libsamplerate](https://github.com/libsndfile/libsamplerate) ("Secret Rabbit
+  Code") by Erik de Castro Lopo, and Julius O. Smith's
+  [windowed-sinc resampling](https://ccrma.stanford.edu/~jos/resample/) notes
+  (CCRMA) — the resampler.
+- [FFmpeg](https://ffmpeg.org) — decode goldens and an independent fixed-point
+  cross-check for AAC.
+- [libopus](https://github.com/xiph/opus) — the Opus reference decoder.
+- Apple's [ALAC](https://github.com/macosforge/alac) reference and David Bryant's
+  [WavPack](https://github.com/dbry/WavPack).
+
+**Specifications** implemented against:
+
+- Opus — [RFC 6716](https://www.rfc-editor.org/rfc/rfc6716),
+  [RFC 7845](https://www.rfc-editor.org/rfc/rfc7845) (Ogg encapsulation) and
+  [RFC 8251](https://www.rfc-editor.org/rfc/rfc8251) (corrections).
+- [FLAC format](https://xiph.org/flac/format.html) and the
+  [Vorbis I specification](https://xiph.org/vorbis/doc/Vorbis_I_spec.html).
+- AAC — ISO/IEC 13818-7 and 14496-3 (LC, SBR, PS).
+- Matroska / WebM — [matroska.org](https://www.matroska.org) and
+  [RFC 9559](https://www.rfc-editor.org/rfc/rfc9559).
+- Apple AIFF-C and Core Audio Format (CAF); Sony/Philips DSF & DSDIFF (DSD);
+  ITU-T G.711 (A-law / µ-law).
+
+**Conformance & test corpus:**
+
+- The Opus [RFC 8251](https://www.rfc-editor.org/rfc/rfc8251) test vectors and the
+  ISO/IEC MPEG audio conformance vectors (used locally; not redistributed here).
+- Real-music fixtures from the
+  [Open Goldberg Variations](http://opengoldbergvariations.org/) — J.S. Bach
+  performed by Kimiko Ishizaka, released into the public domain (**CC0**) by a
+  [MuseScore](https://musescore.org) & Kimiko Ishizaka project. Thank you for
+  freeing this music.
+
+## License
+
+Dual-licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT)
+at your option. Unless you state otherwise, any contribution you intentionally
+submit for inclusion is dual-licensed as above, with no additional terms.
