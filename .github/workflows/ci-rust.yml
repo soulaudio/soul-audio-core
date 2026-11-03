@@ -17,7 +17,7 @@ jobs:
     name: verify (fmt · clippy · tests · no_std cross-builds)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # rust-toolchain.toml pins the channel, components, and the thumbv7em
       # target; rustup installs them on first use. Add them explicitly so a
@@ -27,7 +27,7 @@ jobs:
           rustup component add rustfmt clippy
           rustup target add thumbv7em-none-eabihf
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # The full gate: fmt, clippy -D warnings, generated-table checks, the host
       # test suite, and the no_std cross-builds for the STM32 target.
