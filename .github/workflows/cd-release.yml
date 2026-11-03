@@ -1,0 +1,33 @@
+name: CD
+
+# Cut a GitHub release when a version tag is pushed. The full gate must pass
+# first. (Publishing the crates to crates.io can be added here later, once the
+# library is ready for a registry release.)
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: verify + release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        run: |
+          rustup component add rustfmt clippy
+          rustup target add thumbv7em-none-eabihf
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify before releasing
+        run: cargo xtask ci
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
