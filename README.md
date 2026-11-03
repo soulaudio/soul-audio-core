@@ -5,8 +5,8 @@
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 A cross-platform, **`no_std` / no-alloc / `forbid(unsafe_code)`** audio
-**decode + resample + playback** library in Rust — one core that runs identically
-on the desktop and on an STM32H743 (bare-metal, Embassy).
+**decode + resample + playback** library in Rust — the same core runs everywhere
+from a desktop down to **bare-metal microcontrollers** (no OS, no allocator).
 
 The pipeline is **decode → resample → sink**:
 
@@ -15,8 +15,8 @@ The pipeline is **decode → resample → sink**:
   PCM. Every codec is a from-scratch Rust decoder — no C bindings.
 - **Resample** to any rate with a windowed-sinc converter (anti-aliased both
   directions, Fast/HQ tiers, runtime-variable ratio).
-- **Play** through a `Sink` — a cpal output device on the desktop (an SAI/I²S DMA
-  sink on the STM32 is implemented, pending on-hardware bring-up).
+- **Play** through a `Sink` — a cpal output device on the desktop, or a bare-metal
+  DMA sink on an MCU (the reference [soul-dap] firmware drives an SAI/I²S DAC).
 
 Every codec is validated against external references (ffmpeg, minimp3, kjmp2,
 libopus, and the RFC 8251 Opus test vectors) bit-exactly where the arithmetic

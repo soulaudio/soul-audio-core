@@ -2,10 +2,10 @@
 
 ## Reporting a vulnerability
 
-Please report security issues **privately** via GitHub's
+Please report security issues **privately** — either via GitHub's
 [private vulnerability reporting](https://github.com/soulaudio/soul-audio-core/security/advisories/new)
-(the repository's **Security** tab → *Report a vulnerability*). Do not open a
-public issue for security problems.
+(the repository's **Security** tab → *Report a vulnerability*) or by email to
+**security@datadir.co**. Do not open a public issue for security problems.
 
 We aim to acknowledge a report within a few days and will coordinate a fix and
 disclosure with you.
