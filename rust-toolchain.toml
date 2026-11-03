@@ -1,4 +1,7 @@
+# Pinned (not floating `stable`) so CI runs the exact toolchain the code is
+# validated against — a floating stable with `clippy -D warnings` breaks CI
+# whenever a new release adds or sharpens a lint. Bump this deliberately.
 [toolchain]
-channel = "stable"
+channel = "1.93.1"
 components = ["rustfmt", "clippy", "llvm-tools", "rust-src"]
 targets = ["thumbv7em-none-eabihf"]
