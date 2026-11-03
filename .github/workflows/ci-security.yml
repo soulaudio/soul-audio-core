@@ -15,12 +15,20 @@ jobs:
   audit:
     name: cargo audit (RustSec advisories)
     runs-on: ubuntu-latest
+    # Force the shim to the preinstalled stable: cargo-audit is a prebuilt binary
+    # (no compile), but the repo pins an older toolchain that can't build some
+    # tools — this keeps the audit independent of the project's pinned rustc.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
-      - name: Vulnerability scan
-        uses: rustsec/audit-check@v2
+      # Prebuilt binary — avoids compiling cargo-audit (whose latest deps need a
+      # newer rustc than this repo's pinned toolchain).
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - name: Vulnerability scan
+        run: cargo audit
 
   sbom:
     name: SBOM (CycloneDX)
