@@ -152,6 +152,25 @@ fn adts_total_frames_from_frame_scan() {
     );
 }
 
+/// A `.aac` with a leading ID3v2 tag (the iTunes/FAAC convention): `open_seekable`
+/// skips the tag and decodes the ADTS beneath. Before the fix the probe called a
+/// leading `ID3` an MP3, so it mis-decoded (wrong sample rate, truncated) — the
+/// "06 untitled + wrong length" dogfooding case.
+#[test]
+fn open_seekable_decodes_id3_prefixed_adts() {
+    let aac = include_bytes!("../../../testdata/meta-id3.aac");
+    let dec = open_seekable(SliceSource::new(aac)).expect("id3-prefixed adts");
+    assert_eq!(dec.stream_info().sample_rate, 44_100);
+    assert_eq!(dec.stream_info().channels, 2);
+    let tf = dec
+        .total_frames()
+        .expect("adts length via frame scan past the ID3");
+    assert!(
+        (60_000..75_000).contains(&tf),
+        "unexpected total_frames: {tf}"
+    );
+}
+
 /// Native `.flac` decodes **bit-exact** to the WAV it was encoded from — FLAC is
 /// lossless and `tone.wav` is the ground-truth source both fixtures share. This
 /// is a stronger check than an ffmpeg hash (equality against the actual source),

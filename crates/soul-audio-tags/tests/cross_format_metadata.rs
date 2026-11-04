@@ -51,10 +51,11 @@ fn cases() -> Vec<Case> {
         full("meta-aac.m4a"),  // moov after mdat (ffmpeg default muxing)
         full("meta-alac.m4a"), // moov after mdat
         full("meta-oggflac.oga"),
-        full("meta.mka"),  // Matroska (EBML tags)
-        full("meta.webm"), // WebM (EBML tags)
-        full("meta.caf"),  // CAF (`info` chunk)
-        full("meta.wv"),   // WavPack (APEv2)
+        full("meta.mka"),     // Matroska (EBML tags)
+        full("meta.webm"),    // WebM (EBML tags)
+        full("meta.caf"),     // CAF (`info` chunk)
+        full("meta.wv"),      // WavPack (APEv2)
+        full("meta-id3.aac"), // raw ADTS fronted by an ID3v2 tag (iTunes/FAAC)
         Case {
             file: "meta.aiff",
             title: Some(TITLE),

@@ -312,6 +312,17 @@ pub fn open<S: BufSource>(mut src: S) -> Result<AnyDecoder<S>, DecodeError> {
 pub fn open_seekable<S: BufSource + crate::io::SeekSource>(
     mut src: S,
 ) -> Result<AnyDecoder<S>, DecodeError> {
+    // An ID3v2 tag can front a raw ADTS (`.aac`) stream (iTunes/FAAC tag it this
+    // way); the plain `probe` calls a leading `ID3` an MP3. If ADTS frames follow
+    // the tag, skip it and decode the ADTS beneath.
+    if let Some(start) = adts_after_id3(&mut src)? {
+        let hint = adts_total_frames(&mut src, start);
+        src.seek(embedded_io::SeekFrom::Start(start))
+            .map_err(|_| DecodeError::Io)?;
+        let mut dec = AacDecoder::new_adts(AdtsReader::new(src)?)?;
+        dec.set_length_hint(hint);
+        return Ok(AnyDecoder::Aac(dec));
+    }
     match probe(&mut src)? {
         Format::Wav => WavDecoder::new(src).map(AnyDecoder::Wav),
         Format::Aiff => AiffDecoder::new(src).map(AnyDecoder::Aiff),
@@ -340,7 +351,7 @@ pub fn open_seekable<S: BufSource + crate::io::SeekSource>(
             // Raw ADTS declares no length. On a seekable source, scan the frame
             // headers for a total (frames × 1024, as the tag reader does) so the
             // playback progress bar has a length. Restores `src` to the start.
-            let hint = adts_total_frames(&mut src);
+            let hint = adts_total_frames(&mut src, 0);
             let mut dec = AacDecoder::new_adts(AdtsReader::new(src)?)?;
             dec.set_length_hint(hint);
             Ok(AnyDecoder::Aac(dec))
@@ -366,9 +377,9 @@ pub fn open_seekable<S: BufSource + crate::io::SeekSource>(
 /// `src` to the start. Each frame's 13-bit `aac_frame_length` (header bytes
 /// 3..6) is the stride; a non-sync/short header ends the count. `None` if no
 /// frame is found.
-fn adts_total_frames<S: crate::io::SeekSource>(src: &mut S) -> Option<u64> {
+fn adts_total_frames<S: crate::io::SeekSource>(src: &mut S, start: u64) -> Option<u64> {
     use embedded_io::SeekFrom;
-    src.seek(SeekFrom::Start(0)).ok()?;
+    src.seek(SeekFrom::Start(start)).ok()?;
     let mut frames: u64 = 0;
     let mut h = [0u8; 7];
     loop {
@@ -399,8 +410,46 @@ fn adts_total_frames<S: crate::io::SeekSource>(src: &mut S) -> Option<u64> {
             break;
         }
     }
-    src.seek(SeekFrom::Start(0)).ok()?;
+    src.seek(SeekFrom::Start(start)).ok()?;
     (frames > 0).then_some(frames * 1024)
+}
+
+/// If `src` starts with an ID3v2 tag immediately followed by a raw ADTS stream
+/// (the iTunes/FAAC way of tagging `.aac`), return the byte offset of the first
+/// ADTS frame (past the tag). Restores `src` to the start. `None` otherwise.
+fn adts_after_id3<S: crate::io::SeekSource>(src: &mut S) -> Result<Option<u64>, DecodeError> {
+    use embedded_io::SeekFrom;
+    src.seek(SeekFrom::Start(0)).map_err(|_| DecodeError::Io)?;
+    let mut hdr = [0u8; 10];
+    let n = read_up_to(src, &mut hdr)?;
+    let mut result = None;
+    if n == 10 && &hdr[0..3] == b"ID3" {
+        let size = (u32::from(hdr[6] & 0x7F) << 21)
+            | (u32::from(hdr[7] & 0x7F) << 14)
+            | (u32::from(hdr[8] & 0x7F) << 7)
+            | u32::from(hdr[9] & 0x7F);
+        let start = 10u64 + u64::from(size);
+        if src.seek(SeekFrom::Start(start)).is_ok() {
+            let mut s = [0u8; 2];
+            if read_up_to(src, &mut s)? == 2 && s[0] == 0xFF && (s[1] & 0xF6) == 0xF0 {
+                result = Some(start);
+            }
+        }
+    }
+    src.seek(SeekFrom::Start(0)).map_err(|_| DecodeError::Io)?;
+    Ok(result)
+}
+
+/// Read up to `buf.len()` bytes; returns how many were read (< len at EOF).
+fn read_up_to<S: crate::io::Source>(src: &mut S, buf: &mut [u8]) -> Result<usize, DecodeError> {
+    let mut off = 0;
+    while off < buf.len() {
+        match embedded_io::Read::read(src, &mut buf[off..]).map_err(|_| DecodeError::Io)? {
+            0 => break,
+            k => off += k,
+        }
+    }
+    Ok(off)
 }
 
 /// Granule position of the last real Ogg page — for FLAC-in-Ogg the decoded

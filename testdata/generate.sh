@@ -262,3 +262,13 @@ ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a libopus -f matroska "${M
 ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a libopus -f webm     "${MT[@]}" meta.webm
 ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a alac   -f caf       "${MT[@]}" meta.caf
 ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a wavpack             "${MT[@]}" meta.wv
+# Raw ADTS fronted by a prepended ID3v2 (iTunes/FAAC convention — ffmpeg's ADTS
+# muxer writes no tags), and small tagged DSD (DSF trailing ID3 / DFF DIIN+ID3),
+# since ffmpeg can neither tag raw .aac nor encode DSD. `add_dsd_tags.py` embeds
+# the tags; our readers surface them.
+cp -f meta.aac meta-id3.aac
+python3 add_dsd_tags.py meta-id3.aac Aria "Kimiko Ishizaka" "Open Goldberg Variations"
+python3 generate_dsd.py meta.dsf 2822400 0.3
+python3 generate_dsd.py meta.dff 2822400 0.3
+python3 add_dsd_tags.py meta.dsf Aria "Kimiko Ishizaka" "Open Goldberg Variations"
+python3 add_dsd_tags.py meta.dff Aria "Kimiko Ishizaka" "Open Goldberg Variations"
