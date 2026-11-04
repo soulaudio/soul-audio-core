@@ -1,9 +1,12 @@
-//! Bare ADTS (`.aac`) duration facts. A raw AAC elementary stream has no
-//! metadata container, so this only frame-scans the 7-byte ADTS headers —
-//! advancing by the 13-bit `aac_frame_length`, counting 1024 PCM samples per
-//! frame — to recover a duration the library view can show. Mirrors the header
-//! fields `soul_audio_core::demux::adts` parses.
+//! Bare ADTS (`.aac`) facts, plus tags from an optional leading ID3v2. A raw
+//! AAC elementary stream has no metadata container of its own, but iTunes/FAAC
+//! and similar taggers prepend an ID3v2 tag (the same TIT2/TPE1/TALB frames as
+//! MP3) — so this reads that tag if present, then frame-scans the 7-byte ADTS
+//! headers (advancing by the 13-bit `aac_frame_length`, 1024 PCM samples per
+//! frame) for a duration. Mirrors the header fields
+//! `soul_audio_core::demux::adts` parses.
 
+use crate::id3v2;
 use crate::util::read_exact;
 use crate::{StreamFacts, TagError, TagSink};
 use embedded_io::SeekFrom;
@@ -36,13 +39,42 @@ fn parse_header(h: &[u8; 7]) -> Result<(u32, u16, usize), TagError> {
     Ok((rate, channels, frame_len))
 }
 
-/// Frame-scan a raw ADTS stream for duration facts. No tags are emitted (raw
-/// ADTS carries no metadata container), so `scratch`/`sink` are unused.
+/// If `src` starts with an ID3v2 tag, read it (title/artist/album) and leave the
+/// cursor at the first byte past it; otherwise rewind to the start. Lets a
+/// tagged `.aac` surface its tags while the frame-scan below still runs over the
+/// ADTS frames beneath the tag.
+fn read_leading_id3<S: SeekSource>(
+    src: &mut S,
+    scratch: &mut [u8],
+    sink: &mut impl TagSink,
+) -> Result<(), TagError> {
+    let mut magic = [0u8; 3];
+    read_exact(src, &mut magic)?;
+    if &magic == b"ID3" {
+        let mut rest = [0u8; 7]; // version(2) flags(1) size(4, synchsafe)
+        read_exact(src, &mut rest)?;
+        let size = (u32::from(rest[3] & 0x7F) << 21)
+            | (u32::from(rest[4] & 0x7F) << 14)
+            | (u32::from(rest[5] & 0x7F) << 7)
+            | u32::from(rest[6] & 0x7F);
+        src.seek(SeekFrom::Start(0)).map_err(|_| TagError::Io)?;
+        id3v2::read_id3v2(src, scratch, sink)?;
+        src.seek(SeekFrom::Start(10 + u64::from(size)))
+            .map_err(|_| TagError::Io)?;
+    } else {
+        src.seek(SeekFrom::Start(0)).map_err(|_| TagError::Io)?;
+    }
+    Ok(())
+}
+
+/// Read an optional leading ID3v2 tag, then frame-scan the ADTS stream for
+/// duration facts.
 pub fn read_adts<S: SeekSource>(
     src: &mut S,
-    _scratch: &mut [u8],
-    _sink: &mut impl TagSink,
+    scratch: &mut [u8],
+    sink: &mut impl TagSink,
 ) -> Result<StreamFacts, TagError> {
+    read_leading_id3(src, scratch, sink)?;
     let mut h = [0u8; 7];
     read_exact(src, &mut h)?; // at least one frame, else genuinely malformed
     let (rate, channels, first_len) = parse_header(&h)?;

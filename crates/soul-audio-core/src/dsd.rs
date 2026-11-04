@@ -353,6 +353,190 @@ impl<D: DsdDecoder> Decoder for DecimateAdapter<D> {
     }
 }
 
+/// Second-stage PCM decimation ratio for the **playback** path. [`DecimateAdapter`]
+/// lands DSD64 at 352.8 kHz (hi-res, the archival/export rate); a further 8:1 drop
+/// brings it to its *native* 44.1 kHz family (2.8224 MHz / 64 = 44.1 kHz — DSD64 is
+/// `64 × 44100`), so the deck's arbitrary-ratio resampler runs at 44.1 kHz instead of
+/// 352.8 kHz. That is ~7× less resampling work — the single-stage 352.8 kHz→device
+/// resample is the real-time bottleneck for DSD — while the cascade of two linear-phase
+/// Kaiser-windowed stages keeps the anti-aliasing audiophile-clean (and strips the
+/// ultrasonic DSD shaped noise). A 48 kHz device then gets a cheap 44.1→48 kHz resample;
+/// a 44.1 kHz device plays bit-for-bit with no resampling at all.
+const PCM_DECIMATION: usize = 8;
+
+/// Stage-1 PCM frames pulled per refill of the second stage's input buffer. A
+/// modest fixed chunk (bounded no-alloc scratch) amortises the per-call cost of
+/// the inner [`DecimateAdapter`] without a large by-value buffer.
+const PEND_FRAMES: usize = 128;
+
+/// DSD → PCM for **playback**: [`DecimateAdapter`] (DSD → 352.8 kHz) cascaded with a
+/// second linear-phase 8:1 PCM FIR, so DSD64 lands at its native 44.1 kHz. Reuses the
+/// exact [`COEFFS`] prototype — its cutoff at `f_in/16` is, for an 8:1 decimation at any
+/// input rate, precisely the output Nyquist (352.8 kHz / 16 = 22.05 kHz = the 44.1 kHz
+/// Nyquist), so the same proven filter anti-aliases the second stage correctly.
+///
+/// Why a separate type (not a flag on [`DecimateAdapter`]): the output *mode* is chosen
+/// by construction (see the module header). `DecimateAdapter::new` stays the archival
+/// 352.8 kHz path the conformance vectors pin; playback constructs this instead.
+pub struct PlaybackDecimateAdapter<D> {
+    /// First stage: the proven bit-domain DSD → 352.8 kHz decimator.
+    stage1: DecimateAdapter<D>,
+    channels: usize,
+    /// Per-channel ring of the last [`TAPS`] stage-1 PCM samples; the next write
+    /// goes to `pos` (so the newest sample is at `pos - 1`). Zero is PCM silence
+    /// (stage-1 maps DSD silence to ≈0), so a zeroed ring is a clean warm-up seed.
+    hist: [[i32; TAPS]; MAX_DECIMATE_CHANNELS],
+    pos: usize,
+    /// Stage-1 frames accumulated toward the next output (0..[`PCM_DECIMATION`]).
+    phase: usize,
+    /// Buffered stage-1 output frames awaiting consumption (`pend_pos..pend_len`).
+    pend: [i32; PEND_FRAMES * MAX_DECIMATE_CHANNELS],
+    pend_len: usize,
+    pend_pos: usize,
+    eof: bool,
+}
+
+impl<D: DsdDecoder> PlaybackDecimateAdapter<D> {
+    /// Wrap `inner` for playback. Per-channel history starts silent (zeroed).
+    pub fn new(inner: D) -> Self {
+        let channels = inner.stream_info().channels as usize;
+        Self {
+            stage1: DecimateAdapter::new(inner),
+            channels,
+            hist: [[0i32; TAPS]; MAX_DECIMATE_CHANNELS],
+            pos: 0,
+            phase: 0,
+            pend: [0i32; PEND_FRAMES * MAX_DECIMATE_CHANNELS],
+            pend_len: 0,
+            pend_pos: 0,
+            eof: false,
+        }
+    }
+
+    /// Total output PCM frames, if the inner DSD decoder declares its length.
+    /// Both stages divide the frame count, so this is the inner sample count over
+    /// `DECIMATION × PCM_DECIMATION` (= 64 for DSD64 → 44.1 kHz). Duration in
+    /// seconds is unchanged (rate and frame count both drop by the same factor),
+    /// so the deck's progress/length stays correct.
+    #[must_use]
+    pub fn total_frames(&self) -> Option<u64> {
+        self.stage1
+            .total_frames()
+            .map(|f| f / PCM_DECIMATION as u64)
+    }
+
+    /// Reset the second-stage filter state (after a seek).
+    fn reset_stage2(&mut self) {
+        self.hist = [[0i32; TAPS]; MAX_DECIMATE_CHANNELS];
+        self.pos = 0;
+        self.phase = 0;
+        self.pend_len = 0;
+        self.pend_pos = 0;
+        self.eof = false;
+    }
+
+    /// Second-stage FIR dot product for channel `ch`: `Σ COEFFS[k]·hist[age k]`,
+    /// then the DC-normalising divide by [`PCM_MAX`] (the coefficient sum) back to
+    /// 24-bit scale, rounded to nearest and saturated. `i64` accumulation covers
+    /// the 128-tap × 24-bit × ~2²⁰-coefficient products without overflow.
+    #[inline]
+    fn fir(&self, ch: usize) -> i32 {
+        let mut acc = 0i64;
+        let mut k = 0usize;
+        while k < TAPS {
+            let idx = (self.pos + TAPS - 1 - k) % TAPS;
+            acc += i64::from(COEFFS[k]) * i64::from(self.hist[ch][idx]);
+            k += 1;
+        }
+        let div = i64::from(PCM_MAX);
+        let half = div / 2;
+        let q = if acc >= 0 {
+            (acc + half) / div
+        } else {
+            (acc - half) / div
+        };
+        (q as i32).clamp(PCM_MIN, PCM_MAX)
+    }
+}
+
+impl<D: DsdDecoder + DsdSeek> PlaybackDecimateAdapter<D> {
+    /// Seek to output PCM `frame`. One output frame spans [`PCM_DECIMATION`] stage-1
+    /// frames; the filter state is reset (brief warm-up transient after the seek).
+    ///
+    /// # Errors
+    /// Propagates the inner [`DecimateAdapter::seek_to_frame`] error.
+    pub fn seek_to_frame(&mut self, frame: u64) -> Result<u64, DecodeError> {
+        let landed = self
+            .stage1
+            .seek_to_frame(frame.saturating_mul(PCM_DECIMATION as u64))?;
+        self.reset_stage2();
+        Ok(landed / PCM_DECIMATION as u64)
+    }
+
+    /// Seek to `secs` seconds (convenience over [`Self::seek_to_frame`]).
+    ///
+    /// # Errors
+    /// Propagates the inner seek error.
+    pub fn seek_to_time(&mut self, secs: f64) -> Result<u64, DecodeError> {
+        self.seek_to_frame(secs_to_samples(secs, self.stream_info().sample_rate))
+    }
+}
+
+impl<D: DsdDecoder> Decoder for PlaybackDecimateAdapter<D> {
+    fn stream_info(&self) -> StreamInfo {
+        let si = self.stage1.stream_info();
+        StreamInfo {
+            sample_rate: si.sample_rate / PCM_DECIMATION as u32,
+            channels: si.channels,
+            format: SampleFormat::Int { bits: 24 },
+        }
+    }
+
+    fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {
+        let c = self.channels;
+        if c == 0 || c > MAX_DECIMATE_CHANNELS {
+            return Err(DecodeError::Unsupported);
+        }
+        let mut w = 0;
+        while w + c <= out.len() {
+            if self.pend_pos >= self.pend_len {
+                if self.eof {
+                    break;
+                }
+                // Disjoint-field borrow: `stage1` and `pend` are distinct fields.
+                let n = self.stage1.decode_into(&mut self.pend[..PEND_FRAMES * c])?;
+                self.pend_len = n / c;
+                self.pend_pos = 0;
+                if self.pend_len == 0 {
+                    self.eof = true;
+                    break;
+                }
+            }
+            // Push one stage-1 frame into the per-channel rings.
+            let base = self.pend_pos * c;
+            let mut ch = 0;
+            while ch < c {
+                self.hist[ch][self.pos] = self.pend[base + ch];
+                ch += 1;
+            }
+            self.pend_pos += 1;
+            self.pos = (self.pos + 1) % TAPS;
+            self.phase += 1;
+            // Emit one decimated output frame every `PCM_DECIMATION` inputs.
+            if self.phase == PCM_DECIMATION {
+                self.phase = 0;
+                let mut ch = 0;
+                while ch < c {
+                    out[w] = self.fir(ch);
+                    w += 1;
+                    ch += 1;
+                }
+            }
+        }
+        Ok(w)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,5 +924,149 @@ mod tests {
             dec_decode_all(&mut fresh),
             "seek resets FIR history"
         );
+    }
+
+    // ---- PlaybackDecimateAdapter (DSD → native 44.1 kHz, the playback path) ----
+
+    fn playback(
+        bytes: &'static [u8],
+        channels: u16,
+        rate: DsdRate,
+    ) -> PlaybackDecimateAdapter<FakeDsd> {
+        PlaybackDecimateAdapter::new(FakeDsd {
+            bytes,
+            pos: 0,
+            rate,
+            channels,
+        })
+    }
+
+    fn pb_decode_all(d: &mut PlaybackDecimateAdapter<FakeDsd>) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut buf = [0i32; 64];
+        loop {
+            let n = d.decode_into(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    #[test]
+    fn playback_decimate_stream_info_is_native_44k() {
+        // DSD64 = 64 × 44100. Two 8:1 stages (64:1 total) land exactly on 44.1 kHz,
+        // DSD64's native PCM rate — so a 44.1 kHz DAC needs no resampling at all.
+        let d = playback(&[], 2, DsdRate::Dsd64);
+        let si = d.stream_info();
+        assert_eq!(si.sample_rate, 44_100);
+        assert_eq!(si.channels, 2);
+        assert_eq!(si.format, SampleFormat::Int { bits: 24 });
+    }
+
+    #[test]
+    fn playback_decimate_total_frames_is_sixty_fourth() {
+        // Both stages divide the frame count by 8 → 64:1 overall. Duration in
+        // seconds is unchanged (rate drops by 64 too), so the length stays right.
+        struct Sized(Option<u64>);
+        impl DsdDecoder for Sized {
+            fn stream_info(&self) -> StreamInfo {
+                StreamInfo {
+                    sample_rate: 44_100,
+                    channels: 2,
+                    format: SampleFormat::Dsd {
+                        rate: DsdRate::Dsd64,
+                    },
+                }
+            }
+            fn read_dsd(&mut self, _out: &mut [u8]) -> Result<usize, DecodeError> {
+                Ok(0)
+            }
+            fn total_samples(&self) -> Option<u64> {
+                self.0
+            }
+        }
+        // 2_822_400 DSD samples / 64 = 44_100 PCM frames (= 1 s at 44.1 kHz).
+        assert_eq!(
+            PlaybackDecimateAdapter::new(Sized(Some(2_822_400))).total_frames(),
+            Some(44_100)
+        );
+        assert_eq!(
+            PlaybackDecimateAdapter::new(Sized(None)).total_frames(),
+            None
+        );
+    }
+
+    #[test]
+    fn playback_decimate_dc_all_ones_is_positive_full_scale() {
+        // A constant +1 DSD input is +full-scale after stage 1; the second stage's
+        // coefficients sum to PCM_MAX (unity DC gain), so the settled output is
+        // +PCM_MAX too — the cascade preserves level, no droop, no overshoot.
+        let bytes: &'static [u8] = vec![0xFFu8; 2048].leak();
+        let out = pb_decode_all(&mut playback(bytes, 1, DsdRate::Dsd64));
+        assert_eq!(out.len(), 2048 / 8); // 64:1 after the 8:1 stage-1 (1 byte→1 frame)
+        // Fully settled once both filters' histories fill (< ~160 output frames).
+        assert_eq!(*out.last().unwrap(), PCM_MAX);
+        assert!(
+            out[200] > PCM_MAX * 9 / 10,
+            "settled DC not near +FS: {}",
+            out[200]
+        );
+    }
+
+    #[test]
+    fn playback_decimate_all_zeros_is_negative_full_scale() {
+        let bytes: &'static [u8] = vec![0x00u8; 2048].leak();
+        let out = pb_decode_all(&mut playback(bytes, 1, DsdRate::Dsd64));
+        assert_eq!(*out.last().unwrap(), -PCM_MAX);
+        assert!(out[200] < -PCM_MAX * 9 / 10);
+    }
+
+    #[test]
+    fn playback_decimate_rejects_nyquist_tone() {
+        // 0x55 = alternating bits = DSD Nyquist → stage 1 ≈ 0 → stage 2 ≈ 0.
+        let bytes: &'static [u8] = vec![0x55u8; 2048].leak();
+        let out = pb_decode_all(&mut playback(bytes, 1, DsdRate::Dsd64));
+        assert!(
+            out.last().unwrap().abs() < 1_000,
+            "Nyquist not rejected: {}",
+            out.last().unwrap()
+        );
+    }
+
+    #[test]
+    fn playback_decimate_ratio_is_sixty_four_to_one() {
+        // 512 input bytes → 512 stage-1 frames → 512/8 = 64 output frames.
+        let bytes: &'static [u8] = vec![0xF0u8; 512].leak();
+        let out = pb_decode_all(&mut playback(bytes, 1, DsdRate::Dsd64));
+        assert_eq!(out.len(), 64);
+    }
+
+    #[test]
+    fn playback_decimate_stereo_separates_channels() {
+        // ch0 all-ones (+FS), ch1 all-zeros (−FS), interleaved; both stages are
+        // per-channel so the separation survives the cascade.
+        let mut bytes = vec![0u8; 4096];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = if i % 2 == 0 { 0xFF } else { 0x00 };
+        }
+        let out = pb_decode_all(&mut playback(bytes.leak(), 2, DsdRate::Dsd64));
+        let last = out.len() - 2;
+        assert_eq!(out[last], PCM_MAX); // L
+        assert_eq!(out[last + 1], -PCM_MAX); // R
+    }
+
+    #[test]
+    fn playback_decimate_seek_to_time_converts_seconds() {
+        // Native rate 44.1 kHz: 0.0001 s × 44_100 = 4.41 → PCM frame 4.
+        let mut d = playback(&[0u8; 8], 2, DsdRate::Dsd64);
+        assert_eq!(d.seek_to_time(0.0001).unwrap(), 4);
+    }
+
+    #[test]
+    fn playback_decimate_seek_to_extreme_frame_saturates() {
+        let mut d = playback(&STEREO_FF_00, 2, DsdRate::Dsd64);
+        assert!(d.seek_to_frame(u64::MAX).is_ok());
     }
 }

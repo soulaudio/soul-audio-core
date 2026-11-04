@@ -24,23 +24,69 @@ AMP = 0.4  # headroom for sigma-delta stability
 BLOCK = 4096  # DSF block size per channel (bytes)
 
 
-def sigma_delta_2nd(x: np.ndarray) -> np.ndarray:
+def sigma_delta_2nd(x: np.ndarray, e1: float = 0.0, e2: float = 0.0):
     """2nd-order error-feedback modulator: x in [-1,1] -> bits (True = +1).
 
     NTF = (1 - z^-1)^2, so quantization noise is pushed up in frequency and the
-    audio band stays clean after decimation.
+    audio band stays clean after decimation. `e1`/`e2` carry the integrator
+    state across blocks (for streaming a long input); returns `(bits, e1, e2)`.
+    Iterates a Python list — far faster than per-sample numpy indexing.
     """
-    bits = np.empty(x.shape[0], dtype=bool)
-    e1 = 0.0
-    e2 = 0.0
-    for n in range(x.shape[0]):
-        u = x[n] + 2.0 * e1 - e2
-        y = 1.0 if u >= 0.0 else -1.0
-        bits[n] = y > 0.0
-        e = u - y
+    xs = x.tolist()
+    out = bytearray(len(xs))
+    for n, xn in enumerate(xs):
+        u = xn + 2.0 * e1 - e2
+        if u >= 0.0:
+            out[n] = 1
+            e = u - 1.0
+        else:
+            e = u + 1.0
         e2 = e1
         e1 = e
-    return bits
+    bits = np.frombuffer(bytes(out), dtype=np.uint8).astype(bool)
+    return bits, e1, e2
+
+
+def modulate_wav(path: str, rate: int):
+    """Modulate a 16-bit PCM WAV to a 1-bit DSD stream per channel at `rate`
+    (a multiple of the WAV's rate), so a DSD fixture carries the *real* source
+    audio rather than a synthesized tone. Streams the input in blocks (bounded
+    memory for the 64x-upsampled signal) into a pre-allocated per-channel bit
+    array. Returns `(ch_bits, samples_per_channel)`.
+    """
+    import wave
+
+    w = wave.open(path, "rb")
+    channels, sw, in_rate, nframes = (
+        w.getnchannels(),
+        w.getsampwidth(),
+        w.getframerate(),
+        w.getnframes(),
+    )
+    if sw != 2:
+        raise SystemExit(f"{path}: need 16-bit PCM")
+    if rate % in_rate != 0:
+        raise SystemExit(f"{path}: DSD rate {rate} is not a multiple of {in_rate}")
+    oversample = rate // in_rate
+    ch_bits = [np.empty(nframes * oversample, dtype=bool) for _ in range(channels)]
+    state = [(0.0, 0.0)] * channels
+    pos = 0
+    while True:
+        raw = w.readframes(in_rate)  # ~1 s per block
+        if not raw:
+            break
+        pcm = np.frombuffer(raw, dtype="<i2").astype(np.float64).reshape(-1, channels) / 32768.0
+        got = pcm.shape[0]
+        for c in range(channels):
+            up = np.repeat(pcm[:, c], oversample)  # zero-order-hold 64x upsample
+            bits, e1, e2 = sigma_delta_2nd(up, state[c][0], state[c][1])
+            state[c] = (e1, e2)
+            ch_bits[c][pos * oversample : pos * oversample + bits.shape[0]] = bits
+        pos += got
+        print(f"  modulated {pos}/{nframes} frames", flush=True)
+    w.close()
+    total = pos * oversample
+    return [cb[:total] for cb in ch_bits], total
 
 
 def big_chunk(cid: bytes, body: bytes) -> bytes:
@@ -120,12 +166,17 @@ def write_dsf(out: str, rate: int, n: int, ch_bits: list) -> None:
 def main() -> None:
     out = sys.argv[1] if len(sys.argv) > 1 else "tone.dsf"
     rate = int(sys.argv[2]) if len(sys.argv) > 2 else DSD64
-    dur = float(sys.argv[3]) if len(sys.argv) > 3 else DUR
-    n = int(dur * rate)
-    t = np.arange(n) / rate
-
-    # 1-bit stream per channel (True = +1); packing/layout is per-container.
-    ch_bits = [sigma_delta_2nd(AMP * np.sin(2.0 * np.pi * f * t)) for f in FREQS]
+    # Third positional: a `.wav` to modulate (DSD of the real track), else a
+    # duration in seconds (synthesized tone, the small committed fixtures).
+    arg3 = sys.argv[3] if len(sys.argv) > 3 else None
+    if arg3 and arg3.lower().endswith(".wav"):
+        ch_bits, n = modulate_wav(arg3, rate)
+    else:
+        dur = float(arg3) if arg3 else DUR
+        n = int(dur * rate)
+        t = np.arange(n) / rate
+        # 1-bit stream per channel (True = +1); packing/layout is per-container.
+        ch_bits = [sigma_delta_2nd(AMP * np.sin(2.0 * np.pi * f * t))[0] for f in FREQS]
 
     if out.endswith(".dff"):
         write_dff(out, rate, ch_bits)

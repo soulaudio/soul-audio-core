@@ -21,7 +21,7 @@ use clap::{Parser, Subcommand};
 use soul_audio_core::demux::MatroskaDemuxer;
 use soul_audio_core::formats::matroska::{MatroskaDecoder, MatroskaVorbisOgg};
 use soul_audio_core::formats::vorbis::VorbisDecoder;
-use soul_audio_core::{AnyDecoder, DecodeError, Decoder, Format, open, probe};
+use soul_audio_core::{AnyDecoder, DecodeError, Decoder, Format, open_seekable, probe};
 
 #[derive(Parser)]
 #[command(name = "soul-audio-cli", about = "soul-audio-core desktop harness")]
@@ -140,7 +140,9 @@ fn decode(input: &Path, out: &Path) -> Result<()> {
             }
         }
         _ => {
-            let mut decoder = open(source).map_err(fail)?;
+            // A file is seekable, so use `open_seekable` — handles MP4/.m4a with
+            // `moov` after `mdat` (ffmpeg's default), not just faststart.
+            let mut decoder = open_seekable(source).map_err(fail)?;
             stream_pcm(&mut decoder, &mut w).map_err(fail)?;
         }
     }

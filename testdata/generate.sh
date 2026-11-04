@@ -230,3 +230,45 @@ if [ -f realmusic.wav ]; then
   ffmpeg -y -hide_banner -loglevel error -i realmusic.wav -c:a libopus -b:a 128k realmusic.opus
   ffmpeg -y -hide_banner -loglevel error -i realmusic.opus -f s16le realmusic.opus.ref.pcm
 fi
+
+# --- Cross-format metadata fixtures (meta.*) -------------------------------
+# The SAME 1.5 s stereo tone muxed into every container the tag reader handles,
+# each carrying identical TITLE/ARTIST/ALBUM — so the cross-format metadata e2e
+# (soul-audio-tags/tests/cross_format_metadata.rs) can assert every format
+# reports consistent tags and a ~1.5 s duration. These encode the player's
+# dogfooding bugs: WAV tags live in a `LIST`/`INFO` chunk; AIFF carries only a
+# `NAME` (title); raw ADTS has no tags at all; Ogg-FLAC writes STREAMINFO
+# total_samples = 0 (duration must fall back to the Ogg granule).
+#
+# The two `.m4a`s deliberately OMIT `-movflags +faststart`, so ffmpeg writes
+# `moov` AFTER `mdat` (its default) — the shape that broke AAC/ALAC playback
+# until `open_seekable` (see soul-audio-core/tests/decode.rs). ALAC is lossless
+# and shares meta.wav's source, so that decode test also checks it bit-exact.
+META_GRAPH="aevalsrc=exprs=0.5*sin(2*PI*440*t)|0.5*sin(2*PI*659.25*t):s=44100:d=1.5:c=stereo,afade=t=in:d=0.05,afade=t=out:st=1.45:d=0.05"
+MT=(-metadata "title=Aria" -metadata "artist=Kimiko Ishizaka" -metadata "album=Open Goldberg Variations")
+ffmpeg -y -hide_banner -loglevel error -f lavfi -i "$META_GRAPH" -c:a pcm_s16le "${MT[@]}" meta.wav
+ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a flac          "${MT[@]}" meta.flac
+ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a libmp3lame -q:a 5 "${MT[@]}" meta.mp3
+ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a libvorbis -q:a 4 "${MT[@]}" meta.ogg
+ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a libopus       "${MT[@]}" meta.opus
+ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a pcm_s16be -f aiff "${MT[@]}" meta.aiff
+ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a flac -f ogg    "${MT[@]}" meta-oggflac.oga
+ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a aac  -f adts   "${MT[@]}" meta.aac
+ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a aac            "${MT[@]}" meta-aac.m4a  # moov AFTER mdat
+ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a alac           "${MT[@]}" meta-alac.m4a # moov AFTER mdat
+# Matroska/WebM (EBML tags), CAF (`info` chunk), WavPack (APEv2) — the
+# containers whose tag readers landed alongside the dogfooding fixes.
+ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a libopus -f matroska "${MT[@]}" meta.mka
+ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a libopus -f webm     "${MT[@]}" meta.webm
+ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a alac   -f caf       "${MT[@]}" meta.caf
+ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a wavpack             "${MT[@]}" meta.wv
+# Raw ADTS fronted by a prepended ID3v2 (iTunes/FAAC convention — ffmpeg's ADTS
+# muxer writes no tags), and small tagged DSD (DSF trailing ID3 / DFF DIIN+ID3),
+# since ffmpeg can neither tag raw .aac nor encode DSD. `add_dsd_tags.py` embeds
+# the tags; our readers surface them.
+cp -f meta.aac meta-id3.aac
+python3 add_dsd_tags.py meta-id3.aac Aria "Kimiko Ishizaka" "Open Goldberg Variations"
+python3 generate_dsd.py meta.dsf 2822400 0.3
+python3 generate_dsd.py meta.dff 2822400 0.3
+python3 add_dsd_tags.py meta.dsf Aria "Kimiko Ishizaka" "Open Goldberg Variations"
+python3 add_dsd_tags.py meta.dff Aria "Kimiko Ishizaka" "Open Goldberg Variations"

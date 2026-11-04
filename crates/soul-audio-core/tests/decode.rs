@@ -5,7 +5,7 @@ use soul_audio_core::demux::ogg_packets::OggPackets;
 use soul_audio_core::formats::matroska::MatroskaVorbisOgg;
 use soul_audio_core::formats::opus::toc::{self, Mode};
 use soul_audio_core::formats::vorbis::VorbisDecoder;
-use soul_audio_core::{DecodeError, Decoder, SeekableDecoder, SliceSource, open};
+use soul_audio_core::{DecodeError, Decoder, SeekableDecoder, SliceSource, open, open_seekable};
 
 /// A minimal valid 16-bit mono WAV carrying `samples`.
 fn wav16(samples: &[i16]) -> Vec<u8> {
@@ -78,6 +78,97 @@ fn open_decodes_flac_in_ogg_matching_ffmpeg() {
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
     assert_eq!(h, 0xc9ba_54f0_06b2_9f75);
+}
+
+/// ffmpeg's **default** MP4 muxing writes `moov` *after* `mdat` (only
+/// `-movflags +faststart` moves it to the front). The streaming decoder reads
+/// `mdat` sequentially, so it needs `open_seekable` to seek back and parse the
+/// trailing `moov` first — `meta-alac.m4a`/`meta-aac.m4a` are real
+/// ffmpeg-default (moov-at-end) M4As. Before the fix these failed to decode at
+/// all (the player's "AAC/ALAC doesn't start playing").
+///
+/// ALAC is lossless and shares the same 1.5 s source as `meta.wav`, so its
+/// decode must be **bit-exact** vs that WAV — a stronger check than a sample
+/// count (ALAC has no encoder delay to account for).
+#[test]
+fn open_seekable_decodes_moov_after_mdat_alac_bit_exact_vs_wav() {
+    let alac = decode_all_seekable(include_bytes!("../../../testdata/meta-alac.m4a"));
+    let wav = decode_all(include_bytes!("../../../testdata/meta.wav"));
+    assert_eq!(alac.len(), wav.len(), "ALAC/WAV sample counts differ");
+    assert_eq!(
+        fnv1a(&alac),
+        fnv1a(&wav),
+        "ALAC (moov-at-end) decode != source WAV"
+    );
+}
+
+/// AAC-LC is lossy, so this asserts the whole stream decodes (the pre-fix
+/// failure was zero samples / `Malformed`), with the right stream facts.
+#[test]
+fn open_seekable_decodes_moov_after_mdat_aac() {
+    let aac = include_bytes!("../../../testdata/meta-aac.m4a");
+    let out = decode_all_seekable(aac);
+    let dec = open_seekable(SliceSource::new(aac)).expect("moov-at-end AAC");
+    assert_eq!(dec.stream_info().sample_rate, 44_100);
+    assert_eq!(dec.stream_info().channels, 2);
+    // ~1.5 s stereo ≈ 132 300 interleaved samples (plus AAC priming); the point
+    // is the whole stream decodes, not zero.
+    assert!(
+        out.len() > 120_000,
+        "decoded too few AAC samples: {}",
+        out.len()
+    );
+}
+
+/// FLAC-in-Ogg STREAMINFO often declares `total_samples = 0` (ffmpeg's streamed
+/// mux), so the decoder's length would be unknown. `open_seekable` falls back to
+/// the last Ogg page's granule — regression for the player's "9 plays as 1
+/// minute" (the progress bar reads the decoder's `total_frames`, not the tags).
+#[test]
+fn ogg_flac_total_frames_falls_back_to_granule() {
+    let oga = include_bytes!("../../../testdata/meta-oggflac.oga");
+    let dec = open_seekable(SliceSource::new(oga)).expect("ogg-flac");
+    let tf = dec
+        .total_frames()
+        .expect("ogg-flac length via granule fallback");
+    // meta.* is ~1.5 s @ 44.1 kHz ≈ 66 150 frames.
+    assert!(
+        (60_000..75_000).contains(&tf),
+        "unexpected ogg-flac total_frames: {tf}"
+    );
+}
+
+/// Raw ADTS declares no length; `open_seekable` scans the frame headers
+/// (× 1024) so the progress bar has one — regression for the player's "6 length
+/// wrong in the progress bar".
+#[test]
+fn adts_total_frames_from_frame_scan() {
+    let aac = include_bytes!("../../../testdata/meta.aac");
+    let dec = open_seekable(SliceSource::new(aac)).expect("adts");
+    let tf = dec.total_frames().expect("adts length via frame scan");
+    assert!(
+        (60_000..75_000).contains(&tf),
+        "unexpected adts total_frames: {tf}"
+    );
+}
+
+/// A `.aac` with a leading ID3v2 tag (the iTunes/FAAC convention): `open_seekable`
+/// skips the tag and decodes the ADTS beneath. Before the fix the probe called a
+/// leading `ID3` an MP3, so it mis-decoded (wrong sample rate, truncated) — the
+/// "06 untitled + wrong length" dogfooding case.
+#[test]
+fn open_seekable_decodes_id3_prefixed_adts() {
+    let aac = include_bytes!("../../../testdata/meta-id3.aac");
+    let dec = open_seekable(SliceSource::new(aac)).expect("id3-prefixed adts");
+    assert_eq!(dec.stream_info().sample_rate, 44_100);
+    assert_eq!(dec.stream_info().channels, 2);
+    let tf = dec
+        .total_frames()
+        .expect("adts length via frame scan past the ID3");
+    assert!(
+        (60_000..75_000).contains(&tf),
+        "unexpected total_frames: {tf}"
+    );
 }
 
 /// Native `.flac` decodes **bit-exact** to the WAV it was encoded from — FLAC is
@@ -1197,6 +1288,31 @@ fn decode_all_with_channels(bytes: &[u8]) -> (Vec<i32>, u16) {
 /// Decode a full stream through the public `open` API and return interleaved PCM.
 fn decode_all(bytes: &[u8]) -> Vec<i32> {
     decode_all_with_channels(bytes).0
+}
+
+/// Like [`decode_all`], but via `open_seekable` — the path that handles MP4
+/// with `moov` after `mdat` (ffmpeg's default muxing). Same big-stack thread.
+fn decode_all_seekable(bytes: &[u8]) -> Vec<i32> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn_scoped(scope, || {
+                let mut dec = open_seekable(SliceSource::new(bytes)).expect("probe + construct");
+                let mut out = Vec::new();
+                let mut buf = [0i32; 4096];
+                loop {
+                    let n = dec.decode_into(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                }
+                out
+            })
+            .expect("spawn decode thread")
+            .join()
+            .expect("decode thread panicked")
+    })
 }
 
 fn fnv1a(samples: &[i32]) -> u64 {

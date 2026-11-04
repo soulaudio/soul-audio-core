@@ -346,10 +346,19 @@ impl<S: Source> AacDecoder<S> {
     }
 
     /// Total per-channel frames from the container's `mdhd` (MP4), or `None`
-    /// for streaming ADTS.
+    /// for streaming ADTS (unless a length hint was supplied — see
+    /// [`Self::set_length_hint`]).
     #[must_use]
     pub fn total_frames(&self) -> Option<u64> {
         self.total_samples
+    }
+
+    /// Supply a scanned fallback length (per-channel frames) for raw ADTS, which
+    /// declares none. No-op when a length is already known (MP4). The dispatcher
+    /// sets this for a seekable ADTS source — a frame count × 1024, matching the
+    /// tag reader's duration — so the playback progress bar has a length.
+    pub fn set_length_hint(&mut self, hint: Option<u64>) {
+        self.total_samples = self.total_samples.or(hint);
     }
 
     /// Gapless encoder delay (leading priming, per-channel samples) from the

@@ -14,8 +14,8 @@ use soul_audio_core::formats::dsf::DsfDecoder;
 use soul_audio_core::formats::matroska::{MatroskaDecoder, MatroskaVorbisOgg};
 use soul_audio_core::formats::vorbis::VorbisDecoder;
 use soul_audio_core::{
-    AnyDecoder, DecimateAdapter, DecodeError, Decoder, Format, SeekableDecoder, StreamInfo, open,
-    probe,
+    AnyDecoder, DecodeError, Decoder, Format, PlaybackDecimateAdapter, SeekableDecoder, StreamInfo,
+    open_seekable, probe,
 };
 
 /// A fully **owned**, `Send` byte source: std buffers the file, so the decoder
@@ -75,8 +75,8 @@ pub enum OwnedDecoder {
     /// Vorbis inside Matroska/WebM — also arena-backed (consumer-dispatched like
     /// bare Vorbis), over the Ogg-synthesizing [`MatroskaVorbisOgg`] adapter.
     MatroskaVorbis(VorbisDecoder<MatroskaVorbisOgg<Src>, Box<[u8]>>),
-    Dsf(DecimateAdapter<DsfDecoder<Src>>),
-    Dff(DecimateAdapter<DffDecoder<Src>>),
+    Dsf(PlaybackDecimateAdapter<DsfDecoder<Src>>),
+    Dff(PlaybackDecimateAdapter<DffDecoder<Src>>),
 }
 
 impl Decoder for OwnedDecoder {
@@ -137,10 +137,15 @@ pub fn open_track(path: &Path) -> Result<OwnedDecoder> {
     let mut src = FromStd::new(IoBufReader::with_capacity(64 * 1024, file));
     let format = probe(&mut src).map_err(|e| anyhow!("probing {}: {e:?}", path.display()))?;
     match format {
-        Format::Dsf => Ok(OwnedDecoder::Dsf(DecimateAdapter::new(
+        // DSD playback: decimate all the way to the native 44.1 kHz family (not the
+        // archival 352.8 kHz `DecimateAdapter`) so the deck's device-rate resample is
+        // cheap enough to sustain real-time — single-stage 352.8 kHz resampling runs at
+        // ~0.5× real-time even in release and starves the audio callback (stutter heard
+        // as slowed/stretched playback). See `PlaybackDecimateAdapter`.
+        Format::Dsf => Ok(OwnedDecoder::Dsf(PlaybackDecimateAdapter::new(
             DsfDecoder::new(src).map_err(|e| anyhow!("DSF {}: {e:?}", path.display()))?,
         ))),
-        Format::Dff => Ok(OwnedDecoder::Dff(DecimateAdapter::new(
+        Format::Dff => Ok(OwnedDecoder::Dff(PlaybackDecimateAdapter::new(
             DffDecoder::new(src).map_err(|e| anyhow!("DFF {}: {e:?}", path.display()))?,
         ))),
         // Vorbis needs a caller-provided arena (`VorbisDecoder<S, A>`), so it
@@ -172,9 +177,11 @@ pub fn open_track(path: &Path) -> Result<OwnedDecoder> {
                 )))
             }
         }
-        // WAV/FLAC/MP3/Ogg-FLAC — `open` re-probes (cheap) and builds the codec.
+        // WAV/FLAC/MP3/Ogg-FLAC/AAC/ALAC — `open_seekable` re-probes (cheap) and
+        // builds the codec. Seekable (not plain `open`) so MP4/.m4a with `moov`
+        // after `mdat` — ffmpeg's default muxing — decodes, not just faststart.
         _ => {
-            Ok(OwnedDecoder::Pcm(open(src).map_err(|e| {
+            Ok(OwnedDecoder::Pcm(open_seekable(src).map_err(|e| {
                 anyhow!("decoding {}: {e:?}", path.display())
             })?))
         }
