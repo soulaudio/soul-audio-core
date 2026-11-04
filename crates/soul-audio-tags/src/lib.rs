@@ -126,6 +126,9 @@ pub fn read<S: SeekSource>(
         locate::Container::Dsf => dsf::read_dsf(src, scratch, sink),
         locate::Container::Dff => dff::read_dff(src, scratch, sink),
         locate::Container::Adts => adts::read_adts(src, scratch, sink),
+        // A bare MPEG stream (tagless .mp3/.mp2/.mp1): no text tags, just the
+        // frame-scan duration so the track still shows a length.
+        locate::Container::Mpeg => Ok(mp3::read_facts(src)),
         locate::Container::Mp4 => mp4::read_mp4(src, scratch, sink),
         locate::Container::Ogg => ogg::read_ogg(src, scratch, sink),
         locate::Container::WavPack => wavpack::read_wavpack(src, scratch, sink),

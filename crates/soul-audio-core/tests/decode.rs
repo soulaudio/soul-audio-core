@@ -171,6 +171,40 @@ fn open_seekable_decodes_id3_prefixed_adts() {
     );
 }
 
+/// Seeking an ID3-prefixed ADTS stream must not reach into the leading ID3 tag.
+/// The reader's `rewind` used to return to byte 0 (the tag), so a seek decoded
+/// ID3 bytes as an ADTS header → `Decode(Malformed)` looping in the player pump
+/// (the dogfooding "seeking on AAC-ADTS doesn't work"). ADTS seek decode-discards
+/// from the stream start, so the post-seek output is bit-identical to the
+/// from-start tail.
+#[test]
+fn id3_prefixed_adts_seek_is_malformed_free_and_exact() {
+    let aac = include_bytes!("../../../testdata/meta-id3.aac");
+    let full = decode_all_seekable(aac);
+    let ch = 2usize;
+    let target_pc = (full.len() / ch / 3) as u64; // seek a third of the way in
+
+    let mut dec = open_seekable(SliceSource::new(aac)).expect("id3-prefixed adts");
+    let landed = dec
+        .seek_to(target_pc)
+        .expect("ADTS seek must not be Malformed");
+
+    let mut rest = Vec::new();
+    let mut buf = [0i32; 4096];
+    loop {
+        let n = dec.decode_into(&mut buf).expect("post-seek decode");
+        if n == 0 {
+            break;
+        }
+        rest.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(
+        rest,
+        full[(landed as usize) * ch..],
+        "post-seek output != from-start tail"
+    );
+}
+
 /// Native `.flac` decodes **bit-exact** to the WAV it was encoded from — FLAC is
 /// lossless and `tone.wav` is the ground-truth source both fixtures share. This
 /// is a stronger check than an ffmpeg hash (equality against the actual source),

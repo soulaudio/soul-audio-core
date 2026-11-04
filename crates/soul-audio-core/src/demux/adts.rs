@@ -139,6 +139,12 @@ fn read_next_header<S: Source>(src: &mut S) -> Result<Option<AdtsHeader>, Decode
 pub struct AdtsReader<S> {
     src: S,
     config: AacConfig,
+    /// Byte offset of the first ADTS frame — where [`Self::rewind`] returns to.
+    /// `0` for a plain `.aac`, but non-zero when an ID3v2 tag fronts the stream
+    /// (iTunes/FAAC), where the reader is constructed past the tag via
+    /// [`Self::new_at`]. Rewinding to `0` instead would re-read the ID3 bytes as
+    /// an ADTS header (a `Malformed` seek) — the bug this field fixes.
+    base: u64,
     /// `raw_data_block` length of a header already read but not yet served —
     /// `Some` right after [`Self::new`] (the first frame's header). Once that
     /// payload is delivered, [`Self::next_frame`] goes back to reading a
@@ -154,12 +160,25 @@ impl<S: Source> AdtsReader<S> {
     /// [`DecodeError::UnexpectedEof`]/[`DecodeError::Io`] on a read failure;
     /// [`DecodeError::Malformed`]/[`DecodeError::Unsupported`] on an invalid
     /// header (see [`parse_header`]).
-    pub fn new(mut src: S) -> Result<Self, DecodeError> {
+    pub fn new(src: S) -> Result<Self, DecodeError> {
+        Self::new_at(src, 0)
+    }
+
+    /// Like [`Self::new`], but records `base` as the byte offset of the first
+    /// ADTS frame so [`Self::rewind`] returns there rather than to `0`. Use when
+    /// the stream is fronted by an ID3v2 tag: seek `src` to `base` first, then
+    /// construct here. The first header is still read from the current position
+    /// (which the caller must have positioned at `base`).
+    ///
+    /// # Errors
+    /// As [`Self::new`].
+    pub fn new_at(mut src: S, base: u64) -> Result<Self, DecodeError> {
         let header = read_first_header(&mut src)?;
         let payload_len = header.frame_len - header.header_len;
         Ok(Self {
             src,
             config: header.config,
+            base,
             pending: Some(payload_len),
         })
     }
@@ -182,7 +201,7 @@ impl<S: Source> AdtsReader<S> {
         S: crate::io::SeekSource,
     {
         self.src
-            .seek(embedded_io::SeekFrom::Start(0))
+            .seek(embedded_io::SeekFrom::Start(self.base))
             .map_err(|_| DecodeError::Io)?;
         let header = read_first_header(&mut self.src)?;
         self.pending = Some(header.frame_len - header.header_len);
@@ -316,5 +335,42 @@ mod tests {
         let mut r = AdtsReader::new(SliceSource::new(AAC)).unwrap();
         let mut tiny = [0u8; 1];
         assert_eq!(r.next_frame(&mut tiny).unwrap_err(), DecodeError::Malformed);
+    }
+
+    #[test]
+    fn rewind_plain_returns_to_frame_zero() {
+        let mut r = AdtsReader::new(SliceSource::new(AAC)).unwrap();
+        let mut buf = [0u8; 8192];
+        let first = r.next_frame(&mut buf).unwrap().unwrap().to_vec();
+        r.next_frame(&mut buf).unwrap().unwrap(); // advance
+        r.rewind().unwrap();
+        let again = r.next_frame(&mut buf).unwrap().unwrap().to_vec();
+        assert_eq!(first, again, "rewind must re-serve frame 0");
+    }
+
+    #[test]
+    fn rewind_id3_prefixed_returns_to_adts_start_not_byte_zero() {
+        use embedded_io::{Seek, SeekFrom};
+        // Front the raw ADTS with a 30-byte ID3v2 tag (10-byte header declaring a
+        // 20-byte body) — the iTunes/FAAC layout `open_seekable` handles. The
+        // reader is built past the tag; rewinding to byte 0 would parse the ID3
+        // bytes as an ADTS header → Malformed (the bug this guards).
+        const ID3_LEN: u64 = 30;
+        let mut full = vec![b'I', b'D', b'3', 3, 0, 0, 0, 0, 0, 20];
+        full.resize(ID3_LEN as usize, 0); // 20 padding bytes
+        full.extend_from_slice(AAC);
+
+        let mut src = SliceSource::new(&full);
+        src.seek(SeekFrom::Start(ID3_LEN)).unwrap();
+        let mut r = AdtsReader::new_at(src, ID3_LEN).unwrap();
+
+        let mut buf = [0u8; 8192];
+        let first = r.next_frame(&mut buf).unwrap().unwrap().to_vec();
+        r.rewind().unwrap(); // must land on ID3_LEN, not 0
+        let again = r.next_frame(&mut buf).unwrap().unwrap().to_vec();
+        assert_eq!(
+            first, again,
+            "rewind must return to the first ADTS frame past the ID3 tag"
+        );
     }
 }

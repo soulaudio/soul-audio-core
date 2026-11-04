@@ -319,7 +319,9 @@ pub fn open_seekable<S: BufSource + crate::io::SeekSource>(
         let hint = adts_total_frames(&mut src, start);
         src.seek(embedded_io::SeekFrom::Start(start))
             .map_err(|_| DecodeError::Io)?;
-        let mut dec = AacDecoder::new_adts(AdtsReader::new(src)?)?;
+        // `new_at(start)` so a later seek rewinds to the first ADTS frame, not to
+        // byte 0 (the ID3 tag) — the latter decodes ID3 bytes as ADTS → Malformed.
+        let mut dec = AacDecoder::new_adts(AdtsReader::new_at(src, start)?)?;
         dec.set_length_hint(hint);
         return Ok(AnyDecoder::Aac(dec));
     }

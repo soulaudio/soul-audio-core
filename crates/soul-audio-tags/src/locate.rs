@@ -13,6 +13,9 @@ pub enum Container {
     Dsf,
     Dff,
     Adts,
+    /// A bare MPEG audio elementary stream with no leading ID3 tag (a tagless
+    /// `.mp3`/`.mp2`/`.mp1`). Carries no text tags; read only for its duration.
+    Mpeg,
     WavPack,
     Caf,
     Matroska,
@@ -62,6 +65,11 @@ pub fn sniff<S: SeekSource>(src: &mut S) -> Result<Container, TagError> {
         // ADTS syncword 0xFFF + layer == 00 (the 0x06 mask rules out an MP3
         // frame, whose layer bits are non-zero).
         Container::Adts
+    } else if h.len() >= 2 && h[0] == 0xFF && (h[1] & 0xE0) == 0xE0 && (h[1] & 0x06) != 0 {
+        // A bare MPEG audio frame (sync 0xFFE + a non-reserved layer) with no
+        // ID3 tag — a tagless `.mp3`/`.mp2`/`.mp1`. No text tags to read; the
+        // reader returns only the frame-scan duration.
+        Container::Mpeg
     } else {
         Container::Unknown
     };
