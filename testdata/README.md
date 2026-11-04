@@ -112,6 +112,9 @@ Goldberg Variations` (self-contained lavfi source in `generate.sh`).
 | `meta.mp3` | ID3v2 |
 | `meta-aac.m4a` / `meta-alac.m4a` | MP4 `ilst`, with **`moov` after `mdat`** (ffmpeg default — no `+faststart`) |
 | `meta-oggflac.oga` | FLAC-in-Ogg — STREAMINFO `total_samples = 0`, duration recovered from the Ogg granule |
+| `meta.mka` / `meta.webm` | Matroska / WebM — EBML `\Info` (Title + Duration) and `\Tags` SimpleTags |
+| `meta.caf` | Apple CAF — `info` chunk key/value pairs + `pakt` frame count |
+| `meta.wv` | WavPack — trailing APEv2 tag + header sample count |
 | `meta.aiff` | AIFF `NAME` chunk (title only; ffmpeg writes no artist/album for AIFF) |
 | `meta.aac` | raw ADTS — no tag structure, facts only |
 

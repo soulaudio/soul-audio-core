@@ -256,3 +256,9 @@ ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a flac -f ogg    "${MT[@]}
 ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a aac  -f adts   "${MT[@]}" meta.aac
 ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a aac            "${MT[@]}" meta-aac.m4a  # moov AFTER mdat
 ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a alac           "${MT[@]}" meta-alac.m4a # moov AFTER mdat
+# Matroska/WebM (EBML tags), CAF (`info` chunk), WavPack (APEv2) — the
+# containers whose tag readers landed alongside the dogfooding fixes.
+ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a libopus -f matroska "${MT[@]}" meta.mka
+ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a libopus -f webm     "${MT[@]}" meta.webm
+ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a alac   -f caf       "${MT[@]}" meta.caf
+ffmpeg -y -hide_banner -loglevel error -i meta.wav -c:a wavpack             "${MT[@]}" meta.wv

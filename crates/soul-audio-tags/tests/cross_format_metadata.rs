@@ -51,6 +51,10 @@ fn cases() -> Vec<Case> {
         full("meta-aac.m4a"),  // moov after mdat (ffmpeg default muxing)
         full("meta-alac.m4a"), // moov after mdat
         full("meta-oggflac.oga"),
+        full("meta.mka"),  // Matroska (EBML tags)
+        full("meta.webm"), // WebM (EBML tags)
+        full("meta.caf"),  // CAF (`info` chunk)
+        full("meta.wv"),   // WavPack (APEv2)
         Case {
             file: "meta.aiff",
             title: Some(TITLE),
@@ -111,7 +115,8 @@ fn every_format_reports_consistent_tags_and_duration() {
         match (facts.total_frames, facts.sample_rate) {
             (Some(tf), Some(sr)) if sr > 0 => {
                 let secs = tf as f64 / f64::from(sr);
-                if !(1.45..=1.60).contains(&secs) {
+                // ~1.5 s; a little slack for ALAC/Opus frame-padding at the tail.
+                if !(1.45..=1.65).contains(&secs) {
                     failures.push(format!("{}: duration {secs:.3}s not ~1.5s", c.file));
                 }
             }

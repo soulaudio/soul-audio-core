@@ -13,6 +13,9 @@ pub enum Container {
     Dsf,
     Dff,
     Adts,
+    WavPack,
+    Caf,
+    Matroska,
     Unknown,
 }
 
@@ -41,6 +44,13 @@ pub fn sniff<S: SeekSource>(src: &mut S) -> Result<Container, TagError> {
         Container::Dsf
     } else if h.starts_with(b"FRM8") && h.len() >= 16 && &h[12..16] == b"DSD " {
         Container::Dff
+    } else if h.starts_with(b"wvpk") {
+        Container::WavPack
+    } else if h.starts_with(b"caff") {
+        Container::Caf
+    } else if h.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        // EBML magic → Matroska or WebM (same container; the DocType differs).
+        Container::Matroska
     } else if h.len() >= 2 && h[0] == 0xFF && (h[1] & 0xF6) == 0xF0 {
         // ADTS syncword 0xFFF + layer == 00 (the 0x06 mask rules out an MP3
         // frame, whose layer bits are non-zero).
@@ -87,6 +97,9 @@ mod tests {
         assert_eq!(sniff_bytes(b"DSD \0\0\0\0"), Container::Dsf);
         assert_eq!(sniff_bytes(b"FRM8\0\0\0\0\0\0\0\0DSD "), Container::Dff);
         assert_eq!(sniff_bytes(b"\xFF\xF1\x50\x80"), Container::Adts);
+        assert_eq!(sniff_bytes(b"wvpk\0\0\0\0"), Container::WavPack);
+        assert_eq!(sniff_bytes(b"caff\0\x01\0\0"), Container::Caf);
+        assert_eq!(sniff_bytes(b"\x1A\x45\xDF\xA3"), Container::Matroska);
         assert_eq!(sniff_bytes(b"garbage!"), Container::Unknown);
     }
 }
