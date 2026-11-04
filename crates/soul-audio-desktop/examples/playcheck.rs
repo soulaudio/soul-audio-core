@@ -43,6 +43,10 @@ fn check(path: &str) -> Result<String, String> {
     let mut frames: u64 = 0;
     let mut nonzero = false;
     let mut buf = [0i32; 4096];
+    // Diagnostic: when SOUL_PCM_OUT is set, dump the decoded (capped) interleaved
+    // i32 LE PCM so a caller can spectrum-check it (music vs. a pure tone).
+    let mut pcm_out = std::env::var_os("SOUL_PCM_OUT")
+        .map(|p| std::io::BufWriter::new(std::fs::File::create(p).expect("SOUL_PCM_OUT create")));
     while frames < cap {
         let n = d
             .decode_into(&mut buf)
@@ -51,6 +55,12 @@ fn check(path: &str) -> Result<String, String> {
             break; // EOF before the cap (short clip)
         }
         nonzero |= buf[..n].iter().any(|&s| s != 0);
+        if let Some(w) = pcm_out.as_mut() {
+            use std::io::Write;
+            for &s in &buf[..n] {
+                w.write_all(&s.to_le_bytes()).ok();
+            }
+        }
         frames += n as u64 / u64::from(ch.max(1));
     }
     let hit = if frames >= cap { "5s+" } else { "EOF" };
