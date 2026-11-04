@@ -715,7 +715,10 @@ fn real_dst_slice_decodes_to_stable_output() {
     let pcm = read_pcm(&out);
     assert_eq!(pcm.len(), 3072, "DST render length changed");
     assert!(pcm.iter().any(|&s| s.abs() > 1000), "DST render silent");
-    // Regression lock over the interleaved i32 LE PCM (fnv1a-64).
+    // Regression lock over the interleaved i32 LE PCM (fnv1a-64). The hash pins
+    // the playback path, which decimates DSD to its native 44.1 kHz family (two
+    // linear-phase stages) before the 44.1→48 kHz resample — not the archival
+    // 352.8 kHz single-stage path (see `PlaybackDecimateAdapter`).
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &s in &pcm {
         for b in s.to_le_bytes() {
@@ -724,7 +727,7 @@ fn real_dst_slice_decodes_to_stable_output() {
         }
     }
     assert_eq!(
-        h, 0xd740_27c2_0c9a_a639,
+        h, 0xdebe_81fc_0d12_6c9d,
         "DST pipeline output changed (hash {h:#018x}) — a DST/decimate/resample regression"
     );
 }
