@@ -9,8 +9,10 @@
 //! decoupled from the decoder/demux stack.
 //!
 //! Deliberate scope limits:
-//! - Layer III only (what "MP3" means in practice); a Layer I/II or
-//!   reserved-layer header is treated as sync noise and skipped over.
+//! - Layer I/II/III are all parsed (so `.mp2`/`.mp1` report a duration too);
+//!   a reserved-layer or reserved-version header is treated as sync noise and
+//!   skipped over. Xing/Info/VBRI is a Layer III convention — Layer I/II (CBR
+//!   in practice) fall through to the file-length × bitrate estimate below.
 //! - Free-format bitrate (index 0) is declined — its frame length isn't
 //!   table-derivable, and it's vanishingly rare in the wild.
 //! - Without a Xing/Info/VBRI header, `total_frames` is estimated from the
@@ -30,12 +32,22 @@ use soul_audio_core::SeekSource;
 /// MP3 syncs within the first few bytes.
 const SYNC_SCAN_WINDOW: usize = 8192;
 
-/// Bitrate (kbps) by 4-bit index, Layer III only, 0 = free/reserved (never a
-/// valid frame — the free-format case is out of scope, see module docs).
+/// Bitrate (kbps) by 4-bit index per (MPEG version, layer), `0` = free/reserved
+/// (never a valid frame here — the free-format case is out of scope, see module
+/// docs). MPEG-2/2.5 share one table for Layers II and III.
+const BR_V1_L1: [u32; 16] = [
+    0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0,
+];
+const BR_V1_L2: [u32; 16] = [
+    0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0,
+];
 const BR_V1_L3: [u32; 16] = [
     0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
 ];
-const BR_V2_L3: [u32; 16] = [
+const BR_V2_L1: [u32; 16] = [
+    0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0,
+];
+const BR_V2_L23: [u32; 16] = [
     0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
 ];
 
@@ -48,7 +60,7 @@ const SAMPLE_RATES: [[u32; 4]; 4] = [
     [44100, 48000, 32000, 0],
 ];
 
-/// A parsed, validated Layer III frame header.
+/// A parsed, validated MPEG audio frame header (Layer I/II/III).
 #[derive(Clone, Copy)]
 struct FrameHeader {
     mpeg1: bool,
@@ -61,18 +73,25 @@ struct FrameHeader {
     crc_bytes: u64,
 }
 
-/// Parse+validate a 4-byte MPEG frame header. `None` for anything that isn't
-/// a supported (Layer III, non-free-format, non-reserved) frame — the caller
-/// treats that as sync noise and keeps scanning.
+/// Parse+validate a 4-byte MPEG audio frame header (Layer I/II/III). `None` for
+/// anything that isn't a supported (non-free-format, non-reserved) frame — the
+/// caller treats that as sync noise and keeps scanning. Duration is derived from
+/// the bitrate + samples-per-frame (both layer-dependent), so Layer II (`.mp2`)
+/// and Layer I (`.mp1`) report a track length too, not just Layer III.
 fn parse_header(h: &[u8; 4]) -> Option<FrameHeader> {
     if h[0] != 0xFF || (h[1] & 0xE0) != 0xE0 {
         return None;
     }
     let version = (h[1] >> 3) & 0x3; // 0=2.5, 1=reserved, 2=v2, 3=v1
-    let layer = (h[1] >> 1) & 0x3; // 01=III, 10=II, 11=I, 00=reserved
-    if version == 1 || layer != 1 {
+    let layer_code = (h[1] >> 1) & 0x3; // 01=III, 10=II, 11=I, 00=reserved
+    if version == 1 || layer_code == 0 {
         return None;
     }
+    let layer = match layer_code {
+        1 => 3,
+        2 => 2,
+        _ => 1,
+    };
     let br_idx = ((h[2] >> 4) & 0xF) as usize;
     let sr_idx = ((h[2] >> 2) & 0x3) as usize;
     let chan_mode = (h[3] >> 6) & 0x3;
@@ -85,17 +104,26 @@ fn parse_header(h: &[u8; 4]) -> Option<FrameHeader> {
     if sample_rate == 0 {
         return None;
     }
-    let bitrate_kbps = if mpeg1 {
-        BR_V1_L3[br_idx]
-    } else {
-        BR_V2_L3[br_idx]
+    let bitrate_kbps = match (mpeg1, layer) {
+        (true, 1) => BR_V1_L1[br_idx],
+        (true, 2) => BR_V1_L2[br_idx],
+        (true, _) => BR_V1_L3[br_idx],
+        (false, 1) => BR_V2_L1[br_idx],
+        (false, _) => BR_V2_L23[br_idx], // Layer II and III share the MPEG-2/2.5 table
     };
     if bitrate_kbps == 0 {
         return None;
     }
 
     let channels = if chan_mode == 3 { 1 } else { 2 };
-    let samples_per_frame = if mpeg1 { 1152 } else { 576 };
+    // Samples per frame: Layer I = 384; Layer II = 1152 (all versions); Layer III
+    // = 1152 (MPEG-1) / 576 (MPEG-2/2.5).
+    let samples_per_frame = match layer {
+        1 => 384,
+        2 => 1152,
+        _ if mpeg1 => 1152,
+        _ => 576,
+    };
     let crc_bytes = if h[1] & 0x1 == 0 { 2 } else { 0 }; // protection bit 0 = CRC present
 
     Some(FrameHeader {
@@ -121,8 +149,8 @@ fn side_info_len(mpeg1: bool, mono: bool) -> u64 {
 }
 
 /// Scan forward from `audio_start` (`src`'s position on entry must match),
-/// within [`SYNC_SCAN_WINDOW`] bytes, for the first valid Layer III frame
-/// sync. On success, `src` is left positioned just past the 4-byte header
+/// within [`SYNC_SCAN_WINDOW`] bytes, for the first valid MPEG audio frame
+/// sync (any layer). On success, `src` is left positioned just past the 4-byte header
 /// (`header_end`); returns the header and its absolute start offset.
 fn find_first_frame<S: SeekSource>(src: &mut S, audio_start: u64) -> Option<(FrameHeader, u64)> {
     let mut window = [0u8; 4];
@@ -207,14 +235,16 @@ fn try_read_facts<S: SeekSource>(src: &mut S) -> Option<StreamFacts> {
     let total_frames = match mpeg_frames {
         Some(frames) => frames.saturating_mul(u64::from(header.samples_per_frame)),
         None => {
-            // No VBR header: approximate from the file length and this
-            // frame's (assumed constant) bitrate. Documented approximation —
-            // loses sub-second precision to the truncating integer division,
-            // and is simply wrong if the stream is actually VBR without a tag.
+            // No VBR header: approximate from the file length and this frame's
+            // (assumed constant) bitrate. Compute per-channel samples in one
+            // u128 expression — `bytes*8*rate/bitrate` — so sub-second files
+            // keep their length instead of truncating to 0 whole seconds. Still
+            // an approximation (wrong for an untagged VBR stream).
             let file_len = src.seek(SeekFrom::End(0)).ok()?;
             let audio_bytes = file_len.saturating_sub(audio_start);
-            let secs = audio_bytes.saturating_mul(8) / u64::from(header.bitrate_bps);
-            secs.saturating_mul(u64::from(header.sample_rate))
+            let samples = u128::from(audio_bytes) * 8 * u128::from(header.sample_rate)
+                / u128::from(header.bitrate_bps);
+            u64::try_from(samples).unwrap_or(u64::MAX)
         }
     };
 
@@ -282,20 +312,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_layer3_and_reserved_headers() {
-        // Layer II (layer bits = 10) at otherwise-valid bitrate/rate indices.
-        let mut h = header_v1(9, 0, false, true);
-        h[1] = (h[1] & !0b0000_0110) | (0b10 << 1);
-        assert!(parse_header(&h).is_none());
+    fn parses_layer2_and_rejects_reserved_headers() {
+        // Layer II (layer bits = 10) is now parsed: 1152 samples/frame and the
+        // Layer II bitrate table (MPEG-1 idx 9 = 160 kbps).
+        let mut l2 = header_v1(9, 0, false, true);
+        l2[1] = (l2[1] & !0b0000_0110) | (0b10 << 1);
+        let f = parse_header(&l2).expect("Layer II is a valid header");
+        assert_eq!(f.samples_per_frame, 1152);
+        assert_eq!(f.bitrate_bps, 160_000);
+
+        // Reserved layer (bits 00) is still rejected.
+        let mut resv = header_v1(9, 0, false, true);
+        resv[1] &= !0b0000_0110;
+        assert!(parse_header(&resv).is_none());
 
         // Reserved version (bits 3-4 of byte1 = 01).
-        let mut h2 = header_v1(9, 0, false, true);
-        h2[1] = (h2[1] & !0b0001_1000) | (0b01 << 3);
-        assert!(parse_header(&h2).is_none());
+        let mut v = header_v1(9, 0, false, true);
+        v[1] = (v[1] & !0b0001_1000) | (0b01 << 3);
+        assert!(parse_header(&v).is_none());
 
         // Free-format bitrate (index 0).
-        let h3 = header_v1(0, 0, false, true);
-        assert!(parse_header(&h3).is_none());
+        assert!(parse_header(&header_v1(0, 0, false, true)).is_none());
     }
 
     #[test]

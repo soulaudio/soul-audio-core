@@ -1,7 +1,10 @@
-//! MP3 (MPEG-1/2/2.5 Audio Layer III) demuxer — skips ID3v2, locks onto the
+//! MPEG-1/2/2.5 Audio (Layer I/II/III) demuxer — skips ID3v2, locks onto the
 //! frame sync, parses stream parameters, and packetizes one MPEG frame per
-//! packet. MP3 *decoding* (Huffman, IMDCT, the bit reservoir) is the codec's
-//! job, deferred.
+//! packet. `parse_header` accepts all three layers (Layer I/II frames differ
+//! only in size and samples-per-frame); the codec routes Layer I/II to the
+//! `mp3_l12` sub-decoder and Layer III (the common `.mp3`) to `mp3_codec`.
+//! *Decoding* (Huffman, IMDCT, the bit reservoir / the L1/L2 subband synthesis)
+//! is the codec's job, deferred.
 
 use embedded_io::SeekFrom;
 
@@ -467,8 +470,10 @@ fn parse_lame_delays(frame: &[u8], off: usize) -> (u32, u32) {
     (delay, padding)
 }
 
-/// Parse+validate a 4-byte MPEG Layer III frame header. `None` if not a valid L3
-/// frame (reserved fields, free/bad bitrate, non-Layer-III, etc.).
+/// Parse+validate a 4-byte MPEG audio frame header (Layer I/II/III). `None` for
+/// a reserved MPEG version, reserved layer (`00`), free/bad bitrate, or reserved
+/// sample-rate index. Layer I/II/III differ only in samples-per-frame and byte
+/// length (computed below).
 fn parse_header(h: &[u8; 4]) -> Option<Frame> {
     if h[0] != 0xFF || (h[1] & 0xE0) != 0xE0 {
         return None;
