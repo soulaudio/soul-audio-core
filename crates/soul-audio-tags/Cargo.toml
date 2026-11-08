@@ -2,6 +2,7 @@
 name = "soul-audio-tags"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 description = "no_std, no-alloc audio tag + cover-art reader (ID3v2, VorbisComment, MP4 ilst)."
 
 [features]

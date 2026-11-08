@@ -1,0 +1,22 @@
+name: Feature request
+description: Suggest a codec, container, or capability
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do that the library doesn't support today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like to see? Link a spec/reference if relevant.
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Fit with the project's constraints
+      options:
+        - label: This can be done without `unsafe` and without heap allocation in `soul-audio-core`

@@ -1,0 +1,38 @@
+name: PR title
+
+# The repo squash-merges, so the PR title becomes the commit subject. Enforce
+# the same policy the local `commit-msg` hook does: Conventional Commits + a
+# clean history (no tool-attribution). Self-contained — no third-party action.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: conventional + clean
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -eu
+          echo "PR title: $TITLE"
+
+          # 1. No AI / attribution references ("ai" only as a whole word).
+          if printf '%s' "$TITLE" | grep -iqE 'claude|anthropic|co-?authored|generated with|🤖|(^|[^[:alnum:]])ai([^[:alnum:]]|$)'; then
+            echo "::error::PR title must not mention Claude / Anthropic / AI / co-author."
+            exit 1
+          fi
+
+          # 2. Conventional Commits.
+          if ! printf '%s' "$TITLE" | grep -qE '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?!?: .+'; then
+            echo "::error::PR title must be a Conventional Commit, e.g. 'feat(core): add WavPack seeking'."
+            echo "::error::Allowed types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert."
+            exit 1
+          fi
+
+          echo "OK"

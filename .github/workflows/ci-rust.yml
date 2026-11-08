@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify (fmt · clippy · tests · no_std cross-builds)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # rust-toolchain.toml pins the channel, components, and the thumbv7em
+      # target; rustup installs them on first use. Add them explicitly so a
+      # missing component fails fast and clearly.
+      - name: Set up Rust
+        run: |
+          rustup component add rustfmt clippy
+          rustup target add thumbv7em-none-eabihf
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      # The full gate: fmt, clippy -D warnings, generated-table checks, the host
+      # test suite, and the no_std cross-builds for the STM32 target.
+      - name: cargo xtask ci
+        run: cargo xtask ci

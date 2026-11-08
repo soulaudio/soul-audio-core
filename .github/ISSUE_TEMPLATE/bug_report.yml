@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a decoding/playback bug, wrong output, or a crash
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! For **security** issues, please use
+        [private reporting](https://github.com/soulaudio/soul-audio-core/security/advisories/new)
+        instead of a public issue.
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: The crate version or git commit you hit this on.
+    validations:
+      required: true
+  - type: dropdown
+    id: format
+    attributes:
+      label: Format / codec
+      options:
+        - WAV
+        - FLAC
+        - MP3
+        - AAC
+        - ALAC
+        - Vorbis
+        - Opus
+        - DSD
+        - Other / N/A
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you expected vs. what actually happened. A minimal repro helps a lot.
+    validations:
+      required: true
+  - type: textarea
+    id: sample
+    attributes:
+      label: Input sample
+      description: >
+        If it's input-specific, how can we obtain a file that reproduces it?
+        Please do not attach copyrighted audio.
+  - type: input
+    id: platform
+    attributes:
+      label: Platform / target
+      description: e.g. x86_64 Windows, aarch64 macOS, thumbv7em-none-eabihf.
