@@ -4,6 +4,9 @@
 
 # Local tooling / session state (not part of the template)
 /.claude/
+/.pi/
+# Python bytecode caches from the testdata helper scripts
+**/__pycache__/
 
 # Plan 4 desktop app (app/ — isolated from the root cargo workspace)
 /app/node_modules/
