@@ -24,7 +24,7 @@ pub use deck::{Deck, DeckError, DeckState, Progress};
 pub use decoder::{DecodeError, Decoder, DsdDecoder, DsdSeek, SeekableDecoder};
 pub use demux::{Demuxer, FlacDemuxer, Mp3Demuxer, Packet, WavDemuxer};
 pub use dispatch::{AnyDecoder, open};
-pub use dsd::{DecimateAdapter, DopAdapter};
+pub use dsd::{DecimateAdapter, DopAdapter, PlaybackDecimateAdapter};
 pub use io::{BufReader, BufSource, SeekSource, SliceSource, Source};
 pub use model::{DsdMode, DsdRate, Format, SampleFormat, StreamInfo};
 pub use probe::probe;

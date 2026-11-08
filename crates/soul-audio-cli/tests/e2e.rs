@@ -723,8 +723,11 @@ fn real_dst_slice_decodes_to_stable_output() {
             h = h.wrapping_mul(0x0100_0000_01b3);
         }
     }
+    // Relocked after DSD playback decimates to its native 44.1 kHz family
+    // (PlaybackDecimateAdapter): the intermediate decimated rate changed
+    // 352.8 kHz -> 44.1 kHz, so the 48 kHz render samples (not length) shifted.
     assert_eq!(
-        h, 0xd740_27c2_0c9a_a639,
+        h, 0xdebe_81fc_0d12_6c9d,
         "DST pipeline output changed (hash {h:#018x}) — a DST/decimate/resample regression"
     );
 }
