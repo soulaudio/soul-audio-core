@@ -18,6 +18,14 @@ pre-commit:
       glob: "*.{rs,toml}"
       run: cargo clippy --all-targets -- -D warnings
 
+# Commit-message policy: Conventional Commits + a clean history (no AI /
+# attribution trailers). Pure-Rust check so it behaves identically on every
+# platform — `{1}` is the path to the commit-message file git passes in.
+commit-msg:
+  commands:
+    policy:
+      run: cargo xtask check-commit-msg {1}
+
 # Full gate before pushing: fmt, clippy, host tests, and both STM32 builds
 # (core no_std + firmware) for thumbv7em.
 pre-push:

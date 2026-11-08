@@ -7,6 +7,7 @@
 use std::path::Path;
 use std::process::{Command, exit};
 
+mod commit_msg;
 mod filterbank_tables;
 mod opus_tables;
 mod ps_tables;
@@ -15,13 +16,14 @@ mod sbr_tables;
 mod silk_tables;
 mod vorbis_tables;
 
-const USAGE: &str = "usage: cargo xtask <verify|ci|qa-audio|gen-resample-tables|gen-filterbank-tables|gen-sbr-tables|gen-ps-tables|gen-vorbis-tables|gen-opus-tables|gen-silk-tables>";
+const USAGE: &str = "usage: cargo xtask <verify|ci|qa-audio|check-commit-msg <file>|gen-resample-tables|gen-filterbank-tables|gen-sbr-tables|gen-ps-tables|gen-vorbis-tables|gen-opus-tables|gen-silk-tables>";
 
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
     let result = match cmd.as_str() {
         "verify" | "ci" => verify(),
         "qa-audio" => qa_audio(),
+        "check-commit-msg" => commit_msg::check(std::env::args().nth(2)),
         "gen-resample-tables" => resample_tables::run(),
         "check-resample-tables" => resample_tables::check(),
         "gen-filterbank-tables" => filterbank_tables::run(),
