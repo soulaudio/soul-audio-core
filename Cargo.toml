@@ -13,6 +13,7 @@ members = [
   "crates/soul-audio-catalog",
   "crates/soul-audio-index",
   "crates/soul-audio-import",
+  "crates/soul-audio-multicatalog",
   "crates/architecture-tests",
   "xtask",
 ]
@@ -28,6 +29,7 @@ default-members = [
   "crates/soul-audio-catalog",
   "crates/soul-audio-index",
   "crates/soul-audio-import",
+  "crates/soul-audio-multicatalog",
   "crates/architecture-tests",
   "xtask",
 ]

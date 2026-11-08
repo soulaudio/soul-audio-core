@@ -1,0 +1,26 @@
+[package]
+name = "soul-audio-multicatalog"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Desktop-only (std) aggregate Catalog: compose N member catalogs into one via a k-way collation merge, routing compound (source, local) ids. The DAP is the N=1 case and never uses this crate."
+
+[lints]
+workspace = true
+
+[dependencies]
+soul-audio-catalog = { path = "../soul-audio-catalog" }
+# `alloc` gives us `soul_audio_index::collation::key` — the SAME key the baker
+# sorts by, so the merge comparator matches the frozen per-source order.
+soul-audio-index = { path = "../soul-audio-index", features = ["alloc"] }
+
+[dev-dependencies]
+# Unit tests bake in-memory member indices (the `build` baker) and read them back
+# over an in-memory `SliceSource`; the e2e test additionally scans real audio
+# fixtures through the importer and decodes located files through core's `open`.
+soul-audio-core = { path = "../soul-audio-core" }
+soul-audio-index = { path = "../soul-audio-index", features = ["build"] }
+# e2e only: real filesystem scan + bake of on-disk fixtures (dev-dep, so it does
+# not enter this crate's normal-dependency surface or shift its tier).
+soul-audio-import = { path = "../soul-audio-import" }

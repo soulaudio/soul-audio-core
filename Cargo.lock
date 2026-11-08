@@ -1915,6 +1915,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "soul-audio-multicatalog"
+version = "0.1.0"
+dependencies = [
+ "soul-audio-catalog",
+ "soul-audio-core",
+ "soul-audio-import",
+ "soul-audio-index",
+]
+
+[[package]]
 name = "soul-audio-queue"
 version = "0.1.0"
 dependencies = [
