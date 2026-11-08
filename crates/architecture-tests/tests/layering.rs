@@ -77,3 +77,76 @@ fn shells_depend_on_core_not_the_reverse() {
         );
     }
 }
+
+// --- Shared data layer (catalog + index) boundaries. These are the
+// machine-enforced half of the "shared 1:1, platform via adapters" design (see
+// docs/superpowers/specs/2026-11-08-shared-catalog-index-architecture.md). The
+// no_std/no-alloc/thumbv7em build gates enforce the other half. ---
+
+/// `soul-audio-catalog` (the shared model + ports) must stay as lean as
+/// core/engine so it builds no_std for the DAP.
+const CATALOG_ALLOWLIST: &[&str] = &["soul-audio-core", "embedded-io"];
+/// The `soul-audio-index` reader may additionally sit on the catalog.
+const INDEX_ALLOWLIST: &[&str] = &["soul-audio-core", "soul-audio-catalog", "embedded-io"];
+
+#[test]
+fn catalog_stays_lean() {
+    let md = MetadataCommand::new().exec().unwrap();
+    for dep in normal_dep_names(pkg(&md, "soul-audio-catalog")) {
+        assert!(
+            CATALOG_ALLOWLIST.contains(&dep.as_str()),
+            "soul-audio-catalog has a disallowed normal dependency: {dep} \
+             (the shared model must stay no_std-able — move platform deps to an adapter)"
+        );
+    }
+}
+
+#[test]
+fn index_sits_on_core_and_catalog_only() {
+    let md = MetadataCommand::new().exec().unwrap();
+    for dep in normal_dep_names(pkg(&md, "soul-audio-index")) {
+        assert!(
+            INDEX_ALLOWLIST.contains(&dep.as_str()),
+            "soul-audio-index has a disallowed normal dependency: {dep} \
+             (the reader is no-alloc; the std baker lives behind the `build` feature)"
+        );
+    }
+}
+
+#[test]
+fn core_does_not_depend_on_shared_data_layer() {
+    let md = MetadataCommand::new().exec().unwrap();
+    let core_deps = normal_dep_names(pkg(&md, "soul-audio-core"));
+    for data_crate in ["soul-audio-catalog", "soul-audio-index"] {
+        assert!(
+            !core_deps.contains(&data_crate.to_string()),
+            "soul-audio-core must not depend on {data_crate} (layering points one way)"
+        );
+    }
+}
+
+#[test]
+fn import_sits_above_the_shared_layer() {
+    let md = MetadataCommand::new().exec().unwrap();
+    // The desktop importer (std) sits on the shared layer + the tag reader.
+    let import_deps = normal_dep_names(pkg(&md, "soul-audio-import"));
+    for needed in [
+        "soul-audio-core",
+        "soul-audio-catalog",
+        "soul-audio-index",
+        "soul-audio-tags",
+    ] {
+        assert!(
+            import_deps.contains(&needed.to_string()),
+            "soul-audio-import should depend on {needed}"
+        );
+    }
+    // The shared no_std layer must never depend on the std importer (it's a
+    // leaf desktop adapter — the DAP builds without it).
+    for shared in ["soul-audio-core", "soul-audio-catalog", "soul-audio-index"] {
+        assert!(
+            !normal_dep_names(pkg(&md, shared)).contains(&"soul-audio-import".to_string()),
+            "{shared} must not depend on soul-audio-import"
+        );
+    }
+}

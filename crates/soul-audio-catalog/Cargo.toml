@@ -1,0 +1,19 @@
+[package]
+name = "soul-audio-catalog"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "no_std music-catalog model + ports (Catalog/ArtStore) shared 1:1 by the desktop app and the DAP. See docs/superpowers/specs/2026-11-08-shared-catalog-index-architecture.md."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+alloc = []
+std = ["alloc"]
+
+[dependencies]
+soul-audio-core = { path = "../soul-audio-core" }
+embedded-io = { workspace = true }

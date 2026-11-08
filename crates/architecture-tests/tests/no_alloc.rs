@@ -9,7 +9,12 @@
 //! `thumbv7em` build enforces it at compile time).
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+// The counting allocator is a single global; two tests measuring it in parallel
+// would corrupt each other's before/after. Serialize the measured regions.
+static MEASURE: Mutex<()> = Mutex::new(());
 
 use embedded_io::{Read, Seek, SeekFrom};
 use soul_audio_core::{BufReader, SliceSource};
@@ -40,6 +45,7 @@ fn core_io_does_not_allocate() {
     let mut out = [0u8; 64];
     let mut scratch = [0u8; 16];
 
+    let _guard = MEASURE.lock().unwrap();
     let before = ALLOCS.load(Ordering::SeqCst);
 
     // Pure no-alloc plumbing across the whole capability ladder:
@@ -55,4 +61,43 @@ fn core_io_does_not_allocate() {
     let after = ALLOCS.load(Ordering::SeqCst);
 
     assert_eq!(before, after, "soul-audio-core io plumbing allocated");
+}
+
+/// The `.soulidx` READER path must not allocate — it reads records/strings into
+/// caller buffers over a seekable source. Skeleton stage: the reader stubs do
+/// no work and no alloc; once the codec lands (and actually seeks/reads), this
+/// is what keeps it heap-free on the DAP. (The baker is `build`-gated std and is
+/// deliberately not exercised here.)
+#[test]
+fn index_reader_does_not_allocate() {
+    use soul_audio_catalog::{BrowseAxis, Catalog, StrRef};
+    use soul_audio_core::SliceSource;
+    use soul_audio_index::IndexReader;
+
+    let bytes = *b"SIDX\x01\x00"; // magic + format version
+    let reader = IndexReader::new(SliceSource::new(&bytes));
+    let mut buf = [0u8; 64];
+
+    let _guard = MEASURE.lock().unwrap();
+    let before = ALLOCS.load(Ordering::SeqCst);
+
+    let _ = reader.track_count();
+    let _ = reader.album_count();
+    let _ = reader.artist_count();
+    let _ = reader.track(0);
+    let _ = reader.album(0);
+    let _ = reader.artist_name(0, &mut buf);
+    let _ = reader.resolve_str(StrRef::default(), &mut buf);
+    let _ = reader.order_len(BrowseAxis::Title);
+    let _ = reader.order(BrowseAxis::ArtistAlbumTrack, 0);
+    let _ = reader.album_track(0, 0);
+    let _ = reader.folder_count();
+    let _ = reader.folder(0);
+    let _ = reader.folder_path(0, &mut buf);
+    let _ = reader.playlist_track(0, 0);
+    let _ = reader.playlist_name(0, &mut buf);
+
+    let after = ALLOCS.load(Ordering::SeqCst);
+
+    assert_eq!(before, after, "the .soulidx reader path allocated");
 }

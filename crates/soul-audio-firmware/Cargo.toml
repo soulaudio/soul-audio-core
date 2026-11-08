@@ -18,6 +18,10 @@ doctest = false
 
 [dependencies]
 soul-audio-core = { path = "../soul-audio-core" }
+# The no-alloc `.soulidx` reader + catalog ports (default features = reader, NOT
+# the std `build` baker) — the DAP reads the card-baked index, never bakes.
+soul-audio-catalog = { path = "../soul-audio-catalog" }
+soul-audio-index = { path = "../soul-audio-index" }
 embedded-io = { workspace = true }
 cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7"

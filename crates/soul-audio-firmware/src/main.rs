@@ -20,6 +20,14 @@ use embassy_stm32::sai::{Sai, split_subblocks};
 use embassy_stm32::{bind_interrupts, dma, peripherals};
 use static_cell::StaticCell;
 
+/// Read the card-baked `.soulidx` and locate a track (no-alloc). Compiled and
+/// type-checked against the real reader; driven from `main` once the SD
+/// `VolumeManager` in [`sd_source`] is brought up. The intended first-light flow
+/// is: `embassy_stm32::init` → bring up SPI/SD → [`sd_source::SdSource`] over
+/// `/.soulidx/index.sidx` → [`soul_audio_index::IndexReader`] →
+/// [`playback::locate`] track 0 → open `card_root / folder / file` over the same
+/// `SdSource` → [`soul_audio_core::open`] → `decode_into` → [`sai_out::SaiOut`].
+mod playback;
 mod sai_out;
 /// SD-card byte source (phase B). Kept compiled; unused until the board SD stack
 /// is wired.

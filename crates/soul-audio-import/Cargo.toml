@@ -1,0 +1,17 @@
+[package]
+name = "soul-audio-import"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Desktop-only (std) library scanner: walk a music tree, read tags, intern into a catalog with folder-isolation, and bake a .soulidx index the DAP reads verbatim."
+
+[lints]
+workspace = true
+
+[dependencies]
+soul-audio-core = { path = "../soul-audio-core" }
+soul-audio-catalog = { path = "../soul-audio-catalog" }
+soul-audio-index = { path = "../soul-audio-index", features = ["build"] }
+soul-audio-tags = { path = "../soul-audio-tags", features = ["std"] }
+embedded-io-adapters = { workspace = true, features = ["std"] }

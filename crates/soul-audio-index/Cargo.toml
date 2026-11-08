@@ -1,0 +1,34 @@
+[package]
+name = "soul-audio-index"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The .soulidx on-SD catalog index: a no_std/no-alloc reader (DAP + desktop browse) and, behind `build`, a std baker (desktop). Mirrors soul-audio-tags' read/write split."
+
+[lints]
+workspace = true
+
+[features]
+# Default surface = the no-alloc READER (DAP + desktop browse).
+default = []
+alloc = []
+std = ["alloc"]
+# The BAKER (desktop-only): lays out records, pre-sorts order tables, string
+# heap, extended + art blobs. Pulls in std — never enabled on the DAP.
+build = ["std"]
+
+[dependencies]
+soul-audio-core = { path = "../soul-audio-core" }
+soul-audio-catalog = { path = "../soul-audio-catalog" }
+embedded-io = { workspace = true }
+
+[dev-dependencies]
+embedded-io-adapters = { workspace = true, features = ["std"] }
+
+# The format round-trip is the TDD contract: it writes an index (build) and
+# reads it back (reader), so it only builds with the `build` feature — a plain
+# `cargo test` (the no-alloc/embedded gates) never pulls in std for it.
+[[test]]
+name = "roundtrip"
+required-features = ["build"]

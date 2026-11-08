@@ -10,5 +10,8 @@ publish = false
 
 [dev-dependencies]
 soul-audio-core = { path = "../soul-audio-core" }
+soul-audio-catalog = { path = "../soul-audio-catalog" }
+# Default features = the no-alloc reader (no `build` baker).
+soul-audio-index = { path = "../soul-audio-index" }
 embedded-io = { workspace = true }
 cargo_metadata = "0.18"
