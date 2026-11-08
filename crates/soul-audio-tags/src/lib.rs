@@ -15,11 +15,14 @@ pub use base64::decode_into;
 pub use owned::{Tags, read_owned, read_picture_bytes};
 
 mod adts;
+mod aiff;
 mod base64;
+mod caf;
 mod dff;
 mod dsf;
 mod id3v2;
 mod locate;
+mod matroska;
 mod mp3;
 mod mp4;
 mod ogg;
@@ -30,6 +33,7 @@ mod riff;
 pub(crate) mod testfix;
 mod util;
 mod vorbis;
+mod wavpack;
 
 /// Normalized tag field, modeled on Symphonia's StandardTag (player subset).
 #[non_exhaustive]
@@ -118,11 +122,15 @@ pub fn read<S: SeekSource>(
         locate::Container::Flac => vorbis::read_flac(src, scratch, sink),
         locate::Container::Id3 => id3v2::read_mp3(src, scratch, sink),
         locate::Container::Wav => riff::read_wav(src, scratch, sink),
+        locate::Container::Aiff => aiff::read_aiff(src, scratch, sink),
         locate::Container::Dsf => dsf::read_dsf(src, scratch, sink),
         locate::Container::Dff => dff::read_dff(src, scratch, sink),
         locate::Container::Adts => adts::read_adts(src, scratch, sink),
         locate::Container::Mp4 => mp4::read_mp4(src, scratch, sink),
         locate::Container::Ogg => ogg::read_ogg(src, scratch, sink),
+        locate::Container::WavPack => wavpack::read_wavpack(src, scratch, sink),
+        locate::Container::Caf => caf::read_caf(src, scratch, sink),
+        locate::Container::Matroska => matroska::read_matroska(src, scratch, sink),
         _ => Err(TagError::Unsupported),
     }
 }
