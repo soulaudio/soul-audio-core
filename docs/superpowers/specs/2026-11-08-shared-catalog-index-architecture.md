@@ -124,6 +124,17 @@ header. Desktop bakes it; the DAP (and desktop browse) read it.
   walk the array; jump-to-letter = binary search. **No on-device sort, no
   alloc.** This is how "same browse on both devices" is guaranteed: the desktop
   computes the order once; both sides read the frozen answer.
+  - **Collation (decided 2026-11-08, research-informed).** The order is keyed by a
+    **byte-comparable collation sort key** (`soul-audio-index::collation`), not raw
+    bytes or ids: leading articles folded ("The Beatles" files under **B**), case
+    folded, numbers natural ("Track 2" before "Track 10"), the full name breaking
+    ties — the MusicBrainz sort-name + ICU collation-key pattern that S+ players
+    use. The key is computed **only on the desktop** (the baker; and the
+    `MultiCatalog` merge recomputes the same key to compare heads across sources),
+    so the `no_std` device never collates — it reads the frozen order. This is
+    **additive** (no format-version change): same layout, a better order. A
+    *stored* sort-key / per-letter jump index for precise on-device jump-to-letter
+    is deferred (the device's binary search otherwise compares raw bytes).
 - **Playlist table** — playlists live here (decision §8): name heap-ref + a run
   of `u32` track-ids. No external playlist file for v1.
 - **String heap** — UTF-8 blob; records index in by `(offset,len)`; the no-alloc

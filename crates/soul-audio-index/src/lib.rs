@@ -72,6 +72,12 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+/// Collation sort keys for browse ordering — byte-comparable keys the desktop
+/// baker sorts by and the desktop `MultiCatalog` merge compares; the device only
+/// ever reads the frozen order (no collation on `no_std`).
+#[cfg(feature = "alloc")]
+pub mod collation;
+
 use core::cell::RefCell;
 
 use embedded_io::SeekFrom;
@@ -533,24 +539,61 @@ pub mod build {
             });
         }
 
-        // Pre-sorted order tables.
-        let title_order = sorted_ids(track_count, |a, b| tracks[a].title.cmp(&tracks[b].title));
+        // Pre-sorted order tables, keyed by COLLATION order (the browse order S+
+        // players use: leading-article-folded, case-folded, natural numbers).
+        // Keys are computed once per entity here; the `no_std` device reads this
+        // frozen order and never runs collation, and `MultiCatalog` recomputes
+        // the same key to merge sources. Ids break ties for a deterministic order
+        // (and keep folder-isolated same-title albums distinct).
+        let title_key: Vec<Vec<u8>> = tracks
+            .iter()
+            .map(|t| crate::collation::key(&t.title))
+            .collect();
+        let album_key: Vec<Vec<u8>> = input
+            .albums
+            .iter()
+            .map(|a| crate::collation::key(&a.title))
+            .collect();
+        let artist_key: Vec<Vec<u8>> = input
+            .artists
+            .iter()
+            .map(|a| crate::collation::key(a))
+            .collect();
+        let folder_key: Vec<Vec<u8>> = input
+            .folders
+            .iter()
+            .map(|f| crate::collation::key(&f.path))
+            .collect();
+        // An out-of-range id sorts as an empty key (never panics).
+        fn key_at(keys: &[Vec<u8>], i: u32) -> &[u8] {
+            keys.get(i as usize).map_or(&[], |v| v.as_slice())
+        }
+
+        let title_order = sorted_ids(track_count, |a, b| {
+            title_key[a].cmp(&title_key[b]).then(a.cmp(&b))
+        });
         let artist_album_track = sorted_ids(track_count, |a, b| {
             let (x, y) = (&tracks[a], &tracks[b]);
-            (x.album_artist, x.album, x.disc_no, x.track_no).cmp(&(
-                y.album_artist,
-                y.album,
-                y.disc_no,
-                y.track_no,
-            ))
+            key_at(&artist_key, x.album_artist)
+                .cmp(key_at(&artist_key, y.album_artist))
+                .then_with(|| x.album_artist.cmp(&y.album_artist))
+                .then_with(|| key_at(&album_key, x.album).cmp(key_at(&album_key, y.album)))
+                .then_with(|| x.album.cmp(&y.album))
+                .then_with(|| (x.disc_no, x.track_no).cmp(&(y.disc_no, y.track_no)))
         });
         let album_order = sorted_ids(track_count, |a, b| {
             let (x, y) = (&tracks[a], &tracks[b]);
-            (x.album, x.disc_no, x.track_no).cmp(&(y.album, y.disc_no, y.track_no))
+            key_at(&album_key, x.album)
+                .cmp(key_at(&album_key, y.album))
+                .then_with(|| x.album.cmp(&y.album))
+                .then_with(|| (x.disc_no, x.track_no).cmp(&(y.disc_no, y.track_no)))
         });
         let folder_order = sorted_ids(track_count, |a, b| {
             let (x, y) = (&tracks[a], &tracks[b]);
-            (x.folder, x.disc_no, x.track_no).cmp(&(y.folder, y.disc_no, y.track_no))
+            key_at(&folder_key, x.folder)
+                .cmp(key_at(&folder_key, y.folder))
+                .then_with(|| x.folder.cmp(&y.folder))
+                .then_with(|| (x.disc_no, x.track_no).cmp(&(y.disc_no, y.track_no)))
         });
 
         // Section sizes + absolute offsets.
