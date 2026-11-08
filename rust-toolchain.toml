@@ -1,4 +1,6 @@
 [toolchain]
-channel = "stable"
+# Pinned (not floating "stable") so clippy/rustc are reproducible between local
+# and CI — a floating channel let CI's newer clippy flag lints local never saw.
+channel = "1.93.1"
 components = ["rustfmt", "clippy", "llvm-tools", "rust-src"]
 targets = ["thumbv7em-none-eabihf"]
