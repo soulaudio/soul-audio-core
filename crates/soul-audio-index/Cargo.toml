@@ -32,3 +32,10 @@ embedded-io-adapters = { workspace = true, features = ["std"] }
 [[test]]
 name = "roundtrip"
 required-features = ["build"]
+
+# Reader performance baseline (hand-rolled timer, no criterion — matches
+# soul-audio-core's throughput bench). Needs `build` to bake the fixtures.
+[[bench]]
+name = "reader"
+harness = false
+required-features = ["build"]
