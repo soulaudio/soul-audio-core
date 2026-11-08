@@ -9,23 +9,27 @@
 //! `thumbv7em` build enforces it at compile time).
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-// The counting allocator is a single global; two tests measuring it in parallel
-// would corrupt each other's before/after. Serialize the measured regions.
-static MEASURE: Mutex<()> = Mutex::new(());
+use std::cell::Cell;
 
 use embedded_io::{Read, Seek, SeekFrom};
 use soul_audio_core::{BufReader, SliceSource};
 
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    // Count allocations PER THREAD, not globally: a global counter is corrupted
+    // by allocations on the libtest harness's other threads during the measured
+    // window (racy — it flaked on CI, 189 vs 190, while passing locally by
+    // timing). Each test's measured region runs on its own thread, so a
+    // per-thread counter measures exactly the plumbing under test and nothing
+    // else. `const`-initialised so the thread-local never allocates on first
+    // access — no recursion back into this allocator.
+    static ALLOCS: Cell<usize> = const { Cell::new(0) };
+}
 
 struct Counting;
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::SeqCst);
+        ALLOCS.with(|c| c.set(c.get().wrapping_add(1)));
         // SAFETY: forwarding to the system allocator with the same layout.
         unsafe { System.alloc(layout) }
     }
@@ -45,8 +49,7 @@ fn core_io_does_not_allocate() {
     let mut out = [0u8; 64];
     let mut scratch = [0u8; 16];
 
-    let _guard = MEASURE.lock().unwrap();
-    let before = ALLOCS.load(Ordering::SeqCst);
+    let before = ALLOCS.with(Cell::get);
 
     // Pure no-alloc plumbing across the whole capability ladder:
     // 1) SliceSource: read the slice in chunks, then seek and read again.
@@ -58,7 +61,7 @@ fn core_io_does_not_allocate() {
     let mut buffered = BufReader::new(SliceSource::new(&data), &mut scratch);
     while buffered.read(&mut out).unwrap() != 0 {}
 
-    let after = ALLOCS.load(Ordering::SeqCst);
+    let after = ALLOCS.with(Cell::get);
 
     assert_eq!(before, after, "soul-audio-core io plumbing allocated");
 }
@@ -78,8 +81,7 @@ fn index_reader_does_not_allocate() {
     let reader = IndexReader::new(SliceSource::new(&bytes));
     let mut buf = [0u8; 64];
 
-    let _guard = MEASURE.lock().unwrap();
-    let before = ALLOCS.load(Ordering::SeqCst);
+    let before = ALLOCS.with(Cell::get);
 
     let _ = reader.track_count();
     let _ = reader.album_count();
@@ -97,7 +99,7 @@ fn index_reader_does_not_allocate() {
     let _ = reader.playlist_track(0, 0);
     let _ = reader.playlist_name(0, &mut buf);
 
-    let after = ALLOCS.load(Ordering::SeqCst);
+    let after = ALLOCS.with(Cell::get);
 
     assert_eq!(before, after, "the .soulidx reader path allocated");
 }
