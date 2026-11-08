@@ -24,5 +24,7 @@ version = "0.15"
 optional = true
 
 [dependencies.ringbuf]
-version = "0.4"
+# 0.6 (API-compatible traits surface with 0.4) — 0.4.x carries RUSTSEC-2026-0293,
+# a use-after-free in `Consumer::clear`/`skip` (which `sink.rs` calls). Fixed >=0.5.2.
+version = "0.6"
 optional = true
