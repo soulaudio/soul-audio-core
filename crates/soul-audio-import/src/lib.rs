@@ -15,6 +15,8 @@ use soul_audio_catalog::NO_FOLDER;
 use soul_audio_index::build::{AlbumMeta, CatalogInput, FolderInput, TrackInput};
 use soul_audio_tags::{StreamFacts, Tags, read_owned};
 
+mod cover;
+
 /// Extensions the decoders support (lower-cased comparison).
 const SUPPORTED: &[&str] = &[
     "wav", "flac", "mp3", "mp2", "mp1", "m4a", "aac", "ogg", "oga", "opus", "aiff", "aif", "dsf",
@@ -91,6 +93,10 @@ struct Interner {
     // album key = (title, folder id) → folder-isolation.
     album_ids: HashMap<(String, u32), u32>,
     albums: Vec<AlbumMeta>,
+    // Parallel to `albums`, recorded on first sight: the album's filesystem
+    // folder and one representative track path — cover-art discovery's inputs.
+    album_dirs: Vec<PathBuf>,
+    album_tracks: Vec<PathBuf>,
 }
 
 impl Interner {
@@ -131,8 +137,19 @@ impl Interner {
         id
     }
 
-    /// Intern an album under folder-isolation; fills its metadata on first sight.
-    fn album(&mut self, title: &str, folder: u32, album_artist: u32, year: u16) -> u32 {
+    /// Intern an album under folder-isolation; fills its metadata on first
+    /// sight, along with `dir` (the album's filesystem folder) and
+    /// `track_path` (a representative track, for embedded cover-art
+    /// discovery) — both recorded only on first sight, same as the metadata.
+    fn album(
+        &mut self,
+        title: &str,
+        folder: u32,
+        album_artist: u32,
+        year: u16,
+        dir: &Path,
+        track_path: &Path,
+    ) -> u32 {
         let key = (title.to_owned(), folder);
         if let Some(&id) = self.album_ids.get(&key) {
             return id;
@@ -144,6 +161,8 @@ impl Interner {
             year,
             folder,
         });
+        self.album_dirs.push(dir.to_owned());
+        self.album_tracks.push(track_path.to_owned());
         self.album_ids.insert(key, id);
         id
     }
@@ -219,7 +238,8 @@ pub fn scan(root: &Path) -> std::io::Result<CatalogInput> {
             .and_then(|d| d.get(0..4))
             .and_then(|y| y.parse::<u16>().ok())
             .unwrap_or(0);
-        let album = interner.album(&album_name, folder, album_artist, year);
+        let album_dir = path.parent().unwrap_or(root);
+        let album = interner.album(&album_name, folder, album_artist, year, album_dir, path);
 
         tracks.push(TrackInput {
             title,
@@ -236,12 +256,20 @@ pub fn scan(root: &Path) -> std::io::Result<CatalogInput> {
         });
     }
 
+    let covers: Vec<Option<Vec<u8>>> = interner
+        .album_dirs
+        .iter()
+        .zip(interner.album_tracks.iter())
+        .map(|(dir, track)| cover::find_album_cover(dir, track))
+        .collect();
+
     Ok(CatalogInput {
         tracks,
         artists: interner.artists,
         albums: interner.albums,
         folders: interner.folders,
         playlists: Vec::new(),
+        covers,
     })
 }
 

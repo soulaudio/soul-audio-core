@@ -473,6 +473,10 @@ pub mod build {
         pub albums: Vec<AlbumMeta>,
         pub folders: Vec<FolderInput>,
         pub playlists: Vec<PlaylistInput>,
+        /// Per-album cover source bytes, aligned to `albums` (index i =
+        /// albums[i]); `None` = no cover. Empty vec = no covers at all (the
+        /// baker treats a missing index as `None`).
+        pub covers: Vec<Option<Vec<u8>>>,
     }
 
     fn intern(heap: &mut Vec<u8>, s: &str) -> (u32, u16) {
