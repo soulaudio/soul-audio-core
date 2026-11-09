@@ -938,3 +938,35 @@ fn playlists_route_across_sources() {
     assert_eq!(unpack(b_first).0, 1);
     assert_eq!(resolve(&multi, multi.track(b_first).unwrap().title), "b1");
 }
+
+/// `art_id` is a per-source ref (into that source's `art.blob`): a non-zero
+/// `art_id` must be re-packed with its owning source (like every other id/off),
+/// while the 0 sentinel ("no art") must stay 0 rather than being packed into a
+/// bogus non-zero id.
+#[test]
+fn art_id_source_routes_when_nonzero_stays_zero_when_zero() {
+    let ms = dataset(); // source 0 = plain (art_id 0); source 1 = covered (art_id 7)
+    // Member 0: baked via write_index (art_id 0 everywhere).
+    let m0 = boxed_member(&to_input(&ms[0]));
+    // Member 1: bake with a forced non-zero art_id on its album(s).
+    let input1 = to_input(&ms[1]);
+    let album_art_id = vec![7u32; input1.albums.len()];
+    let bytes1: &'static [u8] = Vec::leak(soul_audio_index::build::write_index_with_art(
+        &input1,
+        &album_art_id,
+    ));
+    let m1: Box<dyn Catalog + Send> = Box::new(IndexReader::new(SliceSource::new(bytes1)));
+    let multi = MultiCatalog::new(vec![m0, m1]);
+
+    // Source 1's album + its tracks carry art_id packed with source 1.
+    let album1 = multi.album(pack(1, 0)).unwrap();
+    assert_eq!(unpack(album1.art_id), (1, 7));
+    let t1 = multi.track(pack(1, 0)).unwrap();
+    assert_eq!(unpack(t1.art_id), (1, 7));
+
+    // Source 0 has no art → art_id stays 0 (not packed into a bogus source).
+    let t0 = multi.track(pack(0, 0)).unwrap();
+    assert_eq!(t0.art_id, 0);
+    // extended_off is always 0 today → stays 0 on both.
+    assert_eq!(t1.extended_off, 0);
+}
