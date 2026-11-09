@@ -8,15 +8,14 @@
 # (If you use a global `core.hooksPath` dispatcher that delegates to lefthook,
 #  don't run `lefthook install` — it would target the global dir. See README.)
 
-# Fast checks — keep commits quick. Run whenever Rust/Cargo files are staged.
+# Fast checks — keep commits quick. `xtask precommit` runs tree-wide `fmt` and
+# scopes `clippy` to the crates with staged changes (a shared no_std / workspace
+# change falls back to full clippy). Runs whenever Rust/Cargo files are staged.
 pre-commit:
   commands:
-    fmt:
+    checks:
       glob: "*.{rs,toml}"
-      run: cargo fmt --all -- --check
-    clippy:
-      glob: "*.{rs,toml}"
-      run: cargo clippy --all-targets -- -D warnings
+      run: cargo xtask precommit
 
 # Commit-message policy: Conventional Commits + a clean history (no AI /
 # attribution trailers). Pure-Rust check so it behaves identically on every
@@ -26,9 +25,11 @@ commit-msg:
     policy:
       run: cargo xtask check-commit-msg {1}
 
-# Full gate before pushing: fmt, clippy, host tests, and both STM32 builds
-# (core no_std + firmware) for thumbv7em.
+# Change-scoped gate before pushing: tree-wide `fmt` + `clippy`/tests for the
+# changed host crates. A shared no_std crate or a workspace-level change falls
+# back to the full gate (host tests + the thumbv7em cross-builds). The full gate
+# is also run in CI on the dev->main PR, which is the authoritative backstop.
 pre-push:
   commands:
-    verify:
+    gate:
       run: cargo xtask verify
