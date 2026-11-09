@@ -306,13 +306,14 @@ impl Catalog for MultiCatalog {
         r.folder = pack(s, r.folder);
         r.title.off = pack(s, r.title.off);
         r.file_name.off = pack(s, r.file_name.off);
-        // `art_id` and `extended_off` are per-source offsets (into `art.blob` /
-        // `extended.blob`) and are deliberately NOT re-packed: both are always 0
-        // today (artbake + extended-TLV unimplemented), and `pack(s, 0)` would
-        // wrongly turn a "no art" / "no extended" 0 into a non-zero id. When
-        // those blobs land, route them through `pack(s, _)` *behind a sentinel
-        // guard* (as `folder.parent`/`NO_FOLDER` is guarded below) so they
-        // resolve against the owning source.
+        // `art_id` / `extended_off` are per-source refs (into art.blob / extended.blob);
+        // re-pack with the source, but keep the 0 sentinel (no art / no extended) as 0.
+        if r.art_id != 0 {
+            r.art_id = pack(s, r.art_id);
+        }
+        if r.extended_off != 0 {
+            r.extended_off = pack(s, r.extended_off);
+        }
         Ok(r)
     }
 
@@ -323,7 +324,9 @@ impl Catalog for MultiCatalog {
         r.album_artist = pack(s, r.album_artist);
         r.folder = pack(s, r.folder);
         r.title.off = pack(s, r.title.off);
-        // `art_id` not re-packed — see the note in `track()` (artbake follow-up).
+        if r.art_id != 0 {
+            r.art_id = pack(s, r.art_id);
+        }
         Ok(r)
     }
 
