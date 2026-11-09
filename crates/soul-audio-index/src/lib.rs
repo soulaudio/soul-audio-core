@@ -491,9 +491,43 @@ pub mod build {
         ids
     }
 
-    /// Serialize `input` into `index.sidx` bytes.
+    /// Default cover art size baked into `art.blob` (see [`bake_art`]).
+    pub const ART_W: u16 = 200;
+    pub const ART_H: u16 = 200;
+
+    /// Encodes each album's cover (via [`soul_audio_artbake::build::encode_cover`])
+    /// into an `art.blob`, deduping identical bitmaps with
+    /// [`soul_audio_artbake::build::ArtBlobWriter`]. Returns the blob bytes and
+    /// the per-album `art_id` (aligned to `input.albums`; `0` = no art). An
+    /// album with no cover (`None`/missing index) or an unsupported/corrupt
+    /// cover (`encode_cover` error) gets `art_id = 0` — best-effort, never
+    /// panics.
+    #[must_use]
+    pub fn bake_art(input: &CatalogInput, width: u16, height: u16) -> (Vec<u8>, Vec<u32>) {
+        let mut writer = soul_audio_artbake::build::ArtBlobWriter::new(width, height);
+        let mut album_art_id = vec![0u32; input.albums.len()];
+        for (i, id) in album_art_id.iter_mut().enumerate() {
+            if let Some(Some(bytes)) = input.covers.get(i) {
+                if let Ok(bitmap) = soul_audio_artbake::build::encode_cover(bytes, width, height) {
+                    *id = writer.add(bitmap);
+                }
+            }
+        }
+        (writer.finish(), album_art_id)
+    }
+
+    /// Serialize `input` into `index.sidx` bytes, with every record's `art_id`
+    /// set to `0` (no cover art baked). Delegates to [`write_index_with_art`].
     #[must_use]
     pub fn write_index(input: &CatalogInput) -> Vec<u8> {
+        write_index_with_art(input, &vec![0u32; input.albums.len()])
+    }
+
+    /// Serialize `input` into `index.sidx` bytes, threading `album_art_id`
+    /// (aligned to `input.albums`, as returned by [`bake_art`]) into each
+    /// track's and album's `art_id` field — a track's `art_id` is its album's.
+    #[must_use]
+    pub fn write_index_with_art(input: &CatalogInput, album_art_id: &[u32]) -> Vec<u8> {
         let tracks = &input.tracks;
         let track_count = tracks.len() as u32;
         let album_count = input.albums.len() as u32;
@@ -661,7 +695,8 @@ pub mod build {
             out.extend_from_slice(&t.duration_ms.to_le_bytes());
             out.extend_from_slice(&t.sample_rate.to_le_bytes());
             out.push(t.channels);
-            out.extend_from_slice(&0u32.to_le_bytes()); // art_id
+            let art_id = album_art_id.get(t.album as usize).copied().unwrap_or(0);
+            out.extend_from_slice(&art_id.to_le_bytes()); // art_id (the track's album's)
             out.extend_from_slice(&0u16.to_le_bytes()); // flags
             out.extend_from_slice(&0u32.to_le_bytes()); // extended_off
             out.extend_from_slice(&foff.to_le_bytes()); // file_name.off
@@ -678,7 +713,8 @@ pub mod build {
             out.extend_from_slice(&meta.album_artist.to_le_bytes());
             out.extend_from_slice(&meta.year.to_le_bytes());
             out.extend_from_slice(&meta.folder.to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes()); // art_id
+            let art_id = album_art_id.get(a).copied().unwrap_or(0);
+            out.extend_from_slice(&art_id.to_le_bytes()); // art_id
         }
         debug_assert_eq!(out.len(), artists_off);
 

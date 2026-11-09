@@ -16,15 +16,17 @@ alloc = []
 std = ["alloc"]
 # The BAKER (desktop-only): lays out records, pre-sorts order tables, string
 # heap, extended + art blobs. Pulls in std — never enabled on the DAP.
-build = ["std"]
+build = ["std", "dep:soul-audio-artbake"]
 
 [dependencies]
 soul-audio-core = { path = "../soul-audio-core" }
 soul-audio-catalog = { path = "../soul-audio-catalog" }
 embedded-io = { workspace = true }
+soul-audio-artbake = { path = "../soul-audio-artbake", features = ["build"], optional = true }
 
 [dev-dependencies]
 embedded-io-adapters = { workspace = true, features = ["std"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # The format round-trip is the TDD contract: it writes an index (build) and
 # reads it back (reader), so it only builds with the `build` feature — a plain

@@ -2031,6 +2031,8 @@ version = "0.1.0"
 dependencies = [
  "embedded-io 0.6.1",
  "embedded-io-adapters",
+ "image",
+ "soul-audio-artbake",
  "soul-audio-catalog",
  "soul-audio-core",
 ]
