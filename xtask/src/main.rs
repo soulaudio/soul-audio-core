@@ -109,6 +109,17 @@ fn verify() -> Result<(), String> {
         "thumbv7em-none-eabihf",
         "--no-default-features",
     ])?;
+    // The .soulidx art.blob reader (DAP ArtStore) must also cross-build no_std —
+    // its heavy `image`-based encoder/writer stays behind the `build` feature,
+    // off by default, so this proves the no_std surface never pulls it in.
+    run(&[
+        "build",
+        "-p",
+        "soul-audio-artbake",
+        "--target",
+        "thumbv7em-none-eabihf",
+        "--no-default-features",
+    ])?;
     // The arena-generic Vorbis codec must also cross-build under the embedded
     // profile (smaller channel/blocksize caps) — the const configuration a
     // future firmware build (issue #32) will actually use once it wires an

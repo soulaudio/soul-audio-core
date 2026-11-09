@@ -17,7 +17,12 @@ fn pkg<'a>(md: &'a cargo_metadata::Metadata, name: &str) -> &'a Package {
 fn normal_dep_names(p: &Package) -> Vec<String> {
     p.dependencies
         .iter()
-        .filter(|d| d.kind == DependencyKind::Normal)
+        // `cargo_metadata` lists an optional dependency's manifest entry
+        // regardless of whether the feature that gates it is active (e.g.
+        // soul-audio-index's `build` -> soul-audio-artbake). Excluding
+        // `optional` deps here is what makes this helper reflect the
+        // default/no_std surface instead of every feature-gated manifest line.
+        .filter(|d| d.kind == DependencyKind::Normal && !d.optional)
         .map(|d| d.name.clone())
         .collect()
 }
@@ -123,6 +128,20 @@ fn core_does_not_depend_on_shared_data_layer() {
             "soul-audio-core must not depend on {data_crate} (layering points one way)"
         );
     }
+}
+
+#[test]
+fn index_reader_has_no_art_build_deps() {
+    let md = MetadataCommand::new().exec().unwrap();
+    let deps = normal_dep_names(pkg(&md, "soul-audio-index"));
+    assert!(
+        !deps.contains(&"soul-audio-artbake".to_string()),
+        "soul-audio-index must not NORMALLY depend on soul-audio-artbake (it is build-only); got {deps:?}"
+    );
+    assert!(
+        !deps.contains(&"image".to_string()),
+        "the `image` crate must stay behind artbake's `build` feature, off the no_std index reader; got {deps:?}"
+    );
 }
 
 #[test]

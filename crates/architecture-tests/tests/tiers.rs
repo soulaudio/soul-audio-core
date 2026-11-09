@@ -82,7 +82,11 @@ fn may_depend(from: Tier, to: Tier) -> bool {
 fn normal_deps(p: &Package) -> impl Iterator<Item = &str> {
     p.dependencies
         .iter()
-        .filter(|d| d.kind == DependencyKind::Normal)
+        // Optional deps (feature-gated, e.g. soul-audio-index's `build` ->
+        // soul-audio-artbake) are listed in the manifest regardless of
+        // activation; exclude them so tiering reflects the default/no_std
+        // surface, not every feature-gated line.
+        .filter(|d| d.kind == DependencyKind::Normal && !d.optional)
         .map(|d| d.name.as_str())
 }
 
