@@ -29,9 +29,9 @@
 //! Each axis is materialized lazily into a cached `Vec` of compound ids.
 #![forbid(unsafe_code)]
 
-use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::sync::Mutex;
 
 use soul_audio_catalog::{
     AlbumId, AlbumRec, ArtistId, BrowseAxis, Catalog, CatalogError, FolderId, FolderRec, NO_FOLDER,
@@ -85,9 +85,17 @@ fn axis_index(a: BrowseAxis) -> usize {
 /// selection is the caller's concern). See the crate docs for the compound-id
 /// and merge model.
 pub struct MultiCatalog {
-    members: Vec<Box<dyn Catalog>>,
-    /// Lazily materialized merged order per axis (compound ids).
-    order_cache: RefCell<[Option<Vec<u32>>; AXIS_COUNT]>,
+    // `+ Send` (not `Sync`): the desktop shares one aggregate across threads
+    // (`Arc<Library>` over the actor + event-pump threads) by wrapping it in a
+    // `Mutex`, which only needs `Send`. It can't be `Sync` — the member readers
+    // use `RefCell` interior mutability (the no_std/no-alloc reader is
+    // single-threaded on the DAP) — so the desktop serializes access behind its
+    // own lock. The DAP never links this crate, so the bound costs it nothing.
+    members: Vec<Box<dyn Catalog + Send>>,
+    /// Lazily materialized merged order per axis (compound ids). A `Mutex` (not a
+    /// `RefCell`) so the cache stays sound under the desktop's shared lock;
+    /// materialized at most once per axis, then read under a brief lock.
+    order_cache: Mutex<[Option<Vec<u32>>; AXIS_COUNT]>,
 }
 
 impl MultiCatalog {
@@ -98,7 +106,7 @@ impl MultiCatalog {
     /// Panics if `members.len() > MAX_SOURCES` — only [`MAX_SOURCES`] sources
     /// fit in the [`SOURCE_BITS`] of a compound id.
     #[must_use]
-    pub fn new(members: Vec<Box<dyn Catalog>>) -> Self {
+    pub fn new(members: Vec<Box<dyn Catalog + Send>>) -> Self {
         assert!(
             members.len() <= MAX_SOURCES,
             "MultiCatalog addresses at most {MAX_SOURCES} sources (SOURCE_BITS={SOURCE_BITS}), got {}",
@@ -107,12 +115,12 @@ impl MultiCatalog {
         const NONE_ORDER: Option<Vec<u32>> = None;
         Self {
             members,
-            order_cache: RefCell::new([NONE_ORDER; AXIS_COUNT]),
+            order_cache: Mutex::new([NONE_ORDER; AXIS_COUNT]),
         }
     }
 
     /// Borrow member `s`, or `OutOfRange` if the source index is unknown.
-    fn member(&self, s: u32) -> Result<&dyn Catalog, CatalogError> {
+    fn member(&self, s: u32) -> Result<&(dyn Catalog + Send), CatalogError> {
         self.members
             .get(s as usize)
             .map(|b| &**b)
@@ -336,19 +344,18 @@ impl Catalog for MultiCatalog {
 
     fn order(&self, axis: BrowseAxis, i: u32) -> Result<TrackId, CatalogError> {
         let ax = axis_index(axis);
-        {
-            let cache = self.order_cache.borrow();
-            if let Some(v) = cache[ax].as_ref() {
-                return v.get(i as usize).copied().ok_or(CatalogError::OutOfRange);
-            }
+        // Hold the lock across materialize: it reads the members' streams, never
+        // this cache, so there is no re-entrancy on `order_cache` and no deadlock.
+        let mut cache = self.order_cache.lock().expect("order-cache mutex poisoned");
+        if cache[ax].is_none() {
+            cache[ax] = Some(self.materialize(axis)?);
         }
-        let materialized = self.materialize(axis)?;
-        let result = materialized
+        cache[ax]
+            .as_ref()
+            .expect("materialized above")
             .get(i as usize)
             .copied()
-            .ok_or(CatalogError::OutOfRange);
-        self.order_cache.borrow_mut()[ax] = Some(materialized);
-        result
+            .ok_or(CatalogError::OutOfRange)
     }
 
     fn album_track(&self, album: AlbumId, i: u32) -> Result<TrackId, CatalogError> {

@@ -45,7 +45,7 @@ fn make_source(tag: &str, files: &[(&str, &str, &str)]) -> PathBuf {
 
 /// Scan + bake `root` through the real importer, leak the bytes for a `'static`
 /// reader, and box it as a `Catalog` member.
-fn baked(root: &Path) -> Box<dyn Catalog> {
+fn baked(root: &Path) -> Box<dyn Catalog + Send> {
     let bytes: &'static [u8] = Vec::leak(soul_audio_import::bake(root).expect("bake"));
     Box::new(IndexReader::new(SliceSource::new(bytes)))
 }
