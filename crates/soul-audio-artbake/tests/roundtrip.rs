@@ -41,3 +41,59 @@ fn reads_dimensions_and_bitmaps_by_art_id() {
         Err(soul_audio_catalog::CatalogError::OutOfRange)
     );
 }
+
+use image::{GrayImage, ImageEncoder, Luma};
+use soul_audio_artbake::build::{ArtBlobWriter, encode_cover};
+
+fn png_of(w: u32, h: u32, f: impl Fn(u32, u32) -> u8) -> Vec<u8> {
+    let img = GrayImage::from_fn(w, h, |x, y| Luma([f(x, y)]));
+    let mut out = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut out)
+        .write_image(img.as_raw(), w, h, image::ExtendedColorType::L8)
+        .unwrap();
+    out
+}
+
+#[test]
+fn solid_black_is_all_ink_white_is_all_blank() {
+    let black = encode_cover(&png_of(16, 16, |_, _| 0), 16, 16).unwrap();
+    assert!(black.iter().all(|&b| b == 0xFF), "black → all ink bits");
+    let white = encode_cover(&png_of(16, 16, |_, _| 255), 16, 16).unwrap();
+    assert!(white.iter().all(|&b| b == 0x00), "white → all blank");
+    assert_eq!(black.len(), 2 * 16); // row_bytes(16)=2 * height 16
+}
+
+#[test]
+fn encode_is_deterministic() {
+    let src = png_of(32, 24, |x, y| ((x * 7 + y * 3) % 256) as u8);
+    assert_eq!(
+        encode_cover(&src, 20, 20).unwrap(),
+        encode_cover(&src, 20, 20).unwrap()
+    );
+}
+
+#[test]
+fn unsupported_bytes_error() {
+    assert!(encode_cover(b"not an image", 8, 8).is_err());
+}
+
+#[test]
+fn writer_dedups_and_round_trips_through_reader() {
+    let a = encode_cover(&png_of(16, 16, |x, _| if x < 8 { 0 } else { 255 }), 16, 16).unwrap();
+    let b = encode_cover(&png_of(16, 16, |_, _| 0), 16, 16).unwrap();
+    let mut w = ArtBlobWriter::new(16, 16);
+    let id_a = w.add(a.clone());
+    let id_b = w.add(b.clone());
+    let id_a2 = w.add(a.clone()); // identical → same id
+    assert_eq!(id_a, 1);
+    assert_eq!(id_b, 2);
+    assert_eq!(id_a2, id_a);
+    let bytes = w.finish();
+    let r = ArtBlobReader::new(SliceSource::new(&bytes));
+    assert_eq!(r.count(), 2);
+    let mut buf = vec![0u8; a.len()];
+    assert_eq!(r.art(id_a, &mut buf).unwrap(), a.len());
+    assert_eq!(buf, a);
+    r.art(id_b, &mut buf).unwrap();
+    assert_eq!(buf, b);
+}
