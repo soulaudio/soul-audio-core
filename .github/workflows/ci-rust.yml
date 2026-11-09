@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
 
 permissions:
@@ -14,10 +14,13 @@ concurrency:
 
 jobs:
   verify:
-    name: verify (fmt · clippy · tests · no_std cross-builds)
+    name: gate (full on main · scoped on dev)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Full history so the scoped gate can diff a dev PR against its base.
+          fetch-depth: 0
 
       # rust-toolchain.toml pins the channel, components, and the thumbv7em
       # target; rustup installs them on first use. Add them explicitly so a
@@ -29,7 +32,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
-      # The full gate: fmt, clippy -D warnings, generated-table checks, the host
-      # test suite, and the no_std cross-builds for the STM32 target.
-      - name: cargo xtask ci
-        run: cargo xtask ci
+      # Full gate for anything landing on `main` (the dev->main PR, pushes to
+      # main): fmt, clippy -D warnings, generated-table checks, the host test
+      # suite, and the no_std cross-builds for the STM32 target. Feature PRs into
+      # `dev` run the change-scoped gate (fmt + clippy + tests for the changed
+      # host crates); the dev->main PR is the authoritative backstop.
+      - name: Gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            target="${{ github.base_ref }}"
+          else
+            target="${{ github.ref_name }}"
+          fi
+          echo "gate target branch: $target"
+          if [ "$target" = "main" ]; then
+            cargo xtask ci
+          else
+            git fetch --no-tags origin "$target"
+            cargo xtask verify --base "origin/$target"
+          fi

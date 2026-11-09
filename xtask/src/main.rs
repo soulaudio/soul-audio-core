@@ -9,6 +9,7 @@ use std::process::{Command, exit};
 
 mod commit_msg;
 mod filterbank_tables;
+mod gate;
 mod opus_tables;
 mod ps_tables;
 mod resample_tables;
@@ -16,12 +17,16 @@ mod sbr_tables;
 mod silk_tables;
 mod vorbis_tables;
 
-const USAGE: &str = "usage: cargo xtask <verify|ci|qa-audio|check-commit-msg <file>|gen-resample-tables|gen-filterbank-tables|gen-sbr-tables|gen-ps-tables|gen-vorbis-tables|gen-opus-tables|gen-silk-tables>";
+const USAGE: &str = "usage: cargo xtask <verify|ci|precommit|qa-audio|check-commit-msg <file>|gen-resample-tables|gen-filterbank-tables|gen-sbr-tables|gen-ps-tables|gen-vorbis-tables|gen-opus-tables|gen-silk-tables>";
 
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
     let result = match cmd.as_str() {
-        "verify" | "ci" => verify(),
+        // `verify` = the change-scoped gate (pre-push hook, dev PRs); `ci` = the
+        // full authoritative gate (CI on dev->main and main).
+        "verify" => gate::verify_scoped(&std::env::args().skip(2).collect::<Vec<_>>()),
+        "ci" => verify(),
+        "precommit" => gate::precommit(),
         "qa-audio" => qa_audio(),
         "check-commit-msg" => commit_msg::check(std::env::args().nth(2)),
         "gen-resample-tables" => resample_tables::run(),
