@@ -138,6 +138,7 @@ fn synth(n: u32) -> CatalogInput {
         albums: album_metas,
         folders,
         playlists: Vec::new(),
+        covers: Vec::new(),
     }
 }
 

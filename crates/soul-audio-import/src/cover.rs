@@ -1,0 +1,148 @@
+//! Per-album cover-art discovery (desktop-only; the `.soulidx` baker never
+//! looks at art — it just stores whatever bytes the importer hands it).
+//!
+//! Ported from `soul-player-ng`'s `art` module, with two deliberate
+//! deviations spelled out where the desktop importer's per-*album* call site
+//! (rather than per-*track*) wants different defaults: no `Scans/`-style
+//! sibling-subdirectory search (an album's cover lives in its own folder or
+//! the folder one level up, e.g. a shared `folder.jpg` above per-disc
+//! subfolders), and "largest file wins" rather than "smallest wins" (we want
+//! the best-looking cover, not the smallest front scan).
+//!
+//! Resolution order: an embedded front-cover picture on a representative
+//! track of the album, else the best sidecar image in the album's own folder,
+//! else the best sidecar image in that folder's immediate parent.
+
+use std::path::{Path, PathBuf};
+
+use soul_audio_tags::{PictureKind, read_owned, read_picture_bytes};
+
+/// Sidecar stems we recognize (lower-cased, exact match only).
+const COVER_STEMS: &[&str] = &["cover", "folder", "front", "album", "artwork"];
+/// Image extensions we accept as cover art (lower-cased comparison).
+const COVER_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
+
+/// Resolve one cover for an album: the embedded front-cover picture of
+/// `a_track_path` (any one track belonging to the album) if present, else the
+/// best sidecar image found in `album_dir` or (failing that) its immediate
+/// parent folder. `None` when neither source yields one, or a read fails —
+/// cover art is best-effort and never fails the surrounding scan.
+#[must_use]
+pub(crate) fn find_album_cover(album_dir: &Path, a_track_path: &Path) -> Option<Vec<u8>> {
+    embedded_cover(a_track_path).or_else(|| sidecar_cover(album_dir))
+}
+
+/// Read the representative track's embedded front-cover picture, falling back
+/// to the first picture of any kind when none is explicitly tagged as the
+/// front cover.
+fn embedded_cover(track_path: &Path) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(track_path).ok()?;
+    let mut src = embedded_io_adapters::std::FromStd::new(file);
+    let (tags, _facts) = read_owned(&mut src).ok()?;
+    let pic = tags
+        .pictures
+        .iter()
+        .find(|p| matches!(p.usage, PictureKind::FrontCover))
+        .or_else(|| tags.pictures.first())?;
+    let mut src2 = embedded_io_adapters::std::FromStd::new(std::fs::File::open(track_path).ok()?);
+    read_picture_bytes(&mut src2, pic).ok()
+}
+
+/// Best sidecar image for an album folder: its own directory first, then
+/// (only if that yields nothing) its immediate parent.
+fn sidecar_cover(album_dir: &Path) -> Option<Vec<u8>> {
+    best_in_dir(album_dir).or_else(|| album_dir.parent().and_then(best_in_dir))
+}
+
+/// The largest cover-named image directly inside `dir`, read to bytes.
+/// `None` if the directory can't be read or holds no recognized sidecar.
+fn best_in_dir(dir: &Path) -> Option<Vec<u8>> {
+    let rd = std::fs::read_dir(dir).ok()?;
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue; // macOS `._*` AppleDouble sidecars
+        }
+        let lower = name.to_ascii_lowercase();
+        let Some((stem, ext)) = lower.rsplit_once('.') else {
+            continue;
+        };
+        if !COVER_STEMS.contains(&stem) || !COVER_EXTS.contains(&ext) {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if best.as_ref().is_none_or(|(best_size, _)| size > *best_size) {
+            best = Some((size, p));
+        }
+    }
+    best.and_then(|(_, p)| std::fs::read(p).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("sai_cover_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn sidecar_in_own_folder_wins_over_parent() {
+        let parent = tmpdir("own_vs_parent");
+        std::fs::write(parent.join("folder.jpg"), vec![0u8; 10]).unwrap();
+        let album = parent.join("Album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("cover.png"), vec![1u8; 5]).unwrap();
+
+        let got = sidecar_cover(&album).unwrap();
+        assert_eq!(got, vec![1u8; 5]);
+    }
+
+    #[test]
+    fn sidecar_falls_back_to_parent_when_own_folder_empty() {
+        let parent = tmpdir("parent_fallback");
+        std::fs::write(parent.join("folder.jpg"), vec![2u8; 7]).unwrap();
+        let album = parent.join("Disc 1");
+        std::fs::create_dir_all(&album).unwrap();
+
+        let got = sidecar_cover(&album).unwrap();
+        assert_eq!(got, vec![2u8; 7]);
+    }
+
+    #[test]
+    fn sidecar_picks_largest_match() {
+        let album = tmpdir("largest");
+        std::fs::write(album.join("front.jpg"), vec![0u8; 100]).unwrap();
+        std::fs::write(album.join("cover.jpg"), vec![0u8; 500]).unwrap();
+        std::fs::write(album.join("artwork.png"), vec![0u8; 50]).unwrap();
+
+        let got = sidecar_cover(&album).unwrap();
+        assert_eq!(got.len(), 500);
+    }
+
+    #[test]
+    fn sidecar_skips_apple_double_and_unrecognized_names() {
+        let album = tmpdir("skip_junk");
+        std::fs::write(album.join("._cover.jpg"), vec![0u8; 9999]).unwrap();
+        std::fs::write(album.join("notes.txt"), b"hi").unwrap();
+        std::fs::write(album.join("back.jpg"), vec![0u8; 9999]).unwrap();
+
+        assert_eq!(sidecar_cover(&album), None);
+    }
+
+    #[test]
+    fn none_when_nothing_present() {
+        let album = tmpdir("none");
+        assert_eq!(find_album_cover(&album, &album.join("missing.flac")), None);
+    }
+}

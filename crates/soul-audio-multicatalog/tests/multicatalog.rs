@@ -172,6 +172,7 @@ fn to_input(m: &MemberData) -> CatalogInput {
                 tracks: tracks.clone(),
             })
             .collect(),
+        covers: Vec::new(),
     }
 }
 

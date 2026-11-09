@@ -66,6 +66,7 @@ fn fixture() -> CatalogInput {
             name: "Favourites".into(),
             tracks: vec![1, 0],
         }],
+        covers: Vec::new(),
     }
 }
 
@@ -169,6 +170,7 @@ fn baked_title_order_is_collation_sorted() {
             parent: NO_FOLDER,
         }],
         playlists: vec![],
+        covers: Vec::new(),
     };
 
     let bytes = write_index(&input);

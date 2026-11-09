@@ -77,3 +77,45 @@ fn scan_tags_intern_bake_read_is_1to1() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn covers_sidecar_found_aligns_with_albums() {
+    let root = std::env::temp_dir().join(format!("soul_import_cover_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let album = root.join("Covered Album");
+    std::fs::create_dir_all(&album).unwrap();
+    std::fs::copy(testdata("tagged.flac"), album.join("01 - song.flac")).unwrap();
+    // Discovery matches by NAME, not validity — arbitrary bytes are fine.
+    let cover_bytes = b"not actually a jpeg, discovery matches by name".to_vec();
+    std::fs::write(album.join("cover.jpg"), &cover_bytes).unwrap();
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(
+        input.covers.len(),
+        input.albums.len(),
+        "covers aligned to albums"
+    );
+    assert_eq!(input.albums.len(), 1);
+    assert_eq!(input.covers[0].as_deref(), Some(cover_bytes.as_slice()));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn covers_none_when_no_cover_present() {
+    let root = std::env::temp_dir().join(format!("soul_import_nocover_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::copy(testdata("tagged.flac"), root.join("01 - song.flac")).unwrap();
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(
+        input.covers.len(),
+        input.albums.len(),
+        "covers aligned to albums"
+    );
+    assert_eq!(input.albums.len(), 1);
+    assert_eq!(input.covers[0], None);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
