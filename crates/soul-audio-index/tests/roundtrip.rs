@@ -7,11 +7,14 @@
 //! stays green.
 #![cfg(feature = "build")]
 
-use soul_audio_catalog::{BrowseAxis, Catalog, NO_FOLDER};
+use image::{GrayImage, ImageEncoder, Luma};
+use soul_audio_artbake::ArtBlobReader;
+use soul_audio_catalog::{ArtStore, BrowseAxis, Catalog, NO_FOLDER};
 use soul_audio_core::SliceSource;
 use soul_audio_index::IndexReader;
 use soul_audio_index::build::{
-    AlbumMeta, CatalogInput, FolderInput, PlaylistInput, TrackInput, write_index,
+    ART_H, ART_W, AlbumMeta, CatalogInput, FolderInput, PlaylistInput, TrackInput, bake_art,
+    write_index, write_index_with_art,
 };
 
 fn fixture() -> CatalogInput {
@@ -189,4 +192,106 @@ fn baked_title_order_is_collation_sorted() {
         order,
         vec!["ABBA", "kinks", "The Kinks", "Track 2", "Track 10"],
     );
+}
+
+/// A tiny gray PNG, generated in-test — same pattern as
+/// `soul-audio-artbake/tests/roundtrip.rs`'s `png_of`.
+fn png_of(w: u32, h: u32, f: impl Fn(u32, u32) -> u8) -> Vec<u8> {
+    let img = GrayImage::from_fn(w, h, |x, y| Luma([f(x, y)]));
+    let mut out = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut out)
+        .write_image(img.as_raw(), w, h, image::ExtendedColorType::L8)
+        .unwrap();
+    out
+}
+
+/// End-to-end: `bake_art` encodes the covered album's cover into `art.blob` and
+/// assigns it a non-zero `art_id`; `write_index_with_art` threads that id into
+/// both the album record and its track's record; the uncovered album/track
+/// stay `art_id == 0`; and the id resolves back through `ArtBlobReader` to the
+/// encoded bitmap.
+#[test]
+fn bakes_cover_art_into_blob_and_assigns_art_id() {
+    let input = CatalogInput {
+        tracks: vec![
+            TrackInput {
+                title: "Covered Track".into(),
+                artist: 0,
+                album: 0,
+                album_artist: 0,
+                folder: 0,
+                track_no: 1,
+                disc_no: 1,
+                duration_ms: 1000,
+                sample_rate: 44_100,
+                channels: 2,
+                file_name: "a.flac".into(),
+            },
+            TrackInput {
+                title: "Uncovered Track".into(),
+                artist: 0,
+                album: 1,
+                album_artist: 0,
+                folder: 0,
+                track_no: 1,
+                disc_no: 1,
+                duration_ms: 1000,
+                sample_rate: 44_100,
+                channels: 2,
+                file_name: "b.flac".into(),
+            },
+        ],
+        artists: vec!["Artist".into()],
+        albums: vec![
+            AlbumMeta {
+                title: "Covered Album".into(),
+                album_artist: 0,
+                year: 2020,
+                folder: 0,
+            },
+            AlbumMeta {
+                title: "Uncovered Album".into(),
+                album_artist: 0,
+                year: 2021,
+                folder: 0,
+            },
+        ],
+        folders: vec![FolderInput {
+            path: "".into(),
+            parent: NO_FOLDER,
+        }],
+        playlists: vec![],
+        covers: vec![
+            Some(png_of(32, 32, |x, y| (((x + y) * 7) % 256) as u8)),
+            None,
+        ],
+    };
+
+    let (art_blob, album_art_id) = bake_art(&input, ART_W, ART_H);
+    let bytes = write_index_with_art(&input, &album_art_id);
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+
+    // Covered album's record and its track share one non-zero art_id.
+    let album0 = rdr.album(0).expect("album 0");
+    assert_ne!(album0.art_id, 0, "covered album gets a non-zero art_id");
+    let track0 = rdr.track(0).expect("track 0");
+    assert_eq!(
+        track0.art_id, album0.art_id,
+        "track's art_id is its album's"
+    );
+
+    // Uncovered album's record and its track stay art_id == 0.
+    let album1 = rdr.album(1).expect("album 1");
+    assert_eq!(album1.art_id, 0, "uncovered album has art_id 0");
+    let track1 = rdr.track(1).expect("track 1");
+    assert_eq!(track1.art_id, 0, "uncovered album's track has art_id 0");
+
+    // The id resolves back through the blob to the encoded bitmap.
+    let art_rdr = ArtBlobReader::new(SliceSource::new(&art_blob));
+    let want_len = soul_audio_artbake::row_bytes(ART_W) * ART_H as usize;
+    let mut buf = vec![0u8; want_len];
+    let n = art_rdr
+        .art(album0.art_id, &mut buf)
+        .expect("art_id resolves in art.blob");
+    assert_eq!(n, want_len);
 }

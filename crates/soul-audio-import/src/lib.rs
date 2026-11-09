@@ -282,17 +282,26 @@ pub fn bake(root: &Path) -> std::io::Result<Vec<u8>> {
 pub const INDEX_DIR: &str = ".soulidx";
 /// The index file inside [`INDEX_DIR`].
 pub const INDEX_FILE: &str = "index.sidx";
+/// The cover-art blob inside [`INDEX_DIR`].
+pub const ART_FILE: &str = "art.blob";
 
-/// Scan `root` and **write** the `.soulidx` to disk: bakes the index and places
-/// it at `out_dir/.soulidx/index.sidx`, creating the `.soulidx/` directory. This
-/// is the "desktop bakes onto the card" step (v1 model = index-the-card): for a
-/// DAP export, `out_dir == root == the SD card`. The audio tree is untouched.
+/// Scan `root` and **write** the `.soulidx` to disk: bakes the index + cover
+/// art and places them at `out_dir/.soulidx/{index.sidx,art.blob}`, creating
+/// the `.soulidx/` directory. This is the "desktop bakes onto the card" step
+/// (v1 model = index-the-card): for a DAP export, `out_dir == root == the SD
+/// card`. The audio tree is untouched.
 ///
-/// `art.blob` / `extended.blob` are deferred (seams reserved); only `index.sidx`
-/// is written here.
+/// `extended.blob` is deferred (seam reserved).
 pub fn export(root: &Path, out_dir: &Path) -> std::io::Result<()> {
-    let bytes = bake(root)?;
+    let input = scan(root)?;
+    let (art_blob, album_art_id) = soul_audio_index::build::bake_art(
+        &input,
+        soul_audio_index::build::ART_W,
+        soul_audio_index::build::ART_H,
+    );
+    let bytes = soul_audio_index::build::write_index_with_art(&input, &album_art_id);
     let dir = out_dir.join(INDEX_DIR);
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(INDEX_FILE), &bytes)
+    std::fs::write(dir.join(INDEX_FILE), &bytes)?;
+    std::fs::write(dir.join(ART_FILE), &art_blob)
 }
