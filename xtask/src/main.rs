@@ -99,6 +99,12 @@ fn verify() -> Result<(), String> {
         "--features",
         "vorbis-embedded-profile",
     ])?;
+    // The `.soulidx` baker, the Floyd-Steinberg art encoder, and the
+    // art_id/art.blob round-trip live behind the `build` feature (std) and are
+    // `required-features`-gated, so the default `cargo test` above SKIPS them.
+    // Run those host tests explicitly so the desktop bake path is actually gated.
+    run(&["test", "-p", "soul-audio-index", "--features", "build"])?;
+    run(&["test", "-p", "soul-audio-artbake", "--features", "build"])?;
     // The STM32 discipline gates: the core, engine, and queue must build no_std
     // for the target, and the firmware must link for it.
     run(&[
