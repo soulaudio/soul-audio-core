@@ -220,7 +220,7 @@ fn to_union(ms: &[MemberData]) -> CatalogInput {
 
 /// Bake `input` and wrap the reader as a `'static` boxed `Catalog` (leaks the
 /// bytes — fine in a test).
-fn boxed_member(input: &CatalogInput) -> Box<dyn Catalog> {
+fn boxed_member(input: &CatalogInput) -> Box<dyn Catalog + Send> {
     let bytes: &'static [u8] = Vec::leak(write_index(input));
     Box::new(IndexReader::new(SliceSource::new(bytes)))
 }
@@ -389,6 +389,16 @@ fn routing() {
     let p0 = multi.playlist_track(bob_mix, 0).unwrap();
     assert_eq!(unpack(p0).0, 1);
     assert_eq!(resolve(&multi, multi.track(p0).unwrap().title), "golf");
+}
+
+/// The desktop moves the aggregate across threads inside a `Mutex` (`Arc<Library>`
+/// over the actor + event-pump threads), so it must be `Send`. It is deliberately
+/// not `Sync` — the member readers are single-threaded (`RefCell` source) — so the
+/// desktop serializes access behind its own lock.
+#[test]
+fn multicatalog_is_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<MultiCatalog>();
 }
 
 /// `unpack(pack(s, l)) == (s, l)` across the valid ranges.
@@ -773,7 +783,7 @@ fn seventeen_sources_panics() {
             playlists: vec![],
         }))
     };
-    let members: Vec<Box<dyn Catalog>> = (0..17).map(|_| one()).collect();
+    let members: Vec<Box<dyn Catalog + Send>> = (0..17).map(|_| one()).collect();
     let _ = MultiCatalog::new(members);
 }
 
