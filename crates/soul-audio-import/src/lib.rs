@@ -260,7 +260,7 @@ pub fn scan(root: &Path) -> std::io::Result<CatalogInput> {
         .album_dirs
         .iter()
         .zip(interner.album_tracks.iter())
-        .map(|(dir, track)| cover::find_album_cover(dir, track))
+        .map(|(dir, track)| cover::find_album_cover(dir, track, root))
         .collect();
 
     Ok(CatalogInput {

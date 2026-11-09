@@ -78,6 +78,32 @@ fn run(args: &[&str]) -> Result<(), String> {
 fn verify() -> Result<(), String> {
     run(&["fmt", "--all", "--", "--check"])?;
     run(&["clippy", "--all-targets", "--", "-D", "warnings"])?;
+    // `--all-targets` above runs with DEFAULT features only, so the
+    // `build`-gated encoder/writer/baker code (soul-audio-index,
+    // soul-audio-artbake) is never clippy-checked by it. Lint those
+    // explicitly under their `build` feature too.
+    run(&[
+        "clippy",
+        "-p",
+        "soul-audio-index",
+        "--all-targets",
+        "--features",
+        "build",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
+    run(&[
+        "clippy",
+        "-p",
+        "soul-audio-artbake",
+        "--all-targets",
+        "--features",
+        "build",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
     // The checked-in generated tables must match their generators.
     resample_tables::check()?;
     filterbank_tables::check()?;

@@ -37,8 +37,10 @@ impl<S: SeekSource> ArtBlobReader<S> {
     pub fn new(mut src: S) -> Self {
         let mut h = [0u8; HEADER_LEN];
         let _ = src.seek(SeekFrom::Start(0));
-        let _ = src.read(&mut h); // best-effort; a bad/absent blob → count 0
-        let ok = h[..4] == MAGIC;
+        // best-effort; a bad/absent/short blob → count 0. `read_exact` fails on
+        // a short read instead of silently leaving `h` partially populated with
+        // garbage dims behind a valid-looking magic.
+        let ok = src.read_exact(&mut h).is_ok() && h[..4] == MAGIC;
         Self {
             src: core::cell::RefCell::new(src),
             width: if ok { le_u16(&h, 6) } else { 0 },

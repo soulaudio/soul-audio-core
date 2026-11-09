@@ -91,7 +91,10 @@ impl ArtBlobWriter {
             hash = hash.wrapping_mul(0x0000_0001_0000_01b3);
         }
         if let Some(&id) = self.seen.get(&hash) {
-            return id;
+            if self.entries[(id - 1) as usize] == bitmap {
+                return id;
+            }
+            // hash collision on distinct bitmaps: fall through, add a new entry
         }
         self.entries.push(bitmap);
         let id = self.entries.len() as u32; // 1-based art_id

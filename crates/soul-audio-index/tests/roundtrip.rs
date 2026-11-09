@@ -212,6 +212,7 @@ fn png_of(w: u32, h: u32, f: impl Fn(u32, u32) -> u8) -> Vec<u8> {
 /// encoded bitmap.
 #[test]
 fn bakes_cover_art_into_blob_and_assigns_art_id() {
+    let cover_png = png_of(32, 32, |x, y| (((x + y) * 7) % 256) as u8);
     let input = CatalogInput {
         tracks: vec![
             TrackInput {
@@ -261,10 +262,7 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
             parent: NO_FOLDER,
         }],
         playlists: vec![],
-        covers: vec![
-            Some(png_of(32, 32, |x, y| (((x + y) * 7) % 256) as u8)),
-            None,
-        ],
+        covers: vec![Some(cover_png.clone()), None],
     };
 
     let (art_blob, album_art_id) = bake_art(&input, ART_W, ART_H);
@@ -294,4 +292,11 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
         .art(album0.art_id, &mut buf)
         .expect("art_id resolves in art.blob");
     assert_eq!(n, want_len);
+    assert_eq!(
+        &buf[..n],
+        soul_audio_artbake::build::encode_cover(&cover_png, ART_W, ART_H)
+            .unwrap()
+            .as_slice(),
+        "resolved bytes match the encoder's output exactly, not just its length"
+    );
 }

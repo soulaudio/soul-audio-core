@@ -11,7 +11,9 @@
 //!
 //! Resolution order: an embedded front-cover picture on a representative
 //! track of the album, else the best sidecar image in the album's own folder,
-//! else the best sidecar image in that folder's immediate parent.
+//! else the best sidecar image in that folder's immediate parent — but only
+//! when that parent is still inside the scanned library root; tracks sitting
+//! directly in the library root must never cause a read outside it.
 
 use std::path::{Path, PathBuf};
 
@@ -25,11 +27,16 @@ const COVER_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
 /// Resolve one cover for an album: the embedded front-cover picture of
 /// `a_track_path` (any one track belonging to the album) if present, else the
 /// best sidecar image found in `album_dir` or (failing that) its immediate
-/// parent folder. `None` when neither source yields one, or a read fails —
-/// cover art is best-effort and never fails the surrounding scan.
+/// parent folder, as long as that parent is still inside `root`. `None` when
+/// neither source yields one, or a read fails — cover art is best-effort and
+/// never fails the surrounding scan.
 #[must_use]
-pub(crate) fn find_album_cover(album_dir: &Path, a_track_path: &Path) -> Option<Vec<u8>> {
-    embedded_cover(a_track_path).or_else(|| sidecar_cover(album_dir))
+pub(crate) fn find_album_cover(
+    album_dir: &Path,
+    a_track_path: &Path,
+    root: &Path,
+) -> Option<Vec<u8>> {
+    embedded_cover(a_track_path).or_else(|| sidecar_cover(album_dir, root))
 }
 
 /// Read the representative track's embedded front-cover picture, falling back
@@ -49,9 +56,18 @@ fn embedded_cover(track_path: &Path) -> Option<Vec<u8>> {
 }
 
 /// Best sidecar image for an album folder: its own directory first, then
-/// (only if that yields nothing) its immediate parent.
-fn sidecar_cover(album_dir: &Path) -> Option<Vec<u8>> {
-    best_in_dir(album_dir).or_else(|| album_dir.parent().and_then(best_in_dir))
+/// (only if that yields nothing) its immediate parent — but only when the
+/// parent is still inside `root`. An album folder sitting directly at `root`
+/// (or outside it) never falls back to a read above the library.
+fn sidecar_cover(album_dir: &Path, root: &Path) -> Option<Vec<u8>> {
+    best_in_dir(album_dir).or_else(|| {
+        let parent = album_dir.parent()?;
+        if parent.starts_with(root) {
+            best_in_dir(parent)
+        } else {
+            None
+        }
+    })
 }
 
 /// The largest cover-named image directly inside `dir`, read to bytes.
@@ -104,7 +120,7 @@ mod tests {
         std::fs::create_dir_all(&album).unwrap();
         std::fs::write(album.join("cover.png"), vec![1u8; 5]).unwrap();
 
-        let got = sidecar_cover(&album).unwrap();
+        let got = sidecar_cover(&album, &parent).unwrap();
         assert_eq!(got, vec![1u8; 5]);
     }
 
@@ -115,8 +131,22 @@ mod tests {
         let album = parent.join("Disc 1");
         std::fs::create_dir_all(&album).unwrap();
 
-        let got = sidecar_cover(&album).unwrap();
+        let got = sidecar_cover(&album, &parent).unwrap();
         assert_eq!(got, vec![2u8; 7]);
+    }
+
+    #[test]
+    fn sidecar_does_not_fall_back_above_scan_root() {
+        // `album` sits directly at the scan root: its parent (`base`) is
+        // OUTSIDE the selected library, so the fallback must not read from
+        // it even though it holds a matching sidecar image.
+        let base = tmpdir("root_bound");
+        std::fs::write(base.join("folder.jpg"), vec![3u8; 11]).unwrap();
+        let root = base.join("Library");
+        std::fs::create_dir_all(&root).unwrap();
+        let album = root.clone();
+
+        assert_eq!(sidecar_cover(&album, &root), None);
     }
 
     #[test]
@@ -126,7 +156,7 @@ mod tests {
         std::fs::write(album.join("cover.jpg"), vec![0u8; 500]).unwrap();
         std::fs::write(album.join("artwork.png"), vec![0u8; 50]).unwrap();
 
-        let got = sidecar_cover(&album).unwrap();
+        let got = sidecar_cover(&album, &album).unwrap();
         assert_eq!(got.len(), 500);
     }
 
@@ -137,12 +167,15 @@ mod tests {
         std::fs::write(album.join("notes.txt"), b"hi").unwrap();
         std::fs::write(album.join("back.jpg"), vec![0u8; 9999]).unwrap();
 
-        assert_eq!(sidecar_cover(&album), None);
+        assert_eq!(sidecar_cover(&album, &album), None);
     }
 
     #[test]
     fn none_when_nothing_present() {
         let album = tmpdir("none");
-        assert_eq!(find_album_cover(&album, &album.join("missing.flac")), None);
+        assert_eq!(
+            find_album_cover(&album, &album.join("missing.flac"), &album),
+            None
+        );
     }
 }
