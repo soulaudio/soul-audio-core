@@ -1175,6 +1175,77 @@ mod tests {
     }
 
     #[test]
+    fn seek_output_matches_natural_playback_after_warmup() {
+        // Decode-path proof that the residual seek click is NOT a decode defect.
+        // A `RampDecoder` emits value == source frame index, so we can read back
+        // exactly which frames the deck produced. Claim: once the de-click fade has
+        // warmed up, every post-seek frame equals the frame a natural play-through
+        // to that position would have emitted — the splice is bit-exact. Any click
+        // a listener still hears therefore lives in the output stage (the sink's
+        // ring clear), not here.
+        fn ramp(frames: u64) -> RampDecoder {
+            RampDecoder {
+                ch: 1,
+                frames,
+                pos: 0,
+                delay: 0,
+                playable: None,
+            }
+        }
+
+        // Natural play-through from 0: output[i] == source frame i.
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 1,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut natural: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
+        natural.load(ramp(20_000)).unwrap();
+        for _ in 0..40 {
+            natural.pump().unwrap();
+        }
+        let nat = &natural.sink.written;
+        assert_eq!(nat[7_000], 7_000, "natural output frame index is the value");
+
+        // Seek to P, then pump past the fade.
+        let p = 5_000usize;
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 1,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut seeked: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
+        seeked.load(ramp(20_000)).unwrap();
+        seeked.pump().unwrap(); // buffer pre-seek audio (the sink discards it IRL)
+        let pre = seeked.sink.written.len();
+        seeked.seek(p as u64).unwrap();
+        for _ in 0..40 {
+            seeked.pump().unwrap();
+        }
+        let post = &seeked.sink.written[pre..];
+
+        let fade_len = 384usize; // round(8 ms * 48000 / 1000)
+        // New side ramps up from zero (the deck fade-in) — not a step.
+        assert_eq!(post[0], 0, "post-seek output starts at zero, not a jump");
+        // After the fade: bit-exact. Emitted frame j is source frame P+j, which is
+        // exactly what the natural play-through emitted at P+j.
+        for j in fade_len..fade_len + 2_000 {
+            assert_eq!(
+                post[j],
+                (p + j) as i32,
+                "post-seek frame {j} decodes source frame P+j"
+            );
+            assert_eq!(
+                post[j],
+                nat[p + j],
+                "seek is bit-exact vs natural play-through at P+{j}"
+            );
+        }
+    }
+
+    #[test]
     fn channels_over_max_are_rejected_not_overflow() {
         // A device with > MAX_CH channels + an equal-rate, equal-channel source
         // takes the no-resampler path; without the guard it would overflow the

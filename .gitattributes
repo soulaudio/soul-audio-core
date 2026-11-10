@@ -12,6 +12,8 @@
 *.pcm binary
 *.flac binary
 *.mp3 binary
+*.mp2 binary
+*.mp1 binary
 *.dsf binary
 *.dff binary
 *.ogg binary
