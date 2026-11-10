@@ -3497,3 +3497,459 @@ fn opus_celt_decode_throughput() {
         .join()
         .unwrap();
 }
+
+/// Raw ADTS (`.aac`) CBR byte-estimate length + fast seek (regression for the
+/// multi-second synchronous block on a seek of a header-less `.aac`).
+///
+/// A raw ADTS elementary stream carries no in-band length (no `mdhd`/Xing), so
+/// before [`AnyDecoder::resolve_lengths`] `total_frames()` is `None` and the
+/// decoder can only seek by a *linear* decode-discard from the stream start —
+/// O(target) full AAC-frame decodes (≈10 s for a 5-minute file). Resolving a CBR
+/// byte-size estimate both supplies a duration and lets the seek jump by a byte
+/// estimate + syncword resync, touching the source O(1) times.
+#[cfg(test)]
+mod adts_cbr_seek {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use embedded_io::{BufRead, ErrorType, Read, Seek, SeekFrom};
+    use soul_audio_core::{Decoder, SliceSource, open};
+
+    const AAC: &[u8] = include_bytes!("../testdata/aac.aac");
+    const AAC_ID3: &[u8] = include_bytes!("../testdata/aac-id3.aac");
+
+    /// A seekable `BufSource` wrapping a `SliceSource` that counts how many times
+    /// its `read` is called — the O(1)-vs-O(frames) seek-cost probe. Seeks and
+    /// buffered peeks (`fill_buf`) are *not* counted: only the decode/resync-path
+    /// `read`s that a linear seek multiplies per frame.
+    struct CountingSource {
+        inner: SliceSource<'static>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl CountingSource {
+        fn new(data: &'static [u8], reads: Arc<AtomicUsize>) -> Self {
+            Self {
+                inner: SliceSource::new(data),
+                reads,
+            }
+        }
+    }
+
+    impl ErrorType for CountingSource {
+        type Error = embedded_io::ErrorKind;
+    }
+    impl Read for CountingSource {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.read(buf)
+        }
+    }
+    impl BufRead for CountingSource {
+        fn fill_buf(&mut self) -> Result<&[u8], Self::Error> {
+            self.inner.fill_buf()
+        }
+        fn consume(&mut self, amt: usize) {
+            self.inner.consume(amt);
+        }
+    }
+    impl Seek for CountingSource {
+        fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// Big-stack decode of a whole ADTS stream → per-channel frame count (ground
+    /// truth for the length estimate). `AacDecoder` exceeds the default test stack.
+    fn real_frames(bytes: &'static [u8]) -> u64 {
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn_scoped(s, || {
+                    let mut dec = open(SliceSource::new(bytes)).expect("open ADTS");
+                    let mut total = 0u64;
+                    let mut buf = [0i32; 4096];
+                    loop {
+                        let n = dec.decode_into(&mut buf).expect("decode");
+                        if n == 0 {
+                            break;
+                        }
+                        total += n as u64;
+                    }
+                    total / u64::from(dec.stream_info().channels.max(1))
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        })
+    }
+
+    /// Open `bytes` through `open()` over a `CountingSource`, optionally resolve
+    /// the CBR length, then seek to `target_sample` — returning
+    /// `(read_calls_during_the_seek, drained_tail_interleaved_len)`.
+    fn seek_measure(bytes: &'static [u8], target_sample: u64, resolve: bool) -> (usize, usize) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn_scoped(s, move || {
+                    let mut dec = open(CountingSource::new(bytes, c.clone())).expect("open ADTS");
+                    if resolve {
+                        dec.resolve_lengths();
+                    }
+                    // Measure only the seek itself.
+                    c.store(0, Ordering::Relaxed);
+                    dec.seek_to(target_sample).expect("seek");
+                    let reads = c.load(Ordering::Relaxed);
+                    let mut tail = 0usize;
+                    let mut buf = [0i32; 4096];
+                    loop {
+                        let n = dec.decode_into(&mut buf).expect("decode");
+                        if n == 0 {
+                            break;
+                        }
+                        tail += n;
+                    }
+                    (reads, tail)
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        })
+    }
+
+    /// `resolve_lengths()` recovers a per-channel length for a raw ADTS stream
+    /// (both bare and ID3-prefixed) within a frame or two of the real decode,
+    /// where before it was `None`. For these short fixtures (≤ the sample budget)
+    /// the walk is exact, so the estimate equals the decoded count.
+    #[test]
+    fn resolve_reports_length_within_a_frame() {
+        for (name, bytes) in [("aac.aac", AAC), ("aac-id3.aac", AAC_ID3)] {
+            let real = real_frames(bytes); // 23552 samples/ch (23 frames)
+            let mut dec = open(SliceSource::new(bytes)).expect("open ADTS");
+            assert_eq!(
+                dec.total_frames(),
+                None,
+                "{name}: raw ADTS has no in-band length before CBR resolve"
+            );
+            dec.resolve_lengths();
+            let total = dec
+                .total_frames()
+                .unwrap_or_else(|| panic!("{name}: resolve_lengths() left total_frames() None"));
+            let off = real.abs_diff(total);
+            assert!(
+                off <= 2 * 1024,
+                "{name}: CBR length estimate {total} vs real {real} off by {off} (> 2 frames)"
+            );
+        }
+    }
+
+    /// After resolving, a seek jumps by byte estimate + resync — touching the
+    /// source a small *constant* number of times — and lands near the target
+    /// (within ~1 frame), whereas the unresolved stream seeks linearly, reading
+    /// the source ~once per decoded frame up to the target.
+    #[test]
+    fn seek_is_o1_after_resolve_and_lands_near_target() {
+        let real = real_frames(AAC); // 23552 samples/ch
+        let total_frames = real / 1024; // 23
+        let target_frame = total_frames * 3 / 4; // 17 — well into the stream
+        let target_sample = target_frame * 1024;
+
+        let (fast_reads, fast_tail) = seek_measure(AAC, target_sample, true);
+        let (linear_reads, linear_tail) = seek_measure(AAC, target_sample, false);
+
+        // Fast evidence: O(1) vs O(frames). The byte-estimate seek touches the
+        // source a handful of times; the linear one reads ~per frame to target.
+        assert!(
+            fast_reads <= 6,
+            "resolved seek should touch the source O(1) times, got {fast_reads}"
+        );
+        assert!(
+            linear_reads >= 15,
+            "linear seek should read ~per-frame to the target, got {linear_reads}"
+        );
+        assert!(
+            fast_reads * 3 < linear_reads,
+            "resolved seek ({fast_reads}) not far cheaper than linear ({linear_reads})"
+        );
+
+        // Both land near the target: the drained stereo tail is within ~2 frames
+        // of the audio remaining after `target_frame` — proof the seek landed near
+        // the target, not at 0 (whole stream) or EOF (empty).
+        let expected_tail = ((total_frames - target_frame) * 1024 * 2) as usize;
+        let tol = 2 * 1024 * 2;
+        for (label, tail) in [("resolved", fast_tail), ("linear", linear_tail)] {
+            let off = tail.abs_diff(expected_tail);
+            assert!(
+                off <= tol,
+                "{label}: tail {tail} vs expected {expected_tail} off by {off} (> 2 frames)"
+            );
+            assert!(tail > 0, "{label}: seek landed at EOF (empty tail)");
+        }
+    }
+}
+
+/// Matroska/WebM **Cues-index seek** (regression for the multi-second synchronous
+/// block seeking Opus-in-mka/webm): before, `seek_to` rewound to the first
+/// Cluster and decode-discarded forward — O(target) full Opus decodes (seconds on
+/// a real file). Now the demuxer resolves the Cues index (via the SeekHead), jumps
+/// straight to the Cluster covering the target, and only decode-discards within
+/// it — touching the source O(1) times on the index + one cluster.
+///
+/// The fixtures (`tone-opus-cues.{webm,mka}`) are the 2 s A4/E5 tone encoded to
+/// Opus with `-cluster_time_limit 250`, forcing **9 clusters** so a late seek has
+/// many clusters to skip — unlike the single-cluster `tone-opus.webm`, where a cue
+/// jump and a restart land in the same place.
+#[cfg(test)]
+mod matroska_cue_seek {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use embedded_io::{BufRead, ErrorType, Read, Seek, SeekFrom};
+    use soul_audio_core::{Decoder, SliceSource, open};
+
+    const OPUS_WEBM: &[u8] = include_bytes!("../../../testdata/tone-opus-cues.webm");
+    const OPUS_MKA: &[u8] = include_bytes!("../../../testdata/tone-opus-cues.mka");
+    const FLAC_MKA: &[u8] = include_bytes!("../../../testdata/tone-flac-cues.mka");
+    const AAC_MKA: &[u8] = include_bytes!("../../../testdata/tone-aac-cues.mka");
+
+    /// A seekable `BufSource` over a `'static` slice that counts `read` calls —
+    /// the O(1)-vs-O(clusters) seek-cost probe (seeks / buffered peeks uncounted),
+    /// mirroring `adts_cbr_seek::CountingSource`.
+    struct CountingSource {
+        inner: SliceSource<'static>,
+        reads: Arc<AtomicUsize>,
+    }
+    impl CountingSource {
+        fn new(data: &'static [u8], reads: Arc<AtomicUsize>) -> Self {
+            Self {
+                inner: SliceSource::new(data),
+                reads,
+            }
+        }
+    }
+    impl ErrorType for CountingSource {
+        type Error = embedded_io::ErrorKind;
+    }
+    impl Read for CountingSource {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.read(buf)
+        }
+    }
+    impl BufRead for CountingSource {
+        fn fill_buf(&mut self) -> Result<&[u8], Self::Error> {
+            self.inner.fill_buf()
+        }
+        fn consume(&mut self, amt: usize) {
+            self.inner.consume(amt);
+        }
+    }
+    impl Seek for CountingSource {
+        fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// Seek to per-channel `target` over a `CountingSource` and return
+    /// `(read_calls_during_the_seek, decoded_interleaved_tail)`. Big stack: the
+    /// Opus decoder carries large CELT/SILK state by value.
+    fn cue_seek(bytes: &'static [u8], target: u64) -> (usize, Vec<i32>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn_scoped(s, move || {
+                    let mut dec =
+                        open(CountingSource::new(bytes, c.clone())).expect("open opus-mkv");
+                    c.store(0, Ordering::Relaxed);
+                    dec.seek_to(target).expect("seek");
+                    let reads = c.load(Ordering::Relaxed);
+                    let mut tail = Vec::new();
+                    let mut buf = [0i32; 4096];
+                    loop {
+                        let n = dec.decode_into(&mut buf).expect("decode");
+                        if n == 0 {
+                            break;
+                        }
+                        tail.extend_from_slice(&buf[..n]);
+                    }
+                    (reads, tail)
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        })
+    }
+
+    /// `read` calls a *linear* seek would spend: decode-discard from the start
+    /// until `target` per-channel samples pass (the work the old restart-based
+    /// seek did). The cue seek must touch the source far fewer times than this.
+    fn linear_reads_to(bytes: &'static [u8], target: u64, channels: usize) -> usize {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn_scoped(s, move || {
+                    let mut dec =
+                        open(CountingSource::new(bytes, c.clone())).expect("open opus-mkv");
+                    c.store(0, Ordering::Relaxed);
+                    let mut passed = 0u64;
+                    let mut buf = [0i32; 4096];
+                    while passed < target {
+                        let n = dec.decode_into(&mut buf).expect("decode");
+                        if n == 0 {
+                            break;
+                        }
+                        passed += (n / channels) as u64;
+                    }
+                    c.load(Ordering::Relaxed)
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        })
+    }
+
+    /// Best per-channel-frame shift (either direction) aligning `tail`'s head
+    /// against `full` around `target`, plus the SNR there. The two-tone fixture
+    /// has no common period, so only the true landing scores high — the shift both
+    /// *locates* the landing (proving it hit the target cluster, not 0 or EOF) and
+    /// its SNR proves the decoded audio correct. Unlike `best_align_segsnr` it
+    /// searches **both** directions (a cue landing can over- or under-shoot the
+    /// reported sample by the index's ms rounding).
+    fn aligned_shift(tail: &[i32], full: &[i32], target: usize, ch: usize, max: i64) -> (i64, f64) {
+        let probe_len = (4096 * ch).min(tail.len());
+        let probe = &tail[..probe_len];
+        let base = (target * ch) as i64; // interleaved index of the target sample
+        let mut best = (0i64, f64::NEG_INFINITY);
+        let mut f = -max;
+        while f <= max {
+            let start = base + f * ch as i64;
+            if start >= 0 && (start as usize) + probe_len <= full.len() {
+                let w = &full[start as usize..start as usize + probe_len];
+                let (mut sig, mut err) = (0f64, 0f64);
+                for i in 0..probe_len {
+                    let r = w[i] as f64;
+                    sig += r * r;
+                    let d = r - probe[i] as f64;
+                    err += d * d;
+                }
+                let snr = if err <= 0.0 {
+                    f64::INFINITY
+                } else {
+                    10.0 * (sig / err).log10()
+                };
+                if snr > best.1 {
+                    best = (f, snr);
+                }
+            }
+            f += 1;
+        }
+        best
+    }
+
+    /// A late Cues seek is **sublinear** (touches the source far fewer times than a
+    /// decode-discard from the start) and lands on the **correct audio** (the tail
+    /// aligns with the full decode at the target within a frame or two, high SNR).
+    #[test]
+    fn late_opus_cue_seek_is_sublinear_and_correct() {
+        for (name, bytes) in [("webm", OPUS_WEBM), ("mka", OPUS_MKA)] {
+            let (full, ch) = super::decode_all_with_channels(bytes);
+            let ch = usize::from(ch);
+            let total = (full.len() / ch) as u64; // per-channel samples
+            // ~94% in — many clusters to skip, yet a few thousand samples of tail.
+            let target = total * 15 / 16;
+
+            let (cue_reads, tail) = cue_seek(bytes, target);
+            let linear = linear_reads_to(bytes, target, ch);
+
+            assert!(
+                cue_reads * 2 < linear,
+                "{name}: Cues seek should be sublinear — cue reads {cue_reads} not << linear {linear}"
+            );
+            assert!(
+                !tail.is_empty(),
+                "{name}: cue seek landed at EOF (empty tail)"
+            );
+
+            // Correctness: the tail is the full decode from `target` at high SNR,
+            // landing within the Matroska index's **1 ms** resolution (≤ ~48 frames
+            // @ 48 kHz) — `CueTime` is ms-granular, so an Opus-in-Matroska cue seek
+            // is frame-granular, not sample-exact. The small shift proves it landed
+            // on the target cluster (not at 0 or EOF); the high SNR proves the audio
+            // there is correct bar codec warm-up.
+            let (shift, snr) = aligned_shift(&tail, &full, target as usize, ch, 64);
+            assert!(
+                snr > 45.0 && shift.unsigned_abs() <= 48,
+                "{name}: cue seek audio wrong — {snr:.1} dB at frame shift {shift} (target {target})"
+            );
+        }
+    }
+
+    /// FLAC-in-Matroska benefits from the same Cues jump, and — FLAC frames being
+    /// independent and self-anchoring from their coded sample number — the seek is
+    /// **sample-accurate and bit-exact**: a late cue seek touches the source far
+    /// fewer times than a linear decode-discard, and its tail equals the full
+    /// decode from the target exactly.
+    #[test]
+    fn late_flac_cue_seek_is_sublinear_and_bit_exact() {
+        let (full, ch) = super::decode_all_with_channels(FLAC_MKA);
+        let ch = usize::from(ch);
+        let total = (full.len() / ch) as u64;
+        let target = total * 7 / 8;
+
+        let (cue_reads, tail) = cue_seek(FLAC_MKA, target);
+        let linear = linear_reads_to(FLAC_MKA, target, ch);
+        // FLAC frames are large (~4096 samples), so a 2 s fixture holds only a
+        // handful — the byte-by-byte Cue scan is a big fraction of the (already
+        // small) linear cost here, so the read-count win is modest on short files
+        // (the decode-count win — a couple of frames vs all of them — is the real
+        // payoff, and grows without bound on a real multi-minute file). We assert
+        // only that the cue seek is **sublinear** (fewer reads than decode-to-
+        // target); correctness is carried by the bit-exact tail below.
+        assert!(
+            cue_reads < linear,
+            "FLAC Cues seek should touch the source fewer times than linear — {cue_reads} vs {linear}"
+        );
+        let base = target as usize * ch;
+        assert_eq!(
+            tail,
+            &full[base..],
+            "FLAC cue seek tail must be bit-exact with the full decode from the target"
+        );
+    }
+
+    /// AAC-in-Matroska takes the same Cues jump. AAC access units carry no sample
+    /// number (unlike FLAC) so the base comes from the (ms-granular) cue time, and
+    /// the filterbank reset warms up over the landed cluster's run-in — so the
+    /// landing is **frame-granular**, correct at high SNR within the index's ms
+    /// resolution, and sublinear in source touches.
+    #[test]
+    fn late_aac_cue_seek_is_sublinear_and_correct() {
+        let (full, ch) = super::decode_all_with_channels(AAC_MKA);
+        let ch = usize::from(ch);
+        let total = (full.len() / ch) as u64;
+        let target = total * 7 / 8;
+
+        let (cue_reads, tail) = cue_seek(AAC_MKA, target);
+        let linear = linear_reads_to(AAC_MKA, target, ch);
+        assert!(
+            cue_reads * 2 < linear,
+            "AAC Cues seek should be sublinear — cue reads {cue_reads} not << linear {linear}"
+        );
+        assert!(!tail.is_empty(), "AAC cue seek landed at EOF (empty tail)");
+
+        // Frame-granular, correct: the landed cluster's run-in warms the filterbank
+        // so the tail is the full decode from the target (within the ms index's
+        // resolution — ≤ ~48 frames @ 48 kHz, either direction) at very high SNR.
+        let (shift, snr) = aligned_shift(&tail, &full, target as usize, ch, 96);
+        assert!(
+            snr > 45.0 && shift.unsigned_abs() <= 48,
+            "AAC cue seek audio wrong — {snr:.1} dB at frame shift {shift} (target {target})"
+        );
+    }
+}

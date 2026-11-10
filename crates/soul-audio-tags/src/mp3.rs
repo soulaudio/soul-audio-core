@@ -9,8 +9,10 @@
 //! decoupled from the decoder/demux stack.
 //!
 //! Deliberate scope limits:
-//! - Layer III only (what "MP3" means in practice); a Layer I/II or
-//!   reserved-layer header is treated as sync noise and skipped over.
+//! - All three MPEG layers (I/II/III) are parsed; only a reserved-layer or
+//!   reserved-version header is treated as sync noise and skipped. Xing/Info/
+//!   VBRI tags are a Layer III convention, so Layer I/II duration always comes
+//!   from the CBR file-length estimate below.
 //! - Free-format bitrate (index 0) is declined — its frame length isn't
 //!   table-derivable, and it's vanishingly rare in the wild.
 //! - Without a Xing/Info/VBRI header, `total_frames` is estimated from the
@@ -30,12 +32,24 @@ use soul_audio_core::SeekSource;
 /// MP3 syncs within the first few bytes.
 const SYNC_SCAN_WINDOW: usize = 8192;
 
-/// Bitrate (kbps) by 4-bit index, Layer III only, 0 = free/reserved (never a
-/// valid frame — the free-format case is out of scope, see module docs).
+/// Bitrate (kbps) by 4-bit index, 0 = free/reserved (never a valid frame —
+/// the free-format case is out of scope, see module docs). The table differs
+/// by MPEG version (1 vs 2/2.5) and by layer, so there is one per combination.
+const BR_V1_L1: [u32; 16] = [
+    0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0,
+];
+const BR_V1_L2: [u32; 16] = [
+    0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0,
+];
 const BR_V1_L3: [u32; 16] = [
     0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
 ];
-const BR_V2_L3: [u32; 16] = [
+/// MPEG2/2.5 Layer I.
+const BR_V2_L1: [u32; 16] = [
+    0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0,
+];
+/// MPEG2/2.5 Layers II and III share one bitrate table.
+const BR_V2_L23: [u32; 16] = [
     0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
 ];
 
@@ -48,7 +62,7 @@ const SAMPLE_RATES: [[u32; 4]; 4] = [
     [44100, 48000, 32000, 0],
 ];
 
-/// A parsed, validated Layer III frame header.
+/// A parsed, validated MPEG (Layer I/II/III) frame header.
 #[derive(Clone, Copy)]
 struct FrameHeader {
     mpeg1: bool,
@@ -62,16 +76,16 @@ struct FrameHeader {
 }
 
 /// Parse+validate a 4-byte MPEG frame header. `None` for anything that isn't
-/// a supported (Layer III, non-free-format, non-reserved) frame — the caller
-/// treats that as sync noise and keeps scanning.
+/// a supported (non-reserved layer/version, non-free-format) frame — the
+/// caller treats that as sync noise and keeps scanning.
 fn parse_header(h: &[u8; 4]) -> Option<FrameHeader> {
     if h[0] != 0xFF || (h[1] & 0xE0) != 0xE0 {
         return None;
     }
     let version = (h[1] >> 3) & 0x3; // 0=2.5, 1=reserved, 2=v2, 3=v1
     let layer = (h[1] >> 1) & 0x3; // 01=III, 10=II, 11=I, 00=reserved
-    if version == 1 || layer != 1 {
-        return None;
+    if version == 1 || layer == 0 {
+        return None; // reserved MPEG version / reserved layer
     }
     let br_idx = ((h[2] >> 4) & 0xF) as usize;
     let sr_idx = ((h[2] >> 2) & 0x3) as usize;
@@ -85,17 +99,30 @@ fn parse_header(h: &[u8; 4]) -> Option<FrameHeader> {
     if sample_rate == 0 {
         return None;
     }
-    let bitrate_kbps = if mpeg1 {
-        BR_V1_L3[br_idx]
-    } else {
-        BR_V2_L3[br_idx]
+    // Bitrate table depends on both the MPEG version and the layer: the three
+    // layers use different tables, and MPEG2/2.5 differs from MPEG1.
+    let bitrate_kbps = match (mpeg1, layer) {
+        (true, 3) => BR_V1_L1[br_idx],       // MPEG1 Layer I
+        (true, 2) => BR_V1_L2[br_idx],       // MPEG1 Layer II
+        (true, 1) => BR_V1_L3[br_idx],       // MPEG1 Layer III
+        (false, 3) => BR_V2_L1[br_idx],      // MPEG2/2.5 Layer I
+        (false, 1 | 2) => BR_V2_L23[br_idx], // MPEG2/2.5 Layers II & III
+        _ => return None,                    // reserved layer (filtered above)
     };
     if bitrate_kbps == 0 {
         return None;
     }
 
     let channels = if chan_mode == 3 { 1 } else { 2 };
-    let samples_per_frame = if mpeg1 { 1152 } else { 576 };
+    // Samples per frame are fixed per layer: Layer I = 384, Layer II = 1152,
+    // Layer III = 1152 (MPEG1) / 576 (MPEG2/2.5).
+    let samples_per_frame = match layer {
+        3 => 384,           // Layer I
+        2 => 1152,          // Layer II
+        1 if mpeg1 => 1152, // Layer III, MPEG1
+        1 => 576,           // Layer III, MPEG2/2.5
+        _ => return None,   // reserved layer (filtered above)
+    };
     let crc_bytes = if h[1] & 0x1 == 0 { 2 } else { 0 }; // protection bit 0 = CRC present
 
     Some(FrameHeader {
@@ -121,8 +148,8 @@ fn side_info_len(mpeg1: bool, mono: bool) -> u64 {
 }
 
 /// Scan forward from `audio_start` (`src`'s position on entry must match),
-/// within [`SYNC_SCAN_WINDOW`] bytes, for the first valid Layer III frame
-/// sync. On success, `src` is left positioned just past the 4-byte header
+/// within [`SYNC_SCAN_WINDOW`] bytes, for the first valid MPEG frame sync.
+/// On success, `src` is left positioned just past the 4-byte header
 /// (`header_end`); returns the header and its absolute start offset.
 fn find_first_frame<S: SeekSource>(src: &mut S, audio_start: u64) -> Option<(FrameHeader, u64)> {
     let mut window = [0u8; 4];
@@ -251,6 +278,22 @@ mod tests {
         [0xFF, b1, b2, b3]
     }
 
+    /// Build a 4-byte MPEG-1 header for an explicit layer. `layer_bits`:
+    /// `0b01` = III, `0b10` = II, `0b11` = I. `br_idx` indexes that layer's
+    /// bitrate table; `sr_idx` indexes row 3 of [`SAMPLE_RATES`].
+    fn header_v1_layer(
+        layer_bits: u8,
+        br_idx: u8,
+        sr_idx: u8,
+        mono: bool,
+        protected: bool,
+    ) -> [u8; 4] {
+        let b1 = 0xE0 | (0b11 << 3) | (layer_bits << 1) | u8::from(!protected);
+        let b2 = (br_idx << 4) | (sr_idx << 2);
+        let b3 = if mono { 0b11 << 6 } else { 0 };
+        [0xFF, b1, b2, b3]
+    }
+
     fn xing_frame(header: [u8; 4], tag_off: usize, magic: &[u8; 4], frame_count: u32) -> Vec<u8> {
         let mut b = alloc::vec![0u8; tag_off + 12];
         b[0..4].copy_from_slice(&header);
@@ -282,10 +325,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_layer3_and_reserved_headers() {
-        // Layer II (layer bits = 10) at otherwise-valid bitrate/rate indices.
+    fn rejects_reserved_layer_version_and_free_format() {
+        // Reserved layer (layer bits = 00). Layers I/II/III are all accepted
+        // now (see the parses_mpeg1_layer{1,2}_header_fields tests); only the
+        // reserved layer value is noise.
         let mut h = header_v1(9, 0, false, true);
-        h[1] = (h[1] & !0b0000_0110) | (0b10 << 1);
+        h[1] &= !0b0000_0110; // clear layer bits -> 00
         assert!(parse_header(&h).is_none());
 
         // Reserved version (bits 3-4 of byte1 = 01).
@@ -378,5 +423,61 @@ mod tests {
         let facts = read_facts(&mut src);
         assert_eq!(facts.sample_rate, Some(44_100));
         assert_eq!(facts.channels, Some(2));
+    }
+
+    #[test]
+    fn parses_mpeg1_layer2_header_fields() {
+        // Layer II (bits 10), 128 kbps (BR_V1_L2 idx 8), 44100 Hz, stereo.
+        let h = header_v1_layer(0b10, 8, 0, false, false);
+        let f = parse_header(&h).expect("Layer II must parse");
+        assert!(f.mpeg1);
+        assert_eq!(f.sample_rate, 44_100);
+        assert_eq!(f.channels, 2);
+        assert_eq!(f.samples_per_frame, 1152);
+        assert_eq!(f.bitrate_bps, 128_000);
+    }
+
+    #[test]
+    fn parses_mpeg1_layer1_header_fields() {
+        // Layer I (bits 11), 128 kbps (BR_V1_L1 idx 4), 44100 Hz, stereo.
+        // Layer I carries only 384 samples per frame (vs 1152 for II/III).
+        let h = header_v1_layer(0b11, 4, 0, false, false);
+        let f = parse_header(&h).expect("Layer I must parse");
+        assert!(f.mpeg1);
+        assert_eq!(f.sample_rate, 44_100);
+        assert_eq!(f.channels, 2);
+        assert_eq!(f.samples_per_frame, 384);
+        assert_eq!(f.bitrate_bps, 128_000);
+    }
+
+    #[test]
+    fn cbr_duration_for_layer2_file() {
+        // Layer II, 128 kbps = 16,000 bytes/sec; a 16,000-byte CBR stream is
+        // ~1 s at 44,100 Hz. Xing/Info/VBRI is a Layer III convention, absent
+        // here, so this takes the CBR file-length estimate — the path real
+        // .mp2 files use. Before the Layer I/II fix the frame sync is rejected
+        // and total_frames comes back None (the 00:00 library bug).
+        let h = header_v1_layer(0b10, 8, 0, false, false);
+        let mut b = alloc::vec![0u8; 16_000];
+        b[0..4].copy_from_slice(&h);
+        let mut src = SliceSource::new(&b);
+        let facts = read_facts(&mut src);
+        assert_eq!(facts.sample_rate, Some(44_100));
+        assert_eq!(facts.channels, Some(2));
+        assert_eq!(facts.total_frames, Some(44_100)); // 1 s -> 44,100 frames
+    }
+
+    #[test]
+    fn cbr_duration_for_layer1_file() {
+        // Layer I, 128 kbps = 16,000 bytes/sec; 16,000 bytes ~= 1 s at
+        // 44,100 Hz. Same CBR estimate path; None before the fix.
+        let h = header_v1_layer(0b11, 4, 0, false, false);
+        let mut b = alloc::vec![0u8; 16_000];
+        b[0..4].copy_from_slice(&h);
+        let mut src = SliceSource::new(&b);
+        let facts = read_facts(&mut src);
+        assert_eq!(facts.sample_rate, Some(44_100));
+        assert_eq!(facts.channels, Some(2));
+        assert_eq!(facts.total_frames, Some(44_100));
     }
 }
