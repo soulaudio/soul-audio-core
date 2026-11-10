@@ -24,16 +24,14 @@
 //!        linear O(target) seek makes this ratio ≈ 4 (0.8·file / 0.2·file) and
 //!        fails; a random-access / index / bisection seek keeps it ≈ 1–2.
 //!
-//! Native FLAC (no seektable in any committed fixture) is the one format whose
-//! seek is *legitimately* linear (the demuxer's `seek_point_before` returns the
-//! origin and the decoder discards to the target), so it is asserted at its real
-//! class (ratio ≈ 4, bytes scale with depth) with a comment, not forced into the
-//! indexed bound. Everything else is random-access, bisection (Ogg
-//! Vorbis/Opus/FLAC), a byte-estimate (CBR MP3/ADTS/MP2/MP1 — the header-less
-//! MP2/MP1/tagless-MP3 case resolves a CBR length then jumps by a bitrate
-//! estimate + syncword resync), an MP4 sample table (AAC/ALAC), or a Matroska
-//! Cues jump (bounded within-cluster forward-decode — the reason POS_FACTOR
-//! tolerates a small multiple).
+//! Every seekable format here is random-access / indexed / bisection: a direct
+//! byte or block offset, a bisection (Ogg Vorbis/Opus/FLAC and **native FLAC** —
+//! which byte-bisects its frame stream by resyncing to real frame headers when
+//! there is no SEEKTABLE, O(log n) and position-independent), a byte-estimate (CBR
+//! MP3/ADTS/MP2/MP1 — the header-less MP2/MP1/tagless-MP3 case resolves a CBR
+//! length then jumps by a bitrate estimate + syncword resync), an MP4 sample table
+//! (AAC/ALAC), or a Matroska Cues jump (bounded within-cluster forward-decode —
+//! the reason POS_FACTOR tolerates a small multiple).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -274,13 +272,6 @@ enum Class {
     /// `(abs_bytes80_max, pos_factor)`. `pos_factor` sits strictly below 4 (the
     /// linear ratio) so a regression to decode-from-start trips it.
     Indexed(u64, f64),
-    /// Legitimately **linear** (decode-discard from the stream start — no usable
-    /// index in the committed fixtures) — asserted at its real class with a
-    /// comment, not forced into the indexed bound. `file_mult` caps `bytes@80%`
-    /// at `file_mult × file_size`: a linear seek reads ≈ the 80 % prefix (ratio
-    /// ≈ 4 vs the 20 % one, printed), and must never re-read the file in full
-    /// passes. If it ever drops to ratio ≈ 1 it gained an index → re-class it.
-    Linear(f64),
 }
 
 struct Spec {
@@ -436,16 +427,18 @@ fn per_format_seek_cost_is_bounded_and_position_independent() {
             kind: Kind::Pcm(false),
             class: Class::Indexed(32_768, 2.0),
         },
-        // --- legitimately LINEAR (decode-discard from the stream start). Native
-        //     FLAC has NO seektable in any committed fixture, so the demuxer's
-        //     `seek_point_before` returns the origin and the decoder discards to
-        //     the target — O(target). (A seektable'd file would be O(1).)
-        //     Asserted at this real class, not forced indexed. ---
+        // --- native FLAC frame BISECTION. No committed fixture has a SEEKTABLE, so
+        //     the decoder byte-bisects the frame stream (resync to a real frame by
+        //     sync + CRC-8 header, read its coded number, narrow toward the target),
+        //     then decode-discards the final frame — O(log n), position-independent
+        //     (ratio ≈ 1, was ≈ 3.5 when it decode-discarded from the start). A few
+        //     tiny header reads per probe keep the byte count flat and far below the
+        //     file. (A seektable'd file takes the index fast path instead.) ---
         Spec {
             name: "flac(no-stbl)",
             bytes: include_bytes!("../../../testdata/realmusic.flac"),
             kind: Kind::Pcm(false),
-            class: Class::Linear(1.25),
+            class: Class::Indexed(65_536, 2.0),
         },
         // --- header-less CBR byte-estimate (NO Xing/Info/VBRI tag). MP2/MP1 (and
         //     a tagless CBR MP3) carry no in-band TOC, but `resolve_lengths()`
@@ -515,27 +508,6 @@ fn per_format_seek_cost_is_bounded_and_position_independent() {
                         "{}: NOT position-independent — bytes@80% {} > {} × bytes@20% {} \
                          (ratio {:.2}); a linear O(target) seek lands near 4",
                         spec.name, m80.bytes, pos_factor, m20.bytes, ratio
-                    ));
-                }
-            }
-            Class::Linear(file_mult) => {
-                // Real class: cost scales with depth (ratio ≈ 4, printed above).
-                // We do NOT claim position-independence; the one invariant worth
-                // locking is that it never re-reads the file in multiple passes —
-                // a linear decode-discard to 80% touches ≈ the 80% prefix, so
-                // bytes@80% ≤ file_mult × file_size. (If it ever drops to ratio
-                // ≈ 1 it gained an index; re-class it as Indexed — that is a
-                // welcome change, not a failure, so there is no min-ratio gate.)
-                let abs_max = (spec.bytes.len() as f64 * file_mult) as u64;
-                if m80.bytes > abs_max {
-                    failures.push(format!(
-                        "{}: bytes@80% {} exceeds {:.0}× the file ({} B) = {} — a linear \
-                         seek should touch ≈ the 80% prefix once, not re-read in passes",
-                        spec.name,
-                        m80.bytes,
-                        file_mult,
-                        spec.bytes.len(),
-                        abs_max
                     ));
                 }
             }

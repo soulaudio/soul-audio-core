@@ -22,6 +22,11 @@ pub struct FlacDemuxer<S> {
     total_samples: Option<u64>,
     /// Absolute byte offset of the first audio frame (after the metadata chain).
     audio_start: u64,
+    /// STREAMINFO maximum block size (samples per channel). For a fixed-blocksize
+    /// stream (min == max) this is the constant per-frame block, so a fixed-blocking
+    /// frame's absolute first sample is `frame_number × max_block` — exact even for
+    /// the short final frame (whose coded block size is smaller). `0` if unknown.
+    max_block: u32,
     /// SEEKTABLE points `(sample_number, byte_offset_from_audio_start)`, sorted,
     /// placeholders excluded. `seek_count` are valid.
     seek_points: [(u64, u64); MAX_SEEK_POINTS],
@@ -53,6 +58,7 @@ impl<S: Source> FlacDemuxer<S> {
         }
 
         let mut stream_info: Option<(StreamInfo, Option<u64>)> = None;
+        let mut max_block = 0u32;
         let mut seek_points = [(0u64, 0u64); MAX_SEEK_POINTS];
         let mut seek_count = 0usize;
         loop {
@@ -72,6 +78,10 @@ impl<S: Source> FlacDemuxer<S> {
                     let mut si = [0u8; 34];
                     read_exact(&mut src, &mut si)?;
                     skip(&mut src, u64::from(length) - 34)?;
+                    // Bytes 2..4 = maximum block size (big-endian); fixed-blocksize
+                    // streams carry min == max, used to map a fixed-blocking frame
+                    // number to its absolute first sample during a seek.
+                    max_block = u32::from(si[2]) << 8 | u32::from(si[3]);
                     stream_info = Some(parse_streaminfo(&si)?);
                 }
                 3 => {
@@ -109,6 +119,7 @@ impl<S: Source> FlacDemuxer<S> {
             info,
             total_samples,
             audio_start: pos,
+            max_block,
             seek_points,
             seek_count,
         })
@@ -118,6 +129,21 @@ impl<S: Source> FlacDemuxer<S> {
     #[must_use]
     pub fn total_samples(&self) -> Option<u64> {
         self.total_samples
+    }
+
+    /// STREAMINFO maximum block size (the constant per-frame block for a
+    /// fixed-blocksize stream), or `0` if unknown.
+    #[must_use]
+    pub(crate) fn max_block(&self) -> u32 {
+        self.max_block
+    }
+
+    /// Whether the container carries at least one usable SEEKTABLE point. When it
+    /// does, [`Self::seek_point_before`] can anchor a seek near the target; when it
+    /// does not, the decoder bisects the frame stream instead.
+    #[must_use]
+    pub(crate) fn has_seek_table(&self) -> bool {
+        self.seek_count > 0
     }
 
     /// Mutable access to the underlying source — used by the FLAC-in-Ogg seek
@@ -164,6 +190,73 @@ impl<S: SeekSource> FlacDemuxer<S> {
             .seek(SeekFrom::Start(self.audio_start + byte_offset))
             .map_err(|_| DecodeError::Io)?;
         Ok(())
+    }
+
+    /// Length of the audio byte region (from the first frame to end of file), in
+    /// bytes-from-`audio_start` units — the upper bound of the seek bisection range.
+    ///
+    /// # Errors
+    /// [`DecodeError::Io`] if the underlying seek fails.
+    pub(crate) fn audio_len(&mut self) -> Result<u64, DecodeError> {
+        let end = self
+            .src
+            .seek(SeekFrom::End(0))
+            .map_err(|_| DecodeError::Io)?;
+        Ok(end.saturating_sub(self.audio_start))
+    }
+
+    /// Scan forward from byte offset `from` (relative to `audio_start`) for the next
+    /// byte-aligned FLAC frame-sync candidate — `0xFF` followed by `0b111110_x`
+    /// (the 14-bit sync `0x3FFE` plus the mandatory-zero reserved bit and the
+    /// blocking-strategy bit). Returns the candidate's offset-from-`audio_start`, or
+    /// `None` if none occurs before `until`. The caller validates the candidate by
+    /// parsing (and CRC-8-checking) the header, so a coincidental byte pattern is
+    /// rejected there. Reads at most a bounded window past each position, so the
+    /// forward bytes pulled are ~one frame per call — the bisection stays
+    /// sub-linear.
+    ///
+    /// # Errors
+    /// [`DecodeError::Io`] on a source seek/read failure.
+    pub(crate) fn find_sync_from(
+        &mut self,
+        from: u64,
+        until: u64,
+    ) -> Result<Option<u64>, DecodeError> {
+        if from >= until {
+            return Ok(None);
+        }
+        self.src
+            .seek(SeekFrom::Start(self.audio_start + from))
+            .map_err(|_| DecodeError::Io)?;
+        let mut buf = [0u8; 512];
+        let mut base = from; // offset-from-audio_start of buf[0]
+        let mut prev_ff = false; // last byte of the previous chunk was 0xFF
+        loop {
+            if base >= until {
+                return Ok(None);
+            }
+            let n = self.src.read(&mut buf).map_err(|_| DecodeError::Io)?;
+            if n == 0 {
+                return Ok(None);
+            }
+            // A sync straddling the previous chunk boundary (0xFF | 0xF8/0xF9).
+            if prev_ff && n > 0 && (buf[0] & 0xFE) == 0xF8 {
+                let pos = base - 1;
+                if pos < until {
+                    return Ok(Some(pos));
+                }
+            }
+            let mut i = 0usize;
+            while i + 1 < n {
+                if buf[i] == 0xFF && (buf[i + 1] & 0xFE) == 0xF8 {
+                    let pos = base + i as u64;
+                    return if pos < until { Ok(Some(pos)) } else { Ok(None) };
+                }
+                i += 1;
+            }
+            prev_ff = buf[n - 1] == 0xFF;
+            base += n as u64;
+        }
     }
 }
 
