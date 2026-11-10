@@ -575,6 +575,22 @@ pub fn read_mp3<S: SeekSource>(
     if n == 3 && &magic == b"ID3" {
         read_id3v2(src, scratch, sink)?;
     }
+    // The audio after the ID3v2 tag may be MPEG (MP1/2/3) *or* a raw ADTS (AAC)
+    // elementary stream — a tagger wraps a bare `.aac` in an ID3v2 tag, and the
+    // magic sniff then sees only "ID3". Peek the first audio bytes: an ADTS
+    // syncword (0xFFF, layer == 00) must go to the ADTS frame scanner. The MPEG
+    // scanner would otherwise latch a *false* sync inside the AAC payload and
+    // report a bogus duration (the ID3-wrapped-AAC library-duration bug).
+    let audio_start = src.seek(SeekFrom::Current(0)).map_err(|_| TagError::Io)?;
+    let mut peek = [0u8; 2];
+    let got = locate::read_full(src, &mut peek)?;
+    src.seek(SeekFrom::Start(audio_start))
+        .map_err(|_| TagError::Io)?;
+    // ADTS: syncword high byte 0xFF, then 0xFFF low nibble with layer bits
+    // (mask 0x06) zero — an MPEG frame's layer bits are never zero.
+    if got == 2 && peek[0] == 0xFF && (peek[1] & 0xF6) == 0xF0 {
+        return crate::adts::read_adts(src, scratch, sink);
+    }
     Ok(crate::mp3::read_facts(src))
 }
 
