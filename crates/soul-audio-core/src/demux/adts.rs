@@ -117,6 +117,17 @@ fn header_at(window: &[u8]) -> Option<AdtsHeader> {
     parse_header(h).ok()
 }
 
+/// Outcome of reading a 7-byte header at an absolute offset during the full
+/// header-walk ([`AdtsReader::count_all_frames`]). Mirrors `tags::adts`.
+enum FrameAt {
+    /// A valid ADTS header; the `usize` is its whole-frame length.
+    Valid(usize),
+    /// Clean end of stream (nothing, or a short tail, at this boundary).
+    Eof,
+    /// Bytes present but not a valid ADTS header (garbage / false sync).
+    Bad,
+}
+
 /// Read+validate the very first header of the stream. Unlike
 /// [`read_next_header`], an empty/too-short source has no frame at all, so any
 /// short read here is a genuine [`DecodeError::UnexpectedEof`], never a clean
@@ -288,10 +299,21 @@ impl<S: SeekSource> AdtsReader<S> {
     /// * Walk up to [`SAMPLE_FRAMES`] frames from the start. If the stream ends
     ///   within that budget, the walked count is the **exact** frame count.
     /// * Otherwise estimate `audio_bytes / mean_frame_len`, taking the mean over
-    ///   a start region **and** an end region; if those regional means differ by
-    ///   more than 25 % the stream is genuinely VBR, so the length is left `None`
-    ///   (the decoder keeps its exact linear seek) rather than report a wrong
-    ///   duration.
+    ///   a start region **and** an end region. When those regional means agree
+    ///   (within 25 %) the stream is uniform CBR and the byte estimate is the
+    ///   O(1) answer.
+    /// * When they **disagree** (apparent VBR drift) the O(1) estimate would be
+    ///   unreliable, so instead of giving up (which left the duration unknown and
+    ///   the deck/seek-bar unable to compute a target), do a one-pass **full ADTS
+    ///   header-walk** ([`Self::count_all_frames`]) — stepping past each frame by
+    ///   its `aac_frame_length`, resyncing past any glitch — for the **exact**
+    ///   frame count. A seekable ADTS stream therefore never reports `None`.
+    ///
+    /// The walk is header-only (a few ms even for a 5-minute file) and runs only
+    /// on the non-uniform branch, so a uniform-CBR stream keeps the O(1) estimate
+    /// and pays nothing extra. Either way [`Self::cbr_frames`] and `audio_bytes`
+    /// are set, so [`Self::seek_near_frame`]'s O(1) byte-estimate seek is used in
+    /// both cases (unchanged).
     ///
     /// Idempotent, and it saves/restores the source cursor, so it is safe to call
     /// at any point without disturbing an in-progress decode. The `pending`
@@ -318,7 +340,10 @@ impl<S: SeekSource> AdtsReader<S> {
         let resolved = if audio_bytes == 0 {
             None
         } else {
+            // Uniform CBR → O(1) byte estimate; non-uniform (was `None`) → exact
+            // full header-walk, so the duration is never left unknown.
             self.estimate_frames(audio_bytes)
+                .or_else(|| self.count_all_frames())
         };
         if let Some(frames) = resolved {
             if frames > 0 {
@@ -445,6 +470,82 @@ impl<S: SeekSource> AdtsReader<S> {
         let (boundary, _hdr) = self.resync_from(anchor).ok()?;
         let (count, bytes, _min, _max, _eof) = self.walk_from(boundary, max).ok()?;
         (count > 0).then(|| bytes / u64::from(count))
+    }
+
+    /// Seek to `off` and classify the 7 bytes there (header-only). A 0-byte or
+    /// short read is [`FrameAt::Eof`]; a full-but-unparsable read is
+    /// [`FrameAt::Bad`]. `Err` only on a hard IO failure.
+    fn frame_at(&mut self, off: u64) -> Result<FrameAt, DecodeError> {
+        if self.src.seek(SeekFrom::Start(off)).is_err() {
+            return Ok(FrameAt::Bad);
+        }
+        let mut h = [0u8; 7];
+        let mut n = 0;
+        while n < h.len() {
+            match self.src.read(&mut h[n..]) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(_) => return Err(DecodeError::Io),
+            }
+        }
+        if n < h.len() {
+            return Ok(FrameAt::Eof); // 0 bytes = clean EOF; 1..7 = truncated tail
+        }
+        Ok(parse_header(&h).map_or(FrameAt::Bad, |hdr| FrameAt::Valid(hdr.frame_len)))
+    }
+
+    /// Walk the **entire** stream header-by-header from [`Self::audio_start`],
+    /// returning the exact frame count. The uniform-CBR byte estimate declined
+    /// (apparent VBR drift), so this one-pass header-only walk recovers the true
+    /// count rather than leave the duration unknown. Steps past each frame by its
+    /// `aac_frame_length`, and — like `tags::adts` and [`Self::resync_from`] —
+    /// resyncs forward past a garbled frame / inter-frame gap (double-validated
+    /// syncword) so a mid-stream glitch can't truncate the count. Ends only at a
+    /// genuine end of stream. `pos` strictly increases every step (`parse_header`
+    /// rejects `frame_len < header_len`, and `.max(pos + 1)` guarantees progress),
+    /// so the walk always terminates. `None` only for a degenerate zero-frame
+    /// stream. The caller ([`Self::resolve_cbr`]) restores the source cursor.
+    fn count_all_frames(&mut self) -> Option<u64> {
+        let mut frames: u64;
+        let mut pos: u64;
+        let mut frame_len: usize;
+        match self.frame_at(self.audio_start).ok()? {
+            FrameAt::Valid(len) => {
+                frames = 1;
+                pos = self.audio_start;
+                frame_len = len;
+            }
+            // A leading glitch before the first real boundary — resync to it.
+            FrameAt::Bad => {
+                let (boundary, hdr) = self.resync_from(self.audio_start).ok()?;
+                frames = 1;
+                pos = boundary;
+                frame_len = hdr.frame_len;
+            }
+            FrameAt::Eof => return None,
+        }
+        loop {
+            // Next frame begins `frame_len` bytes on; `.max(pos + 1)` guarantees
+            // forward progress even for a degenerate frame length.
+            let next = (pos + frame_len as u64).max(pos + 1);
+            match self.frame_at(next).ok()? {
+                FrameAt::Valid(len) => {
+                    frames += 1;
+                    pos = next;
+                    frame_len = len;
+                }
+                FrameAt::Eof => break, // genuine end of stream — done
+                FrameAt::Bad => match self.resync_from(next) {
+                    Ok((boundary, hdr)) => {
+                        frames += 1;
+                        pos = boundary;
+                        frame_len = hdr.frame_len;
+                    }
+                    Err(_) => break, // no valid frame ahead within the span → end
+                },
+            }
+        }
+        Some(frames)
     }
 
     /// Scan forward from byte `from` for an ADTS frame boundary, validated by a
@@ -601,5 +702,82 @@ mod tests {
         let mut r = AdtsReader::new(SliceSource::new(AAC)).unwrap();
         let mut tiny = [0u8; 1];
         assert_eq!(r.next_frame(&mut tiny).unwrap_err(), DecodeError::Malformed);
+    }
+
+    /// Build one 44.1 kHz-stereo (sfi=4, chan_cfg=2), LC (profile=01),
+    /// protection-absent ADTS frame: a 7-byte header + `payload` zero bytes, so
+    /// `aac_frame_length == 7 + payload`. Mirrors the `tags::adts` test builder.
+    fn adts_frame(payload: usize) -> Vec<u8> {
+        let frame_len = (7 + payload) as u32;
+        let mut v = Vec::with_capacity(frame_len as usize);
+        v.push(0xFF); // sync hi
+        v.push(0xF1); // sync lo + layer 00 + protection_absent=1
+        v.push(0x50); // profile=01(LC) | sfi=0100(4) | priv=0 | chan_cfg hi=0
+        v.push(0x80 | ((frame_len >> 11) & 0x03) as u8); // chan_cfg lo=10 | fl[12:11]
+        v.push(((frame_len >> 3) & 0xFF) as u8); // fl[10:3]
+        v.push((((frame_len & 0x07) << 5) as u8) | 0x1F); // fl[2:0] | buffer-fullness hi
+        v.push(0xFC); // buffer-fullness lo | num_raw_blocks=0
+        v.extend(core::iter::repeat_n(0u8, payload));
+        v
+    }
+
+    /// RED→GREEN for the ADTS-duration bug: a stream whose frame sizes drift
+    /// enough to trip the >25 % VBR guard (small opening frames, large tail
+    /// frames) used to resolve to `cbr_frames() == None` — so the deck/seek-bar
+    /// got no duration and seeked to 0. `resolve_cbr` now falls back to the exact
+    /// full header-walk, so a seekable ADTS stream reports its true frame count.
+    #[test]
+    fn resolve_cbr_nonuniform_falls_back_to_exact_header_walk() {
+        // 40 small (payload 20 → 27 B) + 40 large (payload 300 → 307 B) frames:
+        // > SAMPLE_FRAMES, and the start/end regional means (27 vs 307) differ far
+        // beyond 25 %, so the byte estimate declines (was `None`).
+        let mut bytes = Vec::new();
+        for _ in 0..40 {
+            bytes.extend_from_slice(&adts_frame(20));
+        }
+        for _ in 0..40 {
+            bytes.extend_from_slice(&adts_frame(300));
+        }
+        let mut r = AdtsReader::new(SliceSource::new(&bytes)).unwrap();
+        assert_eq!(r.cbr_frames(), None, "unresolved before resolve_cbr");
+        r.resolve_cbr();
+        // RED (old): None (VBR guard gave up). GREEN: exact walked count.
+        assert_eq!(
+            r.cbr_frames(),
+            Some(80),
+            "non-uniform ADTS must resolve to the exact frame count, not None"
+        );
+    }
+
+    /// A mid-stream glitch inside a non-uniform stream must be resynced past, not
+    /// truncate the count (the walk mirrors `tags::adts`): two 40-frame runs of
+    /// differing size separated by non-sync junk total 80 frames.
+    #[test]
+    fn resolve_cbr_header_walk_resyncs_past_midstream_gap() {
+        let mut bytes = Vec::new();
+        for _ in 0..40 {
+            bytes.extend_from_slice(&adts_frame(20));
+        }
+        bytes.extend_from_slice(&[0u8; 40]); // non-sync junk (never 0xFFF)
+        for _ in 0..40 {
+            bytes.extend_from_slice(&adts_frame(300));
+        }
+        let mut r = AdtsReader::new(SliceSource::new(&bytes)).unwrap();
+        r.resolve_cbr();
+        assert_eq!(
+            r.cbr_frames(),
+            Some(80),
+            "resync must count across the gap, not stop at it"
+        );
+    }
+
+    /// No-regression on the uniform path: a stream that fits the sample budget
+    /// (`aac.aac`, 23 frames) keeps resolving to its exact count via the O(1)
+    /// estimate — the header-walk fallback is never reached.
+    #[test]
+    fn resolve_cbr_uniform_stays_exact_via_estimate() {
+        let mut r = AdtsReader::new(SliceSource::new(AAC)).unwrap();
+        r.resolve_cbr();
+        assert_eq!(r.cbr_frames(), Some(23), "uniform CBR aac.aac = 23 frames");
     }
 }
