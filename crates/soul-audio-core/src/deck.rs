@@ -24,6 +24,12 @@ const CANONICAL_BITS: i32 = 24;
 const CANONICAL_MAX: f32 = 8_388_607.0; // 2^23 - 1
 const BLOCK: usize = 256; // resampler output frames per pump
 const MAX_CH: usize = 8;
+/// Seek de-click fade length, in milliseconds. On a seek the output is ramped up
+/// over this long with a raised-cosine (smoothstep) gain, so the splice from the
+/// just-cleared sink buffer to the first post-seek sample is a smooth rise from
+/// zero rather than a full-level step — a step is a format-agnostic click, even on
+/// bit-exact formats. 8 ms ≈ a few hundred frames at 44.1 kHz.
+const FADE_MS: u32 = 8;
 /// Input scratch capacity (frames) — covers the resampler's largest demand within
 /// its supported downsample range at `BLOCK` output frames.
 const IN_FIFO: usize = 2560;
@@ -122,6 +128,12 @@ struct Track<D> {
     eof: bool,
     /// Remaining silence-fed pumps to drain the resampler tail after `eof`.
     drain: usize,
+    /// Seek de-click: output frames of fade-in still owed. Armed to `fade_len`
+    /// (see [`Deck::fade_len`]) by [`seek`](Deck::seek); decremented one per
+    /// emitted output frame in [`produce_block`](Deck::produce_block) until it
+    /// reaches `0` (full scale). `0` for a freshly loaded/preloaded track, so a
+    /// normal play/gapless swap never fades — only an explicit seek does.
+    fade_remaining: u32,
 }
 
 /// A streaming player of [`SeekableDecoder`] tracks into a [`Sink`], with a
@@ -138,6 +150,9 @@ pub struct Deck<K, D, const PRELOAD: usize> {
     preloads: [Option<Track<D>>; PRELOAD],
     preload_len: usize,
     state: DeckState,
+    /// Seek de-click fade length in output frames: `round(FADE_MS * sink_rate /
+    /// 1000)`. Fixed per sink; a seek arms `Track::fade_remaining` to this.
+    fade_len: u32,
     in_buf: [i32; IN_FIFO * MAX_CH],
     rs_buf: [i32; BLOCK * MAX_CH],
     out_buf: [i32; BLOCK * MAX_CH],
@@ -156,6 +171,9 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             preloads: core::array::from_fn(|_| None),
             preload_len: 0,
             state: DeckState::Stopped,
+            // round(FADE_MS * sink_rate / 1000) with integer rounding (no f32::round
+            // in no_std). `+ 500` is the round-half-up bias for the /1000 divide.
+            fade_len: (FADE_MS * si.sample_rate + 500) / 1000,
             in_buf: [0; IN_FIFO * MAX_CH],
             rs_buf: [0; BLOCK * MAX_CH],
             out_buf: [0; BLOCK * MAX_CH],
@@ -218,6 +236,7 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             skip_remaining: encoder_delay,
             eof: false,
             drain: 0,
+            fade_remaining: 0,
         })
     }
 
@@ -320,6 +339,7 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
     /// # Errors
     /// [`DeckError::Decode`] (incl. `Unsupported`) if the track can't seek.
     pub fn seek(&mut self, frame: u64) -> Result<u64, DeckError> {
+        let fade_len = self.fade_len;
         let track = self
             .current
             .as_mut()
@@ -331,6 +351,9 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         if let Some(r) = track.resampler.as_mut() {
             r.reset();
         }
+        // Arm the seek de-click fade-in (re-arming overwrites any in-flight fade),
+        // so `produce_block` ramps the first post-seek frames up from zero.
+        track.fade_remaining = fade_len;
         // The `track` borrow of `self.current` ends above; drop the sink's
         // already-buffered pre-seek audio so the landing point is heard promptly
         // instead of after the old buffer drains.
@@ -445,23 +468,41 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             self.block_plain()?
         };
         // Normalize + channel-map rs_buf → out_buf, then write. Volume is applied
-        // downstream at the sink's output stage (see `Sink::set_volume`).
-        let track = self.current.as_ref().unwrap();
-        let src_ch = track.channels;
-        let g = track.norm;
+        // downstream at the sink's output stage (see `Sink::set_volume`). A seek
+        // fade-in (if armed) scales each frame by a rising smoothstep gain; copied
+        // out so the per-frame decrement doesn't need a mutable track borrow here.
+        let (src_ch, g, map, mut fade_remaining) = {
+            let track = self.current.as_ref().unwrap();
+            (track.channels, track.norm, track.map, track.fade_remaining)
+        };
+        let fade_len = self.fade_len;
         for f in 0..out_frames {
+            // Seek de-click gain for this output frame: smoothstep `t*t*(3 - 2*t)`
+            // with `t = fade_pos / fade_len ∈ [0,1]` — a raised-cosine-like S-curve
+            // needing no trig (no_std-safe) whose zero-slope endpoints add no click
+            // of their own (unlike a linear ramp). `t=0` → 0 at the splice, `t→1`
+            // → full scale. One gain for all channels keeps the image stable.
+            let fade = if fade_remaining > 0 {
+                let t = (fade_len - fade_remaining) as f32 / fade_len as f32;
+                fade_remaining -= 1;
+                t * t * (3.0 - 2.0 * t)
+            } else {
+                1.0
+            };
             for oc in 0..sink_ch {
-                let sc = match track.map {
+                let sc = match map {
                     Map::Passthrough => oc,
                     Map::MonoToStereo => 0,
                 };
-                let s = self.rs_buf[f * src_ch + sc] as f32 * g;
+                let s = self.rs_buf[f * src_ch + sc] as f32 * g * fade;
                 // Round to nearest without `f32::round` (std-only in no_std).
                 let r = if s >= 0.0 { s + 0.5 } else { s - 0.5 };
                 self.out_buf[f * sink_ch + oc] =
                     r.clamp(-CANONICAL_MAX - 1.0, CANONICAL_MAX) as i32;
             }
         }
+        // Persist the fade progress for the next block (a fade can span several).
+        self.current.as_mut().unwrap().fade_remaining = fade_remaining;
         self.sink
             .write(&self.out_buf[..out_frames * sink_ch])
             .map_err(DeckError::Sink)?;
@@ -1059,6 +1100,78 @@ mod tests {
             1,
             "seek must discard the buffered pre-seek audio exactly once"
         );
+    }
+
+    #[test]
+    fn seek_fades_in_to_declick_the_splice() {
+        // A seek is a hard splice: the sink buffer is cleared and the first
+        // post-seek sample jumps from the (now-silent) ring straight to full level
+        // — a step, i.e. a click, on EVERY format. The deck must ramp the first
+        // frames up from zero with a smoothstep gain so there is no step.
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 1,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
+        // 16-bit constant 100 → canonical full scale 25600. Long enough to pump
+        // several blocks after the seek.
+        deck.load(const_dec(48_000, 1, 100, 100_000)).unwrap();
+
+        // Non-seek path is unchanged: a first play fades NOT — full level at once.
+        deck.pump().unwrap();
+        let pre_len = deck.sink.written.len();
+        assert_eq!(pre_len, BLOCK, "one block pumped pre-seek");
+        assert!(
+            deck.sink.written.iter().all(|&s| s == 25_600),
+            "no fade before a seek — first play is full scale"
+        );
+
+        // fade_len = round(8 ms * 48000 / 1000) = 384 output frames (> BLOCK, so
+        // the fade deliberately spans more than one pump).
+        let fade_len = 384usize;
+        deck.seek(5000).unwrap();
+        // Pump past the fade (3 blocks = 768 frames ≥ fade_len).
+        deck.pump().unwrap();
+        deck.pump().unwrap();
+        deck.pump().unwrap();
+        let post = &deck.sink.written[pre_len..];
+        let full = 25_600i32;
+
+        // Splice point: starts at exactly zero (smoothstep t=0) — no step/click.
+        assert_eq!(post[0], 0, "fade starts at zero at the splice");
+        // Monotonic non-decreasing across the whole fade (a clean rise).
+        for i in 1..=fade_len {
+            assert!(
+                post[i] >= post[i - 1],
+                "fade must rise monotonically at frame {i}: {} < {}",
+                post[i],
+                post[i - 1]
+            );
+        }
+        // Smoothstep waypoints are exact here (25600 × dyadic fractions):
+        //   t=0.25 → 0.15625 → 4000 ; t=0.5 → 0.5 → 12800 ; t=0.75 → 0.84375 → 21600.
+        assert_eq!(post[fade_len / 4], 4000, "quarter-fade = smoothstep(0.25)");
+        assert_eq!(
+            post[fade_len / 2],
+            12_800,
+            "mid-fade = smoothstep(0.5) = half"
+        );
+        assert_eq!(
+            post[3 * fade_len / 4],
+            21_600,
+            "three-quarter-fade = smoothstep(0.75)"
+        );
+        // Still rising just before the end, then full scale by frame fade_len.
+        assert!(
+            post[fade_len - 1] < full,
+            "below full at the last fade frame: {}",
+            post[fade_len - 1]
+        );
+        assert_eq!(post[fade_len], full, "full scale by frame fade_len (384)");
+        // And it stays at full afterwards (fade does not re-trigger).
+        assert_eq!(post[fade_len + 100], full, "full scale past the fade");
     }
 
     #[test]
