@@ -684,12 +684,29 @@ impl<S: SeekSource> AacDecoder<S> {
             if let Some(total) = adts_total {
                 let per_au = self.output_samples_per_au();
                 let target_frame = (sample / per_au).min(total.saturating_sub(1));
+                // Bias the byte estimate to land a short run-in *before* the
+                // target so a decode-discard warms the filterbank before the
+                // target AU is emitted. AAC frames are not independent — the
+                // filterbank carries a 1024-sample MDCT overlap — so landing cold
+                // on the target would emit a warm-up transient (TDAC uncancelled).
+                // Matches the Matroska path's 4-AU run-in; a small constant, so
+                // the seek stays O(1) (not linear).
+                const PREROLL_AAC: u64 = 4;
+                let preroll_frame = target_frame.saturating_sub(PREROLL_AAC);
                 let landed = match &mut self.src {
-                    FrameSrc::Adts(r) => r.seek_near_frame(target_frame).is_ok(),
+                    FrameSrc::Adts(r) => r.seek_near_frame(preroll_frame).is_ok(),
                     _ => false,
                 };
                 if landed {
                     self.reset_decode_state();
+                    // Warm the filterbank over [preroll_frame, target_frame),
+                    // discarding the primed AUs.
+                    for _ in preroll_frame..target_frame {
+                        if !self.fill_next_frame()? {
+                            return Ok(target_frame * per_au); // EOF during pre-roll
+                        }
+                        self.pcm_pos = self.pcm_len;
+                    }
                     // Frame-granular: report the requested frame's first sample.
                     return Ok(target_frame * per_au);
                 }
