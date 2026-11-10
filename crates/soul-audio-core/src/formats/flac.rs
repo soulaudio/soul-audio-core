@@ -43,6 +43,24 @@ const BYTE_BUF: usize = 4096;
 /// The 14-bit FLAC frame sync code.
 const SYNC_CODE: u32 = 0x3FFE;
 
+/// Upper bound on seek-bisection probes — ample for any file (a halving search
+/// over a `u64` byte range needs ≤ 64); also a hard stop against a pathological
+/// loop.
+const MAX_BISECT_ITERS: u32 = 64;
+/// Stop bisecting once the live byte window is this small (below a plausible
+/// frame header): the kept anchor already bounds the target frame, and the final
+/// decode-discard resolves the exact sample.
+const MIN_BISECT_GAP: u64 = 16;
+/// Per-probe cap on coincidental sync patterns skipped before giving up on a
+/// window (returns "no frame", steering the bisection elsewhere). Real false
+/// syncs are rare (sync byte pattern + CRC-8), so this is only a safety bound.
+const MAX_SYNC_PROBES: u32 = 64;
+/// Bytes primed into the bit reader to parse one frame header during a seek probe.
+/// A FLAC frame header is at most ~16 bytes (sync + up to a 7-byte UTF-8 number +
+/// explicit block/rate + CRC-8); 64 is comfortable headroom while keeping the
+/// per-probe forward read tiny.
+const HEADER_WINDOW: usize = 64;
+
 /// FLAC decoder over a byte [`Source`]. Decodes frames to interleaved `i32` PCM.
 pub struct FlacDecoder<S> {
     demux: FlacDemuxer<S>,
@@ -50,6 +68,11 @@ pub struct FlacDecoder<S> {
     /// Stream bit depth (from STREAMINFO); the frame's declared depth normally
     /// matches this and is used when the frame header defers to STREAMINFO.
     bits: u8,
+    /// STREAMINFO max block size (the constant per-frame block for a
+    /// fixed-blocksize stream); maps a fixed-blocking frame number to its absolute
+    /// first sample (`frame_number × stream_block`), correct even for the short
+    /// final frame. `0` if the container did not declare it.
+    stream_block: u64,
     total_samples: Option<u64>,
     decoded_per_ch: u64,
 
@@ -142,10 +165,12 @@ impl<S: Source> FlacDecoder<S> {
             return Err(DecodeError::Unsupported);
         }
         let total_samples = demux.total_samples();
+        let stream_block = u64::from(demux.max_block());
         Ok(Self {
             demux,
             channels: info.channels,
             bits,
+            stream_block,
             total_samples,
             decoded_per_ch: 0,
             bytes: [0; BYTE_BUF],
@@ -316,10 +341,21 @@ impl<S: Source> FlacDecoder<S> {
         // position to this frame's own coded number — exact regardless of where
         // the landing point fell or whether a partial frame was resynced past.
         if self.anchor_pending {
+            // Variable blocking codes the first *sample* number directly; fixed
+            // blocking codes the *frame* number, whose first sample is
+            // `frame_number × stream_block` (the constant block size). Using the
+            // stream block — not this frame's coded block — stays exact for the
+            // short final frame. Fall back to the frame's own block if STREAMINFO
+            // did not declare a block size.
+            let blk = if self.stream_block != 0 {
+                self.stream_block
+            } else {
+                h.block as u64
+            };
             self.decoded_per_ch = if h.blocking_variable {
                 h.coded_num
             } else {
-                h.coded_num * h.block as u64
+                h.coded_num * blk
             };
             self.anchor_pending = false;
         }
@@ -698,19 +734,152 @@ impl<S: Source> FlacDecoder<S> {
 }
 
 impl<S: SeekSource> FlacDecoder<S> {
-    /// Seek to per-channel `sample` (sample-accurate). Uses the SEEKTABLE to jump
-    /// near, then decodes forward to the exact sample. Returns the sample landed
-    /// on (clamped to the stream length when known).
+    /// Seek to per-channel `sample` (sample-accurate). Returns the sample landed on
+    /// (clamped to the stream length when known).
+    ///
+    /// With a **SEEKTABLE** it jumps to the nearest point at or before the target
+    /// and decodes forward. **Without one** it would otherwise discard from the very
+    /// start — O(target), linear — so instead it **byte-bisects the frame stream**
+    /// in O(log n): probe the byte range, resync to a real FLAC frame (sync + CRC-8
+    /// header), read that frame's coded number to place it absolutely, and narrow
+    /// toward the target; then decode-discard the last frame for the exact,
+    /// bit-exact landing. Mirrors the FLAC-in-Ogg granule bisection, but on native
+    /// frame headers instead of Ogg page granules.
     ///
     /// # Errors
     /// [`DecodeError::Io`] on a source-seek failure; propagates decode errors
     /// from the forward pass.
     pub fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
         let target = self.total_samples.map_or(sample, |t| sample.min(t));
+        if !self.demux.has_seek_table() {
+            return self.bisect_seek(target);
+        }
         let (base_sample, byte_off) = self.demux.seek_point_before(target);
         self.demux.seek_audio(byte_off)?;
         self.reset_stream_state(base_sample);
         self.decode_discard_to(target)
+    }
+
+    /// Byte-bisect the native frame stream to land on the frame whose first sample
+    /// is the greatest `≤ target`, then decode-discard to the exact sample. Used
+    /// when there is no SEEKTABLE anchor. O(log n) over the file: each probe resyncs
+    /// to one real frame and reads its coded number. The search always keeps a known
+    /// anchor (the stream start, sample 0), so a stretch of unparseable bytes only
+    /// costs locality, never correctness — the final decode-discard is bit-exact.
+    fn bisect_seek(&mut self, target: u64) -> Result<u64, DecodeError> {
+        let audio_len = self.demux.audio_len()?;
+        let mut lo = 0u64; // offset of a known frame boundary at/before `best`
+        let mut hi = audio_len; // offset known to be at/after the target frame
+        let mut best_off = 0u64; // best frame start found with first_sample ≤ target
+        let mut best_sample = 0u64; // its absolute first sample (stream start = 0)
+
+        let saved_crc = self.validate_crc;
+        self.validate_crc = true; // CRC-8-validate every resync candidate
+        let mut pending_err = None;
+        let mut iters = 0u32;
+        while lo + MIN_BISECT_GAP < hi && iters < MAX_BISECT_ITERS {
+            iters += 1;
+            let mid = lo + (hi - lo) / 2;
+            match self.frame_at_or_after(mid, hi) {
+                Ok(Some((off, first_sample))) => {
+                    if first_sample <= target {
+                        best_off = off;
+                        best_sample = first_sample;
+                        lo = off + 1; // make progress past this frame
+                    } else {
+                        hi = mid; // this frame starts after the target
+                    }
+                }
+                Ok(None) => hi = mid, // no resyncable frame in [mid, hi)
+                Err(e) => {
+                    pending_err = Some(e);
+                    break;
+                }
+            }
+        }
+        self.validate_crc = saved_crc;
+        self.anchor_pending = false;
+        if let Some(e) = pending_err {
+            return Err(e);
+        }
+
+        self.demux.seek_audio(best_off)?;
+        self.reset_stream_state(best_sample);
+        self.decode_discard_to(target)
+    }
+
+    /// Find the first resyncable, CRC-8-valid FLAC frame starting at or after byte
+    /// offset `from` (bounded by `until`), returning `(frame_offset, first_sample)`.
+    /// A coincidental sync byte pattern that fails to parse/CRC is skipped; `None`
+    /// means no valid frame occurs before `until`.
+    fn frame_at_or_after(
+        &mut self,
+        from: u64,
+        until: u64,
+    ) -> Result<Option<(u64, u64)>, DecodeError> {
+        let mut search = from;
+        let mut probes = 0u32;
+        while search < until && probes < MAX_SYNC_PROBES {
+            probes += 1;
+            match self.demux.find_sync_from(search, until)? {
+                None => return Ok(None),
+                Some(sync_off) => match self.header_first_sample_at(sync_off)? {
+                    Some(first_sample) => return Ok(Some((sync_off, first_sample))),
+                    None => search = sync_off + 1, // false sync; keep scanning
+                },
+            }
+        }
+        Ok(None)
+    }
+
+    /// Parse the frame header at byte offset `off` (relative to the audio start),
+    /// validating its CRC-8, and return the frame's absolute first sample. `None`
+    /// if the bytes there are not a valid frame header (so `off` was a coincidental
+    /// sync pattern inside frame data). Reuses [`Self::read_frame_header`] — the
+    /// same parser the decode path uses — so there is no second header parser.
+    ///
+    /// Requires `self.validate_crc` to already be set so the parse rejects a bad
+    /// CRC-8.
+    fn header_first_sample_at(&mut self, off: u64) -> Result<Option<u64>, DecodeError> {
+        self.demux.seek_audio(off)?;
+        // Prime the bit reader with a *small* window — a frame header is at most a
+        // few dozen bytes, so this bounds the per-probe forward read (the full
+        // `BYTE_BUF` refill would dominate the cost on a short stream). If a parse
+        // somehow needed more it would refill normally; valid headers never do.
+        self.acc = 0;
+        self.acc_bits = 0;
+        self.crc8 = 0;
+        self.crc16 = 0;
+        self.block_total = 0;
+        self.emit_i = 0;
+        self.byte_cur = 0;
+        self.byte_len = self.demux.read_audio(&mut self.bytes[..HEADER_WINDOW])?;
+        match self.read_frame_header() {
+            Ok(h) => {
+                // Reject absurd headers a coincidental sync might produce.
+                let nchannels = match h.ca {
+                    0..=7 => (h.ca + 1) as usize,
+                    8..=10 => 2,
+                    _ => return Ok(None),
+                };
+                if nchannels != self.channels as usize || h.block == 0 || h.block > MAX_BLOCK {
+                    return Ok(None);
+                }
+                let blk = if self.stream_block != 0 {
+                    self.stream_block
+                } else {
+                    h.block as u64
+                };
+                let first = if h.blocking_variable {
+                    h.coded_num
+                } else {
+                    h.coded_num.saturating_mul(blk)
+                };
+                Ok(Some(first))
+            }
+            Err(DecodeError::Io) => Err(DecodeError::Io),
+            Err(_) => Ok(None), // not a real frame boundary here
+        }
     }
 
     /// Seek to `secs` seconds (convenience over [`Self::seek_to`]). Returns the
@@ -1474,10 +1643,34 @@ mod tests {
 
     // -- seeking --------------------------------------------------------------
 
-    /// Encode one VERBATIM mono frame carrying `samples` (16-bit).
-    fn verbatim_frame(samples: &[i32]) -> Vec<u8> {
+    /// Encode one fixed-blocking VERBATIM mono frame carrying `samples` (16-bit)
+    /// with coded frame number `frame_no` and a **valid header CRC-8** — mirroring a
+    /// real encoder, so the no-SEEKTABLE seek can resync and anchor on it. (The
+    /// frame CRC-16 is left zero; the resync validates the header only.) `frame_no`
+    /// must be `< 128` so it is a single-byte UTF-8 code.
+    fn verbatim_frame(samples: &[i32], frame_no: u64) -> Vec<u8> {
+        assert!(
+            frame_no < 128,
+            "test frame number must be single-byte UTF-8"
+        );
         let mut bw = BitWriter::new();
-        write_header(&mut bw, samples.len(), 0);
+        // Frame header (same field order as `read_frame_header`), byte-aligned
+        // after the explicit block size (56 bits = 7 bytes) before the CRC-8.
+        bw.bits(u64::from(SYNC_CODE), 14);
+        bw.bits(0, 1); // reserved
+        bw.bits(0, 1); // fixed blocking strategy
+        bw.bits(7, 4); // block size code 7 → explicit 16-bit size
+        bw.bits(0, 4); // sample rate code 0 (defer to STREAMINFO)
+        bw.bits(0, 4); // channel assignment 0 (mono)
+        bw.bits(0, 3); // sample size code 0 (defer to STREAMINFO)
+        bw.bits(0, 1); // reserved
+        bw.bits(frame_no, 8); // UTF-8 coded frame number (single byte for < 128)
+        bw.bits((samples.len() - 1) as u64, 16); // explicit block size
+        let mut c8 = 0u8;
+        for &b in &bw.bytes {
+            c8 = crc8_update(c8, b); // CRC-8 over the 7 header bytes
+        }
+        bw.bits(u64::from(c8), 8); // valid header CRC-8
         bw.bits(0, 1); // subframe leading 0
         bw.bits(1, 6); // VERBATIM
         bw.bits(0, 1); // no wasted bits
@@ -1489,28 +1682,37 @@ mod tests {
     }
 
     /// A multi-frame mono FLAC of a counting ramp (`sample[i] == i`), split into
-    /// `block`-sized VERBATIM frames, optionally carrying a SEEKTABLE with one
-    /// point per frame. Returns `(bytes, ramp)`.
+    /// `block`-sized VERBATIM frames (fixed blocking, correct frame numbers),
+    /// optionally carrying a SEEKTABLE with one point per frame. Returns
+    /// `(bytes, ramp)`.
     fn ramp_flac(total: usize, block: usize, with_seektable: bool) -> (Vec<u8>, Vec<i32>) {
         let ramp: Vec<i32> = (0..total as i32).collect();
         let mut frames: Vec<Vec<u8>> = Vec::new();
         let mut points: Vec<(u64, u64, u16)> = Vec::new(); // (sample, byte_off, count)
         let mut off = 0u64;
         let mut s = 0usize;
+        let mut frame_no = 0u64;
         while s < total {
             let n = block.min(total - s);
-            let fr = verbatim_frame(&ramp[s..s + n]);
+            let fr = verbatim_frame(&ramp[s..s + n], frame_no);
             points.push((s as u64, off, n as u16));
             off += fr.len() as u64;
             frames.push(fr);
             s += n;
+            frame_no += 1;
         }
+
+        // Declare the fixed block size in STREAMINFO (min == max == block) so a
+        // fixed-blocking frame number maps to its absolute first sample.
+        let mut si = streaminfo(44_100, 1, 16, total as u64);
+        si[0..2].copy_from_slice(&(block as u16).to_be_bytes());
+        si[2..4].copy_from_slice(&(block as u16).to_be_bytes());
 
         let mut v = Vec::new();
         v.extend_from_slice(b"fLaC");
         v.push(if with_seektable { 0x00 } else { 0x80 }); // STREAMINFO (last iff no seektable)
         v.extend_from_slice(&[0, 0, 34]);
-        v.extend_from_slice(&streaminfo(44_100, 1, 16, total as u64));
+        v.extend_from_slice(&si);
         if with_seektable {
             let body = points.len() * 18;
             v.push(0x83); // last + SEEKTABLE (type 3)
@@ -1564,7 +1766,7 @@ mod tests {
 
     #[test]
     fn seek_round_trip_without_seektable() {
-        // No SEEKTABLE → decode-forward fallback from the stream start.
+        // No SEEKTABLE → O(log n) frame bisection; must stay sample-accurate.
         let (bytes, ramp) = ramp_flac(40, 8, false);
         for &n in &[0u64, 3, 8, 20, 39] {
             let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
@@ -1576,6 +1778,78 @@ mod tests {
                 "seek({n})"
             );
         }
+    }
+
+    /// A `SliceSource` that counts bytes pulled forward (returned by `read`), so a
+    /// test can prove a seek is sub-linear — touching far fewer bytes than a scan
+    /// of the whole pre-target prefix would.
+    struct CountingSlice<'a> {
+        inner: SliceSource<'a>,
+        bytes: std::rc::Rc<std::cell::Cell<u64>>,
+    }
+    impl embedded_io::ErrorType for CountingSlice<'_> {
+        type Error = embedded_io::ErrorKind;
+    }
+    impl embedded_io::Read for CountingSlice<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+            let n = self.inner.read(buf)?;
+            self.bytes.set(self.bytes.get() + n as u64);
+            Ok(n)
+        }
+    }
+    impl embedded_io::Seek for CountingSlice<'_> {
+        fn seek(&mut self, pos: embedded_io::SeekFrom) -> Result<u64, Self::Error> {
+            self.inner.seek(pos)
+        }
+    }
+
+    #[test]
+    fn seek_without_seektable_is_sublinear() {
+        // RED (linear decode-discard): bytes scale with target → a late seek reads
+        // ≈ the whole prefix and is ~N× an early seek. GREEN (frame bisection):
+        // the byte cost is flat in position and far below the prefix.
+        // 100 fixed-block frames (no SEEKTABLE), numbers 0..99 (single-byte UTF-8).
+        let total = 100 * 512;
+        let (bytes, ramp) = ramp_flac(total, 512, false);
+        let file_len = bytes.len() as u64;
+
+        let measure = |target: u64| -> (u64, i32) {
+            let counter = std::rc::Rc::new(std::cell::Cell::new(0u64));
+            let src = CountingSlice {
+                inner: SliceSource::new(&bytes),
+                bytes: counter.clone(),
+            };
+            let mut dec = FlacDecoder::new(src).unwrap();
+            assert_eq!(dec.seek_to(target).unwrap(), target, "seek({target})");
+            let mut out = [0i32; 1];
+            assert_eq!(dec.decode_into(&mut out).unwrap(), 1);
+            (counter.get(), out[0])
+        };
+
+        let t_early = total as u64 * 10 / 100;
+        let t_late = total as u64 * 90 / 100;
+        let (bytes_early, s_early) = measure(t_early);
+        let (bytes_late, s_late) = measure(t_late);
+
+        // Bit-exact at both depths. The ramp is stored 16-bit, so values wrap into
+        // `i16`; they stay unique over this length (< 65536), so matching the
+        // truncated value still proves the exact landing sample (a wrong anchor
+        // would decode a different sample here even though `seek_to` reported the
+        // target position).
+        assert_eq!(s_early, ramp[t_early as usize] as i16 as i32);
+        assert_eq!(s_late, ramp[t_late as usize] as i16 as i32);
+
+        // A linear seek to 90 % reads ≈ the 90 % prefix; bisection must stay far
+        // below the whole file and be position-independent (a linear seek's late
+        // cost is ~9× its early cost — assert well under that).
+        assert!(
+            bytes_late * 2 < file_len,
+            "late-seek bytes {bytes_late} not ≪ file {file_len} (looks linear)"
+        );
+        assert!(
+            bytes_late <= bytes_early * 3,
+            "not position-independent: late {bytes_late} vs early {bytes_early}"
+        );
     }
 
     #[test]
