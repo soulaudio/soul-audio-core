@@ -603,6 +603,94 @@ fn mp3_seek_tail(bytes: &'static [u8], sample: u64) -> (u64, Vec<i32>) {
     })
 }
 
+/// Like [`mp3_seek_tail`] but calls `resolve_lengths()` before seeking, so a
+/// **header-less CBR** MP1/MP2 (or a tagless CBR MP3) goes through the
+/// byte-estimate + double-validated-resync seek path (O(1)) instead of the
+/// linear forward-scan. Returns `(landed_first_sample, interleaved_pcm_tail)`.
+fn mp3_seek_tail_resolved(bytes: &'static [u8], sample: u64) -> (u64, Vec<i32>) {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn_scoped(scope, move || {
+                let mut dec = open(SliceSource::new(bytes)).expect("open mp3");
+                dec.resolve_lengths(); // fills the CBR length → byte-estimate seek
+                let landed = dec.seek_to(sample).expect("seek");
+                let mut out = Vec::new();
+                let mut buf = [0i32; 4096];
+                loop {
+                    let n = dec.decode_into(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                }
+                (landed, out)
+            })
+            .expect("spawn mp3 seek thread")
+            .join()
+            .expect("mp3 seek thread panicked")
+    })
+}
+
+/// The header-less CBR **byte-estimate seek** (MP1/MP2, and a tagless MP3) must
+/// land bit-exact just like the Xing-TOC path. With no Xing/Info/VBRI tag the
+/// demuxer resolves a CBR length and jumps by a bitrate byte estimate + a
+/// double-validated syncword resync (O(1), formerly a linear decode-discard);
+/// the decoder then runs the same [`PREROLL_MP3`]-frame pre-roll from the landed
+/// frame. Layer I/II have **no bit reservoir** but DO carry the polyphase
+/// synthesis filterbank's delay line across frames, so a cold landing still emits
+/// a warm-up transient — the pre-roll is what makes the post-seek output a
+/// **bit-exact suffix** of the straight-through decode from the first emitted
+/// sample. Covers a Layer II (`tone.mp2`) and a Layer I (`tone-layer1.mp1`)
+/// fixture through that path. (RED without the pre-roll: cold filterbank
+/// transient; RED without the fix: the linear scan, slow but still exact.)
+#[test]
+fn mp3_byte_estimate_seek_bit_exact_layer1_and_layer2() {
+    for &(label, data) in &[
+        (
+            "mp2 (MPEG-1 Layer II)",
+            &include_bytes!("../../../testdata/tone.mp2")[..],
+        ),
+        (
+            "mp1 (MPEG-1 Layer I)",
+            &include_bytes!("../../../testdata/tone-layer1.mp1")[..],
+        ),
+    ] {
+        let (full, ch) = decode_all_with_channels(data);
+        let ch = ch as usize;
+        let total_samples = (full.len() / ch) as u64;
+        assert!(
+            total_samples > 8_000,
+            "{label}: fixture too short ({total_samples} samples/ch)"
+        );
+        // Mid-stream targets (well past the pre-roll window), as fractions of the
+        // length so the test is independent of the per-layer samples-per-frame.
+        for frac in [1u64, 2, 3] {
+            let sample = total_samples * frac / 4;
+            let (landed, tail) = mp3_seek_tail_resolved(data, sample);
+            assert!(
+                landed <= sample,
+                "{label}: landed {landed} past requested {sample}"
+            );
+            assert!(
+                tail.len() > 2_000 * ch,
+                "{label}: seek to {sample}: too little runway ({} samples)",
+                tail.len()
+            );
+            // Byte-estimate seek + pre-roll ⇒ a bit-exact suffix of the full
+            // decode, aligned by the tail length (the landing is frame-granular).
+            let align = full.len() - tail.len();
+            assert_eq!(
+                tail,
+                &full[align..],
+                "{label}: byte-estimate seek to {sample} (landed {landed}) is not a \
+                 bit-exact suffix of the straight-through decode — cold filterbank \
+                 transient or a bad resync landing"
+            );
+        }
+    }
+}
+
 /// FIX 1 — the MP3 seek **bit-reservoir + filterbank pre-roll**. A Layer III
 /// frame's `main_data` can back-reference up to 511 bytes of *previous* frames
 /// (the bit reservoir), and the synthesis filterbank carries the prior frame's

@@ -24,13 +24,16 @@
 //!        linear O(target) seek makes this ratio ≈ 4 (0.8·file / 0.2·file) and
 //!        fails; a random-access / index / bisection seek keeps it ≈ 1–2.
 //!
-//! WavPack is the one committed format whose seek is *legitimately* linear
-//! (rewind + decode-discard forward — a block index is a documented follow-up),
-//! so it is asserted at its real class (ratio ≈ 4, bytes scale with depth) with a
-//! comment, not forced into the indexed bound. Everything else is random-access,
-//! bisection (Ogg Vorbis/Opus/FLAC), a byte-estimate (CBR MP3/ADTS/MP2/MP1), an
-//! MP4 sample table (AAC/ALAC), or a Matroska Cues jump (bounded within-cluster
-//! forward-decode — the reason POS_FACTOR tolerates a small multiple).
+//! Native FLAC (no seektable in any committed fixture) is the one format whose
+//! seek is *legitimately* linear (the demuxer's `seek_point_before` returns the
+//! origin and the decoder discards to the target), so it is asserted at its real
+//! class (ratio ≈ 4, bytes scale with depth) with a comment, not forced into the
+//! indexed bound. Everything else is random-access, bisection (Ogg
+//! Vorbis/Opus/FLAC), a byte-estimate (CBR MP3/ADTS/MP2/MP1 — the header-less
+//! MP2/MP1/tagless-MP3 case resolves a CBR length then jumps by a bitrate
+//! estimate + syncword resync), an MP4 sample table (AAC/ALAC), or a Matroska
+//! Cues jump (bounded within-cluster forward-decode — the reason POS_FACTOR
+//! tolerates a small multiple).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -436,26 +439,32 @@ fn per_format_seek_cost_is_bounded_and_position_independent() {
         // --- legitimately LINEAR (decode-discard from the stream start). Native
         //     FLAC has NO seektable in any committed fixture, so the demuxer's
         //     `seek_point_before` returns the origin and the decoder discards to
-        //     the target — O(target). (A seektable'd file would be O(1).) MP2/MP1
-        //     are header-less CBR with no Info-TOC, so their seek likewise
-        //     decode-discards. Asserted at this real class, not forced indexed. ---
+        //     the target — O(target). (A seektable'd file would be O(1).)
+        //     Asserted at this real class, not forced indexed. ---
         Spec {
             name: "flac(no-stbl)",
             bytes: include_bytes!("../../../testdata/realmusic.flac"),
             kind: Kind::Pcm(false),
             class: Class::Linear(1.25),
         },
+        // --- header-less CBR byte-estimate (NO Xing/Info/VBRI tag). MP2/MP1 (and
+        //     a tagless CBR MP3) carry no in-band TOC, but `resolve_lengths()`
+        //     resolves a CBR length, so the seek jumps by a bitrate byte estimate
+        //     + double-validated syncword resync — O(1), position-independent
+        //     (ratio ≈ 1, was ≈ 3 when it decode-discarded from the start). The
+        //     resync reads one bounded window, so `bytes@80%` is a flat constant
+        //     well below the file. ---
         Spec {
             name: "mp2",
             bytes: include_bytes!("../../../testdata/tone.mp2"),
             kind: Kind::Pcm(true),
-            class: Class::Linear(1.25),
+            class: Class::Indexed(24_576, 2.0),
         },
         Spec {
             name: "mp1",
             bytes: include_bytes!("../../../testdata/tone-layer1.mp1"),
             kind: Kind::Pcm(true),
-            class: Class::Linear(1.25),
+            class: Class::Indexed(20_480, 2.0),
         },
     ];
 
