@@ -1199,6 +1199,32 @@ fn decode_all(bytes: &[u8]) -> Vec<i32> {
     decode_all_with_channels(bytes).0
 }
 
+/// Decode a full stream through the public `open_seekable` API (the seekable
+/// path, which handles non-faststart MP4) and return interleaved PCM.
+fn decode_all_seekable(bytes: &[u8]) -> Vec<i32> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn_scoped(scope, || {
+                let mut dec = soul_audio_core::open_seekable(SliceSource::new(bytes))
+                    .expect("probe + construct (seekable)");
+                let mut out = Vec::new();
+                let mut buf = [0i32; 4096];
+                loop {
+                    let n = dec.decode_into(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                }
+                out
+            })
+            .expect("spawn decode thread")
+            .join()
+            .expect("decode thread panicked")
+    })
+}
+
 fn fnv1a(samples: &[i32]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &s in samples {
@@ -1311,6 +1337,78 @@ fn open_decodes_aac_mp4_matching_ffmpeg_within_tolerance() {
         snr > 45.0,
         "AAC/MP4 decode SNR vs ffmpeg too low: {snr:.1} dB (offset {off} frames)"
     );
+}
+
+/// Non-faststart AAC-LC in MP4 (`mdat` before `moov`, ffmpeg's default layout):
+/// the forward-only `open()` can't reach the trailing `moov` and returns
+/// `Unsupported`, but `open_seekable()` seeks to the `moov`, parses it, and
+/// decodes the audio. `aac-nonfaststart.m4a` is a stream-copy remux of
+/// `aac.m4a` (same `mdat`/`esds`, `moov` moved to the end), so its decode
+/// matches the same ffmpeg reference within the AAC-LC lossy tolerance.
+#[test]
+fn open_seekable_decodes_non_faststart_aac() {
+    let m4a = include_bytes!("../testdata/aac-nonfaststart.m4a");
+    // The bug: forward-only open() cannot decode a moov-after-mdat file.
+    assert_eq!(
+        open(SliceSource::new(m4a)).err(),
+        Some(DecodeError::Unsupported),
+        "non-faststart MP4 must stay Unsupported via the forward-only open()"
+    );
+    // The fix: the seekable path decodes it.
+    let refr = load_s16le(include_bytes!("../testdata/aac.m4a.ref.pcm"));
+    let ours = decode_all_seekable(m4a);
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 45.0,
+        "non-faststart AAC decode SNR vs ffmpeg too low: {snr:.1} dB (offset {off} frames)"
+    );
+}
+
+/// Non-faststart ALAC (Apple Lossless) in MP4: same `open()`→`Unsupported`,
+/// `open_seekable()`→decode story as the AAC case. ALAC is **lossless**, so the
+/// seekable decode of `alac-nonfaststart.m4a` (a stream-copy remux of
+/// `alac.m4a`) must be **bit-exact** to the faststart fixture's decode — the
+/// box order moved, not a single audio sample.
+#[test]
+fn open_seekable_decodes_non_faststart_alac_bit_exact() {
+    let m4a = include_bytes!("../testdata/alac-nonfaststart.m4a");
+    assert_eq!(
+        open(SliceSource::new(m4a)).err(),
+        Some(DecodeError::Unsupported),
+        "non-faststart MP4 must stay Unsupported via the forward-only open()"
+    );
+    let ours = decode_all_seekable(m4a);
+    let faststart = decode_all(include_bytes!("../testdata/alac.m4a"));
+    assert_eq!(
+        ours.len(),
+        faststart.len(),
+        "non-faststart ALAC length differs"
+    );
+    assert_eq!(
+        fnv1a(&ours),
+        fnv1a(&faststart),
+        "non-faststart ALAC not bit-exact vs the faststart fixture"
+    );
+    // ...and the faststart decode is itself bit-exact vs ffmpeg's s16le ref,
+    // so this transitively matches the external oracle too.
+    assert_eq!(ours, load_s16le(include_bytes!("../testdata/alac.ref.pcm")));
+}
+
+/// `open_seekable()` is a strict superset of `open()`: a **faststart** MP4 and a
+/// **fragmented** MP4 both still decode identically through the seekable path
+/// (the desktop now routes every MP4 — incl. fragmented — through it, so this
+/// guards the new constructor's faststart and `moof` branches against a
+/// regression, not just the non-faststart case it adds).
+#[test]
+fn open_seekable_still_decodes_faststart_mp4() {
+    let aac = include_bytes!("../testdata/aac.m4a");
+    assert_eq!(decode_all_seekable(aac), decode_all(aac));
+    let alac = include_bytes!("../testdata/alac.m4a");
+    assert_eq!(decode_all_seekable(alac), decode_all(alac));
+    // Fragmented (`moov` init + `moof`/`mdat` fragments): `new_seekable` must
+    // span every fragment exactly as `new` does.
+    let frag = include_bytes!("../testdata/frag-aac.m4a");
+    assert_eq!(decode_all_seekable(frag), decode_all(frag));
 }
 
 /// **Fragmented** AAC in MP4 (`frag-aac.m4a`: `empty_moov` + 9 `moof`/`mdat`
@@ -1592,6 +1690,25 @@ fn open_decodes_aac_adts_matching_ffmpeg_within_tolerance() {
     );
 }
 
+/// A raw ADTS (`.aac`) elementary stream carrying a leading ID3v2 tag (taggers
+/// add ID3 to `.aac` too) must route to the AAC decoder, not MP3. Before the
+/// probe/ADTS fix the `ID3` magic was classified unconditionally as MP3, so
+/// `open()` built an MP3 decoder that reported bogus stream info (48000 Hz /
+/// mono) and emitted garbage. The fixture is a 42-byte ID3v2.3 tag prepended to
+/// `aac.aac`, so its audio is byte-identical to the untagged fixture.
+#[test]
+fn id3_prefixed_adts_routes_to_aac_not_mp3() {
+    let id3 = include_bytes!("../testdata/aac-id3.aac");
+    let dec = open(SliceSource::new(id3)).expect("ID3+ADTS must probe as AAC");
+    assert_eq!(dec.stream_info().sample_rate, 44_100); // was 48000 as MP3
+    assert_eq!(dec.stream_info().channels, 2); // was 1 (mono) as MP3
+    // Audio is identical to the un-tagged fixture (same ADTS bytes follow).
+    assert_eq!(
+        decode_all(id3),
+        decode_all(include_bytes!("../testdata/aac.aac"))
+    );
+}
+
 /// HE-AAC (AAC-LC + SBR) conformance vs ffmpeg for both signalling paths
 /// (`sbr.m4a` = explicit HE-AAC in MP4, `sbr.aac` = implicit SBR in raw ADTS).
 ///
@@ -1729,6 +1846,66 @@ fn open_decodes_layer2_matching_kjmp2() {
         let pcm = decode_all(c.data);
         assert_eq!(pcm.len(), c.samples, "sample count");
         assert_eq!(fnv1a(&pcm), c.fnv, "bit-exact vs kjmp2");
+    }
+}
+
+/// MP1/MP2 length (regression for "reports wrong/unknown length"). MP1/MP2
+/// streams are CBR and — unlike Layer III — carry **no** Xing/Info/VBRI header
+/// (those live in a Layer-III side-info region MP1/MP2 don't have), so the only
+/// length source the demuxer has is absent and `total_frames()` is `None`: the
+/// player shows unknown/0 duration. `resolve_lengths()` fills that gap with a
+/// CBR byte-size estimate (`audio_bytes / frame_len` MPEG frames), which for a
+/// clean CBR stream with no trailing tag is **exact**.
+///
+/// Self-checking: the expected length is the *actually decoded* per-channel
+/// frame count (`decode_all(bytes).len() / channels`). Each fixture here has a
+/// non-padded first frame and an integral byte/frame ratio, so the estimate
+/// lands exactly on the decoded count (asserted `==`; a stream that grew a
+/// partial final frame or a trailing tag would drift by at most one MPEG frame).
+#[test]
+fn resolve_lengths_recovers_cbr_length_for_mp1_mp2() {
+    let fixtures: &[(&str, &[u8])] = &[
+        (
+            "l2_m44_128.mp2",
+            include_bytes!("../testdata/l2_m44_128.mp2"),
+        ),
+        (
+            "l2_s44_128.mp2",
+            include_bytes!("../testdata/l2_s44_128.mp2"),
+        ),
+        ("l2_m44_48.mp2", include_bytes!("../testdata/l2_m44_48.mp2")),
+        ("l2_m32_48.mp2", include_bytes!("../testdata/l2_m32_48.mp2")),
+        (
+            "l2_s48_256.mp2",
+            include_bytes!("../testdata/l2_s48_256.mp2"),
+        ),
+        (
+            "layer1-32k-stereo.mp1",
+            include_bytes!("../testdata/layer1-32k-stereo.mp1"),
+        ),
+    ];
+    for &(name, bytes) in fixtures {
+        // Ground truth: the per-channel frame count a full decode actually yields.
+        let (pcm, channels) = decode_all_with_channels(bytes);
+        let decoded = pcm.len() / usize::from(channels.max(1));
+
+        let mut dec = open(SliceSource::new(bytes)).expect("probe + construct MP1/MP2");
+        // No Xing/Info/VBRI header on a CBR MP1/MP2 → no declared length yet.
+        assert_eq!(
+            dec.total_frames(),
+            None,
+            "{name}: MP1/MP2 has no header length source before CBR resolve"
+        );
+
+        dec.resolve_lengths();
+
+        let total = dec
+            .total_frames()
+            .unwrap_or_else(|| panic!("{name}: resolve_lengths() left total_frames() None"));
+        assert_eq!(
+            total, decoded as u64,
+            "{name}: CBR length estimate {total} must equal decoded per-channel count {decoded}"
+        );
     }
 }
 

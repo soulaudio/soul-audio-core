@@ -98,6 +98,20 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
         }
     }
 
+    /// Resolve any length a decoder can only compute with random access.
+    ///
+    /// Currently this only affects MP3: a CBR MP1/MP2 (or a Xing-less MP3) has
+    /// no in-band declared length, so [`Self::total_frames`] returns `None` until
+    /// this runs a CBR byte-size estimate (needs the file size, hence the
+    /// [`SeekSource`](crate::io::SeekSource) bound). Idempotent, and a no-op for
+    /// every other variant — all of which get their length from a header parsed
+    /// at `open()` time.
+    pub fn resolve_lengths(&mut self) {
+        if let AnyDecoder::Mp3(d) = self {
+            d.resolve_length();
+        }
+    }
+
     /// Seek to per-channel `sample`. Returns the frame actually landed on.
     /// Granularity: **sample-accurate** for WAV, FLAC (native + Ogg), ALAC, AAC,
     /// and Opus; **frame-granular** for MP3 (a short format-inherent warm-up).
@@ -300,6 +314,38 @@ pub fn open<S: BufSource>(mut src: S) -> Result<AnyDecoder<S>, DecodeError> {
         Format::WavPack => WavpackDecoder::new(src).map(AnyDecoder::WavPack),
         // Apple CAF (lpcm / alac).
         Format::Caf => CafDecoder::new(src).map(AnyDecoder::Caf),
+    }
+}
+
+/// Like [`open`], but for a **seekable** source: routes `Format::Mp4` through
+/// [`Mp4Reader::new_seekable`], so a **non-faststart** `.m4a`/`.mp4` (`mdat`
+/// before `moov` — ffmpeg's default layout) decodes instead of failing
+/// `Unsupported`. Faststart and fragmented MP4 decode identically to [`open`]
+/// (the seekable constructor is a superset). Every other container delegates to
+/// [`open`] unchanged, so callers with a seekable source (local files) can use
+/// this uniformly.
+///
+/// `open` itself keeps its forward-only [`BufSource`] bound — this is an
+/// additive, opt-in path for seekable callers, not a change to `open`.
+///
+/// # Errors
+/// As [`open`]; additionally propagates the seekable MP4 reader's errors.
+pub fn open_seekable<S: BufSource + crate::io::SeekSource>(
+    mut src: S,
+) -> Result<AnyDecoder<S>, DecodeError> {
+    match probe(&mut src)? {
+        // The one format that benefits from random access: parse the `moov`
+        // wherever it sits (incl. after `mdat`), then decode from the `mdat`.
+        Format::Mp4 => {
+            let reader = Mp4Reader::new_seekable(src)?;
+            match reader.codec() {
+                Mp4Codec::Alac(_) => AlacDecoder::from_reader(reader).map(AnyDecoder::Alac),
+                Mp4Codec::Aac(_) => AacDecoder::new_mp4(reader).map(AnyDecoder::Aac),
+            }
+        }
+        // `probe` consumed nothing (it peeks via `fill_buf`), so `src` is still
+        // at byte 0 — every other format routes through the existing `open`.
+        _ => open(src),
     }
 }
 

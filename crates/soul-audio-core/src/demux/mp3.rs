@@ -85,6 +85,11 @@ pub struct Mp3Demuxer<S> {
     frame_len: usize,
     /// VBR/duration header from the first frame, if any.
     vbr: Option<VbrTag>,
+    /// Resolved total length in per-channel samples. Seeded in [`Self::new`] from
+    /// the Xing/Info/VBRI header (`None` for a header-less CBR MP1/MP2/MP3), and
+    /// filled in on demand by [`Self::resolve_cbr_length`] with a CBR byte-size
+    /// estimate when no header declared it.
+    total: Option<u64>,
     /// The buffered first frame (header + body), served before any seek.
     first_frame: [u8; FRAME_MAX],
     first_len: usize,
@@ -159,6 +164,7 @@ impl<S: Source> Mp3Demuxer<S> {
             audio_start: pos - 4,
             frame_len: f.len,
             vbr,
+            total: vbr.map(|v| v.total_frames * u64::from(f.spf)),
             first_frame,
             first_len: n,
             first_pending: true,
@@ -172,11 +178,12 @@ impl<S: Source> Mp3Demuxer<S> {
         self.spf
     }
 
-    /// Total samples per channel, if a Xing/Info/VBRI header declared the frame
-    /// count. `None` for a raw stream without a VBR header.
+    /// Total samples per channel. Comes from a Xing/Info/VBRI header when present;
+    /// otherwise `None` until [`Self::resolve_cbr_length`] computes a CBR estimate
+    /// (a header-less CBR MP1/MP2/MP3 has no in-band length).
     #[must_use]
     pub fn total_samples(&self) -> Option<u64> {
-        self.vbr.map(|v| v.total_frames * u64::from(self.spf))
+        self.total
     }
 
     /// Encoder delay (per-channel priming samples) from the LAME/Lavc info tag;
@@ -290,6 +297,43 @@ impl<S: SeekSource> Mp3Demuxer<S> {
         let hi = if i < 99 { f64::from(toc[i + 1]) } else { 256.0 };
         let interp = lo + (hi - lo) * (frac - i as f64);
         Some((interp / 256.0 * v.total_bytes as f64) as u64)
+    }
+
+    /// Resolve the stream length for a header-less CBR stream (MP1/MP2, or an
+    /// MP3 with no Xing/Info/VBRI tag), seeding [`Self::total_samples`] with a
+    /// CBR byte-size estimate: `(audio_bytes / frame_len)` whole MPEG frames,
+    /// each worth `spf` per-channel samples.
+    ///
+    /// No-op if a header already declared the length (that exact count wins) or
+    /// if the frame length is degenerate. For a clean CBR stream with no trailing
+    /// tag the estimate is exact; a partial final frame would round it down by at
+    /// most one frame. Saves and restores the source position, so it is safe to
+    /// call at any point without disturbing an in-progress decode.
+    pub(crate) fn resolve_cbr_length(&mut self) {
+        if self.total.is_some() || self.frame_len == 0 {
+            return;
+        }
+        // Save the cursor so a mid-decode call doesn't lose its place.
+        let Ok(saved) = self.src.seek(SeekFrom::Current(0)) else {
+            return;
+        };
+        let Ok(end) = self.src.seek(SeekFrom::End(0)) else {
+            return;
+        };
+        // A trailing ID3v1 tag (128 bytes beginning with "TAG") is metadata, not
+        // audio — exclude it from the frame count.
+        let mut trailer = 0u64;
+        if end >= self.audio_start + 128 && self.src.seek(SeekFrom::Start(end - 128)).is_ok() {
+            let mut tag = [0u8; 3];
+            if read_exact(&mut self.src, &mut tag).is_ok() && &tag == b"TAG" {
+                trailer = 128;
+            }
+        }
+        let audio_bytes = end.saturating_sub(self.audio_start).saturating_sub(trailer);
+        let frames = audio_bytes / self.frame_len as u64;
+        self.total = Some(frames * u64::from(self.spf));
+        // Restore the cursor the caller was reading from.
+        let _ = self.src.seek(SeekFrom::Start(saved));
     }
 }
 

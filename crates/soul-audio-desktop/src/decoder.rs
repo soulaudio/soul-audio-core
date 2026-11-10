@@ -15,7 +15,7 @@ use soul_audio_core::formats::matroska::{MatroskaDecoder, MatroskaVorbisOgg};
 use soul_audio_core::formats::vorbis::VorbisDecoder;
 use soul_audio_core::{
     AnyDecoder, DecodeError, Decoder, Format, PlaybackDecimateAdapter, SeekableDecoder, StreamInfo,
-    open, probe,
+    open_seekable, probe,
 };
 
 /// A fully **owned**, `Send` byte source: std buffers the file, so the decoder
@@ -177,11 +177,19 @@ pub fn open_track(path: &Path) -> Result<OwnedDecoder> {
                 )))
             }
         }
-        // WAV/FLAC/MP3/Ogg-FLAC — `open` re-probes (cheap) and builds the codec.
+        // WAV/FLAC/MP3/Ogg-FLAC/AAC/ALAC/CAF — `open_seekable` re-probes (cheap)
+        // and builds the codec. The file source is always seekable, so MP4 goes
+        // through the seekable reader (decoding non-faststart `.m4a` too); every
+        // other format delegates to the same `open` path as before.
         _ => {
-            Ok(OwnedDecoder::Pcm(open(src).map_err(|e| {
-                anyhow!("decoding {}: {e:?}", path.display())
-            })?))
+            let mut any =
+                open_seekable(src).map_err(|e| anyhow!("decoding {}: {e:?}", path.display()))?;
+            // A CBR MP1/MP2 (or a Xing-less MP3) carries no in-band length, so
+            // `total_frames()` would be `None` and the player would show an
+            // unknown/0 duration. Resolve a CBR byte-size estimate now (a no-op
+            // for every other format) so the deck reports a real length.
+            any.resolve_lengths();
+            Ok(OwnedDecoder::Pcm(any))
         }
     }
 }
@@ -199,8 +207,13 @@ mod tests {
     fn open_track_decodes_real_vorbis() {
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tone-vorbis.ogg");
+        // 64 MiB, like the matroska sibling below: building the desktop-profile
+        // `VorbisDecoder` (~668 KiB by value) multiplies through many debug-build
+        // move frames, which overflows a 16 MiB thread on the Windows MSVC debug
+        // toolchain (STATUS_STACK_OVERFLOW). The runtime pump/loader threads carry
+        // 16–64 MiB for the same reason.
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(move || {
                 let mut d = open_track(&path).expect("open real Vorbis fixture");
                 assert_eq!(d.stream_info().channels, 2);

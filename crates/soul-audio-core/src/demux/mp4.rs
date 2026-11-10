@@ -305,6 +305,93 @@ impl<S: Source> Mp4Reader<S> {
 }
 
 impl<S: crate::io::SeekSource> Mp4Reader<S> {
+    /// Parse the header of an ALAC/AAC `.m4a` that may be **non-faststart**
+    /// (`mdat` before `moov`), leaving `src` positioned at the start of the
+    /// first `mdat`'s audio.
+    ///
+    /// A strict superset of [`Mp4Reader::new`]: it walks the same top-level box
+    /// tree and handles the faststart (`moov` then one `mdat`) and **fragmented**
+    /// (`moov` then `moof`/`mdat` fragments) layouts identically — but when an
+    /// `mdat` is reached *before* any `moov`, it records that `mdat`'s file
+    /// location, seeks past it to find and parse the trailing `moov`, then seeks
+    /// back to the audio. That back-seek is the one thing the forward-only
+    /// [`Mp4Reader::new`] cannot do, so it requires [`SeekSource`]; callers with
+    /// only a forward stream keep using `new` (faststart-only).
+    ///
+    /// # Errors
+    /// As [`Mp4Reader::new`], plus [`DecodeError::Io`] on a seek failure, and
+    /// [`DecodeError::Malformed`] if no `moov` is found (the box walk hits EOF).
+    pub fn new_seekable(mut src: S) -> Result<Self, DecodeError> {
+        let mut codec: Option<Mp4Codec> = None;
+        let mut total_samples: u64 = 0;
+        let mut encoder_delay: u64 = 0;
+        let mut present_frames: Option<u64> = None;
+        let mut fragmented = false;
+        // A leading `mdat` (non-faststart): its (audio-content offset, length),
+        // remembered until the trailing `moov` is parsed, then seeked back to.
+        let mut pending_mdat: Option<(u64, u64)> = None;
+        loop {
+            let (len, fourcc, _) = box_header(&mut src)?;
+            match &fourcc {
+                b"moov" => {
+                    let info = parse_moov(&mut src, len)?;
+                    codec = Some(info.codec);
+                    total_samples = info.total_samples;
+                    encoder_delay = info.encoder_delay;
+                    present_frames = info.present_frames;
+                    // Non-faststart: the audio preceded us — seek back and start.
+                    if let Some((offset, mdat_len)) = pending_mdat {
+                        src.seek(SeekFrom::Start(offset))
+                            .map_err(|_| DecodeError::Io)?;
+                        return Ok(Self {
+                            src,
+                            codec: info.codec,
+                            total_samples,
+                            encoder_delay,
+                            present_frames,
+                            mdat_remaining: mdat_len,
+                            fragmented,
+                            tables: None,
+                        });
+                    }
+                }
+                // A movie fragment before the first `mdat` (DASH/CMAF): sample
+                // data is split across `moof`/`mdat` fragments — same as `new`.
+                b"moof" => {
+                    fragmented = true;
+                    skip(&mut src, len)?;
+                }
+                b"mdat" => match codec {
+                    // Faststart (or fragmented init): `moov` already parsed, the
+                    // audio starts here — return exactly as `new` does.
+                    Some(codec) => {
+                        return Ok(Self {
+                            src,
+                            codec,
+                            total_samples,
+                            encoder_delay,
+                            present_frames,
+                            mdat_remaining: len,
+                            fragmented,
+                            tables: None,
+                        });
+                    }
+                    // Non-faststart: remember this `mdat`'s audio offset, then
+                    // seek past it to find the trailing `moov`.
+                    None => {
+                        let offset = src
+                            .seek(SeekFrom::Current(0))
+                            .map_err(|_| DecodeError::Io)?;
+                        pending_mdat = Some((offset, len));
+                        src.seek(SeekFrom::Start(offset + len))
+                            .map_err(|_| DecodeError::Io)?;
+                    }
+                },
+                _ => skip(&mut src, len)?, // ftyp, free, udta, ...
+            }
+        }
+    }
+
     /// Locate (once, cached) the `stbl` sample-table boxes by re-walking the box
     /// tree from the start using `SeekSource`. Additive to `new`'s forward walk.
     fn ensure_tables(&mut self) -> Result<SampleTableLoc, DecodeError> {

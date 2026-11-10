@@ -69,9 +69,26 @@ fn identify(head: &[u8]) -> Option<Format> {
             _ => {}
         }
     }
-    // MP3: an ID3v2 tag ("ID3") or a raw MPEG frame sync (0xFF 0xEx).
+    // ID3v2-prefixed elementary stream: MP3 *or* raw AAC/ADTS (taggers add an
+    // ID3 tag to `.aac` elementary streams too, not just `.mp3`). Skip the tag
+    // and classify by the first real frame's sync: an ADTS syncword with
+    // layer == 00 is raw AAC; anything else — including a tag that runs past the
+    // buffered window — stays MP3 (the historical default).
     if head.len() >= 3 && &head[0..3] == b"ID3" {
-        return Some(Format::Mp3);
+        if head.len() >= 10 {
+            let size = (u32::from(head[6] & 0x7F) << 21)
+                | (u32::from(head[7] & 0x7F) << 14)
+                | (u32::from(head[8] & 0x7F) << 7)
+                | u32::from(head[9] & 0x7F);
+            let footer = if head[5] & 0x10 != 0 { 10 } else { 0 };
+            let tag_end = 10usize + size as usize + footer as usize;
+            if let Some(s) = head.get(tag_end..tag_end + 2) {
+                if s[0] == 0xFF && (s[1] & 0xF0) == 0xF0 && (s[1] & 0x06) == 0 {
+                    return Some(Format::Adts); // ADTS sync + layer == 00 => raw AAC
+                }
+            }
+        }
+        return Some(Format::Mp3); // MPEG-audio, or the tag runs past the buffer
     }
     // ADTS (raw .aac elementary stream): syncword 0xFFF + layer == 00 —
     // checked *before* the MP3 raw-sync fallback below, whose looser 3-bit
@@ -124,6 +141,30 @@ mod tests {
             probe_bytes(&[0xFF, 0xF1, 0x50, 0x80, 0x2C, 0xDF, 0xFC]).unwrap(),
             Format::Adts
         );
+    }
+
+    #[test]
+    fn id3_prefixed_adts_probes_as_aac_not_mp3() {
+        // A tagger may wrap a raw `.aac` elementary stream in an ID3v2 tag. The
+        // probe must skip the tag and classify by the first real frame's sync:
+        // an ADTS syncword with layer == 00 is raw AAC, not MP3. 10-byte ID3v2.3
+        // header (size 0, no footer) immediately followed by an ADTS header.
+        let bytes = [
+            0x49, 0x44, 0x33, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID3 hdr
+            0xFF, 0xF1, 0x50, 0x80, // ADTS sync, layer 00
+        ];
+        assert_eq!(probe_bytes(&bytes).unwrap(), Format::Adts);
+    }
+
+    #[test]
+    fn id3_prefixed_mp3_still_probes_as_mp3() {
+        // The common case must not regress: an ID3v2-tagged MP3 (MPEG-1 Layer III
+        // sync 0xFF 0xFB, layer != 00) still routes to MP3.
+        let bytes = [
+            0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ID3 hdr
+            0xFF, 0xFB, 0x90, 0x00, // MPEG-1 Layer III sync
+        ];
+        assert_eq!(probe_bytes(&bytes).unwrap(), Format::Mp3);
     }
 
     /// Build a minimal, probe-realistic Ogg BOS page: a 27-byte page header +
