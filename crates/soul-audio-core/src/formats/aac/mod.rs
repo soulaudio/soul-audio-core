@@ -980,6 +980,52 @@ mod tests {
         );
     }
 
+    /// Build one 44.1 kHz-stereo LC, protection-absent ADTS frame (7-byte header
+    /// + `payload` zero bytes), so `aac_frame_length == 7 + payload`.
+    fn adts_frame(payload: usize) -> Vec<u8> {
+        let frame_len = (7 + payload) as u32;
+        let mut v = Vec::with_capacity(frame_len as usize);
+        v.push(0xFF);
+        v.push(0xF1);
+        v.push(0x50);
+        v.push(0x80 | ((frame_len >> 11) & 0x03) as u8);
+        v.push(((frame_len >> 3) & 0xFF) as u8);
+        v.push((((frame_len & 0x07) << 5) as u8) | 0x1F);
+        v.push(0xFC);
+        v.extend(core::iter::repeat_n(0u8, payload));
+        v
+    }
+
+    /// The public total-frames path for the ADTS-duration fix: a non-uniform ADTS
+    /// stream (frame sizes that trip the >25 % VBR guard) must report an **exact**
+    /// `total_frames()` after `resolve_length()`, not `None`. Header-only — the
+    /// zero-payload frames never decode — so no big stack is needed. RED (old):
+    /// `None` (the deck/seek-bar then had no duration → seeked to 0). GREEN:
+    /// `Some(frames × 1024)` from the full header-walk.
+    #[test]
+    fn adts_nonuniform_total_frames_exact_not_none() {
+        let mut bytes = Vec::new();
+        for _ in 0..40 {
+            bytes.extend_from_slice(&adts_frame(20)); // small opening frames
+        }
+        for _ in 0..40 {
+            bytes.extend_from_slice(&adts_frame(300)); // large tail frames
+        }
+        let reader = AdtsReader::new(SliceSource::new(&bytes)).expect("adts header");
+        let mut dec = AacDecoder::new_adts(reader).expect("aac decoder");
+        assert_eq!(
+            dec.total_frames(),
+            None,
+            "ADTS length is unknown until resolve"
+        );
+        dec.resolve_length();
+        assert_eq!(
+            dec.total_frames(),
+            Some(80 * 1024),
+            "non-uniform ADTS must report an exact duration, not None"
+        );
+    }
+
     /// Backward-compatibility: a pure AAC-LC ADTS stream (no `EXT_SBR_DATA`
     /// fill element) decodes exactly as before — SBR never activates, the rate
     /// stays the core rate (NOT doubled), and every frame stays 1024
