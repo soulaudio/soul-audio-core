@@ -50,6 +50,13 @@ const SRATE: [[u32; 4]; 4] = [
 /// Layer III at 320 kbps / 32 kHz is 1441 bytes.
 const FRAME_MAX: usize = 1600;
 
+/// Bytes read in one window when resyncing to a frame boundary after a
+/// header-less CBR byte-estimate seek ([`Mp3Demuxer::resync_from`]). Holds
+/// several MPEG frames (max ≈1728 B for MPEG-1 Layer II) so the scan can
+/// **double-validate** a candidate sync against the following frame's header,
+/// yet stays a small constant so the seek is O(1) on the stream size.
+const RESYNC_WINDOW: usize = 4096;
+
 /// A parsed Xing/Info/VBRI VBR header (present in the first frame of most
 /// encoder output). Gives duration and a seek index.
 #[derive(Clone, Copy)]
@@ -257,6 +264,26 @@ impl<S: SeekSource> Mp3Demuxer<S> {
             }
         }
 
+        // Fast path for a **header-less CBR** stream (MP1/MP2, or an MP3 with no
+        // Xing/Info/VBRI tag) once [`Self::resolve_cbr_length`] has filled
+        // `total`: jump by a bitrate-derived byte estimate and resync to a real
+        // frame boundary — O(1), vs the linear decode-discard below. Mirrors the
+        // raw-ADTS fast seek. Only taken without a VBR tag (a tagged VBR stream
+        // keeps the exact scan so no bad landing is produced); without `total`
+        // (true tagless VBR) it stays linear.
+        if self.vbr.is_none() {
+            if let Some(total) = self.total {
+                let total_frames = total / u64::from(self.spf);
+                if total_frames > 0 {
+                    if let Ok(pos) = self.seek_cbr_estimate(target, total_frames) {
+                        return Ok(pos);
+                    }
+                    // Resync found no validated boundary near the estimate — fall
+                    // through to the exact forward-scan rather than risk garbage.
+                }
+            }
+        }
+
         // Exact fallback: forward-scan frame headers from the start.
         self.src
             .seek(SeekFrom::Start(self.audio_start))
@@ -302,6 +329,93 @@ impl<S: SeekSource> Mp3Demuxer<S> {
         let hi = if i < 99 { f64::from(toc[i + 1]) } else { 256.0 };
         let interp = lo + (hi - lo) * (frac - i as f64);
         Some((interp / 256.0 * v.total_bytes as f64) as u64)
+    }
+
+    /// Byte-estimate seek for a header-less CBR stream: compute frame `target`'s
+    /// approximate byte offset from the **bitrate** (padding-immune, like
+    /// [`Self::resolve_cbr_length`]), seek there, then [`Self::resync_from`]
+    /// snaps to the next real, double-validated frame boundary and positions the
+    /// source at it so the next `next_packet` serves a clean frame. Frame-granular
+    /// approximate (the landing is within ~one frame; the decoder's pre-roll warms
+    /// the filterbank from there). `total_frames` is the resolved frame count.
+    ///
+    /// # Errors
+    /// [`DecodeError::Io`] on a seek failure; [`DecodeError::Malformed`] if no
+    /// validated boundary is found near the estimate (caller falls back to scan).
+    fn seek_cbr_estimate(&mut self, target: u64, total_frames: u64) -> Result<u64, DecodeError> {
+        let tf = target.min(total_frames.saturating_sub(1));
+        // byte ≈ frame × bitrate × spf ÷ (8 × sample_rate). u128 keeps the product
+        // (frames·bits·spf can reach ~1e15 on a long file) from overflowing;
+        // integer math only (`no_std`).
+        let off = (u128::from(tf) * u128::from(self.bitrate_bps) * u128::from(self.spf)
+            / (8 * u128::from(self.info.sample_rate))) as u64;
+        let boundary = self.resync_from(self.audio_start + off)?;
+        self.src
+            .seek(SeekFrom::Start(boundary))
+            .map_err(|_| DecodeError::Io)?;
+        self.pending = None; // next_packet reads the header fresh at `boundary`
+        self.pos_samples = tf * u64::from(self.spf);
+        Ok(self.pos_samples)
+    }
+
+    /// Scan forward from byte `from` for an MPEG frame boundary whose header
+    /// matches the stream's (constant, CBR) parameters and is **confirmed by a
+    /// second matching header exactly `frame_len` bytes later** — rejecting a
+    /// false `0xFFE`/`0xFFF` sync inside the audio data. Returns the boundary's
+    /// absolute offset. Reads a bounded [`RESYNC_WINDOW`] (moving the cursor); the
+    /// caller repositions afterwards.
+    ///
+    /// # Errors
+    /// [`DecodeError::Io`] on a seek/read failure; [`DecodeError::Malformed`] if
+    /// no validated boundary lies within the window.
+    fn resync_from(&mut self, from: u64) -> Result<u64, DecodeError> {
+        self.src
+            .seek(SeekFrom::Start(from))
+            .map_err(|_| DecodeError::Io)?;
+        let mut buf = [0u8; RESYNC_WINDOW];
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            match self.src.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(k) => filled += k,
+                Err(_) => return Err(DecodeError::Io),
+            }
+        }
+        // First double-validated syncword wins; a single-validated candidate whose
+        // successor falls outside the window is kept only as a last resort (a
+        // boundary within one frame of the stream's end).
+        let mut single: Option<usize> = None;
+        let mut i = 0usize;
+        while i + 4 <= filled {
+            if let Some(fc) = header_at(&buf[i..filled]) {
+                if self.matches_stream(&fc) {
+                    let j = i + fc.len;
+                    if j + 4 <= filled {
+                        if header_at(&buf[j..filled]).is_some_and(|fs| self.matches_stream(&fs)) {
+                            return Ok(from + i as u64); // two consecutive stream frames
+                        }
+                        // Successor mismatched → false sync in a payload; keep scanning.
+                    } else if single.is_none() {
+                        single = Some(i);
+                    }
+                }
+            }
+            i += 1;
+        }
+        match single {
+            Some(i) => Ok(from + i as u64),
+            None => Err(DecodeError::Malformed),
+        }
+    }
+
+    /// Does `f` carry this stream's constant CBR parameters? Used to lock a resync
+    /// candidate onto the real frame grid (sample rate, bitrate, and samples per
+    /// frame are invariant across a CBR MPEG stream).
+    fn matches_stream(&self, f: &Frame) -> bool {
+        f.sample_rate == self.info.sample_rate
+            && f.bitrate_bps == self.bitrate_bps
+            && f.spf == self.spf
+            && f.channels == self.info.channels
     }
 
     /// Resolve the stream length for a header-less CBR stream (MP1/MP2, or an
@@ -525,6 +639,14 @@ fn parse_lame_delays(frame: &[u8], off: usize) -> (u32, u32) {
     let delay = (u32::from(tag[21]) << 4) | (u32::from(tag[22]) >> 4);
     let padding = ((u32::from(tag[22]) & 0xF) << 8) | u32::from(tag[23]);
     (delay, padding)
+}
+
+/// Parse the 4-byte MPEG frame header at the start of `b` (which must be ≥ 4
+/// bytes). `None` if the slice is too short or the header is invalid. Convenience
+/// over [`parse_header`] for byte-window scans (resync).
+fn header_at(b: &[u8]) -> Option<Frame> {
+    let h: [u8; 4] = b.get(0..4)?.try_into().ok()?;
+    parse_header(&h)
 }
 
 /// Parse+validate a 4-byte MPEG Layer III frame header. `None` if not a valid L3
