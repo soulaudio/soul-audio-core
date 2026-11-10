@@ -97,17 +97,6 @@ fn open_decodes_native_flac_bit_exact_vs_wav() {
     );
 }
 
-/// AIFF (big-endian PCM) decodes **bit-exact** to the WAV it was encoded from —
-/// both are the same lossless 16-bit PCM from `tone.wav`. Covers the big-endian
-/// `SSND` path and the probe → `AnyDecoder::Aiff` → decode route end-to-end.
-#[test]
-fn open_decodes_aiff_bit_exact_vs_wav() {
-    let aiff = decode_all(include_bytes!("../../../testdata/tone-aiff.aiff"));
-    let wav = decode_all(include_bytes!("../../../testdata/tone.wav"));
-    assert_eq!(aiff.len(), wav.len(), "AIFF/WAV sample counts differ");
-    assert_eq!(fnv1a(&aiff), fnv1a(&wav), "AIFF decode != source WAV");
-}
-
 /// AIFF-C `sowt` (little-endian PCM) decodes bit-exact to the same source WAV —
 /// exercises the AIFF-C `compressionType` branch and the no-byteswap path.
 #[test]
@@ -234,46 +223,6 @@ fn open_decodes_aiff_alaw_matches_ffmpeg() {
     );
 }
 
-/// FLAC-in-Matroska (`.mka`) decodes **bit-exact** to the native `tone.flac` —
-/// both carry the identical FLAC frames (the `.mka` is `tone.flac` remuxed with
-/// `-c:a copy`). Proves the EBML/`SimpleBlock` demux and the `MatroskaFlacReader`
-/// native-stream adapter that lets `FlacDecoder` decode it unchanged.
-#[test]
-fn open_decodes_matroska_flac_bit_exact_vs_native() {
-    let mka = decode_all(include_bytes!("../../../testdata/tone-flac.mka"));
-    let flac = decode_all(include_bytes!("../../../testdata/tone.flac"));
-    assert_eq!(
-        mka.len(),
-        flac.len(),
-        "Matroska-FLAC/native sample counts differ"
-    );
-    assert_eq!(
-        fnv1a(&mka),
-        fnv1a(&flac),
-        "Matroska-FLAC decode != native FLAC"
-    );
-}
-
-/// Opus-in-WebM (Matroska) decodes correctly vs ffmpeg's own decode of the same
-/// file. The frames are the identical Opus packets as `tone.opus` (remuxed with
-/// `-c:a copy`), driven through the shared Opus core from `SimpleBlock`s — so
-/// this proves the EBML demux plus the Opus packet seam (pre-skip + gain) end to
-/// end. Same 60 dB bar as the Ogg CELT golden (same decoder core).
-#[test]
-fn open_decodes_matroska_opus_matching_ffmpeg() {
-    let webm = include_bytes!("../../../testdata/tone-opus.webm");
-    let refr = load_s16le(include_bytes!("../../../testdata/tone-opus.webm.ref.pcm"));
-    let dec = open(SliceSource::new(webm)).expect("probe + construct Matroska-Opus");
-    assert_eq!(dec.stream_info().sample_rate, 48_000);
-    assert_eq!(dec.stream_info().channels, 2);
-    let ours = decode_all(webm);
-    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
-    assert!(
-        snr > 60.0,
-        "Matroska-Opus SNR vs ffmpeg too low: {snr:.1} dB (offset {off} frames)"
-    );
-}
-
 /// WavPack (`.wv`) decodes **bit-exact** to the WAV it was encoded from — it is
 /// a lossless codec and `tone.wv` / `tone.wav` carry the same 16-bit stereo
 /// signal. Exercises the from-scratch block parse, adaptive-median entropy
@@ -284,65 +233,6 @@ fn open_decodes_wavpack_bit_exact_vs_wav() {
     let wav = decode_all(include_bytes!("../../../testdata/tone.wav"));
     assert_eq!(wv.len(), wav.len(), "WavPack/WAV sample counts differ");
     assert_eq!(fnv1a(&wv), fnv1a(&wav), "WavPack decode != source WAV");
-}
-
-/// Open a WavPack stream, seek to per-channel `target`, and decode the tail.
-/// Returns `(channels, landed, tail)`. Big stack for the by-value `AnyDecoder`.
-fn wavpack_seek_tail(bytes: &'static [u8], target: u64) -> (u16, u64, Vec<i32>) {
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn_scoped(scope, || {
-                let mut dec = open(SliceSource::new(bytes)).expect("open wavpack");
-                let ch = dec.stream_info().channels;
-                let landed = dec.seek_to(target).expect("seek");
-                let mut tail = Vec::new();
-                let mut buf = [0i32; 4096];
-                loop {
-                    let n = dec.decode_into(&mut buf).unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    tail.extend_from_slice(&buf[..n]);
-                }
-                (ch, landed, tail)
-            })
-            .expect("spawn")
-            .join()
-            .expect("decode thread panicked")
-    })
-}
-
-/// WavPack seeks via `open()`/`AnyDecoder`: the seek lands exactly and the
-/// decoded tail is **bit-identical** to the full decode from that point (WavPack
-/// is lossless and blocks decode independently). Covers the block-header walk at
-/// several targets — `tone.wv` is four 22050-sample blocks, so 30 000 lands in
-/// block 1 (one block skipped) and 70 000 in block 3 (three skipped, none
-/// decoded). The exact-landing assert is the guard that the block-index walk
-/// stays sample-accurate; the bit-identical tail proves standalone block decode.
-#[test]
-fn wavpack_seek_tail_matches_full_decode() {
-    let wv: &'static [u8] = include_bytes!("../../../testdata/tone.wv");
-    let full = decode_all(wv);
-    let ch = usize::from(wavpack_seek_tail(wv, 0).0);
-    for target in [0u64, 30_000, 44_100, 70_000] {
-        let (_, landed, tail) = wavpack_seek_tail(wv, target);
-        assert_eq!(
-            landed, target,
-            "WavPack seek to {target} not sample-accurate"
-        );
-        let base = target as usize * ch;
-        assert_eq!(
-            tail,
-            &full[base..],
-            "post-seek WavPack tail != full decode (target {target})"
-        );
-    }
-    // Seeking past the end clamps to the total frame count and yields no tail.
-    let total = (full.len() / ch) as u64;
-    let (_, landed, tail) = wavpack_seek_tail(wv, total + 10_000);
-    assert_eq!(landed, total, "beyond-end WavPack seek clamps to total");
-    assert!(tail.is_empty(), "beyond-end WavPack seek yields no samples");
 }
 
 /// Mono WavPack decodes bit-exact to ffmpeg's own decode — exercises the mono
@@ -401,34 +291,6 @@ fn open_decodes_wavpack_24bit_magnitude_bit_exact() {
         fnv1a(&refr),
         "24-bit-magnitude WavPack decode != ffmpeg"
     );
-}
-
-/// AAC-in-Matroska decodes vs ffmpeg's own decode of the same file. The frames
-/// are the identical AAC access units as `tone-aac.m4a` (remuxed `-c:a copy`);
-/// the config comes from the `CodecPrivate` AudioSpecificConfig. Same 45 dB bar
-/// as the MP4-AAC golden (our AAC decoder vs ffmpeg on the same frames).
-#[test]
-fn open_decodes_matroska_aac_matching_ffmpeg() {
-    let mka = include_bytes!("../../../testdata/tone-aac.mka");
-    let refr = load_s16le(include_bytes!("../../../testdata/tone-aac.mka.ref.pcm"));
-    let dec = open(SliceSource::new(mka)).expect("probe + construct Matroska-AAC");
-    assert_eq!(dec.stream_info().channels, 2);
-    let ours = decode_all(mka);
-    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
-    assert!(
-        snr > 45.0,
-        "Matroska-AAC SNR vs ffmpeg too low: {snr:.1} dB (offset {off} frames)"
-    );
-}
-
-/// CAF `lpcm` (big-endian PCM) decodes **bit-exact** to the source WAV. Covers
-/// the CAF container parse (`caff` → `desc`/`data` chunks) and the PCM path.
-#[test]
-fn open_decodes_caf_pcm_bit_exact_vs_wav() {
-    let caf = decode_all(include_bytes!("../../../testdata/tone.caf"));
-    let wav = decode_all(include_bytes!("../../../testdata/tone.wav"));
-    assert_eq!(caf.len(), wav.len(), "CAF-PCM/WAV sample counts differ");
-    assert_eq!(fnv1a(&caf), fnv1a(&wav), "CAF-PCM decode != source WAV");
 }
 
 /// CAF `alac` (Apple Lossless) decodes **bit-exact** to the source WAV — ALAC is
@@ -837,106 +699,6 @@ fn aac_48k_matches_ffmpeg() {
 // clip is committable (credited in testdata/README.md).
 // ===========================================================================
 
-#[test]
-fn realmusic_flac_bit_exact() {
-    let flac = decode_all(include_bytes!("../../../testdata/realmusic.flac"));
-    let wav = decode_all(include_bytes!("../../../testdata/realmusic.wav"));
-    assert_eq!(
-        flac.len(),
-        wav.len(),
-        "FLAC/WAV length differs (real music)"
-    );
-    assert_eq!(
-        fnv1a(&flac),
-        fnv1a(&wav),
-        "FLAC not bit-exact on real music"
-    );
-}
-
-#[test]
-fn realmusic_alac_bit_exact() {
-    let alac = decode_all(include_bytes!("../../../testdata/realmusic-alac.m4a"));
-    let wav = decode_all(include_bytes!("../../../testdata/realmusic.wav"));
-    assert_eq!(
-        alac.len(),
-        wav.len(),
-        "ALAC/WAV length differs (real music)"
-    );
-    assert_eq!(
-        fnv1a(&alac),
-        fnv1a(&wav),
-        "ALAC not bit-exact on real music"
-    );
-}
-
-#[test]
-fn realmusic_wavpack_bit_exact() {
-    let wv = decode_all(include_bytes!("../../../testdata/realmusic.wv"));
-    let wav = decode_all(include_bytes!("../../../testdata/realmusic.wav"));
-    assert_eq!(
-        wv.len(),
-        wav.len(),
-        "WavPack/WAV length differs (real music)"
-    );
-    assert_eq!(
-        fnv1a(&wv),
-        fnv1a(&wav),
-        "WavPack not bit-exact on real music"
-    );
-}
-
-#[test]
-fn realmusic_mp3_matches_ffmpeg() {
-    let ours = decode_all(include_bytes!("../../../testdata/realmusic.mp3"));
-    let refr = load_s16le(include_bytes!("../../../testdata/realmusic.mp3.ref.pcm"));
-    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
-    assert!(
-        snr > 55.0,
-        "real-music MP3 SNR vs ffmpeg {snr:.1} dB (offset {off})"
-    );
-}
-
-#[test]
-fn realmusic_vorbis_matches_ffmpeg() {
-    let ours = decode_ogg_vorbis_all(include_bytes!("../../../testdata/realmusic-vorbis.ogg"));
-    let refr = load_s16le(include_bytes!(
-        "../../../testdata/realmusic-vorbis.ogg.ref.pcm"
-    ));
-    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
-    assert!(
-        snr > 55.0,
-        "real-music Vorbis SNR vs ffmpeg {snr:.1} dB (offset {off})"
-    );
-}
-
-#[test]
-fn realmusic_opus_matches_ffmpeg() {
-    let ours = decode_all(include_bytes!("../../../testdata/realmusic.opus"));
-    let refr = load_s16le(include_bytes!("../../../testdata/realmusic.opus.ref.pcm"));
-    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
-    assert!(
-        snr > 55.0,
-        "real-music Opus SNR vs ffmpeg {snr:.1} dB (offset {off})"
-    );
-}
-
-/// Real-music AAC vs ffmpeg. Piano is largely tonal, so PNS (decoder-specific
-/// noise fill) is minimal here — unlike pure noise — keeping it SNR-matchable.
-/// (The two-independent-decoder cross-check — float vs fixed-point — is already
-/// established by `stress_aac_short_blocks_match_ffmpeg`, so this uses one ref.)
-#[test]
-fn realmusic_aac_matches_ffmpeg() {
-    let ours = decode_all(include_bytes!("../../../testdata/realmusic-aac.m4a"));
-    let refr = load_s16le(include_bytes!(
-        "../../../testdata/realmusic-aac.m4a.ref.pcm"
-    ));
-    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
-    assert!(
-        snr > 50.0,
-        "real-music AAC SNR vs ffmpeg {snr:.1} dB (offset {off})"
-    );
-}
-
 /// AAC-LC on a full-band **chirp** (`chirp.wav`, 50 Hz→18 kHz sweep) — its rapid
 /// spectral motion forces the encoder into EIGHT_SHORT transient windows, so this
 /// exercises the short-block grouping / de-interleave / 8×128 IMDCT path the
@@ -1076,33 +838,6 @@ fn stress_wavpack_antiphase_bit_exact() {
     );
 }
 
-/// Open a Matroska stream, seek to per-channel `target`, and decode the tail.
-/// Returns `(channels, landed, tail)`. Runs on a big stack (`AnyDecoder`).
-fn matroska_seek_tail(bytes: &'static [u8], target: u64) -> (u16, u64, Vec<i32>) {
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn_scoped(scope, || {
-                let mut dec = open(SliceSource::new(bytes)).expect("probe + construct");
-                let channels = dec.stream_info().channels;
-                let landed = dec.seek_to(target).expect("seek");
-                let mut tail = Vec::new();
-                let mut buf = [0i32; 4096];
-                loop {
-                    let n = dec.decode_into(&mut buf).unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    tail.extend_from_slice(&buf[..n]);
-                }
-                (channels, landed, tail)
-            })
-            .expect("spawn")
-            .join()
-            .expect("decode thread panicked")
-    })
-}
-
 /// Decode a full Vorbis-in-Matroska stream through the consumer-dispatch path
 /// (the Ogg-synthesizing [`MatroskaVorbisOgg`] adapter + arena-backed
 /// `VorbisDecoder`), the way the desktop/CLI shells build it.
@@ -1150,158 +885,6 @@ fn open_decodes_matroska_vorbis_matches_ogg() {
         &ogg[..],
         "Vorbis-in-mka prefix != Ogg-Vorbis decode"
     );
-}
-
-/// Matroska seek lands exactly and the decoded tail is **bit-identical** to the
-/// full decode from that point — the seek restarts at the first cluster and
-/// decode-discards, so the decoder state equals the full-decode state. Covers
-/// Opus (WebM), FLAC, and AAC in Matroska.
-#[test]
-fn matroska_opus_seek_tail_matches_full_decode() {
-    let webm: &'static [u8] = include_bytes!("../../../testdata/tone-opus.webm");
-    let full = decode_all(webm);
-    let (ch, landed, tail) = matroska_seek_tail(webm, 24_000); // 0.5 s @ 48 kHz
-    assert_eq!(landed, 24_000, "Opus-in-mka seek is sample-accurate");
-    let base = 24_000usize * usize::from(ch);
-    assert_eq!(tail, &full[base..], "post-seek Opus tail != full decode");
-}
-
-#[test]
-fn matroska_flac_seek_tail_matches_full_decode() {
-    let mka: &'static [u8] = include_bytes!("../../../testdata/tone-flac.mka");
-    let full = decode_all(mka);
-    let (ch, landed, tail) = matroska_seek_tail(mka, 20_000);
-    assert_eq!(landed, 20_000, "FLAC-in-mka seek is sample-accurate");
-    let base = 20_000usize * usize::from(ch);
-    assert_eq!(tail, &full[base..], "post-seek FLAC tail != full decode");
-}
-
-#[test]
-fn matroska_aac_seek_tail_matches_full_decode() {
-    let mka: &'static [u8] = include_bytes!("../../../testdata/tone-aac.mka");
-    let full = decode_all(mka);
-    let (ch, landed, tail) = matroska_seek_tail(mka, 20_000);
-    assert_eq!(landed, 20_000, "AAC-in-mka seek is sample-accurate");
-    let base = 20_000usize * usize::from(ch);
-    assert_eq!(tail, &full[base..], "post-seek AAC tail != full decode");
-}
-
-/// CAF seeks through `open()`/`AnyDecoder` for both payloads: the seek lands
-/// exactly and the decoded tail is **bit-identical** to the full decode (both
-/// lpcm and alac are lossless — PCM seeks by byte offset, ALAC jumps via the
-/// `pakt` packet-size table to the containing packet).
-fn caf_seek_tail(bytes: &'static [u8], target: u64) -> (u16, u64, Vec<i32>) {
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn_scoped(scope, || {
-                let mut dec = open(SliceSource::new(bytes)).expect("open caf");
-                let ch = dec.stream_info().channels;
-                let landed = dec.seek_to(target).expect("seek");
-                let mut tail = Vec::new();
-                let mut buf = [0i32; 4096];
-                loop {
-                    let n = dec.decode_into(&mut buf).unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    tail.extend_from_slice(&buf[..n]);
-                }
-                (ch, landed, tail)
-            })
-            .expect("spawn")
-            .join()
-            .expect("decode thread panicked")
-    })
-}
-
-#[test]
-fn caf_pcm_seek_tail_matches_full_decode() {
-    let caf: &'static [u8] = include_bytes!("../../../testdata/tone.caf");
-    let full = decode_all(caf);
-    let (ch, landed, tail) = caf_seek_tail(caf, 25_000);
-    assert_eq!(landed, 25_000, "CAF-PCM seek is sample-accurate");
-    let base = 25_000usize * usize::from(ch);
-    assert_eq!(tail, &full[base..], "post-seek CAF-PCM tail != full decode");
-}
-
-/// CAF-ALAC seeks via the `pakt` packet-size walk. ALAC packets are a constant
-/// 4096 frames, so targets land in different packets: 25 000 in packet 6, 70 000
-/// in packet 17 — each jumped to directly (prior packets' bytes summed from
-/// `pakt`, not decoded). Exact landing guards the packet-offset arithmetic; the
-/// bit-identical tail proves standalone packet decode, and the beyond-end seek
-/// exercises the past-the-table fallback that clamps to the total.
-#[test]
-fn caf_alac_seek_tail_matches_full_decode() {
-    let caf: &'static [u8] = include_bytes!("../../../testdata/tone-alac.caf");
-    let full = decode_all(caf);
-    let ch = usize::from(caf_seek_tail(caf, 0).0);
-    for target in [0u64, 25_000, 49_152, 70_000] {
-        let (_, landed, tail) = caf_seek_tail(caf, target);
-        assert_eq!(
-            landed, target,
-            "CAF-ALAC seek to {target} not sample-accurate"
-        );
-        let base = target as usize * ch;
-        assert_eq!(
-            tail,
-            &full[base..],
-            "post-seek CAF-ALAC tail != full decode (target {target})"
-        );
-    }
-    let total = (full.len() / ch) as u64;
-    let (_, landed, tail) = caf_seek_tail(caf, total + 5_000);
-    assert_eq!(landed, total, "beyond-end CAF-ALAC seek clamps to total");
-    assert!(
-        tail.is_empty(),
-        "beyond-end CAF-ALAC seek yields no samples"
-    );
-}
-
-/// Ogg-FLAC seeks sample-accurately through `open()`/`AnyDecoder` (the tail is
-/// bit-identical to a from-start decode — FLAC-in-Ogg is lossless with
-/// independent frames). This fixture's STREAMINFO declares no total, so
-/// `total_frames()` is `None` — a valid streaming case that must not panic.
-#[test]
-fn ogg_flac_seeks_sample_accurate() {
-    let ogg: &[u8] = include_bytes!("../testdata/flac-in-ogg.ogg");
-    let full = decode_all(ogg);
-    assert_eq!(
-        open(SliceSource::new(ogg)).unwrap().total_frames(),
-        None,
-        "fixture declares no total"
-    );
-    for &t in &[0u64, 1000, 5000] {
-        // `AnyDecoder` is large by value; seek+decode on a generous stack.
-        let (landed, ch, tail) = std::thread::scope(|s| {
-            std::thread::Builder::new()
-                .stack_size(16 * 1024 * 1024)
-                .spawn_scoped(s, move || {
-                    let mut dec = open(SliceSource::new(ogg)).expect("open ogg-flac");
-                    let ch = dec.stream_info().channels as usize;
-                    let landed = dec.seek_to(t).expect("ogg-flac seek");
-                    let mut out = Vec::new();
-                    let mut buf = [0i32; 4096];
-                    loop {
-                        let n = dec.decode_into(&mut buf).unwrap();
-                        if n == 0 {
-                            break;
-                        }
-                        out.extend_from_slice(&buf[..n]);
-                    }
-                    (landed, ch, out)
-                })
-                .unwrap()
-                .join()
-                .unwrap()
-        });
-        assert_eq!(landed, t, "sample-accurate landing at {t}");
-        assert_eq!(
-            tail,
-            full[t as usize * ch..],
-            "bit-exact tail after seek to {t}"
-        );
-    }
 }
 
 #[test]
@@ -1830,29 +1413,6 @@ fn open_decodes_opus_5p1_matching_ffmpeg() {
     assert!(
         seen.iter().all(|&s| s),
         "the 6 Opus channels must map one-to-one onto ffmpeg's; got {matched:?} (collapse/swap)"
-    );
-}
-
-/// Raw ADTS `.aac` AAC-LC (`aac.aac`) decoded via `open()` matches ffmpeg's own
-/// decode (`aac.aac.ref.pcm`, s16le) within tolerance.
-///
-/// Measured segmental SNR = 55.3 dB at a 0-frame offset (raw ADTS has no edit
-/// list, so ffmpeg keeps the priming too and the streams align at the front);
-/// bar = 45 dB. See the MP4 test above for the calibration rationale and the
-/// PNS-silence note (the same fixture content, ADTS-framed).
-#[test]
-fn open_decodes_aac_adts_matching_ffmpeg_within_tolerance() {
-    let aac = include_bytes!("../testdata/aac.aac");
-    let refr = load_s16le(include_bytes!("../testdata/aac.aac.ref.pcm"));
-    let dec = open(SliceSource::new(aac)).expect("probe + construct AAC/ADTS");
-    assert_eq!(dec.stream_info().sample_rate, 44_100);
-    assert_eq!(dec.stream_info().channels, 2);
-    assert_eq!(dec.total_frames(), None); // ADTS is streaming; no declared length
-    let ours = decode_all(aac);
-    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
-    assert!(
-        snr > 45.0,
-        "AAC/ADTS decode SNR vs ffmpeg too low: {snr:.1} dB (offset {off} frames)"
     );
 }
 
