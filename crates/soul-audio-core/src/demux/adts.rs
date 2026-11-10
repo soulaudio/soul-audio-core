@@ -103,6 +103,22 @@ fn parse_header(h: &[u8; 7]) -> Result<AdtsHeader, DecodeError> {
 fn read_first_header<S: Source>(src: &mut S) -> Result<AdtsHeader, DecodeError> {
     let mut h = [0u8; 7];
     read_exact(src, &mut h)?;
+    // A tagger may prepend an ID3v2 tag to a raw `.aac` elementary stream
+    // (mirrors `super::flac::skip_id3v2`). Skip it so the first *real* ADTS
+    // header is parsed, not the "ID3" magic.
+    if &h[0..3] == b"ID3" {
+        // `h` holds ID3 bytes 0..=6; read the remaining 3 header bytes (7,8,9)
+        // to recover the 28-bit syncsafe tag size and the footer-present flag.
+        let mut rest = [0u8; 3];
+        read_exact(src, &mut rest)?;
+        let size = (u32::from(h[6] & 0x7F) << 21)
+            | (u32::from(rest[0] & 0x7F) << 14)
+            | (u32::from(rest[1] & 0x7F) << 7)
+            | u32::from(rest[2] & 0x7F);
+        let footer = if h[5] & 0x10 != 0 { 10 } else { 0 };
+        skip(src, u64::from(size) + footer)?;
+        read_exact(src, &mut h)?; // the real first ADTS header
+    }
     let parsed = parse_header(&h)?;
     if parsed.header_len == 9 {
         skip(src, 2)?; // discard the 16-bit CRC

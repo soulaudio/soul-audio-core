@@ -1592,6 +1592,25 @@ fn open_decodes_aac_adts_matching_ffmpeg_within_tolerance() {
     );
 }
 
+/// A raw ADTS (`.aac`) elementary stream carrying a leading ID3v2 tag (taggers
+/// add ID3 to `.aac` too) must route to the AAC decoder, not MP3. Before the
+/// probe/ADTS fix the `ID3` magic was classified unconditionally as MP3, so
+/// `open()` built an MP3 decoder that reported bogus stream info (48000 Hz /
+/// mono) and emitted garbage. The fixture is a 42-byte ID3v2.3 tag prepended to
+/// `aac.aac`, so its audio is byte-identical to the untagged fixture.
+#[test]
+fn id3_prefixed_adts_routes_to_aac_not_mp3() {
+    let id3 = include_bytes!("../testdata/aac-id3.aac");
+    let dec = open(SliceSource::new(id3)).expect("ID3+ADTS must probe as AAC");
+    assert_eq!(dec.stream_info().sample_rate, 44_100); // was 48000 as MP3
+    assert_eq!(dec.stream_info().channels, 2); // was 1 (mono) as MP3
+    // Audio is identical to the un-tagged fixture (same ADTS bytes follow).
+    assert_eq!(
+        decode_all(id3),
+        decode_all(include_bytes!("../testdata/aac.aac"))
+    );
+}
+
 /// HE-AAC (AAC-LC + SBR) conformance vs ffmpeg for both signalling paths
 /// (`sbr.m4a` = explicit HE-AAC in MP4, `sbr.aac` = implicit SBR in raw ADTS).
 ///
