@@ -345,11 +345,31 @@ impl<S: Source> AacDecoder<S> {
         })
     }
 
-    /// Total per-channel frames from the container's `mdhd` (MP4), or `None`
-    /// for streaming ADTS.
+    /// Total per-channel output frames from the container's `mdhd` (MP4), or —
+    /// for a raw ADTS stream once [`Self::resolve_length`] has run — from the CBR
+    /// byte estimate. `None` for an unresolved, VBR, or fragmented stream.
+    ///
+    /// The ADTS value scales with the current SBR state ([`Self::output_samples_per_au`]):
+    /// a resolved frame count times 1024 (AAC-LC) or 2048 (HE-AAC, once SBR is
+    /// confirmed). Either way it stays consistent with the reported output rate,
+    /// so a duration computed as `total_frames / sample_rate` is correct in both
+    /// states.
     #[must_use]
     pub fn total_frames(&self) -> Option<u64> {
-        self.total_samples
+        match &self.src {
+            FrameSrc::Adts(r) => r.cbr_frames().map(|f| f * self.output_samples_per_au()),
+            FrameSrc::Mp4(_) | FrameSrc::Matroska(_) => self.total_samples,
+        }
+    }
+
+    /// Output samples per access unit: 1024 core samples, doubled once dual-rate
+    /// SBR is confirmed (output rate = 2× core).
+    fn output_samples_per_au(&self) -> u64 {
+        if self.sbr_confirmed && self.config.sample_rate != 0 {
+            1024 * u64::from((self.output_rate / self.config.sample_rate).max(1))
+        } else {
+            1024
+        }
     }
 
     /// Gapless encoder delay (leading priming, per-channel samples) from the
@@ -529,6 +549,18 @@ impl<S: Source> AacDecoder<S> {
 }
 
 impl<S: SeekSource> AacDecoder<S> {
+    /// Resolve a CBR byte-estimate length for a raw ADTS stream, so
+    /// [`Self::total_frames`] reports a duration and [`Self::seek_to`] can use the
+    /// O(1) byte-estimate path instead of a linear decode-discard from the start.
+    /// No-op for MP4/Matroska (they declare their length) and for a VBR ADTS
+    /// stream (whose length stays unknown). Mirrors MP3's `resolve_length`;
+    /// called once after `open` (see [`crate::dispatch::AnyDecoder::resolve_lengths`]).
+    pub fn resolve_length(&mut self) {
+        if let FrameSrc::Adts(r) = &mut self.src {
+            r.resolve_cbr();
+        }
+    }
+
     /// Seek to per-channel output `sample` (clamped). AAC frames are **not**
     /// independent — the filterbank carries a 1024-sample MDCT overlap, and
     /// HE-AAC SBR/PS carry QMF delay lines + delta-time-coded envelopes — so a
@@ -559,16 +591,6 @@ impl<S: SeekSource> AacDecoder<S> {
             self.config.sample_rate
         };
         self.seek_to(crate::decoder::secs_to_samples(secs, rate))
-    }
-
-    /// Output samples per access unit: 1024 core samples, doubled once dual-rate
-    /// SBR is confirmed (output rate = 2× core).
-    fn output_samples_per_au(&self) -> u64 {
-        if self.sbr_confirmed && self.config.sample_rate != 0 {
-            1024 * u64::from((self.output_rate / self.config.sample_rate).max(1))
-        } else {
-            1024
-        }
     }
 
     /// Reset all cross-frame decode state to a clean post-seek baseline. Keeps
@@ -646,8 +668,37 @@ impl<S: SeekSource> AacDecoder<S> {
     }
 
     fn seek_to_adts(&mut self, sample: u64) -> Result<u64, DecodeError> {
-        // ADTS has no index/length: rewind, reset, and decode-discard output
-        // samples until the target (O(target), but correct across LC/SBR/PS).
+        // Fast path: a resolved CBR length ([`Self::resolve_length`]) lets us jump
+        // by byte estimate + syncword resync (O(1)) instead of decode-discarding
+        // from the start (O(target), the ~10 s block this fixes). Frame-granular
+        // approximate, like MP3's CBR seek — the landing is within ~1 frame.
+        //
+        // HE-AAC (SBR confirmed) is excluded: the frame-0 SBR header and the
+        // delta-time envelopes can't be reconstructed from a mid-stream landing,
+        // so it keeps the decode-from-start path (same rule as the MP4 seek).
+        let adts_total = match &self.src {
+            FrameSrc::Adts(r) => r.cbr_frames(),
+            FrameSrc::Mp4(_) | FrameSrc::Matroska(_) => None,
+        };
+        if !self.sbr_confirmed {
+            if let Some(total) = adts_total {
+                let per_au = self.output_samples_per_au();
+                let target_frame = (sample / per_au).min(total.saturating_sub(1));
+                let landed = match &mut self.src {
+                    FrameSrc::Adts(r) => r.seek_near_frame(target_frame).is_ok(),
+                    _ => false,
+                };
+                if landed {
+                    self.reset_decode_state();
+                    // Frame-granular: report the requested frame's first sample.
+                    return Ok(target_frame * per_au);
+                }
+                // Resync failed near the estimate — fall through to the linear seek.
+            }
+        }
+
+        // Fallback: rewind, reset, and decode-discard output samples until the
+        // target (exact; VBR/unresolved length or an HE-AAC stream).
         match &mut self.src {
             FrameSrc::Adts(r) => r.rewind()?,
             FrameSrc::Mp4(_) | FrameSrc::Matroska(_) => unreachable!("adts seek path"),

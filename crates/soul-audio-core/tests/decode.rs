@@ -3497,3 +3497,195 @@ fn opus_celt_decode_throughput() {
         .join()
         .unwrap();
 }
+
+/// Raw ADTS (`.aac`) CBR byte-estimate length + fast seek (regression for the
+/// multi-second synchronous block on a seek of a header-less `.aac`).
+///
+/// A raw ADTS elementary stream carries no in-band length (no `mdhd`/Xing), so
+/// before [`AnyDecoder::resolve_lengths`] `total_frames()` is `None` and the
+/// decoder can only seek by a *linear* decode-discard from the stream start —
+/// O(target) full AAC-frame decodes (≈10 s for a 5-minute file). Resolving a CBR
+/// byte-size estimate both supplies a duration and lets the seek jump by a byte
+/// estimate + syncword resync, touching the source O(1) times.
+#[cfg(test)]
+mod adts_cbr_seek {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use embedded_io::{BufRead, ErrorType, Read, Seek, SeekFrom};
+    use soul_audio_core::{Decoder, SliceSource, open};
+
+    const AAC: &[u8] = include_bytes!("../testdata/aac.aac");
+    const AAC_ID3: &[u8] = include_bytes!("../testdata/aac-id3.aac");
+
+    /// A seekable `BufSource` wrapping a `SliceSource` that counts how many times
+    /// its `read` is called — the O(1)-vs-O(frames) seek-cost probe. Seeks and
+    /// buffered peeks (`fill_buf`) are *not* counted: only the decode/resync-path
+    /// `read`s that a linear seek multiplies per frame.
+    struct CountingSource {
+        inner: SliceSource<'static>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl CountingSource {
+        fn new(data: &'static [u8], reads: Arc<AtomicUsize>) -> Self {
+            Self {
+                inner: SliceSource::new(data),
+                reads,
+            }
+        }
+    }
+
+    impl ErrorType for CountingSource {
+        type Error = embedded_io::ErrorKind;
+    }
+    impl Read for CountingSource {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.read(buf)
+        }
+    }
+    impl BufRead for CountingSource {
+        fn fill_buf(&mut self) -> Result<&[u8], Self::Error> {
+            self.inner.fill_buf()
+        }
+        fn consume(&mut self, amt: usize) {
+            self.inner.consume(amt);
+        }
+    }
+    impl Seek for CountingSource {
+        fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// Big-stack decode of a whole ADTS stream → per-channel frame count (ground
+    /// truth for the length estimate). `AacDecoder` exceeds the default test stack.
+    fn real_frames(bytes: &'static [u8]) -> u64 {
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn_scoped(s, || {
+                    let mut dec = open(SliceSource::new(bytes)).expect("open ADTS");
+                    let mut total = 0u64;
+                    let mut buf = [0i32; 4096];
+                    loop {
+                        let n = dec.decode_into(&mut buf).expect("decode");
+                        if n == 0 {
+                            break;
+                        }
+                        total += n as u64;
+                    }
+                    total / u64::from(dec.stream_info().channels.max(1))
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        })
+    }
+
+    /// Open `bytes` through `open()` over a `CountingSource`, optionally resolve
+    /// the CBR length, then seek to `target_sample` — returning
+    /// `(read_calls_during_the_seek, drained_tail_interleaved_len)`.
+    fn seek_measure(bytes: &'static [u8], target_sample: u64, resolve: bool) -> (usize, usize) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn_scoped(s, move || {
+                    let mut dec = open(CountingSource::new(bytes, c.clone())).expect("open ADTS");
+                    if resolve {
+                        dec.resolve_lengths();
+                    }
+                    // Measure only the seek itself.
+                    c.store(0, Ordering::Relaxed);
+                    dec.seek_to(target_sample).expect("seek");
+                    let reads = c.load(Ordering::Relaxed);
+                    let mut tail = 0usize;
+                    let mut buf = [0i32; 4096];
+                    loop {
+                        let n = dec.decode_into(&mut buf).expect("decode");
+                        if n == 0 {
+                            break;
+                        }
+                        tail += n;
+                    }
+                    (reads, tail)
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        })
+    }
+
+    /// `resolve_lengths()` recovers a per-channel length for a raw ADTS stream
+    /// (both bare and ID3-prefixed) within a frame or two of the real decode,
+    /// where before it was `None`. For these short fixtures (≤ the sample budget)
+    /// the walk is exact, so the estimate equals the decoded count.
+    #[test]
+    fn resolve_reports_length_within_a_frame() {
+        for (name, bytes) in [("aac.aac", AAC), ("aac-id3.aac", AAC_ID3)] {
+            let real = real_frames(bytes); // 23552 samples/ch (23 frames)
+            let mut dec = open(SliceSource::new(bytes)).expect("open ADTS");
+            assert_eq!(
+                dec.total_frames(),
+                None,
+                "{name}: raw ADTS has no in-band length before CBR resolve"
+            );
+            dec.resolve_lengths();
+            let total = dec
+                .total_frames()
+                .unwrap_or_else(|| panic!("{name}: resolve_lengths() left total_frames() None"));
+            let off = real.abs_diff(total);
+            assert!(
+                off <= 2 * 1024,
+                "{name}: CBR length estimate {total} vs real {real} off by {off} (> 2 frames)"
+            );
+        }
+    }
+
+    /// After resolving, a seek jumps by byte estimate + resync — touching the
+    /// source a small *constant* number of times — and lands near the target
+    /// (within ~1 frame), whereas the unresolved stream seeks linearly, reading
+    /// the source ~once per decoded frame up to the target.
+    #[test]
+    fn seek_is_o1_after_resolve_and_lands_near_target() {
+        let real = real_frames(AAC); // 23552 samples/ch
+        let total_frames = real / 1024; // 23
+        let target_frame = total_frames * 3 / 4; // 17 — well into the stream
+        let target_sample = target_frame * 1024;
+
+        let (fast_reads, fast_tail) = seek_measure(AAC, target_sample, true);
+        let (linear_reads, linear_tail) = seek_measure(AAC, target_sample, false);
+
+        // Fast evidence: O(1) vs O(frames). The byte-estimate seek touches the
+        // source a handful of times; the linear one reads ~per frame to target.
+        assert!(
+            fast_reads <= 6,
+            "resolved seek should touch the source O(1) times, got {fast_reads}"
+        );
+        assert!(
+            linear_reads >= 15,
+            "linear seek should read ~per-frame to the target, got {linear_reads}"
+        );
+        assert!(
+            fast_reads * 3 < linear_reads,
+            "resolved seek ({fast_reads}) not far cheaper than linear ({linear_reads})"
+        );
+
+        // Both land near the target: the drained stereo tail is within ~2 frames
+        // of the audio remaining after `target_frame` — proof the seek landed near
+        // the target, not at 0 (whole stream) or EOF (empty).
+        let expected_tail = ((total_frames - target_frame) * 1024 * 2) as usize;
+        let tol = 2 * 1024 * 2;
+        for (label, tail) in [("resolved", fast_tail), ("linear", linear_tail)] {
+            let off = tail.abs_diff(expected_tail);
+            assert!(
+                off <= tol,
+                "{label}: tail {tail} vs expected {expected_tail} off by {off} (> 2 frames)"
+            );
+            assert!(tail > 0, "{label}: seek landed at EOF (empty tail)");
+        }
+    }
+}

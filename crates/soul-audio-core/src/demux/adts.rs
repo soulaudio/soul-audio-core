@@ -5,9 +5,21 @@
 //! later slice; this module only demuxes frame boundaries and exposes the
 //! stream's [`AacConfig`].
 
+use embedded_io::SeekFrom;
+
 use super::{SAMPLE_RATES, channels_for, read_exact, skip};
 use crate::decoder::DecodeError;
-use crate::io::Source;
+use crate::io::{SeekSource, Source};
+
+/// Frames sampled per region when resolving the CBR length / detecting VBR. A
+/// stream of at most this many frames is walked in full (exact count); a longer
+/// one is byte-estimated from a start- and end-region mean.
+const SAMPLE_FRAMES: u32 = 32;
+
+/// Resync scan window: two maximal ADTS frames. The 13-bit `aac_frame_length`
+/// caps a frame at 8191 bytes, so this always spans a syncword plus enough of
+/// the following frame to validate its header.
+const RESYNC_WINDOW: usize = 2 * 8192;
 
 /// The subset of `AudioSpecificConfig` an ADTS header (or an MP4 `esds`, in a
 /// later task) carries — enough to construct an AAC-LC decoder.
@@ -96,13 +108,24 @@ fn parse_header(h: &[u8; 7]) -> Result<AdtsHeader, DecodeError> {
     })
 }
 
+/// Try to parse an ADTS header at the start of `window` (≥ 7 bytes). `None` if
+/// the window is too short or the bytes aren't a valid header. Used by the
+/// resync scan to test candidate syncword positions without consuming the
+/// source.
+fn header_at(window: &[u8]) -> Option<AdtsHeader> {
+    let h: &[u8; 7] = window.get(..7)?.try_into().ok()?;
+    parse_header(h).ok()
+}
+
 /// Read+validate the very first header of the stream. Unlike
 /// [`read_next_header`], an empty/too-short source has no frame at all, so any
 /// short read here is a genuine [`DecodeError::UnexpectedEof`], never a clean
 /// end of stream.
-fn read_first_header<S: Source>(src: &mut S) -> Result<AdtsHeader, DecodeError> {
+fn read_first_header<S: Source>(src: &mut S) -> Result<(AdtsHeader, u64), DecodeError> {
     let mut h = [0u8; 7];
     read_exact(src, &mut h)?;
+    // Byte offset of the first *real* ADTS header: 0, or past a leading ID3v2 tag.
+    let mut audio_start = 0u64;
     // A tagger may prepend an ID3v2 tag to a raw `.aac` elementary stream
     // (mirrors `super::flac::skip_id3v2`). Skip it so the first *real* ADTS
     // header is parsed, not the "ID3" magic.
@@ -117,13 +140,15 @@ fn read_first_header<S: Source>(src: &mut S) -> Result<AdtsHeader, DecodeError> 
             | u32::from(rest[2] & 0x7F);
         let footer = if h[5] & 0x10 != 0 { 10 } else { 0 };
         skip(src, u64::from(size) + footer)?;
+        // 10-byte ID3v2 header + tag body (+ optional 10-byte footer).
+        audio_start = 10 + u64::from(size) + footer;
         read_exact(src, &mut h)?; // the real first ADTS header
     }
     let parsed = parse_header(&h)?;
     if parsed.header_len == 9 {
         skip(src, 2)?; // discard the 16-bit CRC
     }
-    Ok(parsed)
+    Ok((parsed, audio_start))
 }
 
 /// Read the next frame's 7-byte header. `Ok(None)` on a clean end of stream
@@ -156,10 +181,24 @@ pub struct AdtsReader<S> {
     src: S,
     config: AacConfig,
     /// `raw_data_block` length of a header already read but not yet served —
-    /// `Some` right after [`Self::new`] (the first frame's header). Once that
-    /// payload is delivered, [`Self::next_frame`] goes back to reading a
-    /// header itself, so this is only ever populated by construction.
+    /// `Some` right after [`Self::new`] (the first frame's header), or after a
+    /// [`Self::seek_near_frame`]/[`Self::rewind`] repositions the reader. Once
+    /// that payload is delivered, [`Self::next_frame`] goes back to reading a
+    /// header itself.
     pending: Option<usize>,
+    /// Absolute byte offset of the first ADTS frame (after any leading ID3v2
+    /// tag) — the origin for the CBR byte-estimate length and seek.
+    audio_start: u64,
+    /// Full byte length (header + CRC + payload) of the first frame — the seed
+    /// CBR frame size, used before [`Self::resolve_cbr`] runs.
+    first_frame_len: usize,
+    /// Audio byte span (`end − audio_start −` any trailing ID3v1 tag); set by
+    /// [`Self::resolve_cbr`], `0` until then.
+    audio_bytes: u64,
+    /// Resolved CBR frame count (each ADTS frame = 1024 AAC-LC core
+    /// samples/channel), or `None` for a not-yet-resolved, VBR, or
+    /// non-seekable stream — in which case seeking stays the linear fallback.
+    cbr_frames: Option<u64>,
 }
 
 impl<S: Source> AdtsReader<S> {
@@ -171,12 +210,16 @@ impl<S: Source> AdtsReader<S> {
     /// [`DecodeError::Malformed`]/[`DecodeError::Unsupported`] on an invalid
     /// header (see [`parse_header`]).
     pub fn new(mut src: S) -> Result<Self, DecodeError> {
-        let header = read_first_header(&mut src)?;
+        let (header, audio_start) = read_first_header(&mut src)?;
         let payload_len = header.frame_len - header.header_len;
         Ok(Self {
             src,
             config: header.config,
             pending: Some(payload_len),
+            audio_start,
+            first_frame_len: header.frame_len,
+            audio_bytes: 0,
+            cbr_frames: None,
         })
     }
 
@@ -184,6 +227,14 @@ impl<S: Source> AdtsReader<S> {
     #[must_use]
     pub fn config(&self) -> AacConfig {
         self.config
+    }
+
+    /// Resolved CBR frame count (each frame = 1024 AAC-LC core samples/channel),
+    /// or `None` until [`Self::resolve_cbr`] runs — or for a VBR/non-seekable
+    /// stream, where the decoder keeps its linear decode-discard seek.
+    #[must_use]
+    pub fn cbr_frames(&self) -> Option<u64> {
+        self.cbr_frames
     }
 
     /// Rewind to the stream start and re-validate the first header, so the next
@@ -195,12 +246,12 @@ impl<S: Source> AdtsReader<S> {
     /// As [`Self::new`], plus [`DecodeError::Io`] if the seek fails.
     pub fn rewind(&mut self) -> Result<(), DecodeError>
     where
-        S: crate::io::SeekSource,
+        S: SeekSource,
     {
         self.src
-            .seek(embedded_io::SeekFrom::Start(0))
+            .seek(SeekFrom::Start(0))
             .map_err(|_| DecodeError::Io)?;
-        let header = read_first_header(&mut self.src)?;
+        let (header, _audio_start) = read_first_header(&mut self.src)?;
         self.pending = Some(header.frame_len - header.header_len);
         Ok(())
     }
@@ -223,6 +274,224 @@ impl<S: Source> AdtsReader<S> {
         let dst = buf.get_mut(..payload_len).ok_or(DecodeError::Malformed)?;
         read_exact(&mut self.src, dst)?;
         Ok(Some(&buf[..payload_len]))
+    }
+}
+
+impl<S: SeekSource> AdtsReader<S> {
+    /// Resolve the stream's CBR length so [`Self::cbr_frames`] reports a frame
+    /// count and [`Self::seek_near_frame`] can scale a byte-estimate seek. For a
+    /// raw ADTS elementary stream there is no in-band length (no `mdhd`/Xing), so
+    /// — mirroring MP3's [`resolve_cbr_length`](crate::demux::Mp3Demuxer) — this
+    /// derives one from the audio byte span and a representative (CBR) frame size.
+    ///
+    /// Strategy:
+    /// * Walk up to [`SAMPLE_FRAMES`] frames from the start. If the stream ends
+    ///   within that budget, the walked count is the **exact** frame count.
+    /// * Otherwise estimate `audio_bytes / mean_frame_len`, taking the mean over
+    ///   a start region **and** an end region; if those regional means differ by
+    ///   more than 25 % the stream is genuinely VBR, so the length is left `None`
+    ///   (the decoder keeps its exact linear seek) rather than report a wrong
+    ///   duration.
+    ///
+    /// Idempotent, and it saves/restores the source cursor, so it is safe to call
+    /// at any point without disturbing an in-progress decode. The `pending`
+    /// frame-serving state is never touched.
+    pub fn resolve_cbr(&mut self) {
+        if self.cbr_frames.is_some() || self.first_frame_len == 0 {
+            return;
+        }
+        let Ok(saved) = self.src.seek(SeekFrom::Current(0)) else {
+            return;
+        };
+        let Ok(end) = self.src.seek(SeekFrom::End(0)) else {
+            return;
+        };
+        // A trailing ID3v1 tag ("TAG", 128 bytes) is metadata, not audio.
+        let mut trailer = 0u64;
+        if end >= self.audio_start + 128 && self.src.seek(SeekFrom::Start(end - 128)).is_ok() {
+            let mut tag = [0u8; 3];
+            if read_exact(&mut self.src, &mut tag).is_ok() && &tag == b"TAG" {
+                trailer = 128;
+            }
+        }
+        let audio_bytes = end.saturating_sub(self.audio_start).saturating_sub(trailer);
+        let resolved = if audio_bytes == 0 {
+            None
+        } else {
+            self.estimate_frames(audio_bytes)
+        };
+        if let Some(frames) = resolved {
+            if frames > 0 {
+                self.audio_bytes = audio_bytes;
+                self.cbr_frames = Some(frames);
+            }
+        }
+        let _ = self.src.seek(SeekFrom::Start(saved));
+    }
+
+    /// Compute the CBR frame count for `audio_bytes` (see [`Self::resolve_cbr`]).
+    /// `None` when the stream looks VBR or can't be sampled.
+    fn estimate_frames(&mut self, audio_bytes: u64) -> Option<u64> {
+        let (count, bytes, _min, _max, eof) =
+            self.walk_from(self.audio_start, SAMPLE_FRAMES).ok()?;
+        if count == 0 {
+            return None;
+        }
+        if eof {
+            // The whole stream fit in the sample budget: an exact frame count.
+            return Some(u64::from(count));
+        }
+        // Integer byte-per-frame means (no_std has no float rounding; frame sizes
+        // are hundreds of bytes, so the ±0.5-byte truncation is negligible).
+        let start_mean = bytes / u64::from(count);
+        // Sample a run near the end (~90 % through the audio) to catch bitrate
+        // drift the opening frames wouldn't show.
+        let near_end = self.audio_start + audio_bytes - audio_bytes / 10;
+        let end_mean = self
+            .sample_region_mean(near_end, SAMPLE_FRAMES)
+            .unwrap_or(start_mean);
+        let lo = start_mean.min(end_mean);
+        let hi = start_mean.max(end_mean);
+        // >25 % drift between the regional means ⇒ genuinely VBR.
+        if lo == 0 || (hi - lo) * 4 > lo {
+            return None; // VBR → unknown length, keep the linear seek
+        }
+        let mean = (start_mean + end_mean) / 2;
+        if mean == 0 {
+            return None;
+        }
+        // Round to the nearest whole frame.
+        Some((audio_bytes + mean / 2) / mean)
+    }
+
+    /// Position the reader so the next [`Self::next_frame`] serves (approximately)
+    /// output frame `target_frame`, via a CBR byte estimate + syncword resync —
+    /// O(1) instead of the linear decode-discard from the start.
+    ///
+    /// Like MP3's CBR seek this is **frame-granular approximate**: the byte
+    /// estimate lands within about one frame of the target, and the caller
+    /// reports the requested position. Requires a resolved CBR length
+    /// ([`Self::cbr_frames`]).
+    ///
+    /// # Errors
+    /// [`DecodeError::Unsupported`] with no resolved length; [`DecodeError::Io`]
+    /// on a seek failure; [`DecodeError::Malformed`] if no valid frame boundary
+    /// is found near the estimate (the caller then falls back to the linear seek).
+    pub fn seek_near_frame(&mut self, target_frame: u64) -> Result<(), DecodeError> {
+        let (Some(total), bytes) = (self.cbr_frames, self.audio_bytes) else {
+            return Err(DecodeError::Unsupported);
+        };
+        if total == 0 || bytes == 0 {
+            return Err(DecodeError::Unsupported);
+        }
+        let tf = target_frame.min(total - 1);
+        let off = (u128::from(tf) * u128::from(bytes) / u128::from(total)) as u64;
+        let (boundary, hdr) = self.resync_from(self.audio_start + off)?;
+        // Land just past the fixed header (+ CRC) so `next_frame` reads the payload.
+        self.src
+            .seek(SeekFrom::Start(boundary + hdr.header_len as u64))
+            .map_err(|_| DecodeError::Io)?;
+        self.pending = Some(hdr.frame_len - hdr.header_len);
+        Ok(())
+    }
+
+    /// Walk up to `max` consecutive frames from byte `start`, returning
+    /// `(count, total_bytes, min_len, max_len, hit_eof)`. Header-only (no decode):
+    /// each step reads a 7-byte header and seeks over the frame body. `hit_eof`
+    /// is `true` when the stream cleanly ended before `max` frames.
+    fn walk_from(
+        &mut self,
+        start: u64,
+        max: u32,
+    ) -> Result<(u32, u64, usize, usize, bool), DecodeError> {
+        self.src
+            .seek(SeekFrom::Start(start))
+            .map_err(|_| DecodeError::Io)?;
+        let mut count = 0u32;
+        let mut bytes = 0u64;
+        let mut min = usize::MAX;
+        let mut max_len = 0usize;
+        while count < max {
+            let mut h = [0u8; 7];
+            let mut n = 0;
+            while n < h.len() {
+                match self.src.read(&mut h[n..]) {
+                    Ok(0) => break,
+                    Ok(k) => n += k,
+                    Err(_) => return Err(DecodeError::Io),
+                }
+            }
+            if n < h.len() {
+                return Ok((count, bytes, min, max_len, true)); // clean end of stream
+            }
+            let Ok(hdr) = parse_header(&h) else {
+                break; // garbage — stop (not a clean EOF)
+            };
+            count += 1;
+            bytes += hdr.frame_len as u64;
+            min = min.min(hdr.frame_len);
+            max_len = max_len.max(hdr.frame_len);
+            self.src
+                .seek(SeekFrom::Current((hdr.frame_len - 7) as i64))
+                .map_err(|_| DecodeError::Io)?;
+        }
+        Ok((count, bytes, min, max_len, false))
+    }
+
+    /// Mean frame length (bytes/frame) over a run of frames beginning at a
+    /// resynced boundary at/after `anchor`. `None` if no boundary is found or the
+    /// run is empty.
+    fn sample_region_mean(&mut self, anchor: u64, max: u32) -> Option<u64> {
+        let (boundary, _hdr) = self.resync_from(anchor).ok()?;
+        let (count, bytes, _min, _max, _eof) = self.walk_from(boundary, max).ok()?;
+        (count > 0).then(|| bytes / u64::from(count))
+    }
+
+    /// Scan forward from byte `from` for an ADTS frame boundary, validated by a
+    /// following frame header (`0xFFF`, `layer == 00`, frame-length-linked) to
+    /// reject a false sync inside an AAC payload. Returns the boundary's absolute
+    /// offset and its parsed header. Reads a window (moving the cursor); the
+    /// caller repositions afterward.
+    ///
+    /// # Errors
+    /// [`DecodeError::Io`] on a seek/read failure; [`DecodeError::Malformed`] if
+    /// no validated boundary lies within the scan window.
+    fn resync_from(&mut self, from: u64) -> Result<(u64, AdtsHeader), DecodeError> {
+        self.src
+            .seek(SeekFrom::Start(from))
+            .map_err(|_| DecodeError::Io)?;
+        let mut buf = [0u8; RESYNC_WINDOW];
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            match self.src.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(k) => filled += k,
+                Err(_) => return Err(DecodeError::Io),
+            }
+        }
+        // First double-validated syncword wins; a single-validated candidate whose
+        // successor falls outside the window is kept only as a last resort (a
+        // boundary within one frame of the stream's end).
+        let mut single: Option<(usize, AdtsHeader)> = None;
+        let mut i = 0usize;
+        while i + 7 <= filled {
+            if let Some(hdr) = header_at(&buf[i..filled]) {
+                let j = i + hdr.frame_len;
+                if j + 7 <= filled {
+                    if header_at(&buf[j..filled]).is_some() {
+                        return Ok((from + i as u64, hdr)); // two consecutive valid headers
+                    }
+                    // Successor invalid → false sync inside a payload; keep scanning.
+                } else if single.is_none() {
+                    single = Some((i, hdr));
+                }
+            }
+            i += 1;
+        }
+        match single {
+            Some((i, hdr)) => Ok((from + i as u64, hdr)),
+            None => Err(DecodeError::Malformed),
+        }
     }
 }
 
