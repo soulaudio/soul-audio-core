@@ -146,6 +146,7 @@ fn to_input(m: &MemberData) -> CatalogInput {
     CatalogInput {
         tracks: m.tracks.iter().map(track_input).collect(),
         artists: m.artists.iter().map(|a| (*a).into()).collect(),
+        artist_sorts: Vec::new(),
         albums: m
             .albums
             .iter()
@@ -425,6 +426,7 @@ fn merge_orders_albums_chronologically_across_sources() {
                 file_name: format!("{track}.flac"),
             }],
             artists: vec![artist.into()],
+            artist_sorts: Vec::new(),
             albums: vec![AlbumMeta {
                 title: album.into(),
                 album_artist: 0,
@@ -461,6 +463,79 @@ fn merge_orders_albums_chronologically_across_sources() {
         order,
         vec!["s0_old".to_string(), "s1_new".to_string()],
         "1990 album before 2000, across sources (chronological, not alphabetical)"
+    );
+}
+
+/// Artists order by their **sort-name** across sources, and the merge honors it
+/// in the head comparator (not just the baker). Source A is "Brian Eno" (sort
+/// "Eno, Brian"); source B is "Eric Clapton" (sort "Clapton, Eric"). By display
+/// name Brian < Eric, but by sort name Clapton < Eno — so the merge must emit
+/// Clapton's track first.
+#[test]
+fn merge_orders_artists_by_sort_name_across_sources() {
+    fn one(artist: &str, sort: &str, album: &str, track: &str) -> CatalogInput {
+        CatalogInput {
+            tracks: vec![TrackInput {
+                title: track.into(),
+                artist: 0,
+                album: 0,
+                album_artist: 0,
+                folder: 1,
+                track_no: 1,
+                disc_no: 1,
+                duration_ms: 0,
+                sample_rate: 44_100,
+                channels: 2,
+                file_name: format!("{track}.flac"),
+            }],
+            artists: vec![artist.into()],
+            artist_sorts: vec![sort.into()],
+            albums: vec![AlbumMeta {
+                title: album.into(),
+                album_artist: 0,
+                year: 0,
+                folder: 1,
+            }],
+            folders: vec![
+                FolderInput {
+                    path: String::new(),
+                    parent: NO_FOLDER,
+                },
+                FolderInput {
+                    path: album.into(),
+                    parent: 0,
+                },
+            ],
+            playlists: vec![],
+            covers: vec![],
+        }
+    }
+    let a: &'static [u8] = Vec::leak(write_index(&one(
+        "Brian Eno",
+        "Eno, Brian",
+        "Warm Jets",
+        "eno_track",
+    )));
+    let b: &'static [u8] = Vec::leak(write_index(&one(
+        "Eric Clapton",
+        "Clapton, Eric",
+        "Slowhand",
+        "clapton_track",
+    )));
+    let multi = MultiCatalog::new(vec![
+        Box::new(IndexReader::new(SliceSource::new(a))) as Box<dyn Catalog + Send>,
+        Box::new(IndexReader::new(SliceSource::new(b))) as Box<dyn Catalog + Send>,
+    ]);
+    let order: Vec<String> = (0..multi.order_len(BrowseAxis::ArtistAlbumTrack))
+        .map(|i| {
+            let id = multi.order(BrowseAxis::ArtistAlbumTrack, i).unwrap();
+            resolve(&multi, multi.track(id).unwrap().title)
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec!["clapton_track".to_string(), "eno_track".to_string()],
+        "sort-name order (Clapton < Eno) reverses display order, across sources"
     );
 }
 

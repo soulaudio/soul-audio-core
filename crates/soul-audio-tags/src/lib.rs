@@ -50,6 +50,10 @@ pub enum Field {
     Date,
     Genre,
     Composer,
+    /// Artist sort-name ("Clapton, Eric"). Vorbis `ARTISTSORT`, ID3 `TSOP`, MP4 `soar`.
+    ArtistSort,
+    /// Album-artist sort-name. Vorbis `ALBUMARTISTSORT`, ID3 `TSO2`, MP4 `soaa`.
+    AlbumArtistSort,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

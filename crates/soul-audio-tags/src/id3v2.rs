@@ -238,6 +238,8 @@ fn map_frame_id(id: &str) -> Option<Field> {
         "TPE1" | "TP1" => Some(Field::Artist),
         "TALB" | "TAL" => Some(Field::Album),
         "TPE2" | "TP2" => Some(Field::AlbumArtist),
+        "TSOP" | "TSP" => Some(Field::ArtistSort),
+        "TSO2" => Some(Field::AlbumArtistSort),
         "TDRC" | "TYER" | "TYE" => Some(Field::Date),
         "TCON" | "TCO" => Some(Field::Genre),
         "TCOM" | "TCM" => Some(Field::Composer),

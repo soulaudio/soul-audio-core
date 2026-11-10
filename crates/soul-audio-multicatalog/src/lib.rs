@@ -183,7 +183,10 @@ impl MultiCatalog {
                 (key(&title), local, 0u16, Vec::new(), 0u32, 0u16, 0u16)
             }
             BrowseAxis::ArtistAlbumTrack => {
-                let album_artist = resolve_name(|buf| m.artist_name(rec.album_artist, buf))?;
+                // Primary key is the album-artist's SORT-name (the baker keys the
+                // order table on it too — see `sort_of` in soul-audio-index).
+                let album_artist_sort =
+                    resolve_name(|buf| m.artist_sort_name(rec.album_artist, buf))?;
                 let album = m.album(rec.album)?;
                 let album_title = resolve_ref(m, album.title)?;
                 let year = if album.year == 0 {
@@ -192,7 +195,7 @@ impl MultiCatalog {
                     album.year
                 };
                 (
-                    key(&album_artist),
+                    key(&album_artist_sort),
                     rec.album_artist,
                     year,
                     key(&album_title),
@@ -349,6 +352,11 @@ impl Catalog for MultiCatalog {
     fn artist_name(&self, id: ArtistId, buf: &mut [u8]) -> Result<usize, CatalogError> {
         let (s, local) = unpack(id);
         self.member(s)?.artist_name(local, buf)
+    }
+
+    fn artist_sort_name(&self, id: ArtistId, buf: &mut [u8]) -> Result<usize, CatalogError> {
+        let (s, local) = unpack(id);
+        self.member(s)?.artist_sort_name(local, buf)
     }
 
     fn resolve_str(&self, s: StrRef, buf: &mut [u8]) -> Result<usize, CatalogError> {
