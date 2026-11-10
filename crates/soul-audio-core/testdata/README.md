@@ -34,6 +34,12 @@ not here — these are minimal decode-correctness vectors.
   in an MP4/M4A container, plus ffmpeg's own decoded PCM reference. Our ALAC
   decoder (via `open()`'s MP4 `moov`/`mdat` parsing) matches ffmpeg's decode
   bit-exactly (golden test in the ALAC decoder/format tests).
+- `alac-nonfaststart.m4a` — a stream-copy remux of `alac.m4a`
+  (`ffmpeg -i alac.m4a -c copy`, ffmpeg's default muxer layout) with the box
+  order **non-faststart**: `ftyp, free, mdat, moov` (`moov` last). The audio is
+  byte-identical to `alac.m4a`, so it decodes bit-exact to `alac.ref.pcm` — but
+  only via `open_seekable()` (the forward-only `open()` returns `Unsupported`
+  because `moov` follows `mdat`). Golden in `tests/decode.rs`.
 
 ## AAC-LC
 
@@ -41,6 +47,17 @@ not here — these are minimal decode-correctness vectors.
   MP4/M4A container (`esds`/`mp4a`), plus ffmpeg's own decoded PCM reference.
 - `aac.aac` / `aac.aac.ref.pcm` — the same encode, framed as a raw ADTS
   elementary stream instead, plus its own ffmpeg PCM reference.
+- `aac-id3.aac` — `aac.aac` with a 42-byte ID3v2.3 tag prepended (by
+  construction, not ffmpeg; a `TIT2`="Aria" frame + padding). Taggers add ID3 to
+  raw `.aac` streams too, so the probe must skip the tag and classify by the
+  first real ADTS frame sync — routing it to the AAC decoder, not MP3. Audio is
+  byte-identical to `aac.aac` (reuses `aac.aac.ref.pcm` / compares equal to
+  `decode_all(aac.aac)`; no new reference). Golden in `tests/decode.rs`.
+- `aac-nonfaststart.m4a` — a stream-copy remux of `aac.m4a`
+  (`ffmpeg -i aac.m4a -c copy`) with the **non-faststart** box order
+  (`ftyp, free, mdat, moov`). Same audio as `aac.m4a`, so it is SNR-compared to
+  `aac.m4a.ref.pcm`, and decodes only via `open_seekable()` (forward-only
+  `open()` is `Unsupported`). Golden in `tests/decode.rs`.
 
 AAC-LC is lossy, so unlike the ALAC/FLAC goldens above, our decode is checked
 against ffmpeg's own decode by **segmental SNR with a tolerance**, not

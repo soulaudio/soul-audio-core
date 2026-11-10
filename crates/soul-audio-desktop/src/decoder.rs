@@ -15,7 +15,7 @@ use soul_audio_core::formats::matroska::{MatroskaDecoder, MatroskaVorbisOgg};
 use soul_audio_core::formats::vorbis::VorbisDecoder;
 use soul_audio_core::{
     AnyDecoder, DecodeError, Decoder, Format, PlaybackDecimateAdapter, SeekableDecoder, StreamInfo,
-    open, probe,
+    open_seekable, probe,
 };
 
 /// A fully **owned**, `Send` byte source: std buffers the file, so the decoder
@@ -177,9 +177,13 @@ pub fn open_track(path: &Path) -> Result<OwnedDecoder> {
                 )))
             }
         }
-        // WAV/FLAC/MP3/Ogg-FLAC — `open` re-probes (cheap) and builds the codec.
+        // WAV/FLAC/MP3/Ogg-FLAC/AAC/ALAC/CAF — `open_seekable` re-probes (cheap)
+        // and builds the codec. The file source is always seekable, so MP4 goes
+        // through the seekable reader (decoding non-faststart `.m4a` too); every
+        // other format delegates to the same `open` path as before.
         _ => {
-            let mut any = open(src).map_err(|e| anyhow!("decoding {}: {e:?}", path.display()))?;
+            let mut any =
+                open_seekable(src).map_err(|e| anyhow!("decoding {}: {e:?}", path.display()))?;
             // A CBR MP1/MP2 (or a Xing-less MP3) carries no in-band length, so
             // `total_frames()` would be `None` and the player would show an
             // unknown/0 duration. Resolve a CBR byte-size estimate now (a no-op

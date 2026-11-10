@@ -1199,6 +1199,32 @@ fn decode_all(bytes: &[u8]) -> Vec<i32> {
     decode_all_with_channels(bytes).0
 }
 
+/// Decode a full stream through the public `open_seekable` API (the seekable
+/// path, which handles non-faststart MP4) and return interleaved PCM.
+fn decode_all_seekable(bytes: &[u8]) -> Vec<i32> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn_scoped(scope, || {
+                let mut dec = soul_audio_core::open_seekable(SliceSource::new(bytes))
+                    .expect("probe + construct (seekable)");
+                let mut out = Vec::new();
+                let mut buf = [0i32; 4096];
+                loop {
+                    let n = dec.decode_into(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                }
+                out
+            })
+            .expect("spawn decode thread")
+            .join()
+            .expect("decode thread panicked")
+    })
+}
+
 fn fnv1a(samples: &[i32]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &s in samples {
@@ -1311,6 +1337,78 @@ fn open_decodes_aac_mp4_matching_ffmpeg_within_tolerance() {
         snr > 45.0,
         "AAC/MP4 decode SNR vs ffmpeg too low: {snr:.1} dB (offset {off} frames)"
     );
+}
+
+/// Non-faststart AAC-LC in MP4 (`mdat` before `moov`, ffmpeg's default layout):
+/// the forward-only `open()` can't reach the trailing `moov` and returns
+/// `Unsupported`, but `open_seekable()` seeks to the `moov`, parses it, and
+/// decodes the audio. `aac-nonfaststart.m4a` is a stream-copy remux of
+/// `aac.m4a` (same `mdat`/`esds`, `moov` moved to the end), so its decode
+/// matches the same ffmpeg reference within the AAC-LC lossy tolerance.
+#[test]
+fn open_seekable_decodes_non_faststart_aac() {
+    let m4a = include_bytes!("../testdata/aac-nonfaststart.m4a");
+    // The bug: forward-only open() cannot decode a moov-after-mdat file.
+    assert_eq!(
+        open(SliceSource::new(m4a)).err(),
+        Some(DecodeError::Unsupported),
+        "non-faststart MP4 must stay Unsupported via the forward-only open()"
+    );
+    // The fix: the seekable path decodes it.
+    let refr = load_s16le(include_bytes!("../testdata/aac.m4a.ref.pcm"));
+    let ours = decode_all_seekable(m4a);
+    let (off, snr) = best_align_segsnr(&ours, &refr, 2);
+    assert!(
+        snr > 45.0,
+        "non-faststart AAC decode SNR vs ffmpeg too low: {snr:.1} dB (offset {off} frames)"
+    );
+}
+
+/// Non-faststart ALAC (Apple Lossless) in MP4: same `open()`→`Unsupported`,
+/// `open_seekable()`→decode story as the AAC case. ALAC is **lossless**, so the
+/// seekable decode of `alac-nonfaststart.m4a` (a stream-copy remux of
+/// `alac.m4a`) must be **bit-exact** to the faststart fixture's decode — the
+/// box order moved, not a single audio sample.
+#[test]
+fn open_seekable_decodes_non_faststart_alac_bit_exact() {
+    let m4a = include_bytes!("../testdata/alac-nonfaststart.m4a");
+    assert_eq!(
+        open(SliceSource::new(m4a)).err(),
+        Some(DecodeError::Unsupported),
+        "non-faststart MP4 must stay Unsupported via the forward-only open()"
+    );
+    let ours = decode_all_seekable(m4a);
+    let faststart = decode_all(include_bytes!("../testdata/alac.m4a"));
+    assert_eq!(
+        ours.len(),
+        faststart.len(),
+        "non-faststart ALAC length differs"
+    );
+    assert_eq!(
+        fnv1a(&ours),
+        fnv1a(&faststart),
+        "non-faststart ALAC not bit-exact vs the faststart fixture"
+    );
+    // ...and the faststart decode is itself bit-exact vs ffmpeg's s16le ref,
+    // so this transitively matches the external oracle too.
+    assert_eq!(ours, load_s16le(include_bytes!("../testdata/alac.ref.pcm")));
+}
+
+/// `open_seekable()` is a strict superset of `open()`: a **faststart** MP4 and a
+/// **fragmented** MP4 both still decode identically through the seekable path
+/// (the desktop now routes every MP4 — incl. fragmented — through it, so this
+/// guards the new constructor's faststart and `moof` branches against a
+/// regression, not just the non-faststart case it adds).
+#[test]
+fn open_seekable_still_decodes_faststart_mp4() {
+    let aac = include_bytes!("../testdata/aac.m4a");
+    assert_eq!(decode_all_seekable(aac), decode_all(aac));
+    let alac = include_bytes!("../testdata/alac.m4a");
+    assert_eq!(decode_all_seekable(alac), decode_all(alac));
+    // Fragmented (`moov` init + `moof`/`mdat` fragments): `new_seekable` must
+    // span every fragment exactly as `new` does.
+    let frag = include_bytes!("../testdata/frag-aac.m4a");
+    assert_eq!(decode_all_seekable(frag), decode_all(frag));
 }
 
 /// **Fragmented** AAC in MP4 (`frag-aac.m4a`: `empty_moov` + 9 `moof`/`mdat`

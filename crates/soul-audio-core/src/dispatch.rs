@@ -317,6 +317,38 @@ pub fn open<S: BufSource>(mut src: S) -> Result<AnyDecoder<S>, DecodeError> {
     }
 }
 
+/// Like [`open`], but for a **seekable** source: routes `Format::Mp4` through
+/// [`Mp4Reader::new_seekable`], so a **non-faststart** `.m4a`/`.mp4` (`mdat`
+/// before `moov` — ffmpeg's default layout) decodes instead of failing
+/// `Unsupported`. Faststart and fragmented MP4 decode identically to [`open`]
+/// (the seekable constructor is a superset). Every other container delegates to
+/// [`open`] unchanged, so callers with a seekable source (local files) can use
+/// this uniformly.
+///
+/// `open` itself keeps its forward-only [`BufSource`] bound — this is an
+/// additive, opt-in path for seekable callers, not a change to `open`.
+///
+/// # Errors
+/// As [`open`]; additionally propagates the seekable MP4 reader's errors.
+pub fn open_seekable<S: BufSource + crate::io::SeekSource>(
+    mut src: S,
+) -> Result<AnyDecoder<S>, DecodeError> {
+    match probe(&mut src)? {
+        // The one format that benefits from random access: parse the `moov`
+        // wherever it sits (incl. after `mdat`), then decode from the `mdat`.
+        Format::Mp4 => {
+            let reader = Mp4Reader::new_seekable(src)?;
+            match reader.codec() {
+                Mp4Codec::Alac(_) => AlacDecoder::from_reader(reader).map(AnyDecoder::Alac),
+                Mp4Codec::Aac(_) => AacDecoder::new_mp4(reader).map(AnyDecoder::Aac),
+            }
+        }
+        // `probe` consumed nothing (it peeks via `fill_buf`), so `src` is still
+        // at byte 0 — every other format routes through the existing `open`.
+        _ => open(src),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
