@@ -576,6 +576,84 @@ fn stress_mp3_matches_ffmpeg_on_broadband() {
     );
 }
 
+/// Seek a fresh `open`ed MP3 decoder to per-channel `sample`, then drain the
+/// tail. Big stack: the MP3 decoder's cross-frame state exceeds the default
+/// test stack. Returns `(landed_first_sample, interleaved_pcm_tail)`.
+fn mp3_seek_tail(bytes: &'static [u8], sample: u64) -> (u64, Vec<i32>) {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn_scoped(scope, move || {
+                let mut dec = open(SliceSource::new(bytes)).expect("open mp3");
+                let landed = dec.seek_to(sample).expect("seek");
+                let mut out = Vec::new();
+                let mut buf = [0i32; 4096];
+                loop {
+                    let n = dec.decode_into(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                }
+                (landed, out)
+            })
+            .expect("spawn mp3 seek thread")
+            .join()
+            .expect("mp3 seek thread panicked")
+    })
+}
+
+/// FIX 1 — the MP3 seek **bit-reservoir + filterbank pre-roll**. A Layer III
+/// frame's `main_data` can back-reference up to 511 bytes of *previous* frames
+/// (the bit reservoir), and the synthesis filterbank carries the prior frame's
+/// IMDCT/QMF overlap. Landing cold on the target frame (reservoir + overlap
+/// zeroed by `codec.reset()`) makes the first ~1 frame decode a loud/garbled
+/// transient. `seek_to` now lands `PREROLL_MP3` frames *before* the target and
+/// decode-discards them to prime that state, so the post-seek output is a
+/// **bit-exact suffix** of the straight-through decode *from the first emitted
+/// sample* — not after a one-frame warm-up.
+///
+/// `tone.mp3` is a real CBR (LAME/Lavc `Info`-tag) MPEG-1 Layer III clip of
+/// ~79 frames, so the mid-stream targets land well past the pre-roll window
+/// (exercising the real pre-roll, not the clamp-to-frame-0 case). RED before
+/// the fix: the first post-seek frame diverges (cold reservoir). GREEN after:
+/// identical from sample 0 of the tail.
+#[test]
+fn mp3_seek_preroll_bit_exact_from_first_frame() {
+    const CH: usize = 2;
+    const TONE: &[u8] = include_bytes!("../../../testdata/tone.mp3");
+    const SPF: u64 = 1152; // MPEG-1 Layer III
+    let full = decode_all(TONE);
+    let total_frames = (full.len() / CH) as u64 / SPF;
+    assert!(
+        total_frames > 40,
+        "fixture too short: {total_frames} frames"
+    );
+
+    for &target_frame in &[20u64, 40, total_frames * 3 / 4] {
+        let sample = target_frame * SPF;
+        let (landed, tail) = mp3_seek_tail(TONE, sample);
+        assert!(
+            landed <= sample && landed % SPF == 0,
+            "frame-aligned landing"
+        );
+        assert!(
+            tail.len() > 4 * SPF as usize * CH,
+            "seek to frame {target_frame}: too little runway ({} samples)",
+            tail.len()
+        );
+        // The seeked decode is a *suffix* of the continuous decode; after the
+        // pre-roll it is bit-exact from the very first emitted sample.
+        let align = full.len() - tail.len();
+        assert_eq!(
+            tail,
+            &full[align..],
+            "MP3 seek to frame {target_frame} (landed {landed}) is not a bit-exact \
+             suffix from the first emitted frame — cold reservoir/overlap transient"
+        );
+    }
+}
+
 // --- MP3 non-MPEG-1 / non-stereo configs vs ffmpeg -------------------------
 // Every other MP3 fixture is 44.1 kHz MPEG-1 stereo, but the decoder has whole
 // code paths the real world uses heavily that none of them reach: MPEG-2 and
@@ -3660,17 +3738,23 @@ mod adts_cbr_seek {
         let (linear_reads, linear_tail) = seek_measure(AAC, target_sample, false);
 
         // Fast evidence: O(1) vs O(frames). The byte-estimate seek touches the
-        // source a handful of times; the linear one reads ~per frame to target.
+        // source a small *constant* number of times — the resync window plus the
+        // `PREROLL_AAC` (4-AU) filterbank run-in — independent of how deep the
+        // target is, whereas the linear one reads ~per frame all the way to the
+        // target. On this 23-AU fixture that is 9 vs 34; on a real multi-minute
+        // file the constant stays put while the linear cost grows without bound
+        // (the ~17× the fast seek was added for).
         assert!(
-            fast_reads <= 6,
-            "resolved seek should touch the source O(1) times, got {fast_reads}"
+            fast_reads <= 12,
+            "resolved seek should touch the source O(1) times (resync + 4-AU \
+             pre-roll), got {fast_reads}"
         );
         assert!(
             linear_reads >= 15,
             "linear seek should read ~per-frame to the target, got {linear_reads}"
         );
         assert!(
-            fast_reads * 3 < linear_reads,
+            fast_reads * 2 < linear_reads,
             "resolved seek ({fast_reads}) not far cheaper than linear ({linear_reads})"
         );
 
@@ -3686,6 +3770,95 @@ mod adts_cbr_seek {
                 "{label}: tail {tail} vs expected {expected_tail} off by {off} (> 2 frames)"
             );
             assert!(tail > 0, "{label}: seek landed at EOF (empty tail)");
+        }
+    }
+
+    /// Big-stack full decode of an ADTS stream → interleaved PCM (ground truth).
+    fn full_pcm(bytes: &'static [u8]) -> Vec<i32> {
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn_scoped(s, || {
+                    let mut dec = open(SliceSource::new(bytes)).expect("open ADTS");
+                    let mut out = Vec::new();
+                    let mut buf = [0i32; 4096];
+                    loop {
+                        let n = dec.decode_into(&mut buf).expect("decode");
+                        if n == 0 {
+                            break;
+                        }
+                        out.extend_from_slice(&buf[..n]);
+                    }
+                    out
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        })
+    }
+
+    /// Open, `resolve_lengths()` (so the **CBR byte-estimate fast path** is taken,
+    /// not the linear decode-discard), seek to `target_sample`, and drain the tail.
+    fn fast_seek_tail(bytes: &'static [u8], target_sample: u64) -> Vec<i32> {
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn_scoped(s, move || {
+                    let mut dec = open(SliceSource::new(bytes)).expect("open ADTS");
+                    dec.resolve_lengths();
+                    dec.seek_to(target_sample).expect("seek");
+                    let mut out = Vec::new();
+                    let mut buf = [0i32; 4096];
+                    loop {
+                        let n = dec.decode_into(&mut buf).expect("decode");
+                        if n == 0 {
+                            break;
+                        }
+                        out.extend_from_slice(&buf[..n]);
+                    }
+                    out
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        })
+    }
+
+    /// FIX 2 — the ADTS-CBR fast-seek **filterbank pre-roll**. The O(1) byte-
+    /// estimate fast path (added for the raw-ADTS long-seek regression) landed on
+    /// the target AU with `reset_decode_state()` — the AAC filterbank's 1024-sample
+    /// MDCT overlap zeroed — so the first emitted AU was a cold-start transient
+    /// (TDAC uncancelled), unlike the bit-exact linear and Matroska paths. The
+    /// fast path now biases the byte estimate a few AUs *before* the target and
+    /// decode-discards a `PREROLL_AAC` run-in to warm the filterbank, so the tail
+    /// is a **bit-exact suffix** of the continuous decode from the first emitted
+    /// sample. (Pure AAC-LC: once the overlap is primed the frames are identical.)
+    /// RED before: the first post-seek AU diverges; GREEN after.
+    #[test]
+    fn fast_seek_is_bit_exact_from_first_frame() {
+        const CH: usize = 2;
+        const PER_AU: u64 = 1024; // AAC-LC core, no SBR
+        let full = full_pcm(AAC);
+        let total_frames = (full.len() / CH) as u64 / PER_AU;
+        assert!(total_frames >= 8, "fixture too short: {total_frames} AUs");
+
+        for &target_frame in &[total_frames / 2, total_frames * 3 / 4] {
+            let target = target_frame * PER_AU;
+            let tail = fast_seek_tail(AAC, target);
+            assert!(
+                tail.len() > 2 * PER_AU as usize * CH,
+                "seek to AU {target_frame}: too little runway ({} samples)",
+                tail.len()
+            );
+            // Whole-AU-aligned suffix: both end at EOF, so length alignment is
+            // frame-exact. A warmed filterbank makes it bit-exact from sample 0.
+            let align = full.len() - tail.len();
+            assert_eq!(
+                tail,
+                &full[align..],
+                "ADTS CBR fast seek to AU {target_frame} is not a bit-exact suffix \
+                 from the first emitted AU — cold filterbank overlap"
+            );
         }
     }
 }
