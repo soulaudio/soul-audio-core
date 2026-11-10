@@ -606,6 +606,16 @@ pub mod build {
         fn key_at(keys: &[Vec<u8>], i: u32) -> &[u8] {
             keys.get(i as usize).map_or(&[], |v| v.as_slice())
         }
+        // Album release year for chronological ordering within an artist (the
+        // collector default S+ players use). Unknown year (0 = untagged) sorts
+        // LAST (as `u16::MAX`) so the dated discography stays chronological and
+        // undated albums trail it. An out-of-range id also sorts last.
+        fn year_at(albums: &[AlbumMeta], i: u32) -> u16 {
+            match albums.get(i as usize).map(|a| a.year) {
+                Some(0) | None => u16::MAX,
+                Some(y) => y,
+            }
+        }
 
         let title_order = sorted_ids(track_count, |a, b| {
             title_key[a].cmp(&title_key[b]).then(a.cmp(&b))
@@ -615,6 +625,7 @@ pub mod build {
             key_at(&artist_key, x.album_artist)
                 .cmp(key_at(&artist_key, y.album_artist))
                 .then_with(|| x.album_artist.cmp(&y.album_artist))
+                .then_with(|| year_at(&input.albums, x.album).cmp(&year_at(&input.albums, y.album)))
                 .then_with(|| key_at(&album_key, x.album).cmp(key_at(&album_key, y.album)))
                 .then_with(|| x.album.cmp(&y.album))
                 .then_with(|| (x.disc_no, x.track_no).cmp(&(y.disc_no, y.track_no)))

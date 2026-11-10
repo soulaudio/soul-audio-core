@@ -402,6 +402,68 @@ fn multicatalog_is_send() {
     assert_send::<MultiCatalog>();
 }
 
+/// Albums order **chronologically** within an artist (the collector default), and
+/// the merge honors it ACROSS sources — exercising the `year` field in the head
+/// comparator, not just the baker. Same artist "X" on two sources: album "Zzz"
+/// from 1990 and "Aaa" from 2000; chronological puts 1990 first, the opposite of
+/// album-title-alphabetical (Aaa < Zzz).
+#[test]
+fn merge_orders_albums_chronologically_across_sources() {
+    fn one_album(artist: &str, album: &str, year: u16, track: &str) -> CatalogInput {
+        CatalogInput {
+            tracks: vec![TrackInput {
+                title: track.into(),
+                artist: 0,
+                album: 0,
+                album_artist: 0,
+                folder: 1,
+                track_no: 1,
+                disc_no: 1,
+                duration_ms: 0,
+                sample_rate: 44_100,
+                channels: 2,
+                file_name: format!("{track}.flac"),
+            }],
+            artists: vec![artist.into()],
+            albums: vec![AlbumMeta {
+                title: album.into(),
+                album_artist: 0,
+                year,
+                folder: 1,
+            }],
+            folders: vec![
+                FolderInput {
+                    path: String::new(),
+                    parent: NO_FOLDER,
+                },
+                FolderInput {
+                    path: album.into(),
+                    parent: 0,
+                },
+            ],
+            playlists: vec![],
+            covers: vec![],
+        }
+    }
+    let a: &'static [u8] = Vec::leak(write_index(&one_album("X", "Zzz", 1990, "s0_old")));
+    let b: &'static [u8] = Vec::leak(write_index(&one_album("X", "Aaa", 2000, "s1_new")));
+    let multi = MultiCatalog::new(vec![
+        Box::new(IndexReader::new(SliceSource::new(a))) as Box<dyn Catalog + Send>,
+        Box::new(IndexReader::new(SliceSource::new(b))) as Box<dyn Catalog + Send>,
+    ]);
+    let order: Vec<String> = (0..multi.order_len(BrowseAxis::ArtistAlbumTrack))
+        .map(|i| {
+            let id = multi.order(BrowseAxis::ArtistAlbumTrack, i).unwrap();
+            resolve(&multi, multi.track(id).unwrap().title)
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec!["s0_old".to_string(), "s1_new".to_string()],
+        "1990 album before 2000, across sources (chronological, not alphabetical)"
+    );
+}
+
 /// `unpack(pack(s, l)) == (s, l)` across the valid ranges.
 #[test]
 fn pack_unpack_roundtrip() {

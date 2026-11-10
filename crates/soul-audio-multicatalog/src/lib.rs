@@ -174,18 +174,27 @@ impl MultiCatalog {
         // folders on different sources would interleave instead of staying
         // grouped. `secondary`/`group1` are the 2nd collation level used only by
         // `ArtistAlbumTrack` (album key + album id under the album-artist).
-        let (primary, group0, secondary, group1, disc, track) = match axis {
+        // `year` orders albums chronologically within an artist on the
+        // ArtistAlbumTrack axis (unknown year 0 → `u16::MAX`, i.e. last, matching
+        // the baker's `year_at`); it is inert (0) on the other axes.
+        let (primary, group0, year, secondary, group1, disc, track) = match axis {
             BrowseAxis::Title => {
                 let title = resolve_ref(m, rec.title)?;
-                (key(&title), local, Vec::new(), 0u32, 0u16, 0u16)
+                (key(&title), local, 0u16, Vec::new(), 0u32, 0u16, 0u16)
             }
             BrowseAxis::ArtistAlbumTrack => {
                 let album_artist = resolve_name(|buf| m.artist_name(rec.album_artist, buf))?;
                 let album = m.album(rec.album)?;
                 let album_title = resolve_ref(m, album.title)?;
+                let year = if album.year == 0 {
+                    u16::MAX
+                } else {
+                    album.year
+                };
                 (
                     key(&album_artist),
                     rec.album_artist,
+                    year,
                     key(&album_title),
                     rec.album,
                     rec.disc_no,
@@ -198,6 +207,7 @@ impl MultiCatalog {
                 (
                     key(&album_title),
                     rec.album,
+                    0u16,
                     Vec::new(),
                     0u32,
                     rec.disc_no,
@@ -209,6 +219,7 @@ impl MultiCatalog {
                 (
                     key(&path),
                     rec.folder,
+                    0u16,
                     Vec::new(),
                     0u32,
                     rec.disc_no,
@@ -220,6 +231,7 @@ impl MultiCatalog {
             primary,
             source: s,
             group0,
+            year,
             secondary,
             group1,
             disc,
@@ -245,6 +257,10 @@ struct Head {
     primary: Vec<u8>,
     source: u32,
     group0: u32,
+    /// Album release year, between the grouping entity and the 2nd collation key,
+    /// so the ArtistAlbumTrack axis orders albums chronologically within an artist
+    /// (unknown = `u16::MAX`, last — matching the baker). Inert (0) on other axes.
+    year: u16,
     secondary: Vec<u8>,
     group1: u32,
     disc: u16,
