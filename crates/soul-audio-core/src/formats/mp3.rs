@@ -20,6 +20,17 @@ use crate::model::StreamInfo;
 /// skip, matching LAME's `DECODERDELAY` and ffmpeg's `528 + 1`.
 const MP3_DECODER_DELAY: u64 = 529;
 
+/// Frames to decode-and-discard *before* the target on a seek, to prime the bit
+/// reservoir and the IMDCT/QMF filterbank overlap so the first emitted frame is
+/// steady-state rather than a cold-decode transient. A Layer III frame's
+/// `main_data` may back-reference up to **511 bytes** of previous frames via the
+/// reservoir; at the worst case (≈52-byte frames, 8 kbps MPEG-2.5) that spans
+/// ⌈511/52⌉ ≈ 10 frames, plus one for the filterbank overlap → **16** is a safe
+/// margin (and matches what dr_mp3/minimp3 pre-roll, ~10–16). The pre-roll is a
+/// small constant, so seeking stays O(1) on the stream size. Clamped to the
+/// start when the target is nearer than this (then the decode is from frame 0).
+const PREROLL_MP3: u64 = 16;
+
 /// Largest MPEG frame we packetize/decode. The worst case is MPEG-1 Layer II at
 /// 384 kbps / 32 kHz = 1728 bytes (Layer III tops out at 1441); round up for
 /// headroom. Larger (free-format) frames are declined by the demuxer.
@@ -121,20 +132,38 @@ impl<S: SeekSource> Mp3Decoder<S> {
     ///
     /// MP3 seeking is **frame-granular, not sample-accurate**: a granule's main
     /// data can live in the bit reservoir of *earlier* frames, and the IMDCT/QMF
-    /// filterbank carries overlap between frames. After a seek both are reset, so
-    /// the first decoded samples are a warm-up transient that differs from a
-    /// continuous decode — this is inherent to the format (minimp3/dr_mp3 behave
-    /// the same). Steady state is reached within one frame.
+    /// filterbank carries overlap between frames. To avoid emitting that cold
+    /// state as a warm-up transient, the seek lands [`PREROLL_MP3`] frames
+    /// *before* the target and decode-discards them (priming the reservoir and
+    /// filterbank overlap), so the first emitted frame is steady-state — a
+    /// bit-exact suffix of the continuous decode. Clamps the pre-roll to the
+    /// stream start for a near-start target.
     ///
     /// # Errors
-    /// Propagates the demuxer seek error.
+    /// Propagates the demuxer seek error, or a read/decode error during pre-roll.
     pub fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
         let spf = u64::from(self.demux.samples_per_frame());
-        let landed = self.demux.seek_to_frame(sample / spf)?;
+        let target_frame = sample / spf;
+        let preroll_frame = target_frame.saturating_sub(PREROLL_MP3);
+        self.demux.seek_to_frame(preroll_frame)?;
         self.codec.reset();
         self.pcm_len = 0;
         self.pcm_pos = 0;
-        Ok(landed)
+        // Decode-and-discard the pre-roll frames so the bit reservoir + IMDCT/QMF
+        // overlap are warm before the target frame is emitted. (Mirrors the
+        // AAC-MP4 path's `PREROLL`.) A frame that can't yet decode (reservoir not
+        // yet primed) still updates the reservoir; its PCM is discarded.
+        for _ in preroll_frame..target_frame {
+            match self.demux.next_packet(&mut self.frame_buf)? {
+                None => break, // EOF during pre-roll — nothing more to prime
+                Some(packet) => {
+                    let _ = self.codec.decode_frame(packet.data, &mut self.pcm);
+                }
+            }
+        }
+        self.pcm_len = 0;
+        self.pcm_pos = 0;
+        Ok(target_frame * spf)
     }
 
     /// Seek to `secs` seconds (convenience over [`Self::seek_to`]). Returns the
@@ -1154,9 +1183,10 @@ mod tests {
         assert!(dec.total_samples().is_some(), "Xing tag → duration");
 
         let full = decode_all(VBR_MP3, 4096);
-        const WARMUP: usize = 2304; // one stereo frame
-        // TOC seek is approximate but the decode remains a suffix of `full` that
-        // converges bit-exactly after the warm-up.
+        // With the seek pre-roll (bit reservoir + filterbank primed), the decode
+        // is a suffix of `full` that is bit-exact from the FIRST emitted sample —
+        // no warm-up window. (Was 2304 = one stereo frame before the pre-roll.)
+        const WARMUP: usize = 0;
         for &target in &[4000u64, 9000, 15000] {
             let (_landed, part) = decode_from_seek(VBR_MP3, target);
             assert!(part.len() > WARMUP, "seek({target}): too little runway");
@@ -1231,11 +1261,10 @@ mod tests {
     #[test]
     fn mp3_seek_converges_to_continuous_decode() {
         // A seeked decode is a *suffix* of the continuous decode: it ends on the
-        // same final samples, with a bounded warm-up at the front where the
-        // reservoir/filterbank are re-priming (frames whose main data lived in the
-        // discarded reservoir may be dropped). Empirically it converges within one
-        // frame (2304 interleaved samples for stereo), after which it is bit-exact.
-        const WARMUP: usize = 2304; // one MPEG-1 stereo frame (1152 × 2)
+        // same final samples. The seek pre-roll decode-discards the frames before
+        // the target, re-priming the bit reservoir and the IMDCT/QMF overlap, so
+        // the suffix is bit-exact from the FIRST emitted sample (no warm-up).
+        const WARMUP: usize = 0; // was 2304 (one stereo frame) before the pre-roll
         let full = decode_all(STEREO_MP3, 4096);
         for &target in &[1152u64, 2304, 3456] {
             // Targets kept early enough to leave runway past the warm-up.

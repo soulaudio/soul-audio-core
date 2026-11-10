@@ -576,6 +576,84 @@ fn stress_mp3_matches_ffmpeg_on_broadband() {
     );
 }
 
+/// Seek a fresh `open`ed MP3 decoder to per-channel `sample`, then drain the
+/// tail. Big stack: the MP3 decoder's cross-frame state exceeds the default
+/// test stack. Returns `(landed_first_sample, interleaved_pcm_tail)`.
+fn mp3_seek_tail(bytes: &'static [u8], sample: u64) -> (u64, Vec<i32>) {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn_scoped(scope, move || {
+                let mut dec = open(SliceSource::new(bytes)).expect("open mp3");
+                let landed = dec.seek_to(sample).expect("seek");
+                let mut out = Vec::new();
+                let mut buf = [0i32; 4096];
+                loop {
+                    let n = dec.decode_into(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                }
+                (landed, out)
+            })
+            .expect("spawn mp3 seek thread")
+            .join()
+            .expect("mp3 seek thread panicked")
+    })
+}
+
+/// FIX 1 — the MP3 seek **bit-reservoir + filterbank pre-roll**. A Layer III
+/// frame's `main_data` can back-reference up to 511 bytes of *previous* frames
+/// (the bit reservoir), and the synthesis filterbank carries the prior frame's
+/// IMDCT/QMF overlap. Landing cold on the target frame (reservoir + overlap
+/// zeroed by `codec.reset()`) makes the first ~1 frame decode a loud/garbled
+/// transient. `seek_to` now lands `PREROLL_MP3` frames *before* the target and
+/// decode-discards them to prime that state, so the post-seek output is a
+/// **bit-exact suffix** of the straight-through decode *from the first emitted
+/// sample* — not after a one-frame warm-up.
+///
+/// `tone.mp3` is a real CBR (LAME/Lavc `Info`-tag) MPEG-1 Layer III clip of
+/// ~79 frames, so the mid-stream targets land well past the pre-roll window
+/// (exercising the real pre-roll, not the clamp-to-frame-0 case). RED before
+/// the fix: the first post-seek frame diverges (cold reservoir). GREEN after:
+/// identical from sample 0 of the tail.
+#[test]
+fn mp3_seek_preroll_bit_exact_from_first_frame() {
+    const CH: usize = 2;
+    const TONE: &[u8] = include_bytes!("../../../testdata/tone.mp3");
+    const SPF: u64 = 1152; // MPEG-1 Layer III
+    let full = decode_all(TONE);
+    let total_frames = (full.len() / CH) as u64 / SPF;
+    assert!(
+        total_frames > 40,
+        "fixture too short: {total_frames} frames"
+    );
+
+    for &target_frame in &[20u64, 40, total_frames * 3 / 4] {
+        let sample = target_frame * SPF;
+        let (landed, tail) = mp3_seek_tail(TONE, sample);
+        assert!(
+            landed <= sample && landed % SPF == 0,
+            "frame-aligned landing"
+        );
+        assert!(
+            tail.len() > 4 * SPF as usize * CH,
+            "seek to frame {target_frame}: too little runway ({} samples)",
+            tail.len()
+        );
+        // The seeked decode is a *suffix* of the continuous decode; after the
+        // pre-roll it is bit-exact from the very first emitted sample.
+        let align = full.len() - tail.len();
+        assert_eq!(
+            tail,
+            &full[align..],
+            "MP3 seek to frame {target_frame} (landed {landed}) is not a bit-exact \
+             suffix from the first emitted frame — cold reservoir/overlap transient"
+        );
+    }
+}
+
 // --- MP3 non-MPEG-1 / non-stereo configs vs ffmpeg -------------------------
 // Every other MP3 fixture is 44.1 kHz MPEG-1 stereo, but the decoder has whole
 // code paths the real world uses heavily that none of them reach: MPEG-2 and
