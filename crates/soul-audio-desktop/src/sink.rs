@@ -347,6 +347,17 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// `max |x[i] − 2·x[i−1] + x[i−2]|` — the discrete second difference's peak.
+    /// A smoothstep ramp (C¹ at both ends, bounded curvature) keeps this tiny
+    /// (≈ FULL·6/FADE_LEN²); a slope break — a hard clear, or a *linear* ramp's
+    /// corners — spikes it (a step ≈ 2·FULL, a linear corner ≈ FULL/FADE_LEN).
+    fn second_difference_peak(xs: &[i32]) -> i64 {
+        xs.windows(3)
+            .map(|w| (i64::from(w[2]) - 2 * i64::from(w[1]) + i64::from(w[0])).abs())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Emit `steady` samples of pre-seek audio, then raise the discard flag and
     /// service it (one callback: `begin` once, then `after` `next` calls). Returns
     /// the full output stream (canonical i32, underrun → 0).
@@ -433,6 +444,29 @@ mod tests {
             4_000,
             "three-quarters in ⇒ smoothstep(0.25)"
         );
+        // No slope break anywhere across the fade-out (the real de-click gate,
+        // complementing the monotonic check above). The audible shape is a steady
+        // full level continuing INTO the fade and out to silence, so prepend two
+        // steady-FULL samples to include the steady→fade junction: a smoothstep is
+        // C¹ at t=1 (zero slope) so that junction is smooth, as is the fade→silence
+        // junction at t=0. The peak second difference therefore stays ≈ FULL·6/n²
+        // (a couple of LSB), orders of magnitude below a hard clear's 0→FULL step
+        // (≈ 2·FULL) or even a linear ramp's corner (≈ FULL/n ≈ 66). Bound K is set
+        // well under that corner so the test proves *smoothstep*, not merely
+        // *some* ramp.
+        let shaped: Vec<i32> = [FULL, FULL]
+            .into_iter()
+            .chain(fade.iter().copied())
+            .collect();
+        let d2 = second_difference_peak(&shaped);
+        let k = i64::from(FULL) / 1000; // 25 — below a linear corner (~66), far below a step
+        assert!(
+            d2 <= k,
+            "fade-out second-difference peak {d2} exceeds {k} — the ramp has a slope \
+             break (not a bounded-curvature smoothstep); a hard clear would be ~{}",
+            2 * i64::from(FULL)
+        );
+
         // Lands at silence; the remainder is cleared and the ack released.
         assert_eq!(fade[n - 1], 0, "fade ends at zero");
         assert!(
