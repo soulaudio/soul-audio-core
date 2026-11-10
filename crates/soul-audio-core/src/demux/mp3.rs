@@ -83,6 +83,10 @@ pub struct Mp3Demuxer<S> {
     audio_start: u64,
     /// Constant CBR frame length in bytes (the first frame's length).
     frame_len: usize,
+    /// First frame's bitrate in bits/second — the basis for the header-less CBR
+    /// length ([`Self::resolve_cbr_length`]), which is bitrate-derived rather
+    /// than frame-length-based so per-frame padding doesn't bias it.
+    bitrate_bps: u32,
     /// VBR/duration header from the first frame, if any.
     vbr: Option<VbrTag>,
     /// Resolved total length in per-channel samples. Seeded in [`Self::new`] from
@@ -163,6 +167,7 @@ impl<S: Source> Mp3Demuxer<S> {
             pos_samples: 0,
             audio_start: pos - 4,
             frame_len: f.len,
+            bitrate_bps: f.bitrate_bps,
             vbr,
             total: vbr.map(|v| v.total_frames * u64::from(f.spf)),
             first_frame,
@@ -300,17 +305,20 @@ impl<S: SeekSource> Mp3Demuxer<S> {
     }
 
     /// Resolve the stream length for a header-less CBR stream (MP1/MP2, or an
-    /// MP3 with no Xing/Info/VBRI tag), seeding [`Self::total_samples`] with a
-    /// CBR byte-size estimate: `(audio_bytes / frame_len)` whole MPEG frames,
-    /// each worth `spf` per-channel samples.
+    /// MP3 with no Xing/Info/VBRI tag), seeding [`Self::total_samples`] from the
+    /// **bitrate**: `round(audio_bytes · 8 · sample_rate ÷ bitrate)` per-channel
+    /// samples.
+    ///
+    /// Bitrate-based, not frame-count-based, because CBR pads only some frames
+    /// (+1 slot) — so the first frame's length isn't representative and dividing
+    /// the byte span by it reads long (MP1 +1.4 s / MP2 +0.44 s). `audio_bytes ·
+    /// 8 ÷ bitrate` is the exact CBR duration regardless of padding distribution.
     ///
     /// No-op if a header already declared the length (that exact count wins) or
-    /// if the frame length is degenerate. For a clean CBR stream with no trailing
-    /// tag the estimate is exact; a partial final frame would round it down by at
-    /// most one frame. Saves and restores the source position, so it is safe to
-    /// call at any point without disturbing an in-progress decode.
+    /// if the bitrate is degenerate. Saves and restores the source position, so
+    /// it is safe to call at any point without disturbing an in-progress decode.
     pub(crate) fn resolve_cbr_length(&mut self) {
-        if self.total.is_some() || self.frame_len == 0 {
+        if self.total.is_some() || self.bitrate_bps == 0 {
             return;
         }
         // Save the cursor so a mid-decode call doesn't lose its place.
@@ -330,8 +338,13 @@ impl<S: SeekSource> Mp3Demuxer<S> {
             }
         }
         let audio_bytes = end.saturating_sub(self.audio_start).saturating_sub(trailer);
-        let frames = audio_bytes / self.frame_len as u64;
-        self.total = Some(frames * u64::from(self.spf));
+        // Bitrate-based CBR length: audio_bytes·8 ÷ bitrate = seconds (exact for
+        // CBR), ×sample_rate = per-channel samples, round-half-up. u128 keeps the
+        // intermediate product (bytes·8·rate ≈ 1e15 for a long file) from
+        // overflowing. `no_std`: integer math only.
+        let num = u128::from(audio_bytes) * 8 * u128::from(self.info.sample_rate);
+        let den = u128::from(self.bitrate_bps);
+        self.total = Some(((num + den / 2) / den) as u64);
         // Restore the cursor the caller was reading from.
         let _ = self.src.seek(SeekFrom::Start(saved));
     }
@@ -399,6 +412,9 @@ struct Frame {
     channels: u16,
     spf: u32,
     len: usize,
+    /// Bitrate in bits/second — the basis for the header-less CBR length, which
+    /// is bitrate-derived (padding-immune) rather than first-frame-length-based.
+    bitrate_bps: u32,
 }
 
 /// Read a big-endian `u32` at `off`, or `None` if out of bounds.
@@ -561,6 +577,7 @@ fn parse_header(h: &[u8; 4]) -> Option<Frame> {
         channels,
         spf,
         len,
+        bitrate_bps: bits,
     })
 }
 

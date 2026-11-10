@@ -69,11 +69,11 @@ struct FrameHeader {
     sample_rate: u32,
     channels: u16,
     samples_per_frame: u32,
-    /// Whole-frame length in bytes (header + body, including this frame's
-    /// padding byte) — the constant CBR frame size. Computed with the exact
-    /// per-layer formula the decoder's demuxer uses, so the CBR duration
-    /// estimate here matches the one playback derives.
-    frame_len: u64,
+    /// Bitrate in bits/second (from the header's bitrate index). The CBR
+    /// duration is derived from *this*, not `frame_len`: a per-frame length is
+    /// padding-biased (CBR pads only some frames, so the first frame isn't
+    /// representative), whereas `audio_bytes·8 ÷ bitrate` is exact for CBR.
+    bitrate_bps: u32,
     /// 2 if the protection bit indicates a trailing 16-bit CRC, else 0 — the
     /// Xing/Info tag sits after this, in addition to the side-info bytes.
     crc_bytes: u64,
@@ -129,27 +129,32 @@ fn parse_header(h: &[u8; 4]) -> Option<FrameHeader> {
     };
     let crc_bytes = if h[1] & 0x1 == 0 { 2 } else { 0 }; // protection bit 0 = CRC present
 
-    // Whole-frame byte length (the constant CBR frame size), computed exactly as
-    // the decoder's demuxer does — per layer, including this frame's padding bit:
-    //   Layer I   = (12·bitrate/sr + pad)·4   (4-byte slots, 384 samples)
-    //   Layer II  = 144·bitrate/sr + pad
-    //   Layer III = (spf/8)·bitrate/sr + pad  (coef 144 for MPEG1, 72 for MPEG2/2.5)
+    // The CBR duration is bitrate-based (see `cbr_total_samples`), so only the
+    // bitrate is carried — not a per-frame length, which would be padding-biased.
     let bitrate_bps = bitrate_kbps * 1000;
-    let padding = u32::from((h[2] >> 1) & 0x1);
-    let frame_len = match layer {
-        3 => u64::from((12 * bitrate_bps / sample_rate + padding) * 4), // Layer I
-        2 => u64::from(144 * bitrate_bps / sample_rate + padding),      // Layer II
-        _ => u64::from((samples_per_frame / 8) * bitrate_bps / sample_rate + padding), // Layer III
-    };
 
     Some(FrameHeader {
         mpeg1,
         sample_rate,
         channels,
         samples_per_frame,
-        frame_len,
+        bitrate_bps,
         crc_bytes,
     })
+}
+
+/// Total per-channel samples for a header-less CBR stream, derived from the
+/// bitrate rather than a per-frame length. For CBR, `audio_bytes·8 ÷ bitrate`
+/// is the exact duration in seconds regardless of how padding is distributed
+/// across frames, so `round(audio_bytes·8·sample_rate ÷ bitrate)` is the
+/// padding-immune sample count. Integer math, round-half-up, `no_std`.
+fn cbr_total_samples(audio_bytes: u64, sample_rate: u32, bitrate_bps: u32) -> u64 {
+    if bitrate_bps == 0 {
+        return 0;
+    }
+    let num = u128::from(audio_bytes) * 8 * u128::from(sample_rate);
+    let den = u128::from(bitrate_bps);
+    ((num + den / 2) / den) as u64
 }
 
 /// Side-info byte length between the header (+ optional CRC) and the
@@ -251,14 +256,15 @@ fn try_read_facts<S: SeekSource>(src: &mut S) -> Option<StreamFacts> {
     let total_frames = match mpeg_frames {
         Some(frames) => frames.saturating_mul(u64::from(header.samples_per_frame)),
         None => {
-            // No VBR header: count whole CBR MPEG frames in the audio byte span —
-            // `(audio_bytes / frame_len) · samples_per_frame` — the SAME byte/frame
-            // formula the decoder's `resolve_cbr_length` uses, so the library LIST
-            // duration matches the one playback reports. (The previous whole-second
-            // estimate — `audio_bytes·8/bitrate` floored, then ×sample_rate — threw
-            // away the sub-second remainder, which showed up as the MP1/MP2
-            // 4:59-vs-5:00 mismatch.) Measured from `frame_start` (the first sync,
-            // past any garbage); a trailing 128-byte ID3v1 "TAG" is metadata.
+            // No VBR header: derive the CBR duration from the bitrate, NOT a
+            // per-frame length. CBR pads only some frames (+1 slot), so the first
+            // frame's length isn't representative — dividing the byte span by it
+            // reads long (MP1 +1.4 s / MP2 +0.44 s, the 5:00-vs-4:59 bug).
+            // `audio_bytes·8 ÷ bitrate` is the exact CBR duration (padding-immune),
+            // and `cbr_total_samples` turns it into a sample count. This matches
+            // the decoder's `resolve_cbr_length`, keeping LIST == PLAYBACK. Measured
+            // from `frame_start` (the first sync, past any garbage); a trailing
+            // 128-byte ID3v1 "TAG" is metadata.
             let end = src.seek(SeekFrom::End(0)).ok()?;
             let mut trailer = 0u64;
             if end >= frame_start + 128 && src.seek(SeekFrom::Start(end - 128)).is_ok() {
@@ -268,8 +274,7 @@ fn try_read_facts<S: SeekSource>(src: &mut S) -> Option<StreamFacts> {
                 }
             }
             let audio_bytes = end.saturating_sub(frame_start).saturating_sub(trailer);
-            let frames = audio_bytes / header.frame_len.max(1);
-            frames.saturating_mul(u64::from(header.samples_per_frame))
+            cbr_total_samples(audio_bytes, header.sample_rate, header.bitrate_bps)
         }
     };
 
@@ -340,7 +345,7 @@ mod tests {
         assert_eq!(f.sample_rate, 44_100);
         assert_eq!(f.channels, 2);
         assert_eq!(f.samples_per_frame, 1152);
-        assert_eq!(f.frame_len, 417); // 144·128000/44100, no padding
+        assert_eq!(f.bitrate_bps, 128_000); // 128 kbps
         assert_eq!(f.crc_bytes, 0);
     }
 
@@ -420,11 +425,10 @@ mod tests {
 
     #[test]
     fn cbr_fallback_estimates_from_file_length_when_no_vbr_header() {
-        // 128 kbps MPEG-1 Layer III @ 44,100 Hz: frame_len = 144·128000/44100 =
-        // 417 B/frame. A 16,000-byte "file" holds 16000/417 = 38 whole frames →
-        // 38 × 1152 = 43,776 samples (~0.993 s). This is the *frame-count* basis
-        // the decoder uses (not the old whole-second ×sample_rate, which read
-        // 44,100), so the library duration matches playback. All-zero body never
+        // 128 kbps MPEG-1 Layer III @ 44,100 Hz. The CBR duration is bitrate-based:
+        // 16,000 B · 8 ÷ 128,000 bps = exactly 1.000 s → 44,100 samples. (The old
+        // frame-count estimate — 16000 ÷ 417 B/frame × 1152 = 43,776 — divided by
+        // the *first* frame's length, which is padding-biased.) All-zero body never
         // spells "Xing"/"Info"/"VBRI", so this is the CBR estimate path.
         let h = header_v1(9, 0, false, true);
         let mut b = alloc::vec![0u8; 16_000];
@@ -433,7 +437,7 @@ mod tests {
         let facts = read_facts(&mut src);
         assert_eq!(facts.sample_rate, Some(44_100));
         assert_eq!(facts.channels, Some(2));
-        assert_eq!(facts.total_frames, Some(43_776));
+        assert_eq!(facts.total_frames, Some(44_100));
     }
 
     #[test]
@@ -464,7 +468,7 @@ mod tests {
         assert_eq!(f.sample_rate, 44_100);
         assert_eq!(f.channels, 2);
         assert_eq!(f.samples_per_frame, 1152);
-        assert_eq!(f.frame_len, 417); // Layer II: 144·128000/44100
+        assert_eq!(f.bitrate_bps, 128_000); // Layer II, 128 kbps
     }
 
     #[test]
@@ -477,17 +481,16 @@ mod tests {
         assert_eq!(f.sample_rate, 44_100);
         assert_eq!(f.channels, 2);
         assert_eq!(f.samples_per_frame, 384);
-        assert_eq!(f.frame_len, 136); // Layer I: (12·128000/44100)·4
+        assert_eq!(f.bitrate_bps, 128_000); // Layer I, 128 kbps
     }
 
     #[test]
     fn cbr_duration_for_layer2_file() {
-        // Layer II, 128 kbps @ 44,100 Hz: frame_len = 144·128000/44100 = 417 B.
-        // 16,000 B / 417 = 38 whole frames × 1152 spf = 43,776 samples (~0.993 s)
-        // — the decoder's frame-count basis. Xing/Info/VBRI is a Layer III
-        // convention, absent here, so this takes the CBR file-length estimate —
-        // the path real .mp2 files use. Before the Layer I/II fix the frame sync
-        // is rejected and total_frames comes back None (the 00:00 library bug).
+        // Layer II, 128 kbps @ 44,100 Hz. Bitrate-based CBR duration:
+        // 16,000 B · 8 ÷ 128,000 = 1.000 s → 44,100 samples. (Old frame-count
+        // estimate 16000 ÷ 417 × 1152 = 43,776 read the padding-biased first
+        // frame.) Xing/Info/VBRI is a Layer III convention, absent here, so this
+        // takes the CBR file-length path — the path real .mp2 files use.
         let h = header_v1_layer(0b10, 8, 0, false, false);
         let mut b = alloc::vec![0u8; 16_000];
         b[0..4].copy_from_slice(&h);
@@ -495,15 +498,15 @@ mod tests {
         let facts = read_facts(&mut src);
         assert_eq!(facts.sample_rate, Some(44_100));
         assert_eq!(facts.channels, Some(2));
-        assert_eq!(facts.total_frames, Some(43_776));
+        assert_eq!(facts.total_frames, Some(44_100));
     }
 
     #[test]
     fn cbr_duration_for_layer1_file() {
-        // Layer I, 128 kbps @ 44,100 Hz: frame_len = (12·128000/44100)·4 = 136 B
-        // (384 samples/frame). 16,000 B / 136 = 117 whole frames × 384 spf =
-        // 44,928 samples (~1.019 s) — the decoder's frame-count basis. Same CBR
-        // estimate path; None before the Layer I fix.
+        // Layer I, 128 kbps @ 44,100 Hz. Bitrate-based CBR duration:
+        // 16,000 B · 8 ÷ 128,000 = 1.000 s → 44,100 samples, independent of the
+        // layer's samples-per-frame. (Old frame-count estimate 16000 ÷ 136 × 384 =
+        // 44,928 read the padding-biased first frame.)
         let h = header_v1_layer(0b11, 4, 0, false, false);
         let mut b = alloc::vec![0u8; 16_000];
         b[0..4].copy_from_slice(&h);
@@ -511,44 +514,59 @@ mod tests {
         let facts = read_facts(&mut src);
         assert_eq!(facts.sample_rate, Some(44_100));
         assert_eq!(facts.channels, Some(2));
-        assert_eq!(facts.total_frames, Some(44_928));
+        assert_eq!(facts.total_frames, Some(44_100));
     }
 
-    /// FIX 3 — the library LIST duration (this tag scan) and the PLAYBACK
-    /// duration (the decoder's `total_frames`) must agree for header-less CBR
-    /// MP1/MP2. They diverged because this scan computed **whole seconds**
-    /// (`audio_bytes×8 ÷ bitrate`, floored) and multiplied by the sample rate —
-    /// throwing away the sub-second remainder — while the decoder counts **whole
-    /// MPEG frames** (`audio_bytes ÷ frame_len × spf`), keeping frame-grained
-    /// precision. On a ~5-minute file that floor was the 4:59-vs-5:00 gap; on
-    /// these sub-second fixtures it zeroed the list duration outright. Aligning
-    /// the scan to the decoder's byte/frame formula makes them land together.
+    /// For header-less CBR MP1/MP2 the library LIST duration (this tag scan) and
+    /// the PLAYBACK duration (the decoder's `total_frames`) must (a) equal each
+    /// other and (b) land within one MPEG frame of the TRUE decoded length. Both
+    /// now use the **bitrate-based** CBR formula (`round(audio_bytes · 8 ·
+    /// sample_rate ÷ bitrate)`): the earlier first-frame-length frame count was
+    /// padding-biased and read long (the `cbr-*-bias` clips below over-read by
+    /// ≥2 frames under it — the FIX B RED→GREEN).
     ///
-    /// Real L1/L2 fixtures, cross-checked against the actual decoder.
+    /// `true_samples` is the per-channel count a full decode yields (cross-checked
+    /// out-of-band with ffmpeg/the decoder), committed as a constant so the test
+    /// needs no in-process decode.
     #[test]
     fn tag_scan_matches_decoder_cbr_duration_for_l1_l2() {
         use soul_audio_core::open;
-        // (name, bytes, samples-per-frame) — one Layer II and one Layer I clip.
-        let cases: [(&str, &[u8], u64); 2] = [
+        // (name, bytes, samples-per-frame, true decoded per-channel samples).
+        let cases: [(&str, &[u8], u64, u64); 4] = [
             (
                 "l2_s48_256.mp2",
                 include_bytes!("../../soul-audio-core/testdata/l2_s48_256.mp2"),
                 1152, // Layer II
+                14_976,
             ),
             (
                 "layer1-32k-stereo.mp1",
                 include_bytes!("../../soul-audio-core/testdata/layer1-32k-stereo.mp1"),
                 384, // Layer I
+                18_816,
+            ),
+            // Padding-biased 44.1 kHz clips: old frame-count estimate over-read by
+            // ≥2 frames (L2 +2304, L1 +1152); bitrate form is within one frame.
+            (
+                "cbr-l2-bias.mp2",
+                include_bytes!("../../soul-audio-core/testdata/cbr-l2-bias.mp2"),
+                1152,
+                617_472,
+            ),
+            (
+                "cbr-l1-bias.mp1",
+                include_bytes!("../../soul-audio-core/testdata/cbr-l1-bias.mp1"),
+                384,
+                257_280,
             ),
         ];
-        for (name, bytes, spf) in cases {
+        for (name, bytes, spf, true_samples) in cases {
             // LIST path: this tag scan → total per-channel samples.
             let mut src = SliceSource::new(bytes);
             let facts = read_facts(&mut src);
             let tag_total = facts
                 .total_frames
                 .unwrap_or_else(|| panic!("{name}: tag scan reported no duration"));
-            let rate = u64::from(facts.sample_rate.expect("sample rate"));
 
             // PLAYBACK path: the decoder's CBR byte estimate.
             let mut dec = open(SliceSource::new(bytes)).expect("open MP1/MP2");
@@ -557,14 +575,17 @@ mod tests {
                 .total_frames()
                 .unwrap_or_else(|| panic!("{name}: decoder reported no duration"));
 
-            assert!(tag_total > 0 && dec_total > 0, "{name}: zero duration");
-            let diff = tag_total.abs_diff(dec_total);
+            // (a) The two estimators compute the SAME bitrate-based length.
+            assert_eq!(
+                tag_total, dec_total,
+                "{name}: LIST {tag_total} != PLAYBACK {dec_total}"
+            );
+            // (b) ...and it is within one MPEG frame of the real decoded length.
+            let diff = tag_total.abs_diff(true_samples);
             assert!(
                 diff <= spf,
-                "{name}: LIST duration {tag_total} vs PLAYBACK {dec_total} differ by \
-                 {diff} samples (> 1 frame of {spf}); tag ms={} decoder ms={}",
-                tag_total * 1000 / rate,
-                dec_total * 1000 / rate,
+                "{name}: estimate {tag_total} is {diff} samples from the true decoded \
+                 {true_samples} (> 1 frame of {spf})"
             );
         }
     }

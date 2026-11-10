@@ -1932,40 +1932,68 @@ fn open_decodes_layer2_matching_kjmp2() {
 /// (those live in a Layer-III side-info region MP1/MP2 don't have), so the only
 /// length source the demuxer has is absent and `total_frames()` is `None`: the
 /// player shows unknown/0 duration. `resolve_lengths()` fills that gap with a
-/// CBR byte-size estimate (`audio_bytes / frame_len` MPEG frames), which for a
-/// clean CBR stream with no trailing tag is **exact**.
+/// **bitrate-based** CBR estimate (`round(audio_bytes · 8 · sample_rate ÷
+/// bitrate)`), which is padding-immune: CBR pads only some frames, so dividing
+/// the byte span by the first frame's length reads long (the MP1 5:00-vs-4:59
+/// bug). The bitrate form lands within one MPEG frame of the true length.
 ///
 /// Self-checking: the expected length is the *actually decoded* per-channel
-/// frame count (`decode_all(bytes).len() / channels`). Each fixture here has a
-/// non-padded first frame and an integral byte/frame ratio, so the estimate
-/// lands exactly on the decoded count (asserted `==`; a stream that grew a
-/// partial final frame or a trailing tag would drift by at most one MPEG frame).
+/// frame count (`decode_all(bytes).len() / channels`). The estimate must be
+/// within one frame (`spf` samples) of it — exact for a padding-free integral
+/// fixture, ±1 frame once per-frame padding enters (e.g. 128 kbps @ 44.1 kHz).
 #[test]
 fn resolve_lengths_recovers_cbr_length_for_mp1_mp2() {
-    let fixtures: &[(&str, &[u8])] = &[
+    // (name, bytes, samples-per-frame) — Layer II is 1152, Layer I is 384.
+    let fixtures: &[(&str, &[u8], u64)] = &[
         (
             "l2_m44_128.mp2",
             include_bytes!("../testdata/l2_m44_128.mp2"),
+            1152,
         ),
         (
             "l2_s44_128.mp2",
             include_bytes!("../testdata/l2_s44_128.mp2"),
+            1152,
         ),
-        ("l2_m44_48.mp2", include_bytes!("../testdata/l2_m44_48.mp2")),
-        ("l2_m32_48.mp2", include_bytes!("../testdata/l2_m32_48.mp2")),
+        (
+            "l2_m44_48.mp2",
+            include_bytes!("../testdata/l2_m44_48.mp2"),
+            1152,
+        ),
+        (
+            "l2_m32_48.mp2",
+            include_bytes!("../testdata/l2_m32_48.mp2"),
+            1152,
+        ),
         (
             "l2_s48_256.mp2",
             include_bytes!("../testdata/l2_s48_256.mp2"),
+            1152,
         ),
         (
             "layer1-32k-stereo.mp1",
             include_bytes!("../testdata/layer1-32k-stereo.mp1"),
+            384,
+        ),
+        // Longer, padding-biased clips (44.1 kHz, where the per-frame length is
+        // non-integral so CBR pads ~half the frames). The old first-frame-length
+        // estimate over-read these by ≥2 frames (L2 +2, L1 +3); the bitrate form
+        // lands within one frame of the decoded length — the RED→GREEN for FIX B.
+        (
+            "cbr-l2-bias.mp2",
+            include_bytes!("../testdata/cbr-l2-bias.mp2"),
+            1152,
+        ),
+        (
+            "cbr-l1-bias.mp1",
+            include_bytes!("../testdata/cbr-l1-bias.mp1"),
+            384,
         ),
     ];
-    for &(name, bytes) in fixtures {
+    for &(name, bytes, spf) in fixtures {
         // Ground truth: the per-channel frame count a full decode actually yields.
         let (pcm, channels) = decode_all_with_channels(bytes);
-        let decoded = pcm.len() / usize::from(channels.max(1));
+        let decoded = (pcm.len() / usize::from(channels.max(1))) as u64;
 
         let mut dec = open(SliceSource::new(bytes)).expect("probe + construct MP1/MP2");
         // No Xing/Info/VBRI header on a CBR MP1/MP2 → no declared length yet.
@@ -1980,9 +2008,11 @@ fn resolve_lengths_recovers_cbr_length_for_mp1_mp2() {
         let total = dec
             .total_frames()
             .unwrap_or_else(|| panic!("{name}: resolve_lengths() left total_frames() None"));
-        assert_eq!(
-            total, decoded as u64,
-            "{name}: CBR length estimate {total} must equal decoded per-channel count {decoded}"
+        let diff = total.abs_diff(decoded);
+        assert!(
+            diff <= spf,
+            "{name}: CBR length estimate {total} must be within one frame ({spf}) of decoded \
+             per-channel count {decoded} (diff {diff})"
         );
     }
 }
