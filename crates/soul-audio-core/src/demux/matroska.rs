@@ -7,7 +7,10 @@
 //!
 //! Scope: known-size elements (seekable files, as every muxer writes them);
 //! the first audio track; no-lacing and all three lacing modes (Xiph / fixed /
-//! EBML). Cues-based seeking is a follow-up — this is the forward demuxer.
+//! EBML). A [`seek_to_cue`](MatroskaDemuxer::seek_to_cue) jumps to the Cluster
+//! covering a target time via the Cues index (located through the SeekHead),
+//! streaming the CuePoints on demand (no-alloc); a Cues-less file falls back to
+//! [`restart`](MatroskaDemuxer::restart) + linear forward decode-discard.
 
 use embedded_io::SeekFrom;
 
@@ -38,6 +41,22 @@ const ID_TIMESTAMP: u32 = 0xE7;
 const ID_SIMPLE_BLOCK: u32 = 0xA3;
 const ID_BLOCK_GROUP: u32 = 0xA0;
 const ID_BLOCK: u32 = 0xA1;
+// Seek index: a SeekHead near the Segment start maps element IDs to their
+// Segment-data-relative byte positions; the Cues element (usually after the
+// clusters) maps presentation timestamps to cluster byte positions.
+const ID_SEEK_HEAD: u32 = 0x114D_9B74;
+const ID_SEEK: u32 = 0x4DBB;
+const ID_SEEK_ID: u32 = 0x53AB;
+const ID_SEEK_POSITION: u32 = 0x53AC;
+const ID_CUES: u32 = 0x1C53_BB6B;
+const ID_CUE_POINT: u32 = 0xBB;
+const ID_CUE_TIME: u32 = 0xB3;
+const ID_CUE_TRACK_POSITIONS: u32 = 0xB7;
+const ID_CUE_TRACK: u32 = 0xF7;
+const ID_CUE_CLUSTER_POSITION: u32 = 0xF1;
+
+/// Default `TimestampScale` (1 ms per tick, in nanoseconds) when Info omits it.
+const DEFAULT_TIMESTAMP_SCALE: u64 = 1_000_000;
 
 const TRACK_TYPE_AUDIO: u64 = 2;
 
@@ -59,9 +78,21 @@ pub struct MatroskaDemuxer<S> {
     codec_private_len: usize,
     /// The audio track number we stream (blocks for other tracks are skipped).
     track_number: u64,
+    /// Absolute byte offset where the Segment's data begins (the first byte after
+    /// the Segment element header) — the base for every `SeekPosition` and
+    /// `CueClusterPosition`, which are stored Segment-data-relative.
+    segment_data_start: u64,
     /// Absolute byte offset where the Segment's data ends (`u64::MAX` if the
     /// Segment had unknown size — then we read to EOF).
     segment_end: u64,
+    /// Absolute byte offset of the Cues element (its ID byte), resolved from the
+    /// SeekHead during init, or `None` when the file carries no Cues index. The
+    /// cue list itself is streamed on demand ([`Self::seek_to_cue`]) — never
+    /// stored, keeping the demuxer no-alloc.
+    cues_offset: Option<u64>,
+    /// `TimestampScale` (nanoseconds per tick) from Info — the factor turning the
+    /// tick-valued `CueTime`/Cluster `Timestamp` into a time (and thence samples).
+    timestamp_scale: u64,
     /// Absolute byte offset where the current Cluster's data ends, if inside one.
     cluster_end: Option<u64>,
     /// Absolute byte offset of the first Cluster's header — the rewind point for
@@ -122,6 +153,7 @@ impl<S: Source> MatroskaDemuxer<S> {
             return Err(DecodeError::Malformed);
         }
         pos += seg.header_len;
+        let segment_data_start = pos;
         let segment_end = seg.size.map_or(u64::MAX, |s| pos + s);
 
         let mut me = Self {
@@ -136,7 +168,10 @@ impl<S: Source> MatroskaDemuxer<S> {
             codec_private: [0; MAX_CODEC_PRIVATE],
             codec_private_len: 0,
             track_number: 0,
+            segment_data_start,
             segment_end,
+            cues_offset: None,
+            timestamp_scale: DEFAULT_TIMESTAMP_SCALE,
             cluster_end: None,
             first_cluster_offset: 0,
             pos,
@@ -156,6 +191,15 @@ impl<S: Source> MatroskaDemuxer<S> {
             match el.id {
                 ID_INFO => me.parse_info(el.size.ok_or(DecodeError::Malformed)?)?,
                 ID_TRACKS => me.parse_tracks(el.size.ok_or(DecodeError::Malformed)?)?,
+                ID_SEEK_HEAD => me.parse_seek_head(el.size.ok_or(DecodeError::Malformed)?)?,
+                ID_CUES => {
+                    // Cues ahead of the clusters (rare) — record its start and
+                    // skip; the SeekHead is the usual locator (Cues trails them).
+                    me.cues_offset.get_or_insert(me.pos - el.header_len);
+                    let s = el.size.ok_or(DecodeError::Malformed)?;
+                    skip(&mut me.src, s)?;
+                    me.pos += s;
+                }
                 ID_CLUSTER => {
                     if me.track_number == 0 {
                         return Err(DecodeError::Unsupported); // reached audio data with no track
@@ -186,6 +230,13 @@ impl<S: Source> MatroskaDemuxer<S> {
         &self.codec_private[..self.codec_private_len]
     }
 
+    /// `TimestampScale` (nanoseconds per tick) — turns the tick-valued `CueTime` a
+    /// [`Self::seek_to_cue`] returns into a time (and thence a sample count).
+    #[must_use]
+    pub fn timestamp_scale(&self) -> u64 {
+        self.timestamp_scale
+    }
+
     /// Parse the Info element (TimestampScale is read but duration isn't needed
     /// for decode, so only sampling defaults come from Tracks/Audio).
     fn parse_info(&mut self, size: u64) -> Result<(), DecodeError> {
@@ -196,7 +247,10 @@ impl<S: Source> MatroskaDemuxer<S> {
             let s = el.size.ok_or(DecodeError::Malformed)?;
             match el.id {
                 ID_TIMESTAMP_SCALE => {
-                    let _ = read_uint(&mut self.src, s)?;
+                    let scale = read_uint(&mut self.src, s)?;
+                    if scale != 0 {
+                        self.timestamp_scale = scale;
+                    }
                     self.pos += s;
                 }
                 ID_DURATION => {
@@ -207,6 +261,58 @@ impl<S: Source> MatroskaDemuxer<S> {
                     skip(&mut self.src, s)?;
                     self.pos += s;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse a SeekHead, resolving the Cues element's absolute offset from its
+    /// Seek entry (`SeekID == Cues`, `SeekPosition` is Segment-data-relative) so a
+    /// later [`Self::seek_to_cue`] can find the index without scanning to EOF.
+    fn parse_seek_head(&mut self, size: u64) -> Result<(), DecodeError> {
+        let end = self.pos + size;
+        while self.pos < end {
+            let el = read_elem(&mut self.src)?;
+            self.pos += el.header_len;
+            let s = el.size.ok_or(DecodeError::Malformed)?;
+            if el.id == ID_SEEK {
+                self.parse_seek_entry(s)?;
+            } else {
+                skip(&mut self.src, s)?;
+                self.pos += s;
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse one Seek entry; if it points at the Cues element, record its
+    /// absolute offset (unless one was already found).
+    fn parse_seek_entry(&mut self, size: u64) -> Result<(), DecodeError> {
+        let end = self.pos + size;
+        let mut seek_id = 0u64;
+        let mut seek_pos: Option<u64> = None;
+        while self.pos < end {
+            let el = read_elem(&mut self.src)?;
+            self.pos += el.header_len;
+            let s = el.size.ok_or(DecodeError::Malformed)?;
+            match el.id {
+                ID_SEEK_ID => {
+                    seek_id = read_uint(&mut self.src, s)?;
+                    self.pos += s;
+                }
+                ID_SEEK_POSITION => {
+                    seek_pos = Some(read_uint(&mut self.src, s)?);
+                    self.pos += s;
+                }
+                _ => {
+                    skip(&mut self.src, s)?;
+                    self.pos += s;
+                }
+            }
+        }
+        if seek_id == u64::from(ID_CUES) {
+            if let Some(p) = seek_pos {
+                self.cues_offset.get_or_insert(self.segment_data_start + p);
             }
         }
         Ok(())
@@ -533,6 +639,130 @@ impl<S: SeekSource> MatroskaDemuxer<S> {
         self.lace_count = 0;
         self.lace_idx = 0;
         Ok(())
+    }
+
+    /// Cues-index seek: position the demuxer at the start of the Cluster whose
+    /// `CueTime` is the largest `≤ target_ticks`, so the decoder only forward-
+    /// decode-discards within that Cluster rather than from the stream start
+    /// (O(1) source touches on the index + one cluster, not O(target)).
+    ///
+    /// Returns `Ok(Some(cluster_ticks))` — the chosen Cue's presentation time, the
+    /// base the decoder converts to its landed sample — on a successful jump, or
+    /// `Ok(None)` when the file has no Cues index (or no Cue at/under the target),
+    /// leaving the position unchanged so the caller can fall back to
+    /// [`Self::restart`] + linear decode-discard.
+    ///
+    /// The CuePoints are streamed and compared on the fly — only the best `(time,
+    /// cluster position)` pair is kept — so no cue list is ever allocated. The
+    /// scan stops at the first `CueTime > target_ticks` (Cues are time-ordered).
+    ///
+    /// # Errors
+    /// [`DecodeError::Io`] on a source-seek failure; the EBML read errors of a
+    /// malformed Cues element.
+    pub(crate) fn seek_to_cue(&mut self, target_ticks: u64) -> Result<Option<u64>, DecodeError> {
+        let cues_offset = match self.cues_offset {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+        self.src
+            .seek(SeekFrom::Start(cues_offset))
+            .map_err(|_| DecodeError::Io)?;
+        self.pos = cues_offset;
+        let cues = read_elem(&mut self.src)?;
+        self.pos += cues.header_len;
+        if cues.id != ID_CUES {
+            return Ok(None); // SeekHead lied / corrupt index — caller falls back.
+        }
+        let cues_end = cues.size.map_or(self.segment_end, |s| self.pos + s);
+
+        let mut best: Option<(u64, u64)> = None; // (cue_time, cluster position)
+        while self.pos < cues_end {
+            let cp = read_elem(&mut self.src)?;
+            self.pos += cp.header_len;
+            let cp_size = cp.size.ok_or(DecodeError::Malformed)?;
+            if cp.id != ID_CUE_POINT {
+                skip(&mut self.src, cp_size)?;
+                self.pos += cp_size;
+                continue;
+            }
+            let cp_end = self.pos + cp_size;
+            let mut cue_time: Option<u64> = None;
+            let mut cluster_pos: Option<u64> = None;
+            while self.pos < cp_end {
+                let el = read_elem(&mut self.src)?;
+                self.pos += el.header_len;
+                let s = el.size.ok_or(DecodeError::Malformed)?;
+                match el.id {
+                    ID_CUE_TIME => {
+                        cue_time = Some(read_uint(&mut self.src, s)?);
+                        self.pos += s;
+                    }
+                    ID_CUE_TRACK_POSITIONS => {
+                        let ctp_end = self.pos + s;
+                        let mut track: Option<u64> = None;
+                        let mut pos: Option<u64> = None;
+                        while self.pos < ctp_end {
+                            let f = read_elem(&mut self.src)?;
+                            self.pos += f.header_len;
+                            let fs = f.size.ok_or(DecodeError::Malformed)?;
+                            match f.id {
+                                ID_CUE_TRACK => {
+                                    track = Some(read_uint(&mut self.src, fs)?);
+                                    self.pos += fs;
+                                }
+                                ID_CUE_CLUSTER_POSITION => {
+                                    pos = Some(read_uint(&mut self.src, fs)?);
+                                    self.pos += fs;
+                                }
+                                _ => {
+                                    skip(&mut self.src, fs)?;
+                                    self.pos += fs;
+                                }
+                            }
+                        }
+                        // Prefer our audio track's position; a cue without a
+                        // CueTrack, or the first seen in a single-track file, is
+                        // taken as a fallback.
+                        if let Some(p) = pos {
+                            let matches = track.is_none_or(|t| t == self.track_number);
+                            if cluster_pos.is_none() || matches {
+                                cluster_pos = Some(p);
+                            }
+                        }
+                    }
+                    _ => {
+                        skip(&mut self.src, s)?;
+                        self.pos += s;
+                    }
+                }
+            }
+            if let (Some(t), Some(p)) = (cue_time, cluster_pos) {
+                if t <= target_ticks {
+                    if best.is_none_or(|(bt, _)| t >= bt) {
+                        best = Some((t, p));
+                    }
+                } else {
+                    break; // Cues are time-ordered — nothing later can qualify.
+                }
+            }
+        }
+
+        let (cue_time, cluster_pos) = match best {
+            Some(v) => v,
+            None => return Ok(None), // target precedes the first cue — fall back.
+        };
+        let cluster_abs = self.segment_data_start + cluster_pos;
+        self.src
+            .seek(SeekFrom::Start(cluster_abs))
+            .map_err(|_| DecodeError::Io)?;
+        self.pos = cluster_abs;
+        // Re-arm the cluster walk exactly as `restart` does: `cluster_end = None`
+        // makes `next_block_first_frame` re-read this Cluster's header (+ its own
+        // Timestamp), and the lacing cursor is cleared.
+        self.cluster_end = None;
+        self.lace_count = 0;
+        self.lace_idx = 0;
+        Ok(Some(cue_time))
     }
 }
 

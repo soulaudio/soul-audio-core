@@ -11,9 +11,11 @@
 //! `AudioSpecificConfig`. Vorbis (`A_VORBIS`) decodes too, but — needing a
 //! caller-provided arena — it is **consumer-dispatched** (built by the
 //! desktop/CLI, not through `AnyDecoder`) over the [`MatroskaVorbisOgg`]
-//! Ogg-synthesizing adapter, exactly like bare Ogg-Vorbis. Seeking restarts at
-//! the first cluster and decode-discards forward (sample-accurate, linear; a
-//! Cues index would make it O(log n) — a follow-up).
+//! Ogg-synthesizing adapter, exactly like bare Ogg-Vorbis. Seeking uses the
+//! container's Cues index — the demuxer jumps to the Cluster covering the target
+//! and the decoder only decode-discards within it (frame-granular at the index's
+//! ms resolution; FLAC self-anchors from its frame header, so it stays sample-
+//! exact). A Cues-less file falls back to restart + linear forward-decode.
 
 use embedded_io::{ErrorType, Read};
 
@@ -31,6 +33,25 @@ use crate::model::{SampleFormat, StreamInfo};
 
 /// Opus always decodes at 48 kHz (RFC 6716 §2).
 const OPUS_RATE: u32 = 48_000;
+
+/// Matroska tick (`TimestampScale` nanoseconds) → per-channel sample count at
+/// `rate`: `samples = ticks · scale · rate / 1e9`. Integer-only (`u128` widens
+/// the product so a long stream's ticks can't overflow), truncating — the seek
+/// is frame-granular, the decoder then discards to the exact sample.
+pub(crate) fn ticks_to_samples(ticks: u64, rate: u32, scale: u64) -> u64 {
+    ((u128::from(ticks) * u128::from(scale) * u128::from(rate)) / 1_000_000_000u128) as u64
+}
+
+/// Per-channel sample count → Matroska tick (the inverse of [`ticks_to_samples`],
+/// for turning a seek target into the `CueTime` to look up). Truncating, so the
+/// chosen Cue is always at/under the target time (never past it).
+pub(crate) fn samples_to_ticks(samples: u64, rate: u32, scale: u64) -> u64 {
+    let denom = u128::from(scale) * u128::from(rate);
+    if denom == 0 {
+        return 0;
+    }
+    (u128::from(samples) * 1_000_000_000u128 / denom) as u64
+}
 /// Largest Opus packet (one `SimpleBlock` frame) we reassemble. Real Opus audio
 /// packets are well under this; an over-long frame is a graceful `Unsupported`.
 const MAX_OPUS_PACKET: usize = 8192;
@@ -114,11 +135,12 @@ impl<S: Source> MatroskaDecoder<S> {
 }
 
 impl<S: SeekSource> MatroskaDecoder<S> {
-    /// Seek to per-channel `sample` (restart at the first cluster + forward
-    /// decode-discard; linear for now, Cues indexing is a follow-up).
+    /// Seek to per-channel `sample`: a Cues-index jump to the covering Cluster
+    /// plus a short forward decode-discard within it (linear fallback when the
+    /// file carries no Cues).
     ///
     /// # Errors
-    /// Propagates the container restart + forward-decode errors.
+    /// Propagates the container seek/restart + forward-decode errors.
     pub fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
         match self {
             MatroskaDecoder::Opus(d) => d.seek_to(sample),
@@ -272,17 +294,48 @@ impl<S: Source> MatroskaOpus<S> {
 }
 
 impl<S: SeekSource> MatroskaOpus<S> {
-    /// Seek to per-channel `sample` by restarting at the first cluster and
-    /// decode-discarding forward (linear; a Cues index would make it O(log n) —
-    /// a follow-up). The full run-in from the stream start converges the Opus
-    /// cross-frame state. Returns the frame landed on.
+    /// Seek to per-channel `sample`. With a Cues index the demuxer jumps straight
+    /// to the Cluster covering the target ([`MatroskaDemuxer::seek_to_cue`]) and
+    /// the decoder forward-decode-discards only within it — O(1) on the index +
+    /// one cluster, not O(target). Without Cues it falls back to restarting at the
+    /// first cluster and decode-discarding from the start (linear).
+    ///
+    /// Opus carries cross-frame state (CELT overlap, SILK history), so the post-
+    /// jump decode warms up over the landed cluster's run-in before the target;
+    /// the stream-global `OpusHead` pre-skip is a leading discard of the very
+    /// first samples, re-applied only on a from-start landing (`base == 0`). A
+    /// mid-stream cue landing is already past it. Returns the frame landed on.
     fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
-        self.demux.restart()?;
+        let scale = self.demux.timestamp_scale();
+        // Look up a Cue a short pre-roll *before* the target so the landed Cluster
+        // gives the Opus cross-frame state (CELT overlap, SILK history) a run-in to
+        // converge before the emitted tail — otherwise a target near a Cluster
+        // boundary would emit cold-start frames. The decode-discard from `base` to
+        // `sample` spends that run-in.
+        const PREROLL: u64 = 3840; // 80 ms @ 48 kHz
+        let lookup_ticks = samples_to_ticks(sample.saturating_sub(PREROLL), OPUS_RATE, scale);
+        // `base` is the per-channel output sample of the landed Cluster's first
+        // emitted sample. A Cue's time is in the *decoded* timeline (pre-skip
+        // included), so a mid-stream landing subtracts the stream-global pre-skip
+        // to reach the output (post-pre-skip) timeline the decoder counts in; a
+        // cluster-0 (cue time 0) or Cues-less landing starts fresh and re-applies
+        // the pre-skip as a leading discard instead.
+        let (base, from_start) = match self.demux.seek_to_cue(lookup_ticks)? {
+            Some(cue_ticks) if cue_ticks != 0 => (
+                ticks_to_samples(cue_ticks, OPUS_RATE, scale).saturating_sub(self.pre_skip),
+                false,
+            ),
+            Some(_) => (0, true),
+            None => {
+                self.demux.restart()?;
+                (0, true)
+            }
+        };
         self.core = OpusFrameDecoder::new(self.channels);
-        self.skip_remaining = self.pre_skip;
+        self.skip_remaining = if from_start { self.pre_skip } else { 0 };
         self.pcm_len = 0;
         self.pcm_pos = 0;
-        let mut landed = 0u64;
+        let mut landed = base;
         while landed < sample {
             if self.pcm_pos >= self.pcm_len {
                 self.fill()?;
@@ -365,6 +418,30 @@ impl<S: SeekSource> MatroskaFlacReader<S> {
         self.frame_pos = 0;
         self.eos = false;
         Ok(())
+    }
+
+    /// Cues-index seek for FLAC-in-Matroska: jump the demuxer to the Cluster
+    /// covering `target_ticks` ([`MatroskaDemuxer::seek_to_cue`]) and reset the
+    /// frame-staging state like [`Self::restart`]. Returns `Ok(true)` on a cue
+    /// jump, `Ok(false)` when the file has no Cues index (caller should
+    /// [`Self::restart`] instead). The FLAC decoder anchors its absolute position
+    /// from the landed frame's own coded sample number, so the jump stays
+    /// sample-accurate despite the ms-granular index.
+    pub(crate) fn seek_to_cue(&mut self, target_ticks: u64) -> Result<bool, DecodeError> {
+        let jumped = self.demux.seek_to_cue(target_ticks)?.is_some();
+        if jumped {
+            self.cp_pos = self.cp_len;
+            self.frame_len = 0;
+            self.frame_pos = 0;
+            self.eos = false;
+        }
+        Ok(jumped)
+    }
+
+    /// `TimestampScale` (ns/tick) of the container — to turn a sample target into
+    /// the `CueTime` tick to look up.
+    pub(crate) fn timestamp_scale(&self) -> u64 {
+        self.demux.timestamp_scale()
     }
 }
 

@@ -708,21 +708,58 @@ impl<S: SeekSource> AacDecoder<S> {
     }
 
     fn seek_to_matroska(&mut self, sample: u64) -> Result<u64, DecodeError> {
-        // Matroska: restart at the first cluster, reset, decode-discard forward
-        // (linear; a Cues index would make it O(log n) — a follow-up).
-        match &mut self.src {
-            FrameSrc::Matroska(d) => d.restart()?,
+        // Cues index (O(1)): jump to the Cluster covering the target, then decode-
+        // discard only within it; a Cue's time is in the decoded timeline, so its
+        // sample base needs no pre-skip adjustment (AAC has none). Falls back to a
+        // linear restart when the file carries no Cues. The landed Cluster's first
+        // access unit warms up the filterbank over the run-in before the target.
+        let rate = if self.sbr_confirmed {
+            self.output_rate
+        } else {
+            self.config.sample_rate
+        };
+        // Look up a Cue a short pre-roll *before* the target so the landed Cluster
+        // gives the filterbank (and any SBR/PS state) a run-in to warm up before
+        // the emitted tail — a target near a Cluster boundary would otherwise emit
+        // the cold-start access unit (missing the prior frame's MDCT overlap). The
+        // decode-discard from `base` to `sample` spends that run-in.
+        let preroll = 4 * self.output_samples_per_au();
+        let base = match &mut self.src {
+            FrameSrc::Matroska(d) => {
+                let scale = d.timestamp_scale();
+                let ticks = crate::formats::matroska::samples_to_ticks(
+                    sample.saturating_sub(preroll),
+                    rate,
+                    scale,
+                );
+                match d.seek_to_cue(ticks)? {
+                    Some(cue_ticks) => {
+                        crate::formats::matroska::ticks_to_samples(cue_ticks, rate, scale)
+                    }
+                    None => {
+                        d.restart()?;
+                        0
+                    }
+                }
+            }
             FrameSrc::Mp4(_) | FrameSrc::Adts(_) => unreachable!("matroska seek path"),
-        }
+        };
         self.reset_decode_state();
-        self.discard_to(sample)
+        self.discard_from(base, sample)
     }
 
     /// Decode-discard per-channel output samples up to `sample`, positioning the
     /// emit cursor exactly. Returns the frame landed on (clamped at EOF). Shared
     /// by the ADTS and Matroska seeks (both container formats carry no index).
     fn discard_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
-        let mut passed = 0u64; // per-channel output samples discarded so far
+        self.discard_from(0, sample)
+    }
+
+    /// As [`Self::discard_to`], but counting from `base` — the per-channel output
+    /// sample of the first frame the source now yields (0 for a from-start
+    /// rewind; the landed Cluster's base for a Cues jump).
+    fn discard_from(&mut self, base: u64, sample: u64) -> Result<u64, DecodeError> {
+        let mut passed = base; // per-channel output samples discarded so far
         while passed < sample {
             if !self.fill_next_frame()? {
                 return Ok(passed); // EOF → clamp to the true length

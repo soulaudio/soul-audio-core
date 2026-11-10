@@ -752,18 +752,27 @@ impl<S: SeekSource> SeekableDecoder for FlacDecoder<OggReader<S>> {
 impl<S: SeekSource> SeekableDecoder
     for FlacDecoder<crate::formats::matroska::MatroskaFlacReader<S>>
 {
-    /// Seek **FLAC-in-Matroska** to per-channel `sample`: the Matroska reader
-    /// rewinds to the first cluster ([`MatroskaFlacReader::restart`]), then the
-    /// FLAC decoder decode-discards forward, anchoring its absolute position from
-    /// the first frame's coded number — the same contract as the FLAC-in-Ogg
-    /// seek, minus the Ogg granule bisection (linear; a Cues index would make it
-    /// O(log n), a follow-up).
+    /// Seek **FLAC-in-Matroska** to per-channel `sample`: with a Cues index the
+    /// Matroska reader jumps straight to the Cluster covering the target
+    /// ([`MatroskaFlacReader::seek_to_cue`]); without one it rewinds to the first
+    /// cluster ([`MatroskaFlacReader::restart`]). Either way the FLAC decoder then
+    /// decode-discards forward, **anchoring its absolute position from the landed
+    /// frame's own coded sample number** — so the cue jump stays sample-accurate
+    /// despite the ms-granular index, and (FLAC frames being independent) the tail
+    /// is bit-exact with no pre-roll. Same contract as the FLAC-in-Ogg seek, with
+    /// a Cues jump in place of the Ogg granule bisection.
     ///
     /// # Errors
-    /// Propagates the container restart + forward-decode errors.
+    /// Propagates the container seek/restart + forward-decode errors.
     fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
         let target = self.total_samples.map_or(sample, |t| sample.min(t));
-        self.demux.src_mut().restart()?;
+        let rate = self.demux.stream_info().sample_rate;
+        let reader = self.demux.src_mut();
+        let ticks =
+            crate::formats::matroska::samples_to_ticks(target, rate, reader.timestamp_scale());
+        if !reader.seek_to_cue(ticks)? {
+            reader.restart()?;
+        }
         self.reset_stream_state(0);
         self.anchor_pending = true;
         self.decode_discard_to(target)

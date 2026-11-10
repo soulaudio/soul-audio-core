@@ -15,3 +15,6 @@
 *.dsf binary
 *.dff binary
 *.ogg binary
+*.mka binary
+*.webm binary
+*.mkv binary

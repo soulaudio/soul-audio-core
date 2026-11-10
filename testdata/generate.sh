@@ -91,6 +91,18 @@ ffmpeg -y -hide_banner -loglevel error -i tone-vorbis.ogg -c:a copy -f matroska 
 # Opus-in-WebM reference (ffmpeg's own decode) for the segmental-SNR e2e.
 ffmpeg -y -hide_banner -loglevel error -i tone-opus.webm -f s16le -c:a pcm_s16le tone-opus.webm.ref.pcm
 
+# Multi-cluster Matroska for the Cues-index seek test (decode.rs
+# `matroska_cue_seek`). `-cluster_time_limit 250` forces ~9 clusters in the 2 s
+# tone (vs the single cluster of the fixtures above), so a late seek has many
+# clusters to skip — the whole point of a Cues index. ffmpeg writes a SeekHead +
+# Cues by default for mkv/webm. Opus at 48 kHz and AAC resampled to 48 kHz so the
+# ms-granular CueTime maps to a whole-sample (frame-aligned) landing; FLAC stays
+# 44.1 kHz because it self-anchors from the frame header (sample-exact regardless).
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a libopus -b:a 96k -cluster_time_limit 250 -f webm tone-opus-cues.webm
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a libopus -b:a 96k -cluster_time_limit 250 -f matroska tone-opus-cues.mka
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -c:a flac -cluster_time_limit 250 -f matroska tone-flac-cues.mka
+ffmpeg -y -hide_banner -loglevel error -i tone.wav -ar 48000 -c:a aac -b:a 192k -cluster_time_limit 250 -f matroska tone-aac-cues.mka
+
 # WavPack (.wv) lossless — stereo (joint + cross decorrelation), mono, and a
 # 32-bit INT32_DATA stream (ffmpeg promotes the 16-bit source to s32 with 16
 # trailing zero bits). Each decodes bit-exact: stereo vs tone.wav, mono/int32 vs
@@ -207,6 +219,7 @@ ffmpeg -y -hide_banner -loglevel error -i chirp-aac-48k.m4a -f s16le chirp-aac-4
 
 echo "generated:"
 ls -la tone.wav tone-f32.wav tone-aiff.aiff tone-aifc-sowt.aifc tone-aiff-fl32.aifc tone-aiff-fl64.aifc tone-aiff-ulaw.aifc tone-aiff-alaw.aifc tone.flac tone-flac.mka tone-aac.mka tone-vorbis.mka tone.wv tone-mono.wv tone-24.wv tone-wv24.wv tone.caf tone-caf-le.caf tone-caf-f32.caf tone-alac.caf tone.mp3 tone.ogg tone.m4a tone-aac.m4a tone.aac tone-vorbis.ogg tone.dsf tagged.flac tone.opus tone-opus.webm arted.flac tone-dsd128.dsf tone-dsd256.dsf tone-dsd512.dsf tone.dff tone-sbr.m4a tone-vorbis-dense.ogg tone.mp2 tone-layer1.mp1 \
+  tone-opus-cues.webm tone-opus-cues.mka tone-flac-cues.mka tone-aac-cues.mka \
   complex.wav complex.flac complex-alac.m4a complex.wv complex.mp3 complex-vorbis.ogg complex.opus chirp.wav chirp-aac.m4a \
   fullscale.wav fullscale.flac fullscale.wv fullscale-alac.m4a antiphase.wav antiphase.flac antiphase.wv \
   mp3-mpeg2-22k.mp3 mp3-mpeg25-11k.mp3 mp3-mono.mp3 complex24.wav complex24.flac complex24-alac.m4a chirp-aac-48k.m4a
