@@ -1,19 +1,18 @@
 //! Per-album cover-art discovery (desktop-only; the `.soulidx` baker never
 //! looks at art — it just stores whatever bytes the importer hands it).
 //!
-//! Ported from `soul-player-ng`'s `art` module, with two deliberate
-//! deviations spelled out where the desktop importer's per-*album* call site
-//! (rather than per-*track*) wants different defaults: no `Scans/`-style
-//! sibling-subdirectory search (an album's cover lives in its own folder or
-//! the folder one level up, e.g. a shared `folder.jpg` above per-disc
-//! subfolders), and "largest file wins" rather than "smallest wins" (we want
-//! the best-looking cover, not the smallest front scan).
+//! Ported from `soul-player-ng`'s `art` module, with one deliberate deviation
+//! for the desktop importer's per-*album* call site (rather than per-*track*):
+//! "largest file wins" rather than "smallest wins" (we want the best-looking
+//! cover, not the smallest front scan).
 //!
 //! Resolution order: an embedded front-cover picture on a representative
 //! track of the album, else the best sidecar image in the album's own folder,
-//! else the best sidecar image in that folder's immediate parent — but only
-//! when that parent is still inside the scanned library root; tracks sitting
-//! directly in the library root must never cause a read outside it.
+//! else the largest `Front*` scan in an album-local `Scans/` subfolder (the
+//! EAC/dBpoweramp full-scan convention, matched case-insensitively), else the
+//! best sidecar image in that folder's immediate parent — but only when that
+//! parent is still inside the scanned library root; tracks sitting directly in
+//! the library root must never cause a read outside it.
 
 use std::path::{Path, PathBuf};
 
@@ -55,24 +54,54 @@ fn embedded_cover(track_path: &Path) -> Option<Vec<u8>> {
     read_picture_bytes(&mut src2, pic).ok()
 }
 
-/// Best sidecar image for an album folder: its own directory first, then
-/// (only if that yields nothing) its immediate parent — but only when the
-/// parent is still inside `root`. An album folder sitting directly at `root`
-/// (or outside it) never falls back to a read above the library.
+/// Best sidecar image for an album folder: its own directory first, then an
+/// album-local `Scans/Front*` scan, then (only if those yield nothing) its
+/// immediate parent — but only when the parent is still inside `root`. An
+/// album folder sitting directly at `root` (or outside it) never falls back to
+/// a read above the library.
 fn sidecar_cover(album_dir: &Path, root: &Path) -> Option<Vec<u8>> {
-    best_in_dir(album_dir).or_else(|| {
-        let parent = album_dir.parent()?;
-        if parent.starts_with(root) {
-            best_in_dir(parent)
-        } else {
-            None
-        }
+    best_in_dir(album_dir)
+        .or_else(|| scans_front_cover(album_dir))
+        .or_else(|| {
+            let parent = album_dir.parent()?;
+            if parent.starts_with(root) {
+                best_in_dir(parent)
+            } else {
+                None
+            }
+        })
+}
+
+/// The largest `Front*` image inside an album-local `Scans/` subfolder (matched
+/// case-insensitively, so `Scans`/`scans`/`SCANS` all count). This honors the
+/// full-scan rip convention where the cover lives at `<album>/Scans/Front.jpg`
+/// or `Front-01.jpg`. Only `front`-stemmed files qualify, so booklet/back/disc
+/// scans in the same folder are never mistaken for the cover. A `Scans/` folder
+/// is always album-local, so the parent is never consulted here.
+fn scans_front_cover(album_dir: &Path) -> Option<Vec<u8>> {
+    let scans = std::fs::read_dir(album_dir).ok()?.flatten().find_map(|e| {
+        let p = e.path();
+        let name = p.file_name()?.to_str()?;
+        (p.is_dir() && name.eq_ignore_ascii_case("scans")).then_some(p)
+    })?;
+    best_in_dir_matching(&scans, |stem, ext| {
+        stem.starts_with("front") && COVER_EXTS.contains(&ext)
     })
 }
 
 /// The largest cover-named image directly inside `dir`, read to bytes.
 /// `None` if the directory can't be read or holds no recognized sidecar.
 fn best_in_dir(dir: &Path) -> Option<Vec<u8>> {
+    best_in_dir_matching(dir, |stem, ext| {
+        COVER_STEMS.contains(&stem) && COVER_EXTS.contains(&ext)
+    })
+}
+
+/// The largest image directly inside `dir` whose lower-cased `(stem, ext)` pass
+/// `matches`, read to bytes. `None` if the directory can't be read or nothing
+/// matches. Hidden `.`-prefixed entries (macOS `._*` AppleDouble sidecars) and
+/// subdirectories are skipped.
+fn best_in_dir_matching(dir: &Path, matches: impl Fn(&str, &str) -> bool) -> Option<Vec<u8>> {
     let rd = std::fs::read_dir(dir).ok()?;
     let mut best: Option<(u64, PathBuf)> = None;
     for entry in rd.flatten() {
@@ -90,7 +119,7 @@ fn best_in_dir(dir: &Path) -> Option<Vec<u8>> {
         let Some((stem, ext)) = lower.rsplit_once('.') else {
             continue;
         };
-        if !COVER_STEMS.contains(&stem) || !COVER_EXTS.contains(&ext) {
+        if !matches(stem, ext) {
             continue;
         }
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
@@ -177,5 +206,80 @@ mod tests {
             find_album_cover(&album, &album.join("missing.flac"), &album),
             None
         );
+    }
+
+    #[test]
+    fn scans_front_found_when_no_folder_sidecar() {
+        let album = tmpdir("scans_only");
+        let scans = album.join("Scans");
+        std::fs::create_dir_all(&scans).unwrap();
+        std::fs::write(scans.join("Front-01.jpg"), vec![7u8; 42]).unwrap();
+
+        let got = sidecar_cover(&album, &album).unwrap();
+        assert_eq!(got, vec![7u8; 42]);
+    }
+
+    #[test]
+    fn folder_sidecar_wins_over_scans_front() {
+        let album = tmpdir("folder_vs_scans");
+        std::fs::write(album.join("cover.jpg"), vec![1u8; 8]).unwrap();
+        let scans = album.join("Scans");
+        std::fs::create_dir_all(&scans).unwrap();
+        std::fs::write(scans.join("Front.jpg"), vec![9u8; 9999]).unwrap();
+
+        // The curated album cover wins over the raw Scans front, even though the
+        // scan is far larger.
+        let got = sidecar_cover(&album, &album).unwrap();
+        assert_eq!(got, vec![1u8; 8]);
+    }
+
+    #[test]
+    fn scans_front_wins_over_parent_sidecar() {
+        let parent = tmpdir("scans_vs_parent");
+        std::fs::write(parent.join("folder.jpg"), vec![3u8; 50]).unwrap();
+        let album = parent.join("Disc 1");
+        std::fs::create_dir_all(&album).unwrap();
+        let scans = album.join("Scans");
+        std::fs::create_dir_all(&scans).unwrap();
+        std::fs::write(scans.join("Front.png"), vec![4u8; 20]).unwrap();
+
+        // The album-local scan is more specific than the shared parent cover.
+        let got = sidecar_cover(&album, &parent).unwrap();
+        assert_eq!(got, vec![4u8; 20]);
+    }
+
+    #[test]
+    fn scans_ignores_non_front_scans() {
+        let album = tmpdir("scans_no_front");
+        let scans = album.join("Scans");
+        std::fs::create_dir_all(&scans).unwrap();
+        std::fs::write(scans.join("Booklet-01.jpg"), vec![0u8; 9999]).unwrap();
+        std::fs::write(scans.join("Back.jpg"), vec![0u8; 9999]).unwrap();
+
+        // No `Front*` in Scans and nothing in the album folder → no cover.
+        assert_eq!(sidecar_cover(&album, &album), None);
+    }
+
+    #[test]
+    fn scans_subdir_matched_case_insensitively() {
+        let album = tmpdir("scans_lower");
+        let scans = album.join("scans"); // lower-case
+        std::fs::create_dir_all(&scans).unwrap();
+        std::fs::write(scans.join("front.jpeg"), vec![5u8; 13]).unwrap();
+
+        let got = sidecar_cover(&album, &album).unwrap();
+        assert_eq!(got, vec![5u8; 13]);
+    }
+
+    #[test]
+    fn scans_picks_largest_front() {
+        let album = tmpdir("scans_largest");
+        let scans = album.join("Scans");
+        std::fs::create_dir_all(&scans).unwrap();
+        std::fs::write(scans.join("Front-01.jpg"), vec![0u8; 100]).unwrap();
+        std::fs::write(scans.join("Front-02.jpg"), vec![0u8; 800]).unwrap();
+
+        let got = sidecar_cover(&album, &album).unwrap();
+        assert_eq!(got.len(), 800);
     }
 }

@@ -119,3 +119,33 @@ fn covers_none_when_no_cover_present() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn covers_prefers_embedded_art_in_multitrack_album() {
+    let root = std::env::temp_dir().join(format!("soul_import_embed_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let album = root.join("Arted Album");
+    std::fs::create_dir_all(&album).unwrap();
+    // A two-track album whose representative (first-walked) track carries an
+    // embedded front cover. A sidecar is ALSO present, so this exercises both
+    // multi-track aggregation (two tracks → one album → one cover) AND the
+    // resolution order: the embedded picture must win over the sidecar.
+    std::fs::copy(testdata("arted.flac"), album.join("01 - first.flac")).unwrap();
+    std::fs::copy(testdata("arted.flac"), album.join("02 - second.flac")).unwrap();
+    let sidecar = b"SIDECAR not the embedded art".to_vec();
+    std::fs::write(album.join("cover.jpg"), &sidecar).unwrap();
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(input.tracks.len(), 2, "two tracks scanned");
+    assert_eq!(input.albums.len(), 1, "both tracks → one album");
+    assert_eq!(input.covers.len(), 1, "one cover per album");
+    let cover = input.covers[0].as_deref().expect("a cover resolved");
+    assert!(!cover.is_empty(), "embedded art bytes extracted");
+    assert_ne!(
+        cover,
+        sidecar.as_slice(),
+        "embedded art wins over the sidecar"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
