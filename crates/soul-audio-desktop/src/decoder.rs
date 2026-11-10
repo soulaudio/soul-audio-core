@@ -207,8 +207,13 @@ mod tests {
     fn open_track_decodes_real_vorbis() {
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tone-vorbis.ogg");
+        // 64 MiB, like the matroska sibling below: building the desktop-profile
+        // `VorbisDecoder` (~668 KiB by value) multiplies through many debug-build
+        // move frames, which overflows a 16 MiB thread on the Windows MSVC debug
+        // toolchain (STATUS_STACK_OVERFLOW). The runtime pump/loader threads carry
+        // 16–64 MiB for the same reason.
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(move || {
                 let mut d = open_track(&path).expect("open real Vorbis fixture");
                 assert_eq!(d.stream_info().channels, 2);
