@@ -149,3 +149,102 @@ fn covers_prefers_embedded_art_in_multitrack_album() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Minimal FLAC bytes: STREAMINFO + a VORBIS_COMMENT (last block) carrying the
+/// given `KEY=VALUE` comments — enough for the importer's tag read, no audio.
+fn flac_with_comments(comments: &[&str]) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"fLaC");
+    // STREAMINFO (type 0), 34-byte body, not last.
+    v.push(0x00);
+    v.extend_from_slice(&[0, 0, 34]);
+    let mut si = [0u8; 34];
+    let (sr, ch, bps, total): (u32, u32, u32, u64) = (44_100, 2, 16, 88_200);
+    si[10] = (sr >> 12) as u8;
+    si[11] = (sr >> 4) as u8;
+    si[12] = (((sr & 0xF) as u8) << 4) | ((((ch - 1) & 0x7) as u8) << 1) | (((bps - 1) >> 4) as u8);
+    si[13] = ((((bps - 1) & 0xF) as u8) << 4) | (((total >> 32) & 0xF) as u8);
+    si[14] = (total >> 24) as u8;
+    si[15] = (total >> 16) as u8;
+    si[16] = (total >> 8) as u8;
+    si[17] = total as u8;
+    v.extend_from_slice(&si);
+    // VORBIS_COMMENT (type 4), LAST block (0x80 | 4 = 0x84).
+    let mut vc = Vec::new();
+    vc.extend_from_slice(&6u32.to_le_bytes());
+    vc.extend_from_slice(b"vendor");
+    vc.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+    for c in comments {
+        vc.extend_from_slice(&(c.len() as u32).to_le_bytes());
+        vc.extend_from_slice(c.as_bytes());
+    }
+    v.push(0x84);
+    v.extend_from_slice(&(vc.len() as u32).to_be_bytes()[1..]);
+    v.extend_from_slice(&vc);
+    v
+}
+
+#[test]
+fn scan_collects_sort_names_and_bakes_sort_order() {
+    let root = std::env::temp_dir().join(format!("soul_import_sort_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    // Two artists whose sort order REVERSES their display order:
+    //   "Brian Eno"    → ALBUMARTISTSORT "Eno, Brian"    (e…)
+    //   "Eric Clapton" → ALBUMARTISTSORT "Clapton, Eric" (c…)
+    let eno = root.join("Eno");
+    let clapton = root.join("Clapton");
+    std::fs::create_dir_all(&eno).unwrap();
+    std::fs::create_dir_all(&clapton).unwrap();
+    std::fs::write(
+        eno.join("01.flac"),
+        flac_with_comments(&[
+            "ARTIST=Brian Eno",
+            "ALBUMARTIST=Brian Eno",
+            "ALBUMARTISTSORT=Eno, Brian",
+            "ALBUM=Here Come the Warm Jets",
+            "TITLE=eno_track",
+        ]),
+    )
+    .unwrap();
+    std::fs::write(
+        clapton.join("01.flac"),
+        flac_with_comments(&[
+            "ARTIST=Eric Clapton",
+            "ALBUMARTIST=Eric Clapton",
+            "ALBUMARTISTSORT=Clapton, Eric",
+            "ALBUM=Slowhand",
+            "TITLE=clapton_track",
+        ]),
+    )
+    .unwrap();
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(
+        input.artists.len(),
+        input.artist_sorts.len(),
+        "sort-names aligned to artists"
+    );
+    let sort_of = |name: &str| -> String {
+        let i = input.artists.iter().position(|a| a == name).unwrap();
+        input.artist_sorts[i].clone()
+    };
+    assert_eq!(sort_of("Brian Eno"), "Eno, Brian");
+    assert_eq!(sort_of("Eric Clapton"), "Clapton, Eric");
+
+    // The baked ArtistAlbumTrack order files Clapton (sort C) before Eno (sort
+    // E) — the reverse of display order, proving the sort-name drives ordering.
+    let bytes = soul_audio_import::bake(&root).expect("bake");
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+    let mut buf = [0u8; 128];
+    let order: Vec<String> = (0..rdr.order_len(BrowseAxis::ArtistAlbumTrack))
+        .map(|i| {
+            let tid = rdr.order(BrowseAxis::ArtistAlbumTrack, i).unwrap();
+            let title = rdr.track(tid).unwrap().title;
+            let n = rdr.resolve_str(title, &mut buf).unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        })
+        .collect();
+    assert_eq!(order, vec!["clapton_track", "eno_track"]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}

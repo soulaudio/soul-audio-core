@@ -55,6 +55,8 @@ const DAY: [u8; 4] = [0xA9, b'd', b'a', b'y']; // ©day
 const GEN: [u8; 4] = [0xA9, b'g', b'e', b'n']; // ©gen
 const COVR: [u8; 4] = *b"covr";
 const WRT: [u8; 4] = [0xA9, b'w', b'r', b't']; // ©wrt
+const SOAR: [u8; 4] = *b"soar"; // sort artist
+const SOAA: [u8; 4] = *b"soaa"; // sort album artist
 
 /// Read one atom header at the (caller-positioned) current stream position
 /// `pos`, bounded by the enclosing container's absolute end
@@ -134,6 +136,8 @@ fn field_for_key(key: [u8; 4]) -> Option<Field> {
         ART => Some(Field::Artist),
         ALB => Some(Field::Album),
         AART => Some(Field::AlbumArtist),
+        SOAR => Some(Field::ArtistSort),
+        SOAA => Some(Field::AlbumArtistSort),
         DAY => Some(Field::Date),
         GEN => Some(Field::Genre),
         WRT => Some(Field::Composer),

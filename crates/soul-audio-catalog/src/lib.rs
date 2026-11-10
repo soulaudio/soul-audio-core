@@ -125,6 +125,17 @@ pub trait Catalog {
     /// [`AlbumRec::album_artist`].
     fn artist_name(&self, id: ArtistId, buf: &mut [u8]) -> Result<usize, CatalogError>;
 
+    /// Resolve an artist's **sort-name** into `buf` ("Clapton, Eric", so "Eric
+    /// Clapton" files under C); returns bytes written. This is the name the
+    /// `ArtistAlbumTrack` browse order keys on. Defaults to
+    /// [`artist_name`](Self::artist_name): a source without stored sort-names (an
+    /// untagged library, or an older index) orders by the display name, exactly
+    /// as before. Same buffer contract as `artist_name` ([`CatalogError::Truncated`]
+    /// when too small).
+    fn artist_sort_name(&self, id: ArtistId, buf: &mut [u8]) -> Result<usize, CatalogError> {
+        self.artist_name(id, buf)
+    }
+
     /// Resolve a heap string into `buf`; returns bytes written.
     fn resolve_str(&self, s: StrRef, buf: &mut [u8]) -> Result<usize, CatalogError>;
 

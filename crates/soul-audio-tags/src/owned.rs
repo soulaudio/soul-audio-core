@@ -20,6 +20,8 @@ pub struct Tags {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub album_artist: Option<String>,
+    pub artist_sort: Option<String>,
+    pub album_artist_sort: Option<String>,
     pub track: Option<u32>,
     pub track_total: Option<u32>,
     pub disc: Option<u32>,
@@ -59,6 +61,14 @@ impl TagSink for OwnedTags {
             }
             Field::AlbumArtist => {
                 self.tags.album_artist.get_or_insert_with(|| value.into());
+            }
+            Field::ArtistSort => {
+                self.tags.artist_sort.get_or_insert_with(|| value.into());
+            }
+            Field::AlbumArtistSort => {
+                self.tags
+                    .album_artist_sort
+                    .get_or_insert_with(|| value.into());
             }
             Field::Date => {
                 self.tags.date.get_or_insert_with(|| value.into());
@@ -226,6 +236,24 @@ mod tests {
         let (tags, _facts) = read_owned(&mut src).unwrap();
 
         assert_eq!(tags.artist.as_deref(), Some("Jiro Inagaki"));
+    }
+
+    #[test]
+    fn read_owned_collects_vorbis_sort_names() {
+        let bytes = flac_fixture(&[
+            "ARTIST=Eric Clapton",
+            "ARTISTSORT=Clapton, Eric",
+            "ALBUMARTIST=Eric Clapton",
+            "ALBUMARTISTSORT=Clapton, Eric",
+            "ALBUM=Slowhand",
+        ]);
+        let mut src = SliceSource::new(&bytes);
+
+        let (tags, _facts) = read_owned(&mut src).unwrap();
+
+        assert_eq!(tags.artist.as_deref(), Some("Eric Clapton"));
+        assert_eq!(tags.artist_sort.as_deref(), Some("Clapton, Eric"));
+        assert_eq!(tags.album_artist_sort.as_deref(), Some("Clapton, Eric"));
     }
 
     /// End-to-end acceptance for issue #26: a real `opusenc`-produced Opus file

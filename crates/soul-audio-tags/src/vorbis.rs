@@ -22,6 +22,10 @@ pub fn map_vorbis_key(key: &str) -> Option<Field> {
         Some(Field::Album)
     } else if key.eq_ignore_ascii_case("ALBUMARTIST") {
         Some(Field::AlbumArtist)
+    } else if key.eq_ignore_ascii_case("ARTISTSORT") {
+        Some(Field::ArtistSort)
+    } else if key.eq_ignore_ascii_case("ALBUMARTISTSORT") {
+        Some(Field::AlbumArtistSort)
     } else if key.eq_ignore_ascii_case("TRACKNUMBER") {
         Some(Field::TrackNumber)
     } else if key.eq_ignore_ascii_case("TRACKTOTAL") || key.eq_ignore_ascii_case("TOTALTRACKS") {

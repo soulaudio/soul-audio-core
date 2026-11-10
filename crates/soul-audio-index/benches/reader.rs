@@ -135,6 +135,7 @@ fn synth(n: u32) -> CatalogInput {
     CatalogInput {
         tracks,
         artists: artist_names,
+        artist_sorts: Vec::new(),
         albums: album_metas,
         folders,
         playlists: Vec::new(),

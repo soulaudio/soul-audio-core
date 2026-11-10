@@ -49,6 +49,12 @@
 //! ARTIST NAME TABLE: artist_count × StrRef (6 B: off u32, len u16), indexed by
 //!   artist id; each resolves to the artist's display name in the string heap.
 //!
+//! ARTIST SORT-NAME TABLE: artist_count × StrRef (6 B), placed immediately after
+//!   the name table (at artists_off + artist_count*6, so no header slot is
+//!   spent). Resolves to the artist's sort-name ("Clapton, Eric"), the name the
+//!   ArtistAlbumTrack order is keyed on; equals the display-name ref when the
+//!   source had no sort tag. (New in format v2.)
+//!
 //! FOLDER RECORD (10 B, fixed; indexed by dense folder id):
 //!    0 path.off u32 · 4 path.len u16 · 6 parent u32 (FolderId::MAX = no parent).
 //!   `path` is the folder's path relative to the card root; a track's physical
@@ -90,7 +96,7 @@ use soul_audio_core::SeekSource;
 /// Magic at the head of `index.sidx` — `"SIDX"`.
 pub const MAGIC: [u8; 4] = *b"SIDX";
 /// Format version in the header.
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 
 const HEADER_SIZE: usize = 64;
 const RECORD_SIZE: usize = 55;
@@ -247,6 +253,22 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
             len: le_u16(&b, 4),
         };
         self.resolve_str(name, buf)
+    }
+
+    fn artist_sort_name(&self, id: ArtistId, buf: &mut [u8]) -> Result<usize, CatalogError> {
+        if id >= self.header.artist_count {
+            return Err(CatalogError::OutOfRange);
+        }
+        // The sort-name table sits immediately after the artist name table
+        // (artist_count StrRefs), so no header slot is spent on its offset.
+        let sorts_off = self.header.artists_off + self.header.artist_count * ARTIST_REF_SIZE as u32;
+        let mut b = [0u8; ARTIST_REF_SIZE];
+        self.read_at(sorts_off + id * ARTIST_REF_SIZE as u32, &mut b)?;
+        let sort = StrRef {
+            off: le_u32(&b, 0),
+            len: le_u16(&b, 4),
+        };
+        self.resolve_str(sort, buf)
     }
 
     fn track(&self, id: TrackId) -> Result<TrackRec, CatalogError> {
@@ -470,6 +492,11 @@ pub mod build {
     pub struct CatalogInput {
         pub tracks: Vec<TrackInput>,
         pub artists: Vec<String>,
+        /// Per-artist sort-name ("Clapton, Eric"), aligned to `artists`
+        /// (index i = artists[i]). An empty entry — or a shorter/empty vec —
+        /// falls back to the display name, so an untagged library orders by
+        /// display name exactly as before.
+        pub artist_sorts: Vec<String>,
         pub albums: Vec<AlbumMeta>,
         pub folders: Vec<FolderInput>,
         pub playlists: Vec<PlaylistInput>,
@@ -483,6 +510,19 @@ pub mod build {
         let off = heap.len() as u32;
         heap.extend_from_slice(s.as_bytes());
         (off, s.len() as u16)
+    }
+
+    /// Artist `i`'s sort-name: the tagged sort-name when present and non-empty,
+    /// else the display name. Used for BOTH the baked `artist_key` and the
+    /// stored sort-name table, so they always resolve the same string (and the
+    /// `MultiCatalog` merge, reading the stored sort-name, recomputes the same
+    /// key the baker used).
+    fn sort_of<'a>(artists: &'a [String], sorts: &'a [String], i: usize) -> &'a str {
+        sorts
+            .get(i)
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&artists[i])
     }
 
     fn sorted_ids(n: u32, cmp: impl Fn(usize, usize) -> Ordering) -> Vec<u32> {
@@ -550,6 +590,19 @@ pub mod build {
             .collect();
         let artist_names: Vec<(u32, u16)> =
             input.artists.iter().map(|a| intern(&mut heap, a)).collect();
+        // Sort-name refs: the tagged sort-name when it differs from the display
+        // name, else the display name's own ref (untagged artists share the heap
+        // string rather than duplicating it).
+        let artist_sorts: Vec<(u32, u16)> = (0..input.artists.len())
+            .map(|i| {
+                let sort = sort_of(&input.artists, &input.artist_sorts, i);
+                if sort == input.artists[i] {
+                    artist_names[i]
+                } else {
+                    intern(&mut heap, sort)
+                }
+            })
+            .collect();
         let folder_paths: Vec<(u32, u16)> = input
             .folders
             .iter()
@@ -592,10 +645,8 @@ pub mod build {
             .iter()
             .map(|a| crate::collation::key(&a.title))
             .collect();
-        let artist_key: Vec<Vec<u8>> = input
-            .artists
-            .iter()
-            .map(|a| crate::collation::key(a))
+        let artist_key: Vec<Vec<u8>> = (0..input.artists.len())
+            .map(|i| crate::collation::key(sort_of(&input.artists, &input.artist_sorts, i)))
             .collect();
         let folder_key: Vec<Vec<u8>> = input
             .folders
@@ -649,6 +700,7 @@ pub mod build {
         let records_size = tracks.len() * RECORD_SIZE;
         let albums_size = n_albums * ALBUM_RECORD_SIZE;
         let artists_size = input.artists.len() * ARTIST_REF_SIZE;
+        let artist_sorts_size = input.artists.len() * ARTIST_REF_SIZE;
         let folders_size = input.folders.len() * FOLDER_RECORD_SIZE;
         let order_size = AXIS_COUNT * tracks.len() * 4;
         let album_dir_size = n_albums * ALBUM_DIR_ENTRY;
@@ -660,7 +712,8 @@ pub mod build {
         let records_off = HEADER_SIZE;
         let albums_off = records_off + records_size;
         let artists_off = albums_off + albums_size;
-        let folders_off = artists_off + artists_size;
+        let artist_sorts_off = artists_off + artists_size;
+        let folders_off = artist_sorts_off + artist_sorts_size;
         let order_tables_off = folders_off + folders_size;
         let album_tracks_off = order_tables_off + order_size;
         let album_runs_off = album_tracks_off + album_dir_size;
@@ -733,6 +786,14 @@ pub mod build {
         for (noff, nlen) in &artist_names {
             out.extend_from_slice(&noff.to_le_bytes());
             out.extend_from_slice(&nlen.to_le_bytes());
+        }
+        debug_assert_eq!(out.len(), artist_sorts_off);
+
+        // --- Artist sort-name refs (StrRef per artist id; the display-name ref
+        // when untagged — see `sort_of`) ---
+        for (soff, slen) in &artist_sorts {
+            out.extend_from_slice(&soff.to_le_bytes());
+            out.extend_from_slice(&slen.to_le_bytes());
         }
         debug_assert_eq!(out.len(), folders_off);
 

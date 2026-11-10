@@ -48,6 +48,7 @@ fn fixture() -> CatalogInput {
             },
         ],
         artists: vec!["Kimiko Ishizaka".into()],
+        artist_sorts: vec!["Ishizaka, Kimiko".into()],
         albums: vec![AlbumMeta {
             title: "Open Goldberg Variations".into(),
             album_artist: 0,
@@ -162,6 +163,7 @@ fn baked_title_order_is_collation_sorted() {
     let input = CatalogInput {
         tracks,
         artists: vec!["A".to_string()],
+        artist_sorts: Vec::new(),
         albums: vec![AlbumMeta {
             title: "A".to_string(),
             album_artist: 0,
@@ -243,6 +245,7 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
             },
         ],
         artists: vec!["Artist".into()],
+        artist_sorts: Vec::new(),
         albums: vec![
             AlbumMeta {
                 title: "Covered Album".into(),
@@ -299,4 +302,128 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
             .as_slice(),
         "resolved bytes match the encoder's output exactly, not just its length"
     );
+}
+
+#[test]
+fn artist_album_track_orders_by_sort_name() {
+    // Two artists whose SORT order differs from their DISPLAY order:
+    //   "Brian Eno"    → sort "Eno, Brian"    (e…)
+    //   "Eric Clapton" → sort "Clapton, Eric" (c…)
+    // By display name "Brian Eno" (b) precedes "Eric Clapton" (e); by sort name
+    // "Clapton, Eric" (c) precedes "Eno, Brian" (e) — the opposite order.
+    let input = CatalogInput {
+        tracks: vec![
+            TrackInput {
+                title: "eno_track".into(),
+                artist: 0,
+                album: 0,
+                album_artist: 0,
+                folder: 0,
+                track_no: 1,
+                disc_no: 1,
+                duration_ms: 0,
+                sample_rate: 44_100,
+                channels: 2,
+                file_name: "eno.flac".into(),
+            },
+            TrackInput {
+                title: "clapton_track".into(),
+                artist: 1,
+                album: 1,
+                album_artist: 1,
+                folder: 0,
+                track_no: 1,
+                disc_no: 1,
+                duration_ms: 0,
+                sample_rate: 44_100,
+                channels: 2,
+                file_name: "clapton.flac".into(),
+            },
+        ],
+        artists: vec!["Brian Eno".into(), "Eric Clapton".into()],
+        artist_sorts: vec!["Eno, Brian".into(), "Clapton, Eric".into()],
+        albums: vec![
+            AlbumMeta {
+                title: "Here Come the Warm Jets".into(),
+                album_artist: 0,
+                year: 1974,
+                folder: 0,
+            },
+            AlbumMeta {
+                title: "Slowhand".into(),
+                album_artist: 1,
+                year: 1977,
+                folder: 0,
+            },
+        ],
+        folders: vec![FolderInput {
+            path: String::new(),
+            parent: NO_FOLDER,
+        }],
+        playlists: vec![],
+        covers: Vec::new(),
+    };
+    let bytes = write_index(&input);
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+    let mut buf = [0u8; 128];
+
+    let order: Vec<String> = (0..rdr.order_len(BrowseAxis::ArtistAlbumTrack))
+        .map(|i| {
+            let tid = rdr.order(BrowseAxis::ArtistAlbumTrack, i).unwrap();
+            let title = rdr.track(tid).unwrap().title;
+            let n = rdr.resolve_str(title, &mut buf).unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        })
+        .collect();
+    // Clapton (sorts under C) before Eno (sorts under E) — sort-name order,
+    // the reverse of display-name order.
+    assert_eq!(order, vec!["clapton_track", "eno_track"]);
+
+    // Display names are preserved; the v2 sort-name table reads back.
+    let n = rdr.artist_name(0, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"Brian Eno");
+    let n = rdr.artist_sort_name(0, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"Eno, Brian");
+    let n = rdr.artist_sort_name(1, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"Clapton, Eric");
+}
+
+#[test]
+fn artist_sort_name_falls_back_to_display_when_untagged() {
+    // Empty artist_sorts → the sort-name table stores the display-name ref, so
+    // artist_sort_name mirrors artist_name (untagged libraries are unchanged).
+    let input = CatalogInput {
+        tracks: vec![TrackInput {
+            title: "t".into(),
+            artist: 0,
+            album: 0,
+            album_artist: 0,
+            folder: 0,
+            track_no: 1,
+            disc_no: 1,
+            duration_ms: 0,
+            sample_rate: 44_100,
+            channels: 2,
+            file_name: "t.flac".into(),
+        }],
+        artists: vec!["Miles Davis".into()],
+        artist_sorts: Vec::new(),
+        albums: vec![AlbumMeta {
+            title: "Kind of Blue".into(),
+            album_artist: 0,
+            year: 1959,
+            folder: 0,
+        }],
+        folders: vec![FolderInput {
+            path: String::new(),
+            parent: NO_FOLDER,
+        }],
+        playlists: vec![],
+        covers: Vec::new(),
+    };
+    let bytes = write_index(&input);
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+    let mut buf = [0u8; 128];
+    let n = rdr.artist_sort_name(0, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"Miles Davis");
 }

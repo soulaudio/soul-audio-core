@@ -88,6 +88,10 @@ fn read_meta(path: &Path) -> Option<(Tags, StreamFacts)> {
 struct Interner {
     artist_ids: HashMap<String, u32>,
     artists: Vec<String>,
+    // Parallel to `artists`: each artist's sort-name ("Clapton, Eric"), defaulting
+    // to the display name and upgraded in place the first time an occurrence
+    // carries a sort tag.
+    artist_sorts: Vec<String>,
     folder_ids: HashMap<PathBuf, u32>,
     folders: Vec<FolderInput>,
     // album key = (title, folder id) → folder-isolation.
@@ -100,12 +104,24 @@ struct Interner {
 }
 
 impl Interner {
-    fn artist(&mut self, name: &str) -> u32 {
+    /// Intern an artist by display `name`, recording its `sort` name (e.g. from
+    /// `ARTISTSORT`/`ALBUMARTISTSORT`). The sort-name defaults to the display name
+    /// and is upgraded in place the first time an occurrence supplies a real one,
+    /// so a sort tag on any sighting wins even if the first sighting lacked it.
+    fn artist(&mut self, name: &str, sort: Option<&str>) -> u32 {
         if let Some(&id) = self.artist_ids.get(name) {
+            if let Some(s) = sort.filter(|s| !s.is_empty()) {
+                let i = id as usize;
+                if self.artist_sorts[i] == self.artists[i] {
+                    self.artist_sorts[i] = s.to_owned(); // still default → upgrade
+                }
+            }
             return id;
         }
         let id = self.artists.len() as u32;
         self.artists.push(name.to_owned());
+        self.artist_sorts
+            .push(sort.filter(|s| !s.is_empty()).unwrap_or(name).to_owned());
         self.artist_ids.insert(name.to_owned(), id);
         id
     }
@@ -229,8 +245,13 @@ pub fn scan(root: &Path) -> std::io::Result<CatalogInput> {
             .unwrap_or_else(|| "Unknown Album".to_owned());
 
         let folder = interner.folder(path.parent().unwrap_or(root), root);
-        let artist = interner.artist(&artist_name);
-        let album_artist = interner.artist(&album_artist_name);
+        let artist = interner.artist(&artist_name, tags.artist_sort.as_deref());
+        let album_artist = interner.artist(
+            &album_artist_name,
+            tags.album_artist_sort
+                .as_deref()
+                .or(tags.artist_sort.as_deref()),
+        );
         // Year = leading 4 digits of the date tag (e.g. "2012-05-29" → 2012).
         let year = tags
             .date
@@ -266,6 +287,7 @@ pub fn scan(root: &Path) -> std::io::Result<CatalogInput> {
     Ok(CatalogInput {
         tracks,
         artists: interner.artists,
+        artist_sorts: interner.artist_sorts,
         albums: interner.albums,
         folders: interner.folders,
         playlists: Vec::new(),
