@@ -1732,6 +1732,66 @@ fn open_decodes_layer2_matching_kjmp2() {
     }
 }
 
+/// MP1/MP2 length (regression for "reports wrong/unknown length"). MP1/MP2
+/// streams are CBR and — unlike Layer III — carry **no** Xing/Info/VBRI header
+/// (those live in a Layer-III side-info region MP1/MP2 don't have), so the only
+/// length source the demuxer has is absent and `total_frames()` is `None`: the
+/// player shows unknown/0 duration. `resolve_lengths()` fills that gap with a
+/// CBR byte-size estimate (`audio_bytes / frame_len` MPEG frames), which for a
+/// clean CBR stream with no trailing tag is **exact**.
+///
+/// Self-checking: the expected length is the *actually decoded* per-channel
+/// frame count (`decode_all(bytes).len() / channels`). Each fixture here has a
+/// non-padded first frame and an integral byte/frame ratio, so the estimate
+/// lands exactly on the decoded count (asserted `==`; a stream that grew a
+/// partial final frame or a trailing tag would drift by at most one MPEG frame).
+#[test]
+fn resolve_lengths_recovers_cbr_length_for_mp1_mp2() {
+    let fixtures: &[(&str, &[u8])] = &[
+        (
+            "l2_m44_128.mp2",
+            include_bytes!("../testdata/l2_m44_128.mp2"),
+        ),
+        (
+            "l2_s44_128.mp2",
+            include_bytes!("../testdata/l2_s44_128.mp2"),
+        ),
+        ("l2_m44_48.mp2", include_bytes!("../testdata/l2_m44_48.mp2")),
+        ("l2_m32_48.mp2", include_bytes!("../testdata/l2_m32_48.mp2")),
+        (
+            "l2_s48_256.mp2",
+            include_bytes!("../testdata/l2_s48_256.mp2"),
+        ),
+        (
+            "layer1-32k-stereo.mp1",
+            include_bytes!("../testdata/layer1-32k-stereo.mp1"),
+        ),
+    ];
+    for &(name, bytes) in fixtures {
+        // Ground truth: the per-channel frame count a full decode actually yields.
+        let (pcm, channels) = decode_all_with_channels(bytes);
+        let decoded = pcm.len() / usize::from(channels.max(1));
+
+        let mut dec = open(SliceSource::new(bytes)).expect("probe + construct MP1/MP2");
+        // No Xing/Info/VBRI header on a CBR MP1/MP2 → no declared length yet.
+        assert_eq!(
+            dec.total_frames(),
+            None,
+            "{name}: MP1/MP2 has no header length source before CBR resolve"
+        );
+
+        dec.resolve_lengths();
+
+        let total = dec
+            .total_frames()
+            .unwrap_or_else(|| panic!("{name}: resolve_lengths() left total_frames() None"));
+        assert_eq!(
+            total, decoded as u64,
+            "{name}: CBR length estimate {total} must equal decoded per-channel count {decoded}"
+        );
+    }
+}
+
 /// MPEG-1 **Layer I** decode. Reference is a real ISO Layer I conformance vector
 /// (`mp1-sample.mp1` from the FFmpeg samples server: 32 kHz stereo, 48 audio
 /// frames after a leading warm-up frame). Two checks:

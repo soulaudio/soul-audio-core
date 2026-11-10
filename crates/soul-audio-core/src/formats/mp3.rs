@@ -107,6 +107,15 @@ impl<S: Source> Mp3Decoder<S> {
 }
 
 impl<S: SeekSource> Mp3Decoder<S> {
+    /// Resolve the stream length for a header-less CBR stream (MP1/MP2, or an
+    /// MP3 with no Xing/Info/VBRI tag), so [`Self::total_frames`] can report a
+    /// duration instead of `None`. No-op when a header already declared the
+    /// length. Needs a [`SeekSource`] (it reads the file size); every desktop
+    /// playback source is one.
+    pub fn resolve_length(&mut self) {
+        self.demux.resolve_cbr_length();
+    }
+
     /// Seek to (the frame containing) per-channel `sample`. Returns the first
     /// sample of the landed frame (≤ `sample`).
     ///

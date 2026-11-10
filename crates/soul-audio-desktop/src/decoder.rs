@@ -179,9 +179,13 @@ pub fn open_track(path: &Path) -> Result<OwnedDecoder> {
         }
         // WAV/FLAC/MP3/Ogg-FLAC — `open` re-probes (cheap) and builds the codec.
         _ => {
-            Ok(OwnedDecoder::Pcm(open(src).map_err(|e| {
-                anyhow!("decoding {}: {e:?}", path.display())
-            })?))
+            let mut any = open(src).map_err(|e| anyhow!("decoding {}: {e:?}", path.display()))?;
+            // A CBR MP1/MP2 (or a Xing-less MP3) carries no in-band length, so
+            // `total_frames()` would be `None` and the player would show an
+            // unknown/0 duration. Resolve a CBR byte-size estimate now (a no-op
+            // for every other format) so the deck reports a real length.
+            any.resolve_lengths();
+            Ok(OwnedDecoder::Pcm(any))
         }
     }
 }

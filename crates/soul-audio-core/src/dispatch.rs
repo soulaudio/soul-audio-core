@@ -98,6 +98,20 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
         }
     }
 
+    /// Resolve any length a decoder can only compute with random access.
+    ///
+    /// Currently this only affects MP3: a CBR MP1/MP2 (or a Xing-less MP3) has
+    /// no in-band declared length, so [`Self::total_frames`] returns `None` until
+    /// this runs a CBR byte-size estimate (needs the file size, hence the
+    /// [`SeekSource`](crate::io::SeekSource) bound). Idempotent, and a no-op for
+    /// every other variant — all of which get their length from a header parsed
+    /// at `open()` time.
+    pub fn resolve_lengths(&mut self) {
+        if let AnyDecoder::Mp3(d) = self {
+            d.resolve_length();
+        }
+    }
+
     /// Seek to per-channel `sample`. Returns the frame actually landed on.
     /// Granularity: **sample-accurate** for WAV, FLAC (native + Ogg), ALAC, AAC,
     /// and Opus; **frame-granular** for MP3 (a short format-inherent warm-up).
