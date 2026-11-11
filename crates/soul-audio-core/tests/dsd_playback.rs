@@ -1,11 +1,12 @@
 //! DSD **playback-path** correctness tests.
 //!
 //! Exercises the real player path end to end: `DsfDecoder`/`DffDecoder` →
-//! [`PlaybackDecimateAdapter`] (DSD → native 44.1 kHz-family PCM) → optionally a
-//! [`Deck`] resample to a device rate. The `tone.*` fixtures (see
-//! `testdata/generate_dsd.py`) carry A4 = 440 Hz on the LEFT channel and
-//! E5 = 659.25 Hz on the RIGHT, synthesized at the stated DSD rate, so pitch,
-//! channel order, rate and level are all checkable against known truth.
+//! [`PlaybackDecimateAdapter`] (DSD → native 44.1 kHz PCM for *every* DSD family) →
+//! optionally a [`Deck`] resample to a device rate. The `tone.*` fixtures carry
+//! A4 = 440 Hz on the LEFT channel and E5 = 659.25 Hz on the RIGHT, so pitch,
+//! channel order, rate and level are all checkable against known truth. DSD64 is a
+//! 2nd-order modulator (`testdata/generate_dsd.py`); the DSD128/256 fixtures are
+//! real 7th-order sigma-delta output from `deltarec` (see `testdata/generate.sh`).
 //!
 //! These pin the shared DSD→PCM decimation that both containers run: a wrong
 //! decimation ratio (pitch/rate), a channel swap, a bit-order error (noise), or a
@@ -30,6 +31,12 @@ const FS24: i32 = 8_388_607;
 // ---- decode helpers (big-stack thread: the adapter + decoder are large) ----
 
 fn decode_dsf(bytes: &'static [u8]) -> (Vec<i32>, u32, u16) {
+    let (pcm, rate, ch, _) = decode_dsf_meta(bytes);
+    (pcm, rate, ch)
+}
+
+/// Like [`decode_dsf`] but also returns the adapter's declared `total_frames`.
+fn decode_dsf_meta(bytes: &'static [u8]) -> (Vec<i32>, u32, u16, Option<u64>) {
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
@@ -37,7 +44,26 @@ fn decode_dsf(bytes: &'static [u8]) -> (Vec<i32>, u32, u16) {
                 let inner = DsfDecoder::new(SliceSource::new(bytes)).expect("open dsf");
                 let mut dec = PlaybackDecimateAdapter::new(inner);
                 let si = dec.stream_info();
-                (drain(&mut dec), si.sample_rate, si.channels)
+                let total = dec.total_frames();
+                (drain(&mut dec), si.sample_rate, si.channels, total)
+            })
+            .expect("spawn")
+            .join()
+            .expect("panicked")
+    })
+}
+
+/// Seek a fresh adapter to output `frame`, then drain the rest. Returns the frame
+/// the seek landed on plus the decoded tail.
+fn seek_then_decode_dsf(bytes: &'static [u8], frame: u64) -> (u64, Vec<i32>) {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn_scoped(scope, || {
+                let inner = DsfDecoder::new(SliceSource::new(bytes)).expect("open dsf");
+                let mut dec = PlaybackDecimateAdapter::new(inner);
+                let landed = dec.seek_to_frame(frame).expect("seek");
+                (landed, drain(&mut dec))
             })
             .expect("spawn")
             .join()
@@ -171,15 +197,56 @@ fn dsf_and_dff_decode_identically() {
 }
 
 #[test]
-fn higher_dsd_families_land_on_their_native_rate() {
-    // The 8:1×8:1 (=64:1) cascade maps each family to DSD_rate/64; pitch unchanged.
-    for (tag, bytes, exp) in [
-        ("DSD128", TONE_DSD128, 88_200u32),
-        ("DSD256", TONE_DSD256, 176_400),
-        ("DSD512", TONE_DSD512, 352_800),
+fn higher_dsd_families_land_on_native_44100() {
+    // The adaptive third stage (ratio DSD_multiple/64 ∈ {2,4,8}) pulls DSD128/256/512
+    // the rest of the way down, so EVERY family lands on native 44.1 kHz — not the old
+    // 88.2/176.4/352.8 kHz that forced the deck to resample an ultrasonic rate. Pitch,
+    // channels and level are unchanged.
+    for (tag, bytes) in [
+        ("DSD128", TONE_DSD128),
+        ("DSD256", TONE_DSD256),
+        ("DSD512", TONE_DSD512),
     ] {
         let (pcm, rate, ch) = decode_dsf(bytes);
-        assert_two_tone(tag, &pcm, rate, ch, exp);
+        assert_two_tone(tag, &pcm, rate, ch, 44_100);
+    }
+}
+
+#[test]
+fn higher_dsd_total_frames_and_seek_round_trip() {
+    // The real-modulator deltarec fixtures: total_frames and seek frame-mapping must
+    // use the FULL adaptive ratio (DSD_multiple), not the DSD64 64:1. A seek that kept
+    // the old span would land 2× (DSD128) / 4× (DSD256) early and desync these.
+    for (tag, bytes) in [("DSD128", TONE_DSD128), ("DSD256", TONE_DSD256)] {
+        let (pcm, rate, ch, total) = decode_dsf_meta(bytes);
+        assert_eq!(rate, 44_100, "{tag}: not 44.1 kHz");
+        let total = total.expect("DSF declares its length");
+        let out_frames = (pcm.len() / ch as usize) as u64;
+        // total_frames (declared, inner_samples / DSD_multiple) ≈ frames actually
+        // decoded (declared minus the short pipeline-flush tail).
+        assert!(
+            total.abs_diff(out_frames) < 256,
+            "{tag}: total_frames {total} vs decoded {out_frames}"
+        );
+
+        let mid = total / 2;
+        let (landed, tail) = seek_then_decode_dsf(bytes, mid);
+        let tail_frames = (tail.len() / ch as usize) as u64;
+        // Block-granular snap: landed ≈ mid (within one DSF block of output frames).
+        assert!(
+            mid.abs_diff(landed) < 1024,
+            "{tag}: seek landed {landed} not ≈ mid {mid}"
+        );
+        // landed + decoded-tail ≈ total: proves the seek advanced the inner stream by
+        // the full adaptive amount (a half/quarter-span bug breaks this by thousands).
+        assert!(
+            (landed + tail_frames).abs_diff(total) < 1024,
+            "{tag}: landed {landed} + tail {tail_frames} != total {total}"
+        );
+        // The post-seek tail is still the clean two-tone at 44.1 kHz (skip the brief
+        // filter warm-up transient so the level window isn't fooled by the ramp-in).
+        let warm = 256 * ch as usize;
+        assert_two_tone(&format!("{tag}/seeked"), &tail[warm..], rate, ch, 44_100);
     }
 }
 
