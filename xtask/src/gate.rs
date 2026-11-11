@@ -29,6 +29,7 @@ const SHARED_CRATES: &[&str] = &[
     "soul-audio-engine",
     "soul-audio-queue",
     "soul-audio-control",
+    "soul-audio-loudness",
     "soul-audio-tags",
     "soul-audio-firmware",
 ];

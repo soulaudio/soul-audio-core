@@ -12,3 +12,11 @@ workspace = true
 [features]
 default = []
 std = []
+
+# Dev-only: the opt-in ffmpeg cross-check (`tests/ffmpeg_crosscheck.rs`) decodes
+# real files through the desktop stack. These are dev-dependencies, so they do
+# not affect the crate's tier (architecture-tests ignores dev edges) nor the
+# no_std `thumbv7em` cross-build (which does not compile tests).
+[dev-dependencies]
+soul-audio-core = { path = "../soul-audio-core" }
+soul-audio-desktop = { path = "../soul-audio-desktop" }
