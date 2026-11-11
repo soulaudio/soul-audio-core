@@ -149,6 +149,24 @@ impl CpalSink {
         let device = cpal::default_host()
             .default_output_device()
             .context("no default output device")?;
+        Self::build(device)
+    }
+
+    /// Open a specific output device by name (one of [`output_device_names`]).
+    /// Errors if no device matches — the caller can fall back to
+    /// [`new`](Self::new) for the system default.
+    pub fn new_on_device(name: &str) -> Result<Self> {
+        let device = cpal::default_host()
+            .output_devices()
+            .context("enumerating output devices")?
+            .find(|d| d.name().map(|n| n == name).unwrap_or(false))
+            .with_context(|| format!("no output device named {name:?}"))?;
+        Self::build(device)
+    }
+
+    /// Build a sink on an already-selected device. Input is always canonical
+    /// 24-bit PCM (the deck normalizes every track to it).
+    fn build(device: cpal::Device) -> Result<Self> {
         let supported = device
             .default_output_config()
             .context("querying default output config")?;
@@ -244,6 +262,23 @@ impl CpalSink {
             channels,
         })
     }
+}
+
+/// Names of the available output devices on the default host, for a device
+/// picker. Empty if the host exposes none (e.g. a headless CI machine).
+pub fn output_device_names() -> Vec<String> {
+    cpal::default_host()
+        .output_devices()
+        .map(|devs| devs.filter_map(|d| d.name().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Name of the current system-default output device, if any — for preselecting
+/// the picker's active entry.
+pub fn default_output_device_name() -> Option<String> {
+    cpal::default_host()
+        .default_output_device()
+        .and_then(|d| d.name().ok())
 }
 
 impl Sink for CpalSink {

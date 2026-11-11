@@ -13,5 +13,5 @@ pub mod sources;
 
 pub use decoder::{OwnedDecoder, Src, open_track, vorbis_arena};
 #[cfg(feature = "playback")]
-pub use sink::CpalSink;
+pub use sink::{CpalSink, default_output_device_name, output_device_names};
 pub use sources::{file_source, tcp_source};
