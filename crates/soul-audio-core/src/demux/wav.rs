@@ -217,13 +217,23 @@ impl<S: SeekSource> WavDemuxer<S> {
     /// [`DecodeError::Io`] if the underlying seek fails.
     pub fn seek_to(&mut self, frame: u64) -> Result<u64, DecodeError> {
         let frame = self.frames_total.map_or(frame, |t| frame.min(t));
-        let byte = self.data_start + frame * u64::from(self.block_align);
+        // Saturate: a stream with an unknown data size (`frames_total == None`)
+        // does NOT clamp `frame`, so an extreme seek target would otherwise
+        // overflow the byte-offset multiply/add (a seek must never panic). A
+        // byte offset past EOF simply yields `Ok(0)` reads. Real frames are far
+        // below `u64::MAX`, so this is behaviour-identical for every in-range
+        // seek.
+        let byte = self
+            .data_start
+            .saturating_add(frame.saturating_mul(u64::from(self.block_align)));
         self.src
             .seek(SeekFrom::Start(byte))
             .map_err(|_| DecodeError::Io)?;
         self.pos_frames = frame;
         if let Some(total) = self.frames_total {
-            self.data_remaining = (total - frame) * u64::from(self.block_align);
+            self.data_remaining = total
+                .saturating_sub(frame)
+                .saturating_mul(u64::from(self.block_align));
         }
         Ok(frame)
     }
@@ -369,6 +379,34 @@ mod tests {
         assert_eq!(si.format, SampleFormat::Int { bits: 16 });
         assert_eq!(d.block_align(), 4);
         assert_eq!(d.frames_total(), Some(2));
+    }
+
+    #[test]
+    fn seek_on_unknown_size_stream_does_not_overflow() {
+        // Regression (tests/fuzz.rs: a length-field corruption of a minimal
+        // WAV). A `data` chunk declaring size 0 is an unknown/streamed length,
+        // so `frames_total` is None and `seek_to` does NOT clamp its argument.
+        // An extreme target must saturate the byte-offset multiply/add rather
+        // than overflowing — a seek must never panic.
+        let mut v = Vec::new();
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&36u32.to_le_bytes());
+        v.extend_from_slice(b"WAVEfmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        v.extend_from_slice(&1u16.to_le_bytes()); // mono
+        v.extend_from_slice(&8000u32.to_le_bytes());
+        v.extend_from_slice(&16000u32.to_le_bytes());
+        v.extend_from_slice(&2u16.to_le_bytes()); // block_align
+        v.extend_from_slice(&16u16.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&0u32.to_le_bytes()); // size 0 → unknown/streamed
+        v.extend_from_slice(&[0, 0, 1, 0, 2, 0, 3, 0]);
+        let mut d = WavDemuxer::new(SliceSource::new(&v)).expect("open");
+        assert_eq!(d.frames_total(), None, "precondition: length is unknown");
+        // Must return gracefully, never panic on the byte-offset arithmetic.
+        let _ = d.seek_to(u64::MAX);
+        let _ = d.seek_to(u64::MAX / 2);
     }
 
     #[test]
