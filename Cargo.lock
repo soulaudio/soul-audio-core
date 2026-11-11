@@ -2038,6 +2038,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "soul-audio-loudness"
+version = "0.1.0"
+dependencies = [
+ "soul-audio-core",
+ "soul-audio-desktop",
+]
+
+[[package]]
 name = "soul-audio-multicatalog"
 version = "0.1.0"
 dependencies = [

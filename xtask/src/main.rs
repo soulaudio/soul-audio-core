@@ -198,6 +198,16 @@ fn verify() -> Result<(), String> {
         "thumbv7em-none-eabihf",
         "--no-default-features",
     ])?;
+    // The loudness analyzer (ReplayGain scan) is no_std/no-alloc/libm-free and
+    // must cross-build for the DAP like the rest of the kernel tier.
+    run(&[
+        "build",
+        "-p",
+        "soul-audio-loudness",
+        "--target",
+        "thumbv7em-none-eabihf",
+        "--no-default-features",
+    ])?;
     run(&[
         "build",
         "-p",
