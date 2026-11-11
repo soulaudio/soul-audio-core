@@ -54,6 +54,23 @@ pub enum Field {
     ArtistSort,
     /// Album-artist sort-name. Vorbis `ALBUMARTISTSORT`, ID3 `TSO2`, MP4 `soaa`.
     AlbumArtistSort,
+    /// ReplayGain track gain, value a dB string like `"-7.89 dB"`. Vorbis
+    /// `REPLAYGAIN_TRACK_GAIN`, ID3 `TXXX:replaygain_track_gain`, MP4
+    /// `----:com.apple.iTunes:replaygain_track_gain`.
+    ReplayGainTrackGain,
+    /// ReplayGain album gain (dB string). Vorbis `REPLAYGAIN_ALBUM_GAIN` etc.
+    ReplayGainAlbumGain,
+    /// ReplayGain track peak — a linear full-scale float like `"0.988"` (1.0 =
+    /// 0 dBFS). Vorbis `REPLAYGAIN_TRACK_PEAK` etc.
+    ReplayGainTrackPeak,
+    /// ReplayGain album peak (linear float). Vorbis `REPLAYGAIN_ALBUM_PEAK` etc.
+    ReplayGainAlbumPeak,
+    /// EBU R128 track gain: value is a signed **integer** in Q7.8 fixed-point dB
+    /// (`gain_db = value / 256`), referenced to -23 LUFS. Vorbis/Opus
+    /// `R128_TRACK_GAIN`.
+    R128TrackGain,
+    /// EBU R128 album gain (Q7.8 integer dB). Vorbis/Opus `R128_ALBUM_GAIN`.
+    R128AlbumGain,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

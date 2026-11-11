@@ -19,7 +19,7 @@
 //!   essentially unused in the wild.
 
 use crate::locate;
-use crate::util::{read_exact, utf8_prefix};
+use crate::util::{discard, map_replaygain_key, read_exact, utf8_prefix};
 use crate::{DataEncoding, Field, MimeType, Picture, PictureKind, StreamFacts, TagError, TagSink};
 use embedded_io::SeekFrom;
 use soul_audio_core::SeekSource;
@@ -402,6 +402,95 @@ fn handle_apic<S: SeekSource>(
     Ok(())
 }
 
+/// Collapse a `TXXX` body (`description NUL value`) in text-encoding `enc` into
+/// an ASCII byte view in `out`, returning the bytes written. NUL separators are
+/// preserved as `0`. Only ASCII content is represented — sufficient for the
+/// ReplayGain keys and numeric values TXXX carries; non-ASCII bytes are
+/// dropped. UTF-16 (enc 1/2) is reduced to its low bytes after any BOM.
+fn fill_ascii(enc: u8, raw: &[u8], out: &mut [u8]) -> usize {
+    let mut n = 0usize;
+    let mut push = |b: u8| {
+        if n < out.len() {
+            out[n] = b;
+            n += 1;
+        }
+    };
+    match enc {
+        1 | 2 => {
+            let mut i = 0usize;
+            let mut big_endian = enc == 2;
+            if enc == 1 && raw.len() >= 2 {
+                match (raw[0], raw[1]) {
+                    (0xFF, 0xFE) => i = 2,
+                    (0xFE, 0xFF) => {
+                        big_endian = true;
+                        i = 2;
+                    }
+                    _ => {}
+                }
+            }
+            while i + 2 <= raw.len() {
+                let unit = if big_endian {
+                    (u16::from(raw[i]) << 8) | u16::from(raw[i + 1])
+                } else {
+                    (u16::from(raw[i + 1]) << 8) | u16::from(raw[i])
+                };
+                i += 2;
+                if unit < 0x80 {
+                    push(unit as u8); // ASCII char or the NUL (0) separator
+                }
+            }
+        }
+        _ => {
+            // Latin-1 (0) / UTF-8 (3): ASCII bytes + the NUL separator pass through.
+            for &b in raw {
+                if b < 0x80 {
+                    push(b);
+                }
+            }
+        }
+    }
+    n
+}
+
+/// `TXXX`/`TXX`: a user-defined text frame, `encoding · description NUL value`.
+/// The description selects the field (the only ones mapped today are
+/// ReplayGain); the value is surfaced verbatim under the description as its
+/// raw key, so a sink can parse the gain/peak (and see unmapped descriptions).
+/// The RVA2 binary gain frame is a separate, deliberately-deferred follow-up.
+// TODO: parse the `RVA2` relative-volume-adjustment frame (binary peak+gain).
+fn handle_txxx<S: embedded_io::Read>(
+    src: &mut S,
+    raw_len: usize,
+    scratch: &mut [u8],
+    sink: &mut impl TagSink,
+) -> Result<(), TagError> {
+    if raw_len == 0 {
+        return Ok(());
+    }
+    let mut enc = [0u8; 1];
+    read_exact(src, &mut enc)?;
+    let body_len = raw_len - 1;
+    let cap = body_len.min(scratch.len());
+    read_exact(src, &mut scratch[..cap])?;
+    if body_len > cap {
+        discard(src, body_len - cap)?;
+    }
+    // ASCII view of "description NUL value" (both ASCII for RG; bounded buffer).
+    let mut ascii = [0u8; 128];
+    let n = fill_ascii(enc[0], &scratch[..cap], &mut ascii);
+    let body = &ascii[..n];
+    let Some(sep) = body.iter().position(|&b| b == 0) else {
+        return Ok(()); // no description/value separator: nothing usable
+    };
+    let desc = utf8_prefix(&body[..sep]);
+    let rest = &body[sep + 1..];
+    let vend = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+    let value = utf8_prefix(&rest[..vend]);
+    sink.text(map_replaygain_key(desc), desc, value);
+    Ok(())
+}
+
 fn handle_frame<S: SeekSource>(
     src: &mut S,
     ver_major: u8,
@@ -411,6 +500,7 @@ fn handle_frame<S: SeekSource>(
     sink: &mut impl TagSink,
 ) -> Result<(), TagError> {
     match id {
+        "TXXX" | "TXX" => handle_txxx(src, raw_len, scratch, sink),
         "TRCK" | "TRK" => handle_num_total(
             src,
             raw_len,
@@ -732,6 +822,52 @@ mod tests {
         assert_eq!(
             &tag[c.pics[0].data_offset as usize..][..8],
             b"\x89PNG\r\n\x1a\n"
+        );
+    }
+
+    #[test]
+    fn id3v2_txxx_replaygain_frames() {
+        // TXXX frames carry ReplayGain by description (case-insensitive).
+        let tag = id3v23(&[
+            txxx_frame("replaygain_track_gain", "-7.89 dB"),
+            txxx_frame("REPLAYGAIN_ALBUM_GAIN", "-8.52 dB"),
+            txxx_frame("replaygain_track_peak", "0.988"),
+            txxx_frame("replaygain_album_peak", "0.995"),
+            txxx_frame("some_other_desc", "ignored"),
+        ]);
+        let mut src = SliceSource::new(&tag);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        read_id3v2(&mut src, &mut scratch, &mut c).unwrap();
+
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::ReplayGainTrackGain) && v == "-7.89 dB"),
+            "track gain TXXX: {:?}",
+            c.fields
+        );
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::ReplayGainAlbumGain) && v == "-8.52 dB")
+        );
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::ReplayGainTrackPeak) && v == "0.988")
+        );
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::ReplayGainAlbumPeak) && v == "0.995")
+        );
+        // The unrelated TXXX maps to no field (surfaced under its description
+        // key with a None field, not an RG one).
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, k, v)| f.is_none() && k == "some_other_desc" && v == "ignored")
         );
     }
 
