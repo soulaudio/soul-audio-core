@@ -27,3 +27,11 @@ version = "1"
 optional = true
 default-features = false
 features = ["derive", "alloc"]
+
+# Transport & Up-Next throughput baseline. Dependency-free (hand-rolled timing,
+# no criterion) to keep this lean no_std crate's dep tree minimal — same
+# convention as `soul-audio-core/benches/throughput.rs`. Host-only.
+# `cargo bench -p soul-audio-queue --bench queue_ops` (add `--features alloc`).
+[[bench]]
+name = "queue_ops"
+harness = false

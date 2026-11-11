@@ -168,3 +168,76 @@ fn repeat_all_cycles_through_the_engine() {
     }
     assert_eq!(cursors, [1, 0, 1, 0]);
 }
+
+/// Drive the engine until the next track swap, returning the handle swapped to.
+fn run_to_next_swap(e: &mut E) -> Option<u32> {
+    for _ in 0..100_000 {
+        service(e);
+        if let Progress::TrackChanged = e.pump().unwrap() {
+            return e.current();
+        }
+    }
+    None
+}
+
+#[test]
+fn reorder_reprimes_the_new_next_through_the_engine() {
+    let mut e = engine(&[0, 1]);
+    e.sequencer_mut().enqueue(90).unwrap();
+    e.sequencer_mut().enqueue(91).unwrap(); // Up-Next [90, 91]; upcoming(1) = 90
+    service(&mut e);
+    e.pump().unwrap(); // current 0, preload 90
+    // Drag 91 to the front of the queue: upcoming(1) becomes 91, so the engine
+    // must discard the stale 90 preload and re-prime 91 — gaplessly, same path as
+    // Play Next.
+    assert!(e.sequencer_mut().move_upnext(0, 1)); // Up-Next [91, 90]
+    assert_eq!(
+        run_to_next_swap(&mut e),
+        Some(91),
+        "reorder re-primed the new front of the queue"
+    );
+}
+
+#[test]
+fn remove_from_queue_reprimes_through_the_engine() {
+    let mut e = engine(&[0, 1]);
+    e.sequencer_mut().enqueue(90).unwrap();
+    e.sequencer_mut().enqueue(91).unwrap(); // upcoming(1) = 90
+    service(&mut e);
+    e.pump().unwrap();
+    // Remove the front queued row (90): 91 is promoted; the engine re-primes it.
+    assert_eq!(e.sequencer_mut().remove_upnext(0), Some(90));
+    assert_eq!(
+        run_to_next_swap(&mut e),
+        Some(91),
+        "removing the front queued row promoted the next, gaplessly"
+    );
+}
+
+#[test]
+fn click_a_queued_row_jumps_to_it_through_the_engine() {
+    let mut e = engine(&[0, 1]);
+    for h in [90, 91, 92] {
+        e.sequencer_mut().enqueue(h).unwrap(); // Up-Next [90, 91, 92]
+    }
+    service(&mut e);
+    e.pump().unwrap(); // current 0
+    let mark = e.deck().sink().written.len();
+    // Click the 2nd queued row (91): jump straight to it, dropping 90. This
+    // changes `current` out of band; the engine's reconcile reloads the deck.
+    assert_eq!(e.sequencer_mut().play_upnext(1), Some(91));
+    assert_eq!(e.current(), Some(91), "sequencer jumped to the clicked row");
+    let mut played_jump_target = false;
+    for _ in 0..100_000 {
+        service(&mut e);
+        e.pump().unwrap();
+        if e.deck().sink().written[mark..].contains(&sample_of(91)) {
+            played_jump_target = true;
+            break;
+        }
+    }
+    assert!(
+        played_jump_target,
+        "the engine reloaded the deck and actually played the jumped-to track"
+    );
+}
