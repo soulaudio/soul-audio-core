@@ -163,6 +163,32 @@ where
         self.engine.sequencer_mut().clear_upnext();
     }
 
+    /// Remove the manually queued track at `index`; returns the removed handle (or
+    /// `None` if out of range). The engine re-primes on the next pump if the
+    /// removal changed what plays next.
+    pub fn remove_from_queue(&mut self, index: usize) -> Option<C::Handle> {
+        self.engine.sequencer_mut().remove_upnext(index)
+    }
+
+    /// Reorder the Up-Next queue: move the item at `from` to `to`. Returns whether
+    /// both indices were in range. The engine re-primes on the next pump if the
+    /// front of the queue changed.
+    pub fn move_in_queue(&mut self, from: usize, to: usize) -> bool {
+        self.engine.sequencer_mut().move_upnext(from, to)
+    }
+
+    /// Play the upcoming row at 1-based offset `k` now — the "click an Up-Next row
+    /// to skip straight to it" jump — consuming the rows above it, and ensure
+    /// playback is running. The engine reconciles the out-of-band current change on
+    /// the next pump. Returns the new current, or `None` if `k` is out of range.
+    pub fn play_upcoming(&mut self, k: usize) -> Option<C::Handle> {
+        let h = self.engine.sequencer_mut().play_upcoming(k);
+        if h.is_some() {
+            self.engine.play();
+        }
+        h
+    }
+
     /// Turn shuffle on (with `seed`) or off, keeping the current track.
     pub fn set_shuffle(&mut self, on: bool, seed: u64) {
         self.engine.sequencer_mut().set_shuffle(on, seed);
@@ -205,6 +231,15 @@ where
                 let _ = self.enqueue(h);
             }
             ClearQueue => self.clear_queue(),
+            RemoveFromQueue(i) => {
+                let _ = self.remove_from_queue(i);
+            }
+            MoveInQueue { from, to } => {
+                let _ = self.move_in_queue(from, to);
+            }
+            PlayUpcoming(k) => {
+                let _ = self.play_upcoming(k);
+            }
             SetShuffle { on, seed } => self.set_shuffle(on, seed),
             SetRepeat(r) => self.set_repeat(r),
             SetStopAfter(s) => self.set_stop_after(s),
@@ -517,6 +552,61 @@ mod tests {
         p.play_next(2).unwrap();
         assert_eq!(p.sequencer().upnext_len(), 1);
         assert_eq!(p.sequencer().upnext_iter().collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn queue_edit_methods_reach_the_queue() {
+        let mut p = player(0);
+        p.set_source(SliceContext::new(vec![0u32, 1, 2]), 0);
+        for h in [10u32, 11, 12] {
+            p.enqueue(h).unwrap();
+        }
+        assert!(p.move_in_queue(0, 2));
+        assert_eq!(
+            p.sequencer().upnext_iter().collect::<Vec<_>>(),
+            [11, 12, 10]
+        );
+        assert!(!p.move_in_queue(9, 0), "out-of-range move reports false");
+        assert_eq!(p.remove_from_queue(1), Some(12));
+        assert_eq!(p.sequencer().upnext_iter().collect::<Vec<_>>(), [11, 10]);
+        assert_eq!(p.remove_from_queue(9), None, "out-of-range remove is None");
+    }
+
+    #[test]
+    fn play_upcoming_jumps_to_the_clicked_row() {
+        let mut p = player(0);
+        p.set_source(SliceContext::new(vec![0u32, 1, 2]), 0); // current 0
+        p.play_next(50).unwrap(); // Up-Next [50]
+        assert_eq!(
+            p.play_upcoming(1),
+            Some(50),
+            "clicking the queued row plays it"
+        );
+        assert_eq!(p.current(), Some(50));
+        assert_eq!(
+            p.play_upcoming(9),
+            None,
+            "out-of-range click changes nothing"
+        );
+        assert_eq!(p.current(), Some(50));
+    }
+
+    #[test]
+    fn apply_routes_the_queue_edit_commands() {
+        let mut p = player(0);
+        p.apply(Command::PlayContext {
+            ctx: SliceContext::new(vec![0u32, 1, 2]),
+            start: 0,
+        })
+        .unwrap();
+        p.apply(Command::Enqueue(10)).unwrap();
+        p.apply(Command::Enqueue(11)).unwrap();
+        p.apply(Command::MoveInQueue { from: 0, to: 1 }).unwrap();
+        assert_eq!(p.sequencer().upnext_iter().collect::<Vec<_>>(), [11, 10]);
+        p.apply(Command::RemoveFromQueue(0)).unwrap();
+        assert_eq!(p.sequencer().upnext_iter().collect::<Vec<_>>(), [10]);
+        p.apply(Command::PlayUpcoming(1)).unwrap();
+        assert_eq!(p.current(), Some(10));
     }
 
     #[test]

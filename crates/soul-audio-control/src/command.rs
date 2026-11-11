@@ -29,6 +29,14 @@ pub enum Command<C: Context> {
     Enqueue(C::Handle),
     /// Clear the Up-Next queue.
     ClearQueue,
+    /// Remove the manually queued track at `index` from the Up-Next queue (the
+    /// per-row "remove from queue" / ✕ affordance).
+    RemoveFromQueue(usize),
+    /// Reorder the Up-Next queue: move the item at `from` to `to` (drag-reorder).
+    MoveInQueue { from: usize, to: usize },
+    /// Play the upcoming row at 1-based offset `k` now — "click an Up-Next row to
+    /// skip straight to it" — consuming the rows above it.
+    PlayUpcoming(usize),
     /// Turn shuffle on (seeded) or off.
     SetShuffle { on: bool, seed: u64 },
     /// Set the repeat mode.
