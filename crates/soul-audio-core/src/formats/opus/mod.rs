@@ -526,8 +526,12 @@ impl<S: SeekSource> SeekableDecoder for OpusDecoder<S> {
             return Ok(0);
         }
 
-        // Absolute granule of the first output sample we want.
-        let granule_target = target + pre_skip;
+        // Absolute granule of the first output sample we want. Saturate: when
+        // the stream declares no length (`total_frames() == None`), `target` is
+        // the raw requested sample and can be near `u64::MAX`, so a plain `+`
+        // would overflow (a seek must never panic). Real granules are tiny, so
+        // this is behaviour-identical for every in-range seek.
+        let granule_target = target.saturating_add(pre_skip);
         // Land on a page giving at least SEEK_PREROLL samples of run-in ahead of
         // the target so the cross-frame state reconverges before emission
         // (RFC 7845 §4.4). `seek_to_granule` lands on the first page whose
@@ -679,6 +683,26 @@ mod tests {
         bytes.extend(ogg_page(0x04, u64::MAX, 7, 1, &opus_tags_packet()));
         let dec = OpusDecoder::new(SliceSource::new(&bytes)).expect("open");
         assert_eq!(dec.total_frames(), None);
+    }
+
+    #[test]
+    fn seek_to_extreme_sample_on_length_unknown_stream_does_not_overflow() {
+        // Regression (tests/fuzz.rs): when `total_frames() == None` the seek
+        // target is NOT clamped, so an extreme request (near `u64::MAX`) reaches
+        // the absolute-granule mapping `target + pre_skip`. That `+` must
+        // saturate, not overflow — a seek must never panic. The fuzzer hit this
+        // via a splice of a valid Opus header prefix and a non-Opus tail: it
+        // opened as Opus but had no discoverable end granule, then a `u64::MAX`
+        // seek target overflowed the add. (All-`u64::MAX` granules reproduce the
+        // "length unknown" precondition in a tiny two-page stream.)
+        let mut bytes = Vec::new();
+        bytes.extend(ogg_page(0x02, u64::MAX, 7, 0, &opus_head_packet(2, 312)));
+        bytes.extend(ogg_page(0x04, u64::MAX, 7, 1, &opus_tags_packet()));
+        let mut dec = OpusDecoder::new(SliceSource::new(&bytes)).expect("open");
+        assert_eq!(dec.total_frames(), None, "precondition: length is unknown");
+        // Must return gracefully (Ok/Err), never panic on the granule add.
+        let _ = dec.seek_to(u64::MAX);
+        let _ = dec.seek_to(u64::MAX / 2);
     }
 
     #[test]
