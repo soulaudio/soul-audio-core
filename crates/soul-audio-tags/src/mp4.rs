@@ -33,7 +33,7 @@
 //! visited, so neither its size nor any trailing padding/garbage after it can
 //! turn a successful tag read into a spurious `Malformed`.
 
-use crate::util::{read_exact, utf8_prefix};
+use crate::util::{map_replaygain_key, read_exact, utf8_prefix};
 use crate::{DataEncoding, Field, MimeType, Picture, PictureKind, StreamFacts, TagError, TagSink};
 use embedded_io::SeekFrom;
 use soul_audio_core::SeekSource;
@@ -44,6 +44,8 @@ const META: [u8; 4] = *b"meta";
 const ILST: [u8; 4] = *b"ilst";
 const MVHD: [u8; 4] = *b"mvhd";
 const DATA: [u8; 4] = *b"data";
+const DASHES: [u8; 4] = *b"----"; // freeform (iTunes `----`) ilst entry
+const NAME: [u8; 4] = *b"name"; // freeform tag-name atom (mean/data are skipped by fourcc)
 
 const NAM: [u8; 4] = [0xA9, b'n', b'a', b'm']; // ©nam
 const ART: [u8; 4] = [0xA9, b'A', b'R', b'T']; // ©ART
@@ -288,10 +290,73 @@ fn handle_data_atom<S: SeekSource>(
     Ok(())
 }
 
-/// Walk one `ilst` entry's children looking for its `data` atom (an entry
-/// may also carry `mean`/`name` atoms for freeform `----` tags, which aren't
-/// modeled here and are simply skipped). Stops at the first `data` atom
-/// found — every key this reader maps carries exactly one.
+/// A freeform `----` ilst entry carries `mean` (reverse-DNS namespace), `name`
+/// (the tag name) and `data` child atoms (ISO/IEC 14496-12 / iTunes). The
+/// `name` selects the [`Field`] — the only ones recognized today are
+/// ReplayGain — regardless of the `mean` namespace, and the `data` atom's UTF-8
+/// value is surfaced under that field. An unrecognized name is skipped.
+fn handle_freeform_entry<S: SeekSource>(
+    src: &mut S,
+    start: u64,
+    end: u64,
+    scratch: &mut [u8],
+    sink: &mut impl TagSink,
+) -> Result<(), TagError> {
+    // Pass 1: capture the `name` string and the `data` atom's bounds. `mean` is
+    // read past (its namespace isn't needed to disambiguate the RG names).
+    let mut name_buf = [0u8; 64];
+    let mut name_len = 0usize;
+    let mut data_bounds: Option<(u64, u64)> = None;
+    let mut pos = start;
+    loop {
+        src.seek(SeekFrom::Start(pos)).map_err(|_| TagError::Io)?;
+        let Some((body_start, body_end, fourcc)) = read_atom_header(src, pos, end)? else {
+            break;
+        };
+        if fourcc == NAME && body_end - body_start > 4 {
+            // FullBox: a 4-byte version/flags prefix precedes the UTF-8 name.
+            src.seek(SeekFrom::Start(body_start + 4))
+                .map_err(|_| TagError::Io)?;
+            let cap = (body_end - body_start - 4).min(name_buf.len() as u64) as usize;
+            read_exact(src, &mut name_buf[..cap])?;
+            name_len = cap;
+        } else if fourcc == DATA {
+            data_bounds = Some((body_start, body_end));
+        }
+        pos = body_end;
+    }
+
+    let name = utf8_prefix(&name_buf[..name_len]);
+    let Some(field) = map_replaygain_key(name) else {
+        return Ok(());
+    };
+    let Some((body_start, body_end)) = data_bounds else {
+        return Ok(());
+    };
+    // The `data` atom body is `u32 type-indicator · u32 locale · payload`.
+    if body_end - body_start < 8 {
+        return Ok(());
+    }
+    src.seek(SeekFrom::Start(body_start))
+        .map_err(|_| TagError::Io)?;
+    let mut hdr = [0u8; 8];
+    read_exact(src, &mut hdr)?;
+    let type_indicator = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    if type_indicator != 1 {
+        return Ok(()); // not UTF-8 text — nothing sensible to parse
+    }
+    let payload_len = (body_end - (body_start + 8)) as usize;
+    let cap = payload_len.min(scratch.len());
+    read_exact(src, &mut scratch[..cap])?;
+    let value = utf8_prefix(&scratch[..cap]);
+    sink.text(Some(field), name, value);
+    Ok(())
+}
+
+/// Walk one `ilst` entry's children looking for its `data` atom. A freeform
+/// `----` entry (which also carries `mean`/`name` atoms) is dispatched to
+/// [`handle_freeform_entry`]; otherwise this stops at the first `data` atom
+/// found — every keyed entry this reader maps carries exactly one.
 fn handle_ilst_entry<S: SeekSource>(
     src: &mut S,
     key: [u8; 4],
@@ -300,6 +365,9 @@ fn handle_ilst_entry<S: SeekSource>(
     scratch: &mut [u8],
     sink: &mut impl TagSink,
 ) -> Result<(), TagError> {
+    if key == DASHES {
+        return handle_freeform_entry(src, start, end, scratch, sink);
+    }
     let mut pos = start;
     loop {
         src.seek(SeekFrom::Start(pos)).map_err(|_| TagError::Io)?;
@@ -558,6 +626,28 @@ mod tests {
         ilst_entry(b"covr", 13, data)
     }
 
+    /// A freeform `----` ilst entry: `mean` (reverse-DNS) + `name` + `data`
+    /// (UTF-8), the iTunes form ReplayGain uses. `mean`/`name` are FullBoxes
+    /// (4-byte version/flags prefix).
+    fn freeform_entry(mean: &str, name: &str, value: &str) -> Vec<u8> {
+        let mut mean_body = Vec::new();
+        mean_body.extend_from_slice(&[0, 0, 0, 0]);
+        mean_body.extend_from_slice(mean.as_bytes());
+        let mut name_body = Vec::new();
+        name_body.extend_from_slice(&[0, 0, 0, 0]);
+        name_body.extend_from_slice(name.as_bytes());
+        let mut data_body = Vec::new();
+        data_body.extend_from_slice(&1u32.to_be_bytes()); // type-indicator 1 = UTF-8
+        data_body.extend_from_slice(&0u32.to_be_bytes()); // locale
+        data_body.extend_from_slice(value.as_bytes());
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&atom(b"mean", &mean_body));
+        body.extend_from_slice(&atom(b"name", &name_body));
+        body.extend_from_slice(&atom(b"data", &data_body));
+        atom(b"----", &body)
+    }
+
     fn ilst(entries: &[Vec<u8>]) -> Vec<u8> {
         let mut body = Vec::new();
         for e in entries {
@@ -597,6 +687,54 @@ mod tests {
         v.extend_from_slice(&atom(b"ftyp", b"M4A \0\0\0\0M4A mp42isom"));
         v.extend_from_slice(&atom(b"moov", &moov_body));
         v
+    }
+
+    #[test]
+    fn mp4_freeform_replaygain_atoms() {
+        let entries = ilst(&[
+            text_entry(&NAM, "Song"),
+            freeform_entry("com.apple.iTunes", "replaygain_track_gain", "-7.89 dB"),
+            freeform_entry("com.apple.iTunes", "replaygain_album_gain", "-8.52 dB"),
+            freeform_entry("com.apple.iTunes", "replaygain_track_peak", "0.988"),
+        ]);
+        let moov_body = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&mvhd_v0(44_100, 1000));
+            v.extend_from_slice(&udta(&meta(&entries)));
+            v
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&atom(b"ftyp", b"M4A \0\0\0\0M4A mp42isom"));
+        bytes.extend_from_slice(&atom(b"moov", &moov_body));
+
+        let mut src = SliceSource::new(&bytes);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        read_mp4(&mut src, &mut scratch, &mut c).unwrap();
+
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::ReplayGainTrackGain) && v == "-7.89 dB"),
+            "freeform fields: {:?}",
+            c.fields
+        );
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::ReplayGainAlbumGain) && v == "-8.52 dB")
+        );
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::ReplayGainTrackPeak) && v == "0.988")
+        );
+        // The ordinary ©nam entry still comes through alongside the freeform ones.
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::Title) && v == "Song")
+        );
     }
 
     #[test]

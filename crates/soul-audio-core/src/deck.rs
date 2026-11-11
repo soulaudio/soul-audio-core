@@ -33,6 +33,11 @@ const FADE_MS: u32 = 8;
 /// Input scratch capacity (frames) — covers the resampler's largest demand within
 /// its supported downsample range at `BLOCK` output frames.
 const IN_FIFO: usize = 2560;
+/// Sane clamp for the combined ReplayGain, in dB, so an absurd caller value can
+/// never produce a NaN/inf or a wild linear factor. `-60 dB` ≈ ×0.001, `+24 dB`
+/// ≈ ×15.85 (which still hard-clips at the existing output clamp).
+const RG_MIN_DB: f32 = -60.0;
+const RG_MAX_DB: f32 = 24.0;
 
 /// Transport state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -153,6 +158,12 @@ pub struct Deck<K, D, const PRELOAD: usize> {
     /// Seek de-click fade length in output frames: `round(FADE_MS * sink_rate /
     /// 1000)`. Fixed per sink; a seek arms `Track::fade_remaining` to this.
     fade_len: u32,
+    /// Combined ReplayGain, in dB, applied to the deck's output (set by the
+    /// caller via [`set_replay_gain`](Deck::set_replay_gain)). `0.0` is unity.
+    rg_gain_db: f32,
+    /// Cached linear multiplier `10^(rg_gain_db/20)` so the dB→linear conversion
+    /// isn't recomputed per sample. `1.0` (exact) when `rg_gain_db == 0.0`.
+    rg_linear: f32,
     in_buf: [i32; IN_FIFO * MAX_CH],
     rs_buf: [i32; BLOCK * MAX_CH],
     out_buf: [i32; BLOCK * MAX_CH],
@@ -174,6 +185,8 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             // round(FADE_MS * sink_rate / 1000) with integer rounding (no f32::round
             // in no_std). `+ 500` is the round-half-up bias for the /1000 divide.
             fade_len: (FADE_MS * si.sample_rate + 500) / 1000,
+            rg_gain_db: 0.0,
+            rg_linear: 1.0,
             in_buf: [0; IN_FIFO * MAX_CH],
             rs_buf: [0; BLOCK * MAX_CH],
             out_buf: [0; BLOCK * MAX_CH],
@@ -334,6 +347,28 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         self.sink.set_volume(volume.clamp(0.0, 1.0));
     }
 
+    /// Set the combined ReplayGain, in dB, applied to the deck's output so
+    /// playback can be loudness-normalized. `0.0` is unity (an exact,
+    /// bit-identical passthrough). The caller (backend) is responsible for
+    /// computing this value — picking track vs album gain, adding any preamp,
+    /// reconciling the tag's reference level to a target — and setting it at a
+    /// track boundary; the deck just applies one constant gain, so there is no
+    /// per-sample ramp and no click to manage. `gain_db` is clamped to
+    /// `[-60, 24]` dB. A positive gain that pushes a sample past full scale is
+    /// still hard-clipped by the output clamp (peak-limited gains avoid it).
+    pub fn set_replay_gain(&mut self, gain_db: f32) {
+        let db = gain_db.clamp(RG_MIN_DB, RG_MAX_DB);
+        self.rg_gain_db = db;
+        // Keep unity exact (1.0) so a 0 dB gain is a bit-identical passthrough.
+        self.rg_linear = if db == 0.0 { 1.0 } else { pow10_db(db) };
+    }
+
+    /// The currently-applied combined ReplayGain, in dB (`0.0` = unity).
+    #[must_use]
+    pub fn replay_gain_db(&self) -> f32 {
+        self.rg_gain_db
+    }
+
     /// Seek the current track to per-channel `frame`.
     ///
     /// # Errors
@@ -475,6 +510,11 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             let track = self.current.as_ref().unwrap();
             (track.channels, track.norm, track.map, track.fade_remaining)
         };
+        // Fold the constant ReplayGain linear factor into the per-track
+        // normalization scale once (it's constant within a track), so the
+        // per-sample output cost is unchanged. Applied BEFORE the existing
+        // output clamp, so a boost past full scale still hard-clips there.
+        let g = g * self.rg_linear;
         let fade_len = self.fade_len;
         for f in 0..out_frames {
             // Seek de-click gain for this output frame: smoothstep `t*t*(3 - 2*t)`
@@ -604,6 +644,40 @@ fn libm_exp2(x: f32) -> f32 {
     } else {
         1.0 / (1u64 << (-n)) as f32
     }
+}
+
+/// `floor(x)` without `f32::floor` (std-only): a truncating `as i32` cast rounds
+/// toward zero, so only a negative non-integer needs the −1 correction.
+fn floor_i32(x: f32) -> i32 {
+    let t = x as i32;
+    if (t as f32) > x { t - 1 } else { t }
+}
+
+/// `10^(db/20)` — the linear amplitude multiplier for a gain in decibels —
+/// without `f32::powf`/`exp2` (std-only; `libm` is banned). Uses the identity
+/// `10^(db/20) = 2^(db/20 · log2(10))`: the exponent is split into its integer
+/// part (built by direct IEEE-754 exponent-field construction, exact for any
+/// in-range exponent) and a fractional part in `[0,1)` from a Taylor series of
+/// `2^f = e^{f·ln2}` (coefficients `(ln2)^k / k!`), accurate to under `1e-5`
+/// over the unit interval — the `exp2`/bit-trick house style of [`libm_exp2`]
+/// and `formats::aac::sbr`'s `pow2`. `db` is pre-clamped by its only caller to
+/// `[-60, 24]`; the exponent is clamped again defensively so the exponent-bit
+/// construction can never go out of range.
+fn pow10_db(db: f32) -> f32 {
+    use core::f32::consts::{LN_2, LOG2_10};
+    let y = ((db / 20.0) * LOG2_10).clamp(-40.0, 40.0);
+    let ip = floor_i32(y);
+    let f = y - ip as f32; // [0, 1)
+    // 2^f via the truncated Taylor series of e^{f·ln2} (Horner form); the
+    // coefficients are (ln2)^k / k! for k = 1..=7.
+    let p = 1.0
+        + f * (LN_2
+            + f * (0.240_226_5
+                + f * (0.055_504_11
+                    + f * (0.009_618_129
+                        + f * (0.001_333_356 + f * (0.000_154_035 + f * 0.000_015_253))))));
+    let two_ip = f32::from_bits(((ip + 127) as u32) << 23); // 2^ip
+    two_ip * p
 }
 
 #[cfg(test)]
@@ -1283,5 +1357,111 @@ mod tests {
         // The deck keeps playing the current track; the bad preload never staged.
         assert_eq!(deck.free_preload_slots(), 1);
         assert_eq!(deck.state(), DeckState::Playing);
+    }
+
+    // --- ReplayGain output gain (Part 1) ---------------------------------
+
+    /// Build a deck over a 16-bit `ConstDecoder` (norm = 2^(24-16) = 256),
+    /// optionally set a ReplayGain, run to Ended and return the written samples.
+    fn run_rg(value: i32, frames: u64, gain_db: Option<f32>) -> Vec<i32> {
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 1,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
+        if let Some(db) = gain_db {
+            deck.set_replay_gain(db);
+        }
+        deck.load(const_dec(48_000, 1, value, frames)).unwrap();
+        run(&mut deck);
+        deck.sink.written
+    }
+
+    #[test]
+    fn replay_gain_unity_is_bit_identical() {
+        // `set_replay_gain(0.0)` must be an exact passthrough: identical, sample
+        // for sample, to no gain at all (unity linear factor is exactly 1.0).
+        let plain = run_rg(12_345, 1000, None);
+        let unity = run_rg(12_345, 1000, Some(0.0));
+        assert_eq!(plain, unity, "0 dB ReplayGain must be bit-identical");
+        // And it's the canonical 24-bit value, not something re-scaled.
+        assert!(unity.iter().all(|&s| s == 12_345 * 256));
+    }
+
+    #[test]
+    fn replay_gain_attenuates() {
+        // value 10000, 16-bit → canonical 2_560_000.
+        let base = 10_000 * 256;
+        // -6.0206 dB ≈ ×0.5.
+        let half = run_rg(10_000, 500, Some(-6.0206));
+        assert!(
+            half.iter().all(|&s| (s - base / 2).abs() <= 3),
+            "-6.0206 dB must halve: got {}",
+            half[0]
+        );
+        // -20 dB = ×0.1.
+        let tenth = run_rg(10_000, 500, Some(-20.0));
+        assert!(
+            tenth.iter().all(|&s| (s - base / 10).abs() <= 3),
+            "-20 dB must be ×0.1: got {}",
+            tenth[0]
+        );
+    }
+
+    #[test]
+    fn replay_gain_boosts() {
+        // value 1000 → canonical 256_000; +6.0206 dB ≈ ×2 (well under full scale).
+        let base = 1000 * 256;
+        let doubled = run_rg(1000, 500, Some(6.0206));
+        assert!(
+            doubled.iter().all(|&s| (s - base * 2).abs() <= 3),
+            "+6.0206 dB must double: got {}",
+            doubled[0]
+        );
+    }
+
+    #[test]
+    fn replay_gain_boost_still_hard_clips() {
+        // value 30000 → canonical 7_680_000; +20 dB (×10) overflows full scale
+        // and must clamp to CANONICAL_MAX, not panic or wrap.
+        let out = run_rg(30_000, 500, Some(20.0));
+        assert!(
+            out.iter().all(|&s| s == CANONICAL_MAX as i32),
+            "a boost past full scale must clamp to CANONICAL_MAX: got {}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn replay_gain_db_clamped_to_sane_range() {
+        // Absurd requests are clamped into [-60, 24] dB before use (no NaN/inf,
+        // no absurd linear factor). A +1000 dB request behaves like +24 dB.
+        let a = run_rg(100, 100, Some(1000.0));
+        let b = run_rg(100, 100, Some(24.0));
+        assert_eq!(a, b, "boost clamps to +24 dB");
+        let c = run_rg(100, 100, Some(-1000.0));
+        let d = run_rg(100, 100, Some(-60.0));
+        assert_eq!(c, d, "attenuation clamps to -60 dB");
+    }
+
+    #[test]
+    fn pow10_db_matches_powf_reference() {
+        // Unity is exact.
+        assert_eq!(pow10_db(0.0), 1.0);
+        // The designed round-number points.
+        assert!((pow10_db(-6.0206) - 0.5).abs() < 1e-4);
+        assert!((pow10_db(-20.0) - 0.1).abs() < 1e-4);
+        assert!((pow10_db(6.0206) - 2.0).abs() < 1e-4);
+        // Cross-check against std powf (tests link std) across the range.
+        for &db in &[-60.0, -24.0, -15.0, -6.0, -3.0, 0.0, 3.0, 6.0, 12.0, 24.0] {
+            let got = pow10_db(db);
+            let want = 10f32.powf(db / 20.0);
+            assert!(
+                (got / want - 1.0).abs() < 1e-4,
+                "pow10_db({db}) = {got}, powf ref {want}"
+            );
+        }
     }
 }

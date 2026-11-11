@@ -33,6 +33,22 @@ pub(crate) fn text_frame(id: &[u8; 4], s: &str) -> Vec<u8> {
     b
 }
 
+/// Build a v2.3 `TXXX` user-defined text frame (UTF-8): encoding byte `0x03`,
+/// description, a NUL separator, then the value.
+pub(crate) fn txxx_frame(desc: &str, value: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(0x03); // UTF-8
+    body.extend_from_slice(desc.as_bytes());
+    body.push(0); // NUL separator between description and value
+    body.extend_from_slice(value.as_bytes());
+    let mut b = Vec::new();
+    b.extend_from_slice(b"TXXX");
+    b.extend_from_slice(&(body.len() as u32).to_be_bytes()); // v2.3 plain size
+    b.extend_from_slice(&[0, 0]); // flags
+    b.extend_from_slice(&body);
+    b
+}
+
 /// Build an `APIC` frame (UTF-8 encoding, MIME string, picture type, empty
 /// description, then raw image bytes).
 pub(crate) fn apic(mime: &str, ptype: u8, data: &[u8]) -> Vec<u8> {

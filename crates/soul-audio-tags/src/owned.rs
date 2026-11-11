@@ -9,12 +9,22 @@ use alloc::vec::Vec;
 use embedded_io::SeekFrom;
 use soul_audio_core::SeekSource;
 
-use crate::util::read_exact;
+use crate::util::{parse_gain_db, parse_peak, parse_r128_gain_db, read_exact};
 use crate::{DataEncoding, Field, Picture, StreamFacts, TagError, TagSink, read};
 
 /// An owned tag snapshot — one heap-allocated value that outlives the read,
 /// unlike the borrowed values a [`TagSink`] streams field-by-field.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// # ReplayGain / R128 loudness
+/// `track_gain_db` / `album_gain_db` hold a loudness-normalization gain in dB,
+/// and `track_peak` / `album_peak` the linear full-scale peak (`1.0` = 0 dBFS).
+/// The gain is stored as-parsed, **without** reconciling reference levels:
+/// ReplayGain tags reference ~ -18 LUFS (RG2) / 83 dB SPL (RG1), while R128
+/// tags (`R128_*_GAIN`, EBU R128) reference -23 LUFS, so a consumer normalizing
+/// to a specific target may need to offset. When a track carries both a
+/// ReplayGain and an R128 tag, the ReplayGain value wins. `Tags` is not `Eq`
+/// (the gain/peak fields are `f32`).
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Tags {
     pub title: Option<String>,
     pub artist: Option<String>,
@@ -30,12 +40,25 @@ pub struct Tags {
     pub genre: Option<String>,
     pub composer: Option<String>,
     pub pictures: Vec<Picture>,
+    /// ReplayGain/R128 track gain, in dB. `None` if untagged.
+    pub track_gain_db: Option<f32>,
+    /// ReplayGain/R128 album gain, in dB. `None` if untagged.
+    pub album_gain_db: Option<f32>,
+    /// ReplayGain track peak — linear full-scale (`1.0` = 0 dBFS).
+    pub track_peak: Option<f32>,
+    /// ReplayGain album peak — linear full-scale (`1.0` = 0 dBFS).
+    pub album_peak: Option<f32>,
 }
 
 /// [`TagSink`] that collects into an owned [`Tags`].
 #[derive(Default)]
 struct OwnedTags {
     tags: Tags,
+    /// Whether the track/album gain came from a ReplayGain tag (vs R128). Set so
+    /// a ReplayGain value always wins over an R128 one regardless of file order:
+    /// an R128 gain is only stored while this is `false`.
+    track_gain_is_rg: bool,
+    album_gain_is_rg: bool,
 }
 
 impl TagSink for OwnedTags {
@@ -91,7 +114,43 @@ impl TagSink for OwnedTags {
             Field::DiscTotal if self.tags.disc_total.is_none() => {
                 self.tags.disc_total = value.parse().ok();
             }
-            Field::TrackNumber | Field::TrackTotal | Field::DiscNumber | Field::DiscTotal => {}
+            // ReplayGain wins over R128: keep the first ReplayGain gain and let
+            // it override any R128 one already stored; only accept an R128 gain
+            // while no ReplayGain gain has been seen.
+            Field::ReplayGainTrackGain if !self.track_gain_is_rg => {
+                if let Some(g) = parse_gain_db(value) {
+                    self.tags.track_gain_db = Some(g);
+                    self.track_gain_is_rg = true;
+                }
+            }
+            Field::ReplayGainAlbumGain if !self.album_gain_is_rg => {
+                if let Some(g) = parse_gain_db(value) {
+                    self.tags.album_gain_db = Some(g);
+                    self.album_gain_is_rg = true;
+                }
+            }
+            Field::R128TrackGain if !self.track_gain_is_rg && self.tags.track_gain_db.is_none() => {
+                self.tags.track_gain_db = parse_r128_gain_db(value);
+            }
+            Field::R128AlbumGain if !self.album_gain_is_rg && self.tags.album_gain_db.is_none() => {
+                self.tags.album_gain_db = parse_r128_gain_db(value);
+            }
+            Field::ReplayGainTrackPeak if self.tags.track_peak.is_none() => {
+                self.tags.track_peak = parse_peak(value);
+            }
+            Field::ReplayGainAlbumPeak if self.tags.album_peak.is_none() => {
+                self.tags.album_peak = parse_peak(value);
+            }
+            Field::TrackNumber
+            | Field::TrackTotal
+            | Field::DiscNumber
+            | Field::DiscTotal
+            | Field::ReplayGainTrackGain
+            | Field::ReplayGainAlbumGain
+            | Field::ReplayGainTrackPeak
+            | Field::ReplayGainAlbumPeak
+            | Field::R128TrackGain
+            | Field::R128AlbumGain => {}
         }
     }
 
@@ -254,6 +313,61 @@ mod tests {
         assert_eq!(tags.artist.as_deref(), Some("Eric Clapton"));
         assert_eq!(tags.artist_sort.as_deref(), Some("Clapton, Eric"));
         assert_eq!(tags.album_artist_sort.as_deref(), Some("Clapton, Eric"));
+    }
+
+    #[test]
+    fn read_owned_parses_replaygain_vorbis_comments() {
+        let bytes = flac_fixture(&[
+            "TITLE=Blue Train",
+            "REPLAYGAIN_TRACK_GAIN=-7.89 dB",
+            "REPLAYGAIN_ALBUM_GAIN=-8.52 dB",
+            "REPLAYGAIN_TRACK_PEAK=0.988",
+            "REPLAYGAIN_ALBUM_PEAK=0.995",
+        ]);
+        let mut src = SliceSource::new(&bytes);
+        let (tags, _facts) = read_owned(&mut src).unwrap();
+
+        assert_eq!(tags.track_gain_db, Some(-7.89));
+        assert_eq!(tags.album_gain_db, Some(-8.52));
+        assert_eq!(tags.track_peak, Some(0.988));
+        assert_eq!(tags.album_peak, Some(0.995));
+    }
+
+    #[test]
+    fn read_owned_reads_r128_gain_when_no_replaygain() {
+        // Opus/Vorbis R128_*_GAIN is a Q7.8 integer: -2314 / 256 = -9.039 dB.
+        let bytes = flac_fixture(&["TITLE=X", "R128_TRACK_GAIN=-2314", "R128_ALBUM_GAIN=512"]);
+        let mut src = SliceSource::new(&bytes);
+        let (tags, _facts) = read_owned(&mut src).unwrap();
+
+        assert!((tags.track_gain_db.unwrap() - (-9.04)).abs() < 0.01);
+        assert_eq!(tags.album_gain_db, Some(2.0)); // 512 / 256
+    }
+
+    #[test]
+    fn read_owned_prefers_replaygain_over_r128_either_order() {
+        // RG wins over R128 regardless of which appears first in the stream.
+        let rg_first = flac_fixture(&["REPLAYGAIN_TRACK_GAIN=-6.00 dB", "R128_TRACK_GAIN=-2314"]);
+        let (tags, _) = read_owned(&mut SliceSource::new(&rg_first)).unwrap();
+        assert_eq!(tags.track_gain_db, Some(-6.0), "RG first");
+
+        let r128_first = flac_fixture(&["R128_TRACK_GAIN=-2314", "REPLAYGAIN_TRACK_GAIN=-6.00 dB"]);
+        let (tags, _) = read_owned(&mut SliceSource::new(&r128_first)).unwrap();
+        assert_eq!(tags.track_gain_db, Some(-6.0), "R128 first, RG still wins");
+    }
+
+    #[test]
+    fn read_owned_parses_replaygain_id3_txxx() {
+        use crate::testfix::{id3v23, txxx_frame};
+        let tag = id3v23(&[
+            txxx_frame("replaygain_track_gain", "-7.89 dB"),
+            txxx_frame("replaygain_track_peak", "0.988"),
+        ]);
+        let mut src = SliceSource::new(&tag);
+        let (tags, _facts) = read_owned(&mut src).unwrap();
+
+        assert_eq!(tags.track_gain_db, Some(-7.89));
+        assert_eq!(tags.track_peak, Some(0.988));
     }
 
     /// End-to-end acceptance for issue #26: a real `opusenc`-produced Opus file
