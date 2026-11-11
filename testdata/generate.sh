@@ -139,13 +139,27 @@ ffmpeg -y -hide_banner -loglevel error -i tone.wav -i _cover.png -t 0.2 \
   -metadata title="Arted Track" arted.flac
 rm -f _cover.png
 
-# DSD: ffmpeg cannot encode PCM->DSD, so synthesize the 1-bit stream ourselves
-# (2nd-order sigma-delta + Sony DSF container). Needs python3 + numpy.
+# DSD: ffmpeg cannot encode PCM->DSD, so synthesize the 1-bit stream ourselves.
+# DSD64 fixtures use the local 2nd-order modulator (generate_dsd.py; needs python3
+# + numpy). The DSD128/256 fixtures instead come from `deltarec` — a real 7th-order
+# sigma-delta PCM->DSD encoder (0 dBFS -> 50% modulation, the SACD convention, so
+# the recovered PCM sits ~6 dB down) — run on THIS repo's own license-safe tone, so
+# the playback decimator is validated against a genuine modulator, not a toy pattern.
+# They exercise the adapter's adaptive 3rd decimation stage that lands 128/256 on
+# 44.1 kHz. deltarec: https://…  (build separately; must be on PATH to regenerate).
 python3 generate_dsd.py tone.dsf                      # DSD64  DSF (0.5 s)
-python3 generate_dsd.py tone-dsd128.dsf 5644800       # DSD128 DSF (0.5 s)
-python3 generate_dsd.py tone-dsd256.dsf 11289600 0.1  # DSD256 DSF (0.1 s, size)
 python3 generate_dsd.py tone-dsd512.dsf 22579200 0.1  # DSD512 DSF (0.1 s, size)
 python3 generate_dsd.py tone.dff                      # DSD64  DSDIFF/raw (0.5 s)
+if command -v deltarec >/dev/null 2>&1; then
+  # Short slices keep the 1-bit fixtures small (~280 KB each).
+  ffmpeg -y -hide_banner -loglevel error -i tone.wav -t 0.2 _dsdsrc128.wav
+  ffmpeg -y -hide_banner -loglevel error -i tone.wav -t 0.1 _dsdsrc256.wav
+  deltarec _dsdsrc128.wav -o tone-dsd128.dsf -r 128 -b 44100 -q  # DSD128 DSF (0.2 s)
+  deltarec _dsdsrc256.wav -o tone-dsd256.dsf -r 256 -b 44100 -q  # DSD256 DSF (0.1 s)
+  rm -f _dsdsrc128.wav _dsdsrc256.wav
+else
+  echo "warning: deltarec not on PATH — keeping committed tone-dsd128/256.dsf" >&2
+fi
 
 # ---------------------------------------------------------------------------
 # Broadband STRESS signals (tests/decode.rs `stress_*`). The 2-tone `tone.wav`
