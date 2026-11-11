@@ -154,7 +154,7 @@ impl<S: Source> MatroskaDemuxer<S> {
         }
         pos += seg.header_len;
         let segment_data_start = pos;
-        let segment_end = seg.size.map_or(u64::MAX, |s| pos + s);
+        let segment_end = seg.size.map_or(u64::MAX, |s| pos.saturating_add(s));
 
         let mut me = Self {
             src,
@@ -205,7 +205,7 @@ impl<S: Source> MatroskaDemuxer<S> {
                         return Err(DecodeError::Unsupported); // reached audio data with no track
                     }
                     me.first_cluster_offset = me.pos - el.header_len;
-                    me.cluster_end = el.size.map(|s| me.pos + s);
+                    me.cluster_end = el.size.map(|s| me.pos.saturating_add(s));
                     return Ok(me);
                 }
                 _ => {
@@ -240,7 +240,7 @@ impl<S: Source> MatroskaDemuxer<S> {
     /// Parse the Info element (TimestampScale is read but duration isn't needed
     /// for decode, so only sampling defaults come from Tracks/Audio).
     fn parse_info(&mut self, size: u64) -> Result<(), DecodeError> {
-        let end = self.pos + size;
+        let end = self.pos.saturating_add(size);
         while self.pos < end {
             let el = read_elem(&mut self.src)?;
             self.pos += el.header_len;
@@ -270,7 +270,7 @@ impl<S: Source> MatroskaDemuxer<S> {
     /// Seek entry (`SeekID == Cues`, `SeekPosition` is Segment-data-relative) so a
     /// later [`Self::seek_to_cue`] can find the index without scanning to EOF.
     fn parse_seek_head(&mut self, size: u64) -> Result<(), DecodeError> {
-        let end = self.pos + size;
+        let end = self.pos.saturating_add(size);
         while self.pos < end {
             let el = read_elem(&mut self.src)?;
             self.pos += el.header_len;
@@ -288,7 +288,7 @@ impl<S: Source> MatroskaDemuxer<S> {
     /// Parse one Seek entry; if it points at the Cues element, record its
     /// absolute offset (unless one was already found).
     fn parse_seek_entry(&mut self, size: u64) -> Result<(), DecodeError> {
-        let end = self.pos + size;
+        let end = self.pos.saturating_add(size);
         let mut seek_id = 0u64;
         let mut seek_pos: Option<u64> = None;
         while self.pos < end {
@@ -312,7 +312,8 @@ impl<S: Source> MatroskaDemuxer<S> {
         }
         if seek_id == u64::from(ID_CUES) {
             if let Some(p) = seek_pos {
-                self.cues_offset.get_or_insert(self.segment_data_start + p);
+                self.cues_offset
+                    .get_or_insert(self.segment_data_start.saturating_add(p));
             }
         }
         Ok(())
@@ -320,7 +321,7 @@ impl<S: Source> MatroskaDemuxer<S> {
 
     /// Parse Tracks, keeping the first audio TrackEntry's parameters.
     fn parse_tracks(&mut self, size: u64) -> Result<(), DecodeError> {
-        let end = self.pos + size;
+        let end = self.pos.saturating_add(size);
         while self.pos < end {
             let el = read_elem(&mut self.src)?;
             self.pos += el.header_len;
@@ -329,8 +330,11 @@ impl<S: Source> MatroskaDemuxer<S> {
                 self.parse_track_entry(s)?;
                 // Keep walking only if we haven't locked onto an audio track yet.
                 if self.track_number != 0 {
-                    // Skip the rest of Tracks.
-                    let remaining = end - self.pos;
+                    // Skip the rest of Tracks. Saturate: a nested TrackEntry
+                    // whose declared size overran `end` can leave `self.pos`
+                    // past it, so a plain subtraction would underflow (a
+                    // malformed stream must never panic).
+                    let remaining = end.saturating_sub(self.pos);
                     skip(&mut self.src, remaining)?;
                     self.pos = end;
                     return Ok(());
@@ -346,7 +350,7 @@ impl<S: Source> MatroskaDemuxer<S> {
     /// Parse one TrackEntry. If it is the audio track, record its number, codec,
     /// codec-private, and audio parameters; otherwise leave `track_number` at 0.
     fn parse_track_entry(&mut self, size: u64) -> Result<(), DecodeError> {
-        let end = self.pos + size;
+        let end = self.pos.saturating_add(size);
         let mut number = 0u64;
         let mut is_audio = false;
         let mut rate = 0u32;
@@ -413,7 +417,7 @@ impl<S: Source> MatroskaDemuxer<S> {
         channels: &mut u16,
         bits: &mut u16,
     ) -> Result<(), DecodeError> {
-        let end = self.pos + size;
+        let end = self.pos.saturating_add(size);
         while self.pos < end {
             let el = read_elem(&mut self.src)?;
             self.pos += el.header_len;
@@ -454,7 +458,7 @@ impl<S: Source> MatroskaDemuxer<S> {
                 let el = read_elem(&mut self.src)?;
                 self.pos += el.header_len;
                 if el.id == ID_CLUSTER {
-                    self.cluster_end = el.size.map(|s| self.pos + s);
+                    self.cluster_end = el.size.map(|s| self.pos.saturating_add(s));
                     continue;
                 }
                 // Non-cluster top-level element (Cues, Tags, SeekHead, …) — skip.
@@ -483,7 +487,7 @@ impl<S: Source> MatroskaDemuxer<S> {
                 }
                 ID_BLOCK_GROUP => {
                     // Walk the group for its Block.
-                    let gend = self.pos + s;
+                    let gend = self.pos.saturating_add(s);
                     while self.pos < gend {
                         let inner = read_elem(&mut self.src)?;
                         self.pos += inner.header_len;
@@ -524,7 +528,11 @@ impl<S: Source> MatroskaDemuxer<S> {
         self.pos += 3;
         let flags = tf[2];
         let header_consumed = self.pos - block_start;
-        let payload = block_size - header_consumed;
+        // A block whose declared size is smaller than its own mandatory header
+        // (track vint + 3 bytes) is malformed — reject rather than underflow.
+        let payload = block_size
+            .checked_sub(header_consumed)
+            .ok_or(DecodeError::Malformed)?;
 
         if track != self.track_number {
             skip(&mut self.src, payload)?;
@@ -555,7 +563,7 @@ impl<S: Source> MatroskaDemuxer<S> {
         match lacing {
             0b10 => {
                 // Fixed lacing: all frames equal; payload split evenly.
-                let body = payload - 1;
+                let body = payload.checked_sub(1).ok_or(DecodeError::Malformed)?;
                 if body % frames as u64 != 0 {
                     return Err(DecodeError::Malformed);
                 }
@@ -580,7 +588,12 @@ impl<S: Source> MatroskaDemuxer<S> {
                     *slot = size;
                     sum += u64::from(size);
                 }
-                self.lace_sizes[frames - 1] = (payload - 1 - consumed_sizes - sum) as u32;
+                self.lace_sizes[frames - 1] = payload
+                    .checked_sub(1)
+                    .and_then(|x| x.checked_sub(consumed_sizes))
+                    .and_then(|x| x.checked_sub(sum))
+                    .ok_or(DecodeError::Malformed)?
+                    as u32;
             }
             _ => {
                 // EBML lacing: first size is an unsigned vint; the rest are signed
@@ -589,18 +602,23 @@ impl<S: Source> MatroskaDemuxer<S> {
                 consumed_sizes += u64::from(l);
                 let mut cur = first.ok_or(DecodeError::Malformed)? as i64;
                 self.lace_sizes[0] = cur as u32;
-                sum += cur as u64;
+                sum = sum.wrapping_add(cur as u64);
                 for i in 1..frames - 1 {
                     let (raw, l) = read_vint(&mut self.src)?;
                     consumed_sizes += u64::from(l);
                     let raw = raw.ok_or(DecodeError::Malformed)?;
                     // Signed vint bias: subtract (2^(7*l-1) - 1).
                     let bias = (1i64 << (7 * i64::from(l) - 1)) - 1;
-                    cur += raw as i64 - bias;
+                    cur = cur.wrapping_add(raw as i64 - bias);
                     self.lace_sizes[i] = cur as u32;
-                    sum += cur as u64;
+                    sum = sum.wrapping_add(cur as u64);
                 }
-                self.lace_sizes[frames - 1] = (payload - 1 - consumed_sizes - sum) as u32;
+                self.lace_sizes[frames - 1] = payload
+                    .checked_sub(1)
+                    .and_then(|x| x.checked_sub(consumed_sizes))
+                    .and_then(|x| x.checked_sub(sum))
+                    .ok_or(DecodeError::Malformed)?
+                    as u32;
             }
         }
         self.pos += consumed_sizes;
@@ -673,7 +691,9 @@ impl<S: SeekSource> MatroskaDemuxer<S> {
         if cues.id != ID_CUES {
             return Ok(None); // SeekHead lied / corrupt index — caller falls back.
         }
-        let cues_end = cues.size.map_or(self.segment_end, |s| self.pos + s);
+        let cues_end = cues
+            .size
+            .map_or(self.segment_end, |s| self.pos.saturating_add(s));
 
         let mut best: Option<(u64, u64)> = None; // (cue_time, cluster position)
         while self.pos < cues_end {
@@ -685,7 +705,7 @@ impl<S: SeekSource> MatroskaDemuxer<S> {
                 self.pos += cp_size;
                 continue;
             }
-            let cp_end = self.pos + cp_size;
+            let cp_end = self.pos.saturating_add(cp_size);
             let mut cue_time: Option<u64> = None;
             let mut cluster_pos: Option<u64> = None;
             while self.pos < cp_end {
@@ -698,7 +718,7 @@ impl<S: SeekSource> MatroskaDemuxer<S> {
                         self.pos += s;
                     }
                     ID_CUE_TRACK_POSITIONS => {
-                        let ctp_end = self.pos + s;
+                        let ctp_end = self.pos.saturating_add(s);
                         let mut track: Option<u64> = None;
                         let mut pos: Option<u64> = None;
                         while self.pos < ctp_end {
@@ -751,7 +771,7 @@ impl<S: SeekSource> MatroskaDemuxer<S> {
             Some(v) => v,
             None => return Ok(None), // target precedes the first cue — fall back.
         };
-        let cluster_abs = self.segment_data_start + cluster_pos;
+        let cluster_abs = self.segment_data_start.saturating_add(cluster_pos);
         self.src
             .seek(SeekFrom::Start(cluster_abs))
             .map_err(|_| DecodeError::Io)?;
@@ -886,6 +906,41 @@ mod tests {
         let mut v = elem(ID_EBML_HEADER, b"\x42\x82\x84webm");
         v.extend_from_slice(&elem(ID_SEGMENT, &segment));
         v
+    }
+
+    #[test]
+    fn undersized_tracks_size_does_not_underflow() {
+        // Regression (tests/fuzz.rs: a byte-substitution of an mkv-aac fixture).
+        // A Tracks element whose declared size is SMALLER than the TrackEntry it
+        // actually carries makes `parse_track_entry` advance `self.pos` past the
+        // Tracks `end`. The subsequent "skip the rest of Tracks" then computed
+        // `end - self.pos`, which underflowed (a debug-build panic). It must
+        // saturate instead — malformed input must never panic.
+        let audio = {
+            let mut a = Vec::new();
+            a.extend_from_slice(&elem(ID_SAMPLING_FREQUENCY, &48_000.0f32.to_be_bytes()));
+            a.extend_from_slice(&elem(ID_CHANNELS, &[2]));
+            a
+        };
+        let mut te = Vec::new();
+        te.extend_from_slice(&elem(ID_TRACK_NUMBER, &[1]));
+        te.extend_from_slice(&elem(ID_TRACK_TYPE, &[TRACK_TYPE_AUDIO as u8]));
+        te.extend_from_slice(&elem(ID_CODEC_ID, b"A_OPUS"));
+        te.extend_from_slice(&elem(ID_AUDIO, &audio));
+        let track_entry = elem(ID_TRACK_ENTRY, &te);
+        // Tracks header with a deliberately-too-small declared size (2 bytes),
+        // though it is immediately followed by the whole (longer) TrackEntry.
+        let mut tracks = id_bytes(ID_TRACKS);
+        tracks.push(size1(2));
+        tracks.extend_from_slice(&track_entry);
+
+        let mut segment = tracks;
+        segment.extend_from_slice(&elem(ID_CLUSTER, &elem(ID_TIMESTAMP, &[0])));
+        let mut bytes = elem(ID_EBML_HEADER, b"\x42\x82\x84webm");
+        bytes.extend_from_slice(&elem(ID_SEGMENT, &segment));
+
+        // Must return gracefully (Ok or Err), never panic.
+        let _ = MatroskaDemuxer::new(SliceSource::new(&bytes));
     }
 
     /// Drain every frame the demuxer yields, as owned byte vecs.
