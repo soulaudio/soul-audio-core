@@ -352,4 +352,88 @@ mod tests {
         let p = a.sample_peak_dbfs();
         assert!((p - (-6.0)).abs() <= 0.05, "peak={p} dBFS, want -6.0");
     }
+
+    /// Synthesize a continuous-phase sine whose level steps through `segments`
+    /// (`(dbfs, seconds)`); `dbfs <= -200` is silence. Continuous phase across
+    /// boundaries avoids spurious splice transients between segments.
+    fn sine_segments(freq: f64, segments: &[(f64, f64)], fs: u32, channels: u8) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        for &(dbfs, secs) in segments {
+            let peak = if dbfs <= -200.0 {
+                0.0
+            } else {
+                powf(10.0, dbfs / 20.0)
+            };
+            let n = (secs * f64::from(fs)) as usize;
+            for _ in 0..n {
+                let t = i as f64 / f64::from(fs);
+                let s = (peak * (2.0 * PI64 * freq * t).sin() * (FULL_SCALE - 1.0)).round() as i32;
+                for _ in 0..channels {
+                    out.push(s);
+                }
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// EBU Tech 3341 Case 2: a 1 kHz sine at −33 dBFS reads −33.0 LUFS (a second
+    /// calibration point — linearity).
+    #[test]
+    fn ebu_case2_minus_33() {
+        let mut a = R128Analyzer::new(48_000, 2);
+        a.feed(&sine(1000.0, sine_peak_at_dbfs(-33.0), 4.0, 48_000, 2));
+        let l = a.integrated_lufs();
+        assert!(
+            (l - (-33.0)).abs() <= 0.1,
+            "integrated={l} LUFS, want -33.0 ±0.1"
+        );
+    }
+
+    /// EBU Tech 3341 Case 3: −36, −23, −36 LUFS segments. The quiet −36 segments
+    /// fall below the RELATIVE gate (−10 LU under the gated mean), so integrated
+    /// loudness is the −23 segment's: −23.0 LUFS ±0.1. (Shorter than the spec's
+    /// 10/60/10 s but the same proportions — gating is duration-independent.)
+    #[test]
+    fn ebu_case3_relative_gating() {
+        let mut a = R128Analyzer::new(48_000, 2);
+        a.feed(&sine_segments(
+            1000.0,
+            &[(-36.0, 2.0), (-23.0, 24.0), (-36.0, 2.0)],
+            48_000,
+            2,
+        ));
+        let l = a.integrated_lufs();
+        assert!(
+            (l - (-23.0)).abs() <= 0.1,
+            "integrated={l} LUFS, want -23.0 ±0.1 (relative gate)"
+        );
+    }
+
+    /// EBU Tech 3341 Case 4: −72, −36, −23, −36, −72 LUFS segments. The −72
+    /// segments fall below the −70 LUFS ABSOLUTE gate and the −36 below the
+    /// relative gate, leaving the −23 segment: −23.0 LUFS ±0.1. Exercises BOTH
+    /// gates.
+    #[test]
+    fn ebu_case4_absolute_and_relative_gating() {
+        let mut a = R128Analyzer::new(48_000, 2);
+        a.feed(&sine_segments(
+            1000.0,
+            &[
+                (-72.0, 2.0),
+                (-36.0, 2.0),
+                (-23.0, 24.0),
+                (-36.0, 2.0),
+                (-72.0, 2.0),
+            ],
+            48_000,
+            2,
+        ));
+        let l = a.integrated_lufs();
+        assert!(
+            (l - (-23.0)).abs() <= 0.1,
+            "integrated={l} LUFS, want -23.0 ±0.1 (abs+rel gate)"
+        );
+    }
 }
