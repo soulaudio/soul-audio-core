@@ -38,6 +38,7 @@ const MANIFEST: &[(&str, Tier)] = &[
     ("soul-audio-tags", Tier::Kernel),
     ("soul-audio-catalog", Tier::Kernel),
     ("soul-audio-index", Tier::Kernel), // default surface = the no-alloc reader
+    ("soul-audio-loudness", Tier::Kernel), // BS.1770 analyzer: no_std, no-alloc, libm-free
     // --- no_std + alloc (T1) ---
     ("soul-audio-queue", Tier::NoStdAlloc),
     ("soul-audio-engine", Tier::NoStdAlloc),
