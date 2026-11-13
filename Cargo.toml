@@ -56,3 +56,14 @@ opt-level = "s"
 lto = "fat"
 codegen-units = 1
 debug = 2          # keep debuginfo for defmt/probe-rs; stripped from flash image
+
+# The decode hot path (DSD cascaded-FIR decimation, the resampler) is far too slow
+# unoptimized to sustain the audio clock in real time — DSD starves the sink and
+# plays at the wrong speed in a debug build. Optimize just this crate at -O3 in
+# dev/test so a debug build still decodes faster than real time, while the rest of
+# the workspace stays debuggable. Guarded by `dsd_decodes_faster_than_real_time`.
+# Consumers (e.g. the -ng app) need the same override in their own workspace.
+[profile.dev.package.soul-audio-core]
+opt-level = 3
+[profile.test.package.soul-audio-core]
+opt-level = 3

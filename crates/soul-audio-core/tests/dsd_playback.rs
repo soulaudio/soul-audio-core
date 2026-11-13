@@ -351,3 +351,45 @@ fn dsd_plays_clean_through_deck_at_48k() {
         "deck@48k peak {p} — clipping or level regression"
     );
 }
+
+/// **Every** DSD family — not just DSD64 — must decode comfortably faster than
+/// real time. The DSD→PCM path runs cascaded 128-tap FIR decimators; the higher
+/// families (DSD128/256) run extra decimation stages — *more* work per output
+/// sample — so they're the ones most likely to starve the audio clock and stretch
+/// playback (the classic DSD "wrong speed"). Optimized, throughput falls off with
+/// the rate as expected (locally DSD64 ≈ 23×, DSD128 ≈ 10×, DSD256 ≈ 7×); in an
+/// **unoptimized** build all of them collapse to ~0.2× and plenty below the floor.
+/// The 1.5× floor sits far above both the real-time clock and the unoptimized
+/// band, so it stays green on slower CI while still failing hard on an algorithmic
+/// slowdown in the decimators or the decode crate no longer being optimized in
+/// this build profile (the `[profile.dev.package]` opt-level override). Short
+/// fixtures are decoded several times for a stable multi-second measure.
+#[test]
+fn dsd_decodes_faster_than_real_time() {
+    // (name, bytes, reps) — reps chosen so each family accumulates ~2–4 s of audio.
+    let families: [(&str, &[u8], usize); 3] = [
+        ("DSD64", TONE_DSF, 8),
+        ("DSD128", TONE_DSD128, 16),
+        ("DSD256", TONE_DSD256, 24),
+    ];
+    for (name, bytes, reps) in families {
+        let start = std::time::Instant::now();
+        let (mut frames, mut rate) = (0usize, 0u32);
+        for _ in 0..reps {
+            let (pcm, r, ch) = decode_dsf(bytes);
+            frames += pcm.len() / ch as usize;
+            rate = r;
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let audio_secs = frames as f64 / f64::from(rate);
+        let realtime_x = audio_secs / elapsed;
+        println!("  {name}: {realtime_x:.1}× real time ({audio_secs:.2}s audio in {elapsed:.2}s)");
+        assert!(
+            realtime_x >= 1.5,
+            "{name} decoded at only {realtime_x:.1}× real time ({audio_secs:.2}s audio in \
+             {elapsed:.2}s). Below the 1.5× floor the player starves the audio clock and DSD \
+             plays at the wrong speed — ensure the decode crate is optimized in this profile \
+             (see [profile.dev.package] in Cargo.toml)."
+        );
+    }
+}
