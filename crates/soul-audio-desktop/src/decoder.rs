@@ -14,8 +14,8 @@ use soul_audio_core::formats::dsf::DsfDecoder;
 use soul_audio_core::formats::matroska::{MatroskaDecoder, MatroskaVorbisOgg};
 use soul_audio_core::formats::vorbis::VorbisDecoder;
 use soul_audio_core::{
-    AnyDecoder, DecodeError, Decoder, Format, PlaybackDecimateAdapter, SeekableDecoder, StreamInfo,
-    open_seekable, probe,
+    AnyDecoder, DecodeError, Decoder, Format, PlaybackDecimateAdapter, SampleFormat,
+    SeekableDecoder, StreamInfo, open_seekable, probe,
 };
 
 /// A fully **owned**, `Send` byte source: std buffers the file, so the decoder
@@ -96,6 +96,17 @@ impl Decoder for OwnedDecoder {
             OwnedDecoder::MatroskaVorbis(d) => d.decode_into(out),
             OwnedDecoder::Dsf(d) => d.decode_into(out),
             OwnedDecoder::Dff(d) => d.decode_into(out),
+        }
+    }
+    /// Forward to each variant's source format so a DSD track reports its native
+    /// `Dsd { rate }` (the DSF/DFF decimators override it), not the decimated PCM.
+    fn source_format(&self) -> SampleFormat {
+        match self {
+            OwnedDecoder::Pcm(d) => d.source_format(),
+            OwnedDecoder::Vorbis(d) => d.source_format(),
+            OwnedDecoder::MatroskaVorbis(d) => d.source_format(),
+            OwnedDecoder::Dsf(d) => d.source_format(),
+            OwnedDecoder::Dff(d) => d.source_format(),
         }
     }
 }

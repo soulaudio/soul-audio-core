@@ -13,9 +13,27 @@
 //! already-opened decoders via [`load`](Deck::load) / [`preload`](Deck::preload).
 
 use crate::decoder::{DecodeError, SeekableDecoder};
-use crate::model::SampleFormat;
+use crate::model::{SampleFormat, StreamInfo};
 use crate::resample::{Quality, ResampleError, Resampler};
 use crate::sink::{Sink, SinkError};
+
+/// A snapshot of the current track's real decode→output chain, for signal-path
+/// transparency. `source` is the original format (a DSD track stays
+/// [`SampleFormat::Dsd`] even though `decoded` is the PCM the decimator hands the
+/// deck); `resampling` is whether the deck resamples `decoded.sample_rate` →
+/// `device_rate`. A `device_rate == decoded.sample_rate` with `!resampling` is a
+/// bit-perfect (sample-rate-exact) path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DecodeInfo {
+    /// The original source format (DSD stays DSD).
+    pub source: SampleFormat,
+    /// The PCM the decoder hands the deck: rate / bit depth / channels.
+    pub decoded: StreamInfo,
+    /// The sink (device) sample rate the deck outputs at.
+    pub device_rate: u32,
+    /// Whether the deck resamples `decoded.sample_rate` → `device_rate`.
+    pub resampling: bool,
+}
 
 /// Canonical output scale: samples are normalized to signed 24-bit (`±2^23`),
 /// which is exact in f32 and independent of the source bit depth — so tracks of
@@ -432,6 +450,19 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         self.current.as_ref().map_or(0, |t| t.rate)
     }
 
+    /// The current track's decode→output chain for a signal-path display, or
+    /// `None` when nothing is loaded. See [`DecodeInfo`].
+    #[must_use]
+    pub fn decode_info(&self) -> Option<DecodeInfo> {
+        let t = self.current.as_ref()?;
+        Some(DecodeInfo {
+            source: t.decoder.source_format(),
+            decoded: t.decoder.stream_info(),
+            device_rate: self.sink_rate,
+            resampling: t.resampler.is_some(),
+        })
+    }
+
     /// Do one block of playback: decode → resample → normalize → volume → write.
     ///
     /// # Errors
@@ -821,6 +852,46 @@ mod tests {
             }
         }
         swaps
+    }
+
+    #[test]
+    fn decode_info_reports_source_decoded_device_and_resampling() {
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 2,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
+        assert!(deck.decode_info().is_none(), "nothing loaded → None");
+
+        // 44.1 kHz / 16-bit PCM into a 48 kHz sink → resampling; a PCM source's
+        // `source` equals its `decoded` format (no hidden conversion).
+        deck.load(const_dec(44_100, 2, 7, 1000)).unwrap();
+        let di = deck.decode_info().expect("loaded");
+        assert_eq!(di.decoded.sample_rate, 44_100);
+        assert_eq!(di.decoded.channels, 2);
+        assert_eq!(di.decoded.format, SampleFormat::Int { bits: 16 });
+        assert_eq!(
+            di.source,
+            SampleFormat::Int { bits: 16 },
+            "PCM source == decoded"
+        );
+        assert_eq!(di.device_rate, 48_000);
+        assert!(di.resampling, "44.1k decoder into a 48k sink resamples");
+
+        // Rate-matched decoder → no resampling (sample-rate-exact path).
+        let sink2 = MockSink {
+            rate: 48_000,
+            ch: 2,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck2: Deck<_, _, 1> = Deck::new(sink2, Quality::Fast);
+        deck2.load(const_dec(48_000, 2, 7, 1000)).unwrap();
+        let di2 = deck2.decode_info().unwrap();
+        assert!(!di2.resampling, "48k decoder into a 48k sink: no resample");
+        assert_eq!(di2.device_rate, 48_000);
     }
 
     #[test]

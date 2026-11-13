@@ -72,6 +72,16 @@ pub trait Decoder {
     fn playable_frames(&self) -> Option<u64> {
         None
     }
+
+    /// The **original** source sample format, seen *through* any internal
+    /// conversion this decoder performs. For a plain PCM decoder this is just
+    /// [`stream_info().format`](Self::stream_info); a DSD→PCM adapter overrides it
+    /// to report the native [`SampleFormat::Dsd`] it decimates from, so a
+    /// signal-path display can show "DSD64" rather than the decimated PCM the
+    /// decoder hands the deck. Default: the output format (no conversion).
+    fn source_format(&self) -> crate::model::SampleFormat {
+        self.stream_info().format
+    }
 }
 
 /// A [`Decoder`] that can also seek and report its length — the capability the
