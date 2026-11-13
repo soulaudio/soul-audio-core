@@ -150,6 +150,13 @@ const TAPS: usize = 128;
 /// Byte-groups spanning the filter — one history byte (8 bits) per group.
 const GROUPS: usize = TAPS / 8;
 
+/// Length of a stage-2/3 **sliding-window** buffer: twice the tap count, so the
+/// most-recent [`TAPS`] samples are always one contiguous run ending at the write
+/// cursor (the live tail is compacted to the front whenever the cursor fills the
+/// buffer). This lets the FIR read a fixed-length `&[i32; TAPS]` with no modulo /
+/// wraparound — the loop LLVM fully unrolls *and* vectorises.
+const WIN: usize = 2 * TAPS;
+
 /// Maximum channels the decimator supports (fixed per-channel history state).
 const MAX_DECIMATE_CHANNELS: usize = 8;
 
@@ -416,6 +423,28 @@ const COEFFS_DIV4: [i32; TAPS] = [
     -1207, -977, -324, 255, 478, 364, 112, -81, -135, -88, -21,
 ];
 
+/// Reverse a 128-tap kernel at compile time: `reversed(c)[j] = c[TAPS-1-j]`.
+const fn reversed(c: &[i32; TAPS]) -> [i32; TAPS] {
+    let mut r = [0i32; TAPS];
+    let mut j = 0;
+    while j < TAPS {
+        r[j] = c[TAPS - 1 - j];
+        j += 1;
+    }
+    r
+}
+
+/// Reversed FIR prototypes (`RC[k] = COEFFS[TAPS-1-k]`). [`PlaybackDecimateAdapter::fir_dot`]
+/// reads a stage's **contiguous sliding window** (oldest sample at `win[0]`, newest at
+/// `win[TAPS-1]`); pairing that against the reversed taps makes the dot product a plain
+/// `Σ win[k]·RC[k]` — a fixed-length, contiguous MAC the optimiser fully unrolls and
+/// vectorises. It is the same set of products as the time-ordered `Σ COEFFS[a]·sample(age a)`,
+/// summed in a different order, so the `i64` result is *bit-identical* (integer addition is
+/// associative) — no gather, no modulo.
+const RCOEFFS: [i32; TAPS] = reversed(&COEFFS);
+const RCOEFFS_DIV2: [i32; TAPS] = reversed(&COEFFS_DIV2);
+const RCOEFFS_DIV4: [i32; TAPS] = reversed(&COEFFS_DIV4);
+
 /// DSD → PCM for **playback**: a cascade that lands *every* DSD family on its native
 /// 44.1 kHz. [`DecimateAdapter`] (stage 1, ÷8 bit-domain) → a second linear-phase ÷8
 /// PCM FIR (stage 2) already put DSD64 (`64 × 44100`) exactly on 44.1 kHz. Stage 2
@@ -437,24 +466,27 @@ pub struct PlaybackDecimateAdapter<D> {
     /// First stage: the proven bit-domain DSD → 352.8 kHz decimator.
     stage1: DecimateAdapter<D>,
     channels: usize,
-    /// Per-channel ring of the last [`TAPS`] stage-1 PCM samples; the next write
-    /// goes to `pos` (so the newest sample is at `pos - 1`). Zero is PCM silence
-    /// (stage-1 maps DSD silence to ≈0), so a zeroed ring is a clean warm-up seed.
-    hist: [[i32; TAPS]; MAX_DECIMATE_CHANNELS],
-    pos: usize,
+    /// Per-channel [`WIN`]-long sliding window of stage-1 PCM samples; the next write
+    /// goes to `wpos`, so the live [`TAPS`]-tail is `buf[wpos-TAPS..wpos]` (newest at
+    /// `wpos-1`) — one contiguous run for the FIR. Zero is PCM silence (stage-1 maps
+    /// DSD silence to ≈0), so a zeroed buffer is a clean warm-up seed. `wpos` starts at
+    /// [`TAPS`] (the seed tail is `buf[0..TAPS]`).
+    buf: [[i32; WIN]; MAX_DECIMATE_CHANNELS],
+    wpos: usize,
     /// Stage-1 frames accumulated toward the next output (0..[`PCM_DECIMATION`]).
     phase: usize,
     /// Adaptive third-stage decimation ratio `DSD_multiple / 64` ∈ {1, 2, 4, 8}.
     /// `1` (DSD64) bypasses stage 3 entirely (bit-identical two-stage output).
     ratio3: usize,
-    /// Stage-3 prototype for this ratio ([`COEFFS_DIV2`]/[`COEFFS_DIV4`]/[`COEFFS`]);
-    /// unused when `ratio3 == 1`.
+    /// Stage-3 **reversed** prototype for this ratio
+    /// ([`RCOEFFS_DIV2`]/[`RCOEFFS_DIV4`]/[`RCOEFFS`]); unused when `ratio3 == 1`.
     coeffs3: &'static [i32; TAPS],
     /// Native output sample rate (44.1 kHz for every DSD family); from the DSD rate.
     out_rate: u32,
-    /// Per-channel ring of the last [`TAPS`] stage-2 PCM samples feeding stage 3.
-    hist3: [[i32; TAPS]; MAX_DECIMATE_CHANNELS],
-    pos3: usize,
+    /// Per-channel [`WIN`]-long sliding window of stage-2 PCM samples feeding stage 3
+    /// (same layout as [`buf`](Self::buf)).
+    buf3: [[i32; WIN]; MAX_DECIMATE_CHANNELS],
+    wpos3: usize,
     /// Stage-2 frames accumulated toward the next stage-3 output (0..`ratio3`).
     phase3: usize,
     /// Buffered stage-1 output frames awaiting consumption (`pend_pos..pend_len`).
@@ -478,26 +510,26 @@ impl<D: DsdDecoder> PlaybackDecimateAdapter<D> {
                 let stage2_rate = rate.hz() / (DECIMATION * PCM_DECIMATION as u32);
                 let r3 = (rate.hz() / 44_100 / 64).max(1) as usize;
                 let coeffs: &'static [i32; TAPS] = match r3 {
-                    2 => &COEFFS_DIV2,
-                    4 => &COEFFS_DIV4,
-                    _ => &COEFFS, // r3 == 8 reuses the 8:1 prototype; r3 == 1 is bypassed
+                    2 => &RCOEFFS_DIV2,
+                    4 => &RCOEFFS_DIV4,
+                    _ => &RCOEFFS, // r3 == 8 reuses the 8:1 prototype; r3 == 1 is bypassed
                 };
                 (r3, coeffs, stage2_rate / r3 as u32)
             }
             // Defensive: PlaybackDecimateAdapter always wraps a DSD decoder.
-            _ => (1, &COEFFS, si.sample_rate / PCM_DECIMATION as u32),
+            _ => (1, &RCOEFFS, si.sample_rate / PCM_DECIMATION as u32),
         };
         Self {
             stage1: DecimateAdapter::new(inner),
             channels,
-            hist: [[0i32; TAPS]; MAX_DECIMATE_CHANNELS],
-            pos: 0,
+            buf: [[0i32; WIN]; MAX_DECIMATE_CHANNELS],
+            wpos: TAPS,
             phase: 0,
             ratio3,
             coeffs3,
             out_rate,
-            hist3: [[0i32; TAPS]; MAX_DECIMATE_CHANNELS],
-            pos3: 0,
+            buf3: [[0i32; WIN]; MAX_DECIMATE_CHANNELS],
+            wpos3: TAPS,
             phase3: 0,
             pend: [0i32; PEND_FRAMES * MAX_DECIMATE_CHANNELS],
             pend_len: 0,
@@ -521,29 +553,35 @@ impl<D: DsdDecoder> PlaybackDecimateAdapter<D> {
 
     /// Reset the second- and third-stage filter state (after a seek).
     fn reset_filters(&mut self) {
-        self.hist = [[0i32; TAPS]; MAX_DECIMATE_CHANNELS];
-        self.pos = 0;
+        self.buf = [[0i32; WIN]; MAX_DECIMATE_CHANNELS];
+        self.wpos = TAPS;
         self.phase = 0;
-        self.hist3 = [[0i32; TAPS]; MAX_DECIMATE_CHANNELS];
-        self.pos3 = 0;
+        self.buf3 = [[0i32; WIN]; MAX_DECIMATE_CHANNELS];
+        self.wpos3 = TAPS;
         self.phase3 = 0;
         self.pend_len = 0;
         self.pend_pos = 0;
         self.eof = false;
     }
 
-    /// Linear-phase FIR dot product over a per-channel ring: `Σ coeffs[k]·hist[age k]`
-    /// (newest sample at `pos - 1`), then the DC-normalising divide by [`PCM_MAX`] (the
-    /// coefficient sum) back to 24-bit scale, rounded to nearest and saturated. `i64`
-    /// accumulation covers the 128-tap × 24-bit × ~2²⁰-coefficient products without
-    /// overflow. Shared by stage 2 ([`COEFFS`]) and the adaptive stage 3.
+    /// Linear-phase FIR over a contiguous [`TAPS`]-sample window `win` (oldest at
+    /// `win[0]`, newest at `win[TAPS-1]`) against the **reversed** prototype `rcoeffs`
+    /// (see [`RCOEFFS`]): `Σ win[k]·rcoeffs[k]`, then the DC-normalising divide by
+    /// [`PCM_MAX`] (the coefficient sum) back to 24-bit scale, rounded to nearest and
+    /// saturated. `i64` accumulation covers the 128-tap × 24-bit × ~2²⁰-coefficient
+    /// products without overflow.
+    ///
+    /// Both operands are fixed-length `&[i32; TAPS]` contiguous arrays, so the loop is
+    /// fully unrolled *and* auto-vectorised (no wraparound/modulo, no gather). Because
+    /// `rcoeffs[k] = coeffs[TAPS-1-k]` and `win[k]` is the sample of age `TAPS-1-k`,
+    /// the sum equals the time-ordered `Σ coeffs[a]·sample(age a)`; reordering an
+    /// integer sum is exact, so the output is bit-identical to the ring formulation.
     #[inline]
-    fn fir_at(hist: &[i32; TAPS], pos: usize, coeffs: &[i32; TAPS]) -> i32 {
+    fn fir_dot(win: &[i32; TAPS], rcoeffs: &[i32; TAPS]) -> i32 {
         let mut acc = 0i64;
         let mut k = 0usize;
         while k < TAPS {
-            let idx = (pos + TAPS - 1 - k) % TAPS;
-            acc += i64::from(coeffs[k]) * i64::from(hist[idx]);
+            acc += i64::from(win[k]) * i64::from(rcoeffs[k]);
             k += 1;
         }
         let div = i64::from(PCM_MAX);
@@ -554,6 +592,16 @@ impl<D: DsdDecoder> PlaybackDecimateAdapter<D> {
             (acc - half) / div
         };
         (q as i32).clamp(PCM_MIN, PCM_MAX)
+    }
+
+    /// The live [`TAPS`]-tail of one channel's sliding window `buf_ch` ending at
+    /// `wpos`: `buf_ch[wpos-TAPS..wpos]` as a fixed-length array ref (newest at
+    /// `[TAPS-1]`). `wpos >= TAPS` holds by construction.
+    #[inline]
+    fn tail(buf_ch: &[i32; WIN], wpos: usize) -> &[i32; TAPS] {
+        buf_ch[wpos - TAPS..wpos]
+            .try_into()
+            .expect("window tail is exactly TAPS long")
     }
 }
 
@@ -610,15 +658,25 @@ impl<D: DsdDecoder> Decoder for PlaybackDecimateAdapter<D> {
                     break;
                 }
             }
-            // Push one stage-1 frame into the per-channel stage-2 rings.
+            // Push one stage-1 frame into each per-channel stage-2 sliding window, then
+            // advance the shared cursor (compacting the live TAPS-tail to the front when
+            // the 2·TAPS buffer fills — amortised one memmove per TAPS frames).
             let base = self.pend_pos * c;
             let mut ch = 0;
             while ch < c {
-                self.hist[ch][self.pos] = self.pend[base + ch];
+                self.buf[ch][self.wpos] = self.pend[base + ch];
                 ch += 1;
             }
             self.pend_pos += 1;
-            self.pos = (self.pos + 1) % TAPS;
+            self.wpos += 1;
+            if self.wpos == WIN {
+                let mut ch = 0;
+                while ch < c {
+                    self.buf[ch].copy_within(TAPS..WIN, 0);
+                    ch += 1;
+                }
+                self.wpos = TAPS;
+            }
             self.phase += 1;
             // Stage 2 emits one frame every `PCM_DECIMATION` stage-1 inputs.
             if self.phase != PCM_DECIMATION {
@@ -629,26 +687,34 @@ impl<D: DsdDecoder> Decoder for PlaybackDecimateAdapter<D> {
                 // DSD64: no third stage — emit stage 2 directly (bit-identical path).
                 let mut ch = 0;
                 while ch < c {
-                    out[w] = Self::fir_at(&self.hist[ch], self.pos, &COEFFS);
+                    out[w] = Self::fir_dot(Self::tail(&self.buf[ch], self.wpos), &RCOEFFS);
                     w += 1;
                     ch += 1;
                 }
                 continue;
             }
-            // DSD128/256/512: feed each stage-2 frame into the stage-3 rings and
-            // decimate by `ratio3` to land on 44.1 kHz.
+            // DSD128/256/512: feed each stage-2 frame into the stage-3 sliding windows
+            // and decimate by `ratio3` to land on 44.1 kHz.
             let mut ch = 0;
             while ch < c {
-                self.hist3[ch][self.pos3] = Self::fir_at(&self.hist[ch], self.pos, &COEFFS);
+                self.buf3[ch][self.wpos3] = Self::fir_dot(Self::tail(&self.buf[ch], self.wpos), &RCOEFFS);
                 ch += 1;
             }
-            self.pos3 = (self.pos3 + 1) % TAPS;
+            self.wpos3 += 1;
+            if self.wpos3 == WIN {
+                let mut ch = 0;
+                while ch < c {
+                    self.buf3[ch].copy_within(TAPS..WIN, 0);
+                    ch += 1;
+                }
+                self.wpos3 = TAPS;
+            }
             self.phase3 += 1;
             if self.phase3 == self.ratio3 {
                 self.phase3 = 0;
                 let mut ch = 0;
                 while ch < c {
-                    out[w] = Self::fir_at(&self.hist3[ch], self.pos3, self.coeffs3);
+                    out[w] = Self::fir_dot(Self::tail(&self.buf3[ch], self.wpos3), self.coeffs3);
                     w += 1;
                     ch += 1;
                 }
