@@ -20,7 +20,7 @@ pub mod probe;
 pub mod resample;
 pub mod sink;
 
-pub use deck::{Deck, DeckError, DeckState, Progress};
+pub use deck::{Deck, DeckError, DeckState, DecodeInfo, Progress};
 pub use decoder::{DecodeError, Decoder, DsdDecoder, DsdSeek, SeekableDecoder};
 pub use demux::{Demuxer, FlacDemuxer, Mp3Demuxer, Packet, WavDemuxer};
 pub use dispatch::{AnyDecoder, open, open_seekable};

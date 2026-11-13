@@ -109,6 +109,11 @@ impl<D: DsdDecoder> Decoder for DopAdapter<D> {
         }
     }
 
+    /// The native DSD source this DoP transport carries (looking past the framing).
+    fn source_format(&self) -> SampleFormat {
+        self.inner.stream_info().format
+    }
+
     fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {
         let c = self.channels;
         if c == 0 || c > MAX_DOP_CHANNELS {
@@ -325,6 +330,11 @@ impl<D: DsdDecoder> Decoder for DecimateAdapter<D> {
             channels: si.channels,
             format: SampleFormat::Int { bits: 24 },
         }
+    }
+
+    /// The native DSD source this adapter decimates from (not the decimated PCM).
+    fn source_format(&self) -> SampleFormat {
+        self.inner.stream_info().format
     }
 
     fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {
@@ -638,6 +648,13 @@ impl<D: DsdDecoder> Decoder for PlaybackDecimateAdapter<D> {
         }
     }
 
+    /// The native DSD source the cascade decimates from (so the signal path shows
+    /// "DSD64/128/…", not the 44.1 kHz PCM it produces). Delegates to stage 1, whose
+    /// inner `DsdDecoder` reports the 1-bit rate.
+    fn source_format(&self) -> SampleFormat {
+        self.stage1.source_format()
+    }
+
     fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {
         let c = self.channels;
         if c == 0 || c > MAX_DECIMATE_CHANNELS {
@@ -697,7 +714,8 @@ impl<D: DsdDecoder> Decoder for PlaybackDecimateAdapter<D> {
             // and decimate by `ratio3` to land on 44.1 kHz.
             let mut ch = 0;
             while ch < c {
-                self.buf3[ch][self.wpos3] = Self::fir_dot(Self::tail(&self.buf[ch], self.wpos), &RCOEFFS);
+                self.buf3[ch][self.wpos3] =
+                    Self::fir_dot(Self::tail(&self.buf[ch], self.wpos), &RCOEFFS);
                 ch += 1;
             }
             self.wpos3 += 1;
@@ -1150,6 +1168,56 @@ mod tests {
         assert_eq!(si.sample_rate, 44_100);
         assert_eq!(si.channels, 2);
         assert_eq!(si.format, SampleFormat::Int { bits: 24 });
+    }
+
+    #[test]
+    fn source_format_reports_native_dsd_not_decimated_pcm() {
+        // For a signal-path display a DSD track must read as "DSD64/128/…", not the
+        // 24-bit PCM the decimator hands the deck. `source_format` sees past the
+        // adapter's own decimation; `stream_info().format` is the decimated PCM.
+        for rate in [
+            DsdRate::Dsd64,
+            DsdRate::Dsd128,
+            DsdRate::Dsd256,
+            DsdRate::Dsd512,
+        ] {
+            let pb = playback(&[], 2, rate);
+            assert_eq!(
+                pb.source_format(),
+                SampleFormat::Dsd { rate },
+                "{rate:?}: PlaybackDecimateAdapter source is native DSD"
+            );
+            assert_eq!(
+                pb.stream_info().format,
+                SampleFormat::Int { bits: 24 },
+                "{rate:?}: decoded output is 24-bit PCM"
+            );
+        }
+        // The archival 1-stage decimator and the DoP transport report native DSD too.
+        let dec = DecimateAdapter::new(FakeDsd {
+            bytes: &[],
+            pos: 0,
+            rate: DsdRate::Dsd64,
+            channels: 2,
+        });
+        assert_eq!(
+            dec.source_format(),
+            SampleFormat::Dsd {
+                rate: DsdRate::Dsd64
+            }
+        );
+        let dop = DopAdapter::new(FakeDsd {
+            bytes: &[],
+            pos: 0,
+            rate: DsdRate::Dsd128,
+            channels: 2,
+        });
+        assert_eq!(
+            dop.source_format(),
+            SampleFormat::Dsd {
+                rate: DsdRate::Dsd128
+            }
+        );
     }
 
     #[test]

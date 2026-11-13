@@ -425,8 +425,20 @@ fn playback_decimate_output_is_bit_exact() {
     // (family, len, sum, fnv-1a) captured from the reference ring implementation.
     let golden: [(&str, &[u8], usize, i64, u64); 3] = [
         ("DSD64", TONE_DSF, 44_100, 78_652_883, 0xe8d7_0331_91f8_33ba),
-        ("DSD128", TONE_DSD128, 17_644, 29_854_779, 0x99b7_5465_651c_4bdc),
-        ("DSD256", TONE_DSD256, 8_824, -10_728_478, 0x2c02_2145_084e_b035),
+        (
+            "DSD128",
+            TONE_DSD128,
+            17_644,
+            29_854_779,
+            0x99b7_5465_651c_4bdc,
+        ),
+        (
+            "DSD256",
+            TONE_DSD256,
+            8_824,
+            -10_728_478,
+            0x2c02_2145_084e_b035,
+        ),
     ];
     for (name, bytes, len, sum, fnv) in golden {
         let (pcm, rate, ch) = decode_dsf(bytes);
