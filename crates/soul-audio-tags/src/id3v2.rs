@@ -457,8 +457,7 @@ fn fill_ascii(enc: u8, raw: &[u8], out: &mut [u8]) -> usize {
 /// The description selects the field (the only ones mapped today are
 /// ReplayGain); the value is surfaced verbatim under the description as its
 /// raw key, so a sink can parse the gain/peak (and see unmapped descriptions).
-/// The RVA2 binary gain frame is a separate, deliberately-deferred follow-up.
-// TODO: parse the `RVA2` relative-volume-adjustment frame (binary peak+gain).
+/// The binary gain frame, `RVA2`, is handled by [`handle_rva2`].
 fn handle_txxx<S: embedded_io::Read>(
     src: &mut S,
     raw_len: usize,
@@ -491,6 +490,103 @@ fn handle_txxx<S: embedded_io::Read>(
     Ok(())
 }
 
+/// RVA2 master-volume channel type (the overall gain, as mp3gain/foobar write).
+const RVA2_MASTER: u8 = 0x01;
+
+/// `RVA2` (ID3v2.4 relative volume adjustment): the master-volume channel's
+/// adjustment is a signed 16-bit value in 1/512 dB. Surface it as a dB string
+/// under the ReplayGain gain field — track gain, or album when the frame's
+/// identification is `"album"` — so a sink reads it exactly like a TXXX
+/// `replaygain_*_gain`. Body: `identification \0`, then per channel
+/// `type · adjustment(2 BE) · peak-bits · peak(ceil(bits/8))`; only the master
+/// channel carries the overall gain. Peak is not surfaced (the deck normalizes
+/// by gain, not peak). Malformed/truncated bodies surface nothing, never panic.
+fn handle_rva2<S: embedded_io::Read>(
+    src: &mut S,
+    raw_len: usize,
+    scratch: &mut [u8],
+    sink: &mut impl TagSink,
+) -> Result<(), TagError> {
+    if raw_len == 0 {
+        return Ok(());
+    }
+    let cap = raw_len.min(scratch.len());
+    read_exact(src, &mut scratch[..cap])?;
+    if raw_len > cap {
+        discard(src, raw_len - cap)?;
+    }
+    let body = &scratch[..cap];
+    let Some(nul) = body.iter().position(|&b| b == 0) else {
+        return Ok(());
+    };
+    let is_album = body[..nul].eq_ignore_ascii_case(b"album");
+    let mut i = nul + 1;
+    while i + 4 <= body.len() {
+        let ch_type = body[i];
+        let adj = i16::from_be_bytes([body[i + 1], body[i + 2]]);
+        let peak_bytes = (body[i + 3] as usize).div_ceil(8);
+        let next = i + 4 + peak_bytes;
+        if next > body.len() {
+            break;
+        }
+        if ch_type == RVA2_MASTER {
+            let field = if is_album {
+                Field::ReplayGainAlbumGain
+            } else {
+                Field::ReplayGainTrackGain
+            };
+            let mut buf = [0u8; 16];
+            sink.text(Some(field), "RVA2", fmt_db_512(adj, &mut buf));
+            return Ok(());
+        }
+        i = next;
+    }
+    Ok(())
+}
+
+/// Format a 1/512-dB RVA2 adjustment as `"±W.FF dB"` into `out` (pure
+/// integer→ASCII — `no_std`, no float, no `core::fmt`). Returns the written
+/// prefix as `&str`.
+fn fmt_db_512(adj: i16, out: &mut [u8; 16]) -> &str {
+    // Hundredths of a dB, truncated toward zero (display precision).
+    let centi = (i32::from(adj) * 100) / 512;
+    let mut n = 0;
+    if centi < 0 {
+        out[n] = b'-';
+        n += 1;
+    }
+    let a = centi.unsigned_abs();
+    n += write_u32(&mut out[n..], a / 100);
+    out[n] = b'.';
+    n += 1;
+    let frac = a % 100;
+    out[n] = b'0' + (frac / 10) as u8;
+    out[n + 1] = b'0' + (frac % 10) as u8;
+    n += 2;
+    out[n..n + 3].copy_from_slice(b" dB");
+    n += 3;
+    core::str::from_utf8(&out[..n]).unwrap_or("0.00 dB")
+}
+
+/// Write `v`'s decimal digits into `out`, returning how many were written.
+fn write_u32(out: &mut [u8], mut v: u32) -> usize {
+    if v == 0 {
+        out[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 10];
+    let mut i = 0;
+    while v > 0 {
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        i += 1;
+    }
+    for j in 0..i {
+        out[j] = tmp[i - 1 - j];
+    }
+    i
+}
+
 fn handle_frame<S: SeekSource>(
     src: &mut S,
     ver_major: u8,
@@ -501,6 +597,7 @@ fn handle_frame<S: SeekSource>(
 ) -> Result<(), TagError> {
     match id {
         "TXXX" | "TXX" => handle_txxx(src, raw_len, scratch, sink),
+        "RVA2" => handle_rva2(src, raw_len, scratch, sink),
         "TRCK" | "TRK" => handle_num_total(
             src,
             raw_len,
@@ -822,6 +919,65 @@ mod tests {
         assert_eq!(
             &tag[c.pics[0].data_offset as usize..][..8],
             b"\x89PNG\r\n\x1a\n"
+        );
+    }
+
+    /// Build an `RVA2` frame (v2.4): identification `\0`, then one channel
+    /// `type · adjustment(2 BE) · peak-bits · peak`.
+    fn rva2_frame(ident: &str, ch_type: u8, adj: i16, peak_bits: u8) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(ident.as_bytes());
+        body.push(0); // identification NUL
+        body.push(ch_type);
+        body.extend_from_slice(&adj.to_be_bytes());
+        body.push(peak_bits);
+        body.extend(core::iter::repeat_n(0u8, (peak_bits as usize).div_ceil(8)));
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RVA2");
+        b.extend_from_slice(&synchsafe(body.len() as u32));
+        b.extend_from_slice(&[0, 0]); // flags
+        b.extend_from_slice(&body);
+        b
+    }
+
+    #[test]
+    fn id3v2_rva2_master_gain_maps_to_replaygain() {
+        let mut scratch = [0u8; 256];
+        // Master volume −7.89 dB = round(−7.89 × 512) = −4040 → track gain.
+        let tag = id3v24(&[rva2_frame("", 0x01, -4040, 0)]);
+        let mut c = Collect::default();
+        read_id3v2(&mut SliceSource::new(&tag), &mut scratch, &mut c).unwrap();
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::ReplayGainTrackGain) && v == "-7.89 dB"),
+            "RVA2 master → track gain: {:?}",
+            c.fields
+        );
+
+        // An "album" identification routes to album gain; +3.00 dB = 1536.
+        let tag = id3v24(&[rva2_frame("album", 0x01, 1536, 16)]);
+        let mut c = Collect::default();
+        read_id3v2(&mut SliceSource::new(&tag), &mut scratch, &mut c).unwrap();
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::ReplayGainAlbumGain) && v == "3.00 dB"),
+            "RVA2 album → album gain: {:?}",
+            c.fields
+        );
+
+        // A non-master-only frame (e.g. front-right) surfaces no overall gain.
+        let tag = id3v24(&[rva2_frame("", 0x02, -1024, 0)]);
+        let mut c = Collect::default();
+        read_id3v2(&mut SliceSource::new(&tag), &mut scratch, &mut c).unwrap();
+        assert!(
+            !c.fields.iter().any(|(f, _, _)| matches!(
+                f,
+                Some(Field::ReplayGainTrackGain | Field::ReplayGainAlbumGain)
+            )),
+            "non-master RVA2 yields no gain: {:?}",
+            c.fields
         );
     }
 
