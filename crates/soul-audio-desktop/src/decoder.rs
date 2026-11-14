@@ -15,7 +15,7 @@ use soul_audio_core::formats::matroska::{MatroskaDecoder, MatroskaVorbisOgg};
 use soul_audio_core::formats::vorbis::VorbisDecoder;
 use soul_audio_core::{
     AnyDecoder, DecodeError, Decoder, Format, PlaybackDecimateAdapter, SampleFormat,
-    SeekableDecoder, StreamInfo, open_seekable, probe,
+    SeekableDecoder, SourceCodec, StreamInfo, open_seekable, probe,
 };
 
 /// A fully **owned**, `Send` byte source: std buffers the file, so the decoder
@@ -107,6 +107,16 @@ impl Decoder for OwnedDecoder {
             OwnedDecoder::MatroskaVorbis(d) => d.source_format(),
             OwnedDecoder::Dsf(d) => d.source_format(),
             OwnedDecoder::Dff(d) => d.source_format(),
+        }
+    }
+    /// The source codec: the dispatch decoder names itself (incl. the MP4 ALAC/AAC
+    /// split); the consumer-dispatched Vorbis variants are Vorbis, and the DSF/DFF
+    /// decimators are native DSD (their decimated-PCM output notwithstanding).
+    fn codec(&self) -> SourceCodec {
+        match self {
+            OwnedDecoder::Pcm(d) => d.codec(),
+            OwnedDecoder::Vorbis(_) | OwnedDecoder::MatroskaVorbis(_) => SourceCodec::Vorbis,
+            OwnedDecoder::Dsf(_) | OwnedDecoder::Dff(_) => SourceCodec::Dsd,
         }
     }
 }
@@ -276,6 +286,58 @@ mod tests {
             .expect("spawn decode thread")
             .join()
             .expect("decode thread panicked");
+    }
+
+    /// `open_track` reports the real source **codec** per container — crucially the
+    /// ALAC-vs-AAC split inside one `.m4a` MP4 container (a lossless ALAC and a
+    /// lossy AAC file must never read the same in a signal-path display), plus the
+    /// consumer-dispatched Vorbis and the DSD decimators.
+    #[test]
+    fn open_track_reports_the_source_codec() {
+        use soul_audio_core::{Decoder, SourceCodec};
+        let td = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata");
+        let cases: &[(&str, SourceCodec)] = &[
+            ("tone.wav", SourceCodec::Wav),
+            ("tone.flac", SourceCodec::Flac),
+            ("tone.m4a", SourceCodec::Alac),
+            ("complex-alac.m4a", SourceCodec::Alac),
+            ("chirp-aac.m4a", SourceCodec::Aac),
+            ("tone.aac", SourceCodec::Aac),
+            ("complex.mp3", SourceCodec::Mp3),
+            ("complex.opus", SourceCodec::Opus),
+            ("complex-vorbis.ogg", SourceCodec::Vorbis),
+            ("antiphase.wv", SourceCodec::WavPack),
+            ("tone.caf", SourceCodec::Caf),
+            ("tone.dsf", SourceCodec::Dsd),
+            ("tone.dff", SourceCodec::Dsd),
+        ];
+        // 64 MiB: `open_track` builds the large `OwnedDecoder` by value, like the
+        // Vorbis tests above (the default stack overflows on Windows MSVC debug).
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let mut failures = Vec::new();
+                for (file, want) in cases {
+                    let path = td.join(file);
+                    match open_track(&path) {
+                        Ok(d) => {
+                            let got = d.codec();
+                            if got != *want {
+                                failures.push(format!("{file}: codec {got:?}, want {want:?}"));
+                            }
+                        }
+                        Err(e) => failures.push(format!("{file}: open failed {e:?}")),
+                    }
+                }
+                assert!(
+                    failures.is_empty(),
+                    "source-codec mismatches:\n  {}",
+                    failures.join("\n  ")
+                );
+            })
+            .expect("spawn codec thread")
+            .join()
+            .expect("codec thread panicked");
     }
 
     /// `OwnedDecoder`'s size is dominated by whichever variant is largest: the

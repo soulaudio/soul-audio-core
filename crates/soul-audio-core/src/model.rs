@@ -139,6 +139,51 @@ pub enum Format {
     Caf,
 }
 
+/// The original audio **codec** a track is encoded with, for a signal-path
+/// display ("FLAC", "ALAC", "AAC", "DSD", …).
+///
+/// Distinct from both [`SampleFormat`] — which only says PCM-vs-DSD and the bit
+/// depth, so a FLAC, a WAV and an ALAC file all read the same — and the container
+/// [`Format`]: an MP4/M4A or CAF container can hold either ALAC (lossless) or
+/// AAC/PCM, and the codec is the one the decoder actually runs. That lossless-vs-
+/// lossy distinction is exactly what a transparency display needs, so the codec
+/// is reported per [`AnyDecoder`](crate::dispatch::AnyDecoder) variant (where the
+/// ALAC/AAC MP4 split is already resolved) via
+/// [`Decoder::codec`](crate::decoder::Decoder::codec).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SourceCodec {
+    /// Multi-bit PCM whose decoder did not name a more specific codec — the
+    /// [`Decoder::codec`](crate::decoder::Decoder::codec) default.
+    Pcm,
+    /// RIFF/WAVE integer or float PCM.
+    Wav,
+    /// AIFF / AIFF-C PCM.
+    Aiff,
+    /// FLAC — native or in an Ogg container. Lossless.
+    Flac,
+    /// Apple Lossless (ALAC), in an MP4/M4A or CAF container. Lossless.
+    Alac,
+    /// AAC-LC, in an MP4/M4A container or a raw ADTS stream. Lossy.
+    Aac,
+    /// MPEG-1/2 Audio Layer III (MP3). Lossy.
+    Mp3,
+    /// Opus — in an Ogg or Matroska container. Lossy.
+    Opus,
+    /// Vorbis — in an Ogg or Matroska container. Lossy.
+    Vorbis,
+    /// WavPack (`.wv`). Lossless.
+    WavPack,
+    /// Apple CAF container — its `lpcm`/`alac` payload is not yet distinguished
+    /// here (a follow-up); the stream's [`SampleFormat`] still shows the PCM depth.
+    Caf,
+    /// Matroska / WebM audio — its contained codec (`A_FLAC`/`A_OPUS`) is not yet
+    /// distinguished here (a follow-up). Matroska-Vorbis reports [`Self::Vorbis`].
+    Matroska,
+    /// Native 1-bit DSD (DSF / DFF).
+    Dsd,
+}
+
 /// Explicit DSD output mode chosen by the caller. Selects which path a native
 /// DSD stream takes to reach playback (see the DSD adapters).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -26,7 +26,7 @@ pub use demux::{Demuxer, FlacDemuxer, Mp3Demuxer, Packet, WavDemuxer};
 pub use dispatch::{AnyDecoder, open, open_seekable};
 pub use dsd::{DecimateAdapter, DopAdapter, PlaybackDecimateAdapter};
 pub use io::{BufReader, BufSource, SeekSource, SliceSource, Source};
-pub use model::{DsdMode, DsdRate, Format, SampleFormat, StreamInfo};
+pub use model::{DsdMode, DsdRate, Format, SampleFormat, SourceCodec, StreamInfo};
 pub use probe::probe;
 pub use resample::{Quality, ResampleError, Resampler};
 pub use sink::{Sink, SinkError};

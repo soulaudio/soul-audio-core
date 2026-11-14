@@ -200,6 +200,28 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
         }
     }
 
+    /// The source codec per variant. The MP4 ALAC/AAC split is already resolved
+    /// into the `Alac`/`Aac` variants at `open` time (see `Mp4Codec` below), so a
+    /// lossless and a lossy `.m4a` report distinct codecs. `OggFlac` is FLAC; both
+    /// Opus variants are Opus. CAF and Matroska carry a container's worth of
+    /// codecs not yet split out here, so they report the container
+    /// ([`SourceCodec::Caf`]/[`SourceCodec::Matroska`]).
+    fn codec(&self) -> crate::model::SourceCodec {
+        use crate::model::SourceCodec;
+        match self {
+            AnyDecoder::Wav(_) => SourceCodec::Wav,
+            AnyDecoder::Aiff(_) => SourceCodec::Aiff,
+            AnyDecoder::Flac(_) | AnyDecoder::OggFlac(_) => SourceCodec::Flac,
+            AnyDecoder::Mp3(_) => SourceCodec::Mp3,
+            AnyDecoder::Alac(_) => SourceCodec::Alac,
+            AnyDecoder::Aac(_) => SourceCodec::Aac,
+            AnyDecoder::Opus(_) | AnyDecoder::OpusMs(_) => SourceCodec::Opus,
+            AnyDecoder::Matroska(_) => SourceCodec::Matroska,
+            AnyDecoder::WavPack(_) => SourceCodec::WavPack,
+            AnyDecoder::Caf(_) => SourceCodec::Caf,
+        }
+    }
+
     fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {
         match self {
             AnyDecoder::Wav(d) => d.decode_into(out),
