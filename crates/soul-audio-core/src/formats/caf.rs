@@ -289,6 +289,14 @@ impl<S: Source> Decoder for CafDecoder<S> {
             CafDecoder::Alac(d) => d.decode_into(out),
         }
     }
+
+    /// The CAF payload codec: generic PCM for `lpcm`, Apple Lossless for `alac`.
+    fn codec(&self) -> crate::model::SourceCodec {
+        match self {
+            CafDecoder::Pcm(_) => crate::model::SourceCodec::Pcm,
+            CafDecoder::Alac(_) => crate::model::SourceCodec::Alac,
+        }
+    }
 }
 
 /// `lpcm` CAF: stream the `data` region, convert each frame to `i32`.

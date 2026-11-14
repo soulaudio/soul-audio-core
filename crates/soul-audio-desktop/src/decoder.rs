@@ -307,7 +307,15 @@ mod tests {
             ("complex.opus", SourceCodec::Opus),
             ("complex-vorbis.ogg", SourceCodec::Vorbis),
             ("antiphase.wv", SourceCodec::WavPack),
-            ("tone.caf", SourceCodec::Caf),
+            // CAF and Matroska containers report their real payload codec, not
+            // the container — the lossless-vs-lossy distinction (CAF-ALAC and
+            // Matroska-FLAC are lossless; Matroska-Opus/AAC are lossy).
+            ("tone.caf", SourceCodec::Pcm),
+            ("tone-alac.caf", SourceCodec::Alac),
+            ("tone-flac.mka", SourceCodec::Flac),
+            ("tone-aac.mka", SourceCodec::Aac),
+            ("tone-opus.webm", SourceCodec::Opus),
+            ("tone-vorbis.mka", SourceCodec::Vorbis),
             ("tone.dsf", SourceCodec::Dsd),
             ("tone.dff", SourceCodec::Dsd),
         ];
