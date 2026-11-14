@@ -216,9 +216,11 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::Alac(_) => SourceCodec::Alac,
             AnyDecoder::Aac(_) => SourceCodec::Aac,
             AnyDecoder::Opus(_) | AnyDecoder::OpusMs(_) => SourceCodec::Opus,
-            AnyDecoder::Matroska(_) => SourceCodec::Matroska,
+            // CAF and Matroska are containers: ask the decoder for its actual
+            // payload codec (CAF lpcm/alac; Matroska A_OPUS/A_FLAC/A_AAC).
+            AnyDecoder::Matroska(d) => d.codec(),
             AnyDecoder::WavPack(_) => SourceCodec::WavPack,
-            AnyDecoder::Caf(_) => SourceCodec::Caf,
+            AnyDecoder::Caf(d) => d.codec(),
         }
     }
 

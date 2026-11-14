@@ -174,11 +174,12 @@ pub enum SourceCodec {
     Vorbis,
     /// WavPack (`.wv`). Lossless.
     WavPack,
-    /// Apple CAF container — its `lpcm`/`alac` payload is not yet distinguished
-    /// here (a follow-up); the stream's [`SampleFormat`] still shows the PCM depth.
+    /// Apple CAF container whose payload codec couldn't be named — a fallback;
+    /// the `lpcm`/`alac` payload normally resolves to [`Self::Pcm`]/[`Self::Alac`].
     Caf,
-    /// Matroska / WebM audio — its contained codec (`A_FLAC`/`A_OPUS`) is not yet
-    /// distinguished here (a follow-up). Matroska-Vorbis reports [`Self::Vorbis`].
+    /// Matroska / WebM audio whose track codec couldn't be named — a fallback;
+    /// `A_OPUS`/`A_FLAC`/`A_AAC` normally resolve to
+    /// [`Self::Opus`]/[`Self::Flac`]/[`Self::Aac`] (Vorbis to [`Self::Vorbis`]).
     Matroska,
     /// Native 1-bit DSD (DSF / DFF).
     Dsd,

@@ -175,6 +175,16 @@ impl<S: Source> Decoder for MatroskaDecoder<S> {
             MatroskaDecoder::Aac(d) => d.decode_into(out),
         }
     }
+
+    /// The contained track codec (`A_OPUS` / `A_FLAC` / `A_AAC`) — the
+    /// lossless-vs-lossy identity the Matroska container itself can't give.
+    fn codec(&self) -> crate::model::SourceCodec {
+        match self {
+            MatroskaDecoder::Opus(_) => crate::model::SourceCodec::Opus,
+            MatroskaDecoder::Flac(_) => crate::model::SourceCodec::Flac,
+            MatroskaDecoder::Aac(_) => crate::model::SourceCodec::Aac,
+        }
+    }
 }
 
 /// Opus-in-Matroska: the shared [`OpusFrameDecoder`] core driven one
