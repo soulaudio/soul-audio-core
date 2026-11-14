@@ -241,6 +241,7 @@ fn normalize_rel(rel: &Path) -> String {
 /// `Tags`/`StreamFacts`. `Clone` so the cache can hand copies back; `Send` (all
 /// fields are) so extraction can fan out across threads.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RawTrack {
     path: PathBuf,
     title: String,
@@ -392,6 +393,7 @@ pub fn bake(root: &Path) -> std::io::Result<Vec<u8>> {
 /// A file's change-detection identity: modification time + size. Cheap to `stat`
 /// and cheap to compare — a mismatch against the cache means "re-read this file".
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FileStamp {
     /// Modification time in nanoseconds since the Unix epoch (0 if unavailable).
     pub mtime_ns: u128,
@@ -415,7 +417,13 @@ fn stamp_of(meta: &std::fs::Metadata) -> FileStamp {
 /// The reusable scan cache: `path → (stamp, extracted RawTrack)`. An in-memory
 /// value (the desktop head persists/reloads it to keep startup warm); `Default`
 /// is empty, which makes the next [`scan_incremental`] a cold full scan.
+/// Bump when [`RawTrack`]/extraction changes so a persisted cache from an older
+/// build is discarded (re-extracted) instead of silently reused with stale fields.
+/// The desktop head stores this alongside the serialized cache and compares on load.
+pub const SCAN_CACHE_VERSION: u32 = 1;
+
 #[derive(Default, Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ScanCache {
     entries: HashMap<PathBuf, (FileStamp, RawTrack)>,
 }
@@ -618,6 +626,23 @@ pub fn scan_incremental(
         changed,
         removed,
     })
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod serde_tests {
+    use super::{FileStamp, RawTrack, ScanCache};
+
+    /// The persistable cache types derive serde under the `serde` feature (the
+    /// desktop head serializes the cache to keep startup warm). A compile-time
+    /// assertion — if the derives are wrong this fails to build; the behavioural
+    /// round-trip is exercised by the `-ng` head that picks the wire format.
+    #[test]
+    fn cache_types_are_serializable() {
+        fn assert_serde<T: serde::Serialize + serde::de::DeserializeOwned>() {}
+        assert_serde::<FileStamp>();
+        assert_serde::<RawTrack>();
+        assert_serde::<ScanCache>();
+    }
 }
 
 /// Subdirectory the baked index lives in, at the card/library root.
