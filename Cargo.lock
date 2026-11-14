@@ -2019,6 +2019,7 @@ name = "soul-audio-import"
 version = "0.1.0"
 dependencies = [
  "embedded-io-adapters",
+ "serde",
  "soul-audio-catalog",
  "soul-audio-core",
  "soul-audio-index",
