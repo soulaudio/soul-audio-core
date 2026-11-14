@@ -13,7 +13,7 @@
 //! already-opened decoders via [`load`](Deck::load) / [`preload`](Deck::preload).
 
 use crate::decoder::{DecodeError, SeekableDecoder};
-use crate::model::{SampleFormat, StreamInfo};
+use crate::model::{SampleFormat, SourceCodec, StreamInfo};
 use crate::resample::{Quality, ResampleError, Resampler};
 use crate::sink::{Sink, SinkError};
 
@@ -27,6 +27,9 @@ use crate::sink::{Sink, SinkError};
 pub struct DecodeInfo {
     /// The original source format (DSD stays DSD).
     pub source: SampleFormat,
+    /// The original codec the track is encoded with (FLAC / ALAC / AAC / DSD / …)
+    /// — the lossless-vs-lossy identity a container or [`SampleFormat`] can't give.
+    pub codec: SourceCodec,
     /// The PCM the decoder hands the deck: rate / bit depth / channels.
     pub decoded: StreamInfo,
     /// The sink (device) sample rate the deck outputs at.
@@ -457,6 +460,7 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         let t = self.current.as_ref()?;
         Some(DecodeInfo {
             source: t.decoder.source_format(),
+            codec: t.decoder.codec(),
             decoded: t.decoder.stream_info(),
             device_rate: self.sink_rate,
             resampling: t.resampler.is_some(),
@@ -876,6 +880,11 @@ mod tests {
             di.source,
             SampleFormat::Int { bits: 16 },
             "PCM source == decoded"
+        );
+        assert_eq!(
+            di.codec,
+            SourceCodec::Pcm,
+            "a decoder that doesn't name a codec reads as the Pcm default"
         );
         assert_eq!(di.device_rate, 48_000);
         assert!(di.resampling, "44.1k decoder into a 48k sink resamples");

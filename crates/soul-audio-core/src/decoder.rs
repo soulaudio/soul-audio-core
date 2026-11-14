@@ -82,6 +82,18 @@ pub trait Decoder {
     fn source_format(&self) -> crate::model::SampleFormat {
         self.stream_info().format
     }
+
+    /// The original audio **codec** this decoder runs, for a signal-path display:
+    /// "FLAC", "ALAC", "AAC", "DSD", … — distinct from the decoded
+    /// [`SampleFormat`](crate::model::SampleFormat) (PCM-vs-DSD + bit depth only)
+    /// and the container [`Format`](crate::model::Format) (an MP4/CAF holds more
+    /// than one codec). The dispatch decoders
+    /// ([`AnyDecoder`](crate::dispatch::AnyDecoder)) name themselves per variant —
+    /// where the MP4 ALAC/AAC split is already resolved; a bare PCM decoder that
+    /// doesn't override this reads as [`SourceCodec::Pcm`](crate::model::SourceCodec::Pcm).
+    fn codec(&self) -> crate::model::SourceCodec {
+        crate::model::SourceCodec::Pcm
+    }
 }
 
 /// A [`Decoder`] that can also seek and report its length — the capability the
