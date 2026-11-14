@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 mod sanitize;
+mod tags;
 mod template;
 
 pub use template::{Template, presets};
