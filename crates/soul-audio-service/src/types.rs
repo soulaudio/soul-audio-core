@@ -126,6 +126,7 @@ pub struct TrackView {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    pub genre: Option<String>,
     pub duration_secs: f64,
 }
 
