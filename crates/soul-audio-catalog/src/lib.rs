@@ -20,6 +20,7 @@
 pub type TrackId = u32;
 pub type AlbumId = u32;
 pub type ArtistId = u32;
+pub type GenreId = u32;
 pub type FolderId = u32;
 pub type PlaylistId = u32;
 
@@ -45,6 +46,9 @@ pub struct TrackRec {
     pub artist: ArtistId,
     pub album: AlbumId,
     pub album_artist: ArtistId,
+    /// Genre entity referenced by this track; resolves to a display name via
+    /// [`Catalog::genre_name`] and keys the [`BrowseAxis::Genre`] order.
+    pub genre: GenreId,
     pub folder: FolderId,
     pub track_no: u16,
     pub disc_no: u16,
@@ -105,6 +109,8 @@ pub enum BrowseAxis {
     Album,
     /// By folder path.
     Folder,
+    /// By genre (then the artist/album/disc/track chain within).
+    Genre,
 }
 
 /// The read port both platforms implement. Seek-based, buffer-based, fallible.
@@ -116,6 +122,7 @@ pub trait Catalog {
     fn track_count(&self) -> u32;
     fn album_count(&self) -> u32;
     fn artist_count(&self) -> u32;
+    fn genre_count(&self) -> u32;
 
     fn track(&self, id: TrackId) -> Result<TrackRec, CatalogError>;
     fn album(&self, id: AlbumId) -> Result<AlbumRec, CatalogError>;
@@ -135,6 +142,13 @@ pub trait Catalog {
     fn artist_sort_name(&self, id: ArtistId, buf: &mut [u8]) -> Result<usize, CatalogError> {
         self.artist_name(id, buf)
     }
+
+    /// Resolve a genre's display name into `buf`; returns bytes written. Genres
+    /// are name entities referenced by [`TrackRec::genre`] and keyed on by the
+    /// [`BrowseAxis::Genre`] browse order. Same buffer contract as
+    /// [`artist_name`](Self::artist_name) ([`CatalogError::Truncated`] when too
+    /// small).
+    fn genre_name(&self, id: GenreId, buf: &mut [u8]) -> Result<usize, CatalogError>;
 
     /// Resolve a heap string into `buf`; returns bytes written.
     fn resolve_str(&self, s: StrRef, buf: &mut [u8]) -> Result<usize, CatalogError>;

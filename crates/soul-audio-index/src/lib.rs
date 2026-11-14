@@ -16,31 +16,33 @@
 //! `(offset, len)` with the offset **relative to the string heap**.
 //!
 //! ```text
-//! HEADER (64 B, fixed):
+//! HEADER (72 B, fixed):
 //!    0  magic "SIDX"            [u8;4]
 //!    4  format_version          u16
 //!    6  reserved                u16
 //!    8  track_count             u32
 //!   12  album_count             u32
 //!   16  artist_count            u32
-//!   20  folder_count            u32
-//!   24  playlist_count          u32
-//!   28  records_off             u32   (abs)
-//!   32  albums_off              u32   (abs)
-//!   36  artists_off             u32   (abs)
-//!   40  folders_off             u32   (abs)
-//!   44  order_tables_off        u32   (abs)
-//!   48  album_tracks_off        u32   (abs)
-//!   52  playlists_off           u32   (abs)
-//!   56  string_heap_off         u32   (abs)
-//!   60  string_heap_len         u32
+//!   20  genre_count             u32
+//!   24  folder_count            u32
+//!   28  playlist_count          u32
+//!   32  records_off             u32   (abs)
+//!   36  albums_off              u32   (abs)
+//!   40  artists_off             u32   (abs)
+//!   44  genres_off              u32   (abs)
+//!   48  folders_off             u32   (abs)
+//!   52  order_tables_off        u32   (abs)
+//!   56  album_tracks_off        u32   (abs)
+//!   60  playlists_off           u32   (abs)
+//!   64  string_heap_off         u32   (abs)
+//!   68  string_heap_len         u32
 //!
-//! TRACK RECORD (55 B, fixed; `record[i]` at records_off + i*55):
+//! TRACK RECORD (59 B, fixed; `record[i]` at records_off + i*59):
 //!    0 id u32 · 4 title.off u32 · 8 title.len u16 · 10 artist u32 ·
-//!   14 album u32 · 18 album_artist u32 · 22 folder u32 · 26 track_no u16 ·
-//!   28 disc_no u16 · 30 duration_ms u32 · 34 sample_rate u32 · 38 channels u8 ·
-//!   39 art_id u32 · 43 flags u16 · 45 extended_off u32 ·
-//!   49 file_name.off u32 · 53 file_name.len u16
+//!   14 album u32 · 18 album_artist u32 · 22 genre u32 · 26 folder u32 ·
+//!   30 track_no u16 · 32 disc_no u16 · 34 duration_ms u32 · 38 sample_rate u32 ·
+//!   42 channels u8 · 43 art_id u32 · 47 flags u16 · 49 extended_off u32 ·
+//!   53 file_name.off u32 · 57 file_name.len u16
 //!
 //! ALBUM RECORD (24 B, fixed; indexed by dense album id):
 //!    0 id u32 · 4 title.off u32 · 8 title.len u16 · 10 album_artist u32 ·
@@ -55,14 +57,18 @@
 //!   ArtistAlbumTrack order is keyed on; equals the display-name ref when the
 //!   source had no sort tag. (New in format v2.)
 //!
+//! GENRE NAME TABLE: genre_count × StrRef (6 B), indexed by genre id; each
+//!   resolves to a genre's display name in the string heap, the name the Genre
+//!   browse order is keyed on. (New in format v3.)
+//!
 //! FOLDER RECORD (10 B, fixed; indexed by dense folder id):
 //!    0 path.off u32 · 4 path.len u16 · 6 parent u32 (FolderId::MAX = no parent).
 //!   `path` is the folder's path relative to the card root; a track's physical
 //!   file is `root / folder.path / track.file_name`.
 //!
-//! ORDER TABLES: AXIS_COUNT (4) arrays of `track_count` × u32 record-ids,
+//! ORDER TABLES: AXIS_COUNT (5) arrays of `track_count` × u32 record-ids,
 //!   pre-sorted by the baker, in axis order [Title, ArtistAlbumTrack, Album,
-//!   Folder]. axis `ax`, slot `i` → order_tables_off + (ax*track_count + i)*4.
+//!   Folder, Genre]. axis `ax`, slot `i` → order_tables_off + (ax*track_count + i)*4.
 //!
 //! ALBUM→TRACKS: a directory of album_count × (count u32, run_abs_off u32),
 //!   then the concatenated u32 track-id runs.
@@ -88,7 +94,7 @@ use core::cell::RefCell;
 
 use embedded_io::SeekFrom;
 use soul_audio_catalog::{
-    AlbumId, AlbumRec, ArtistId, BrowseAxis, Catalog, CatalogError, FolderId, FolderRec,
+    AlbumId, AlbumRec, ArtistId, BrowseAxis, Catalog, CatalogError, FolderId, FolderRec, GenreId,
     PlaylistId, StrRef, TrackId, TrackRec,
 };
 use soul_audio_core::SeekSource;
@@ -96,19 +102,20 @@ use soul_audio_core::SeekSource;
 /// Magic at the head of `index.sidx` — `"SIDX"`.
 pub const MAGIC: [u8; 4] = *b"SIDX";
 /// Format version in the header.
-pub const FORMAT_VERSION: u16 = 2;
+pub const FORMAT_VERSION: u16 = 3;
 
-const HEADER_SIZE: usize = 64;
-const RECORD_SIZE: usize = 55;
+const HEADER_SIZE: usize = 72;
+const RECORD_SIZE: usize = 59;
 const ALBUM_RECORD_SIZE: usize = 24;
 const ARTIST_REF_SIZE: usize = 6; // StrRef (off u32, len u16) per artist
+const GENRE_REF_SIZE: usize = 6; // StrRef (off u32, len u16) per genre
 const FOLDER_RECORD_SIZE: usize = 10; // path StrRef (6) + parent u32 (4)
 const ALBUM_DIR_ENTRY: usize = 8;
 const PLAYLIST_DIR_ENTRY: usize = 14;
 /// Number of pre-sorted browse axes (keep in sync with [`axis_index`]). Used by
 /// the baker to size the order-table section.
 #[cfg(feature = "build")]
-const AXIS_COUNT: usize = 4;
+const AXIS_COUNT: usize = 5;
 
 fn axis_index(a: BrowseAxis) -> u32 {
     match a {
@@ -116,6 +123,7 @@ fn axis_index(a: BrowseAxis) -> u32 {
         BrowseAxis::ArtistAlbumTrack => 1,
         BrowseAxis::Album => 2,
         BrowseAxis::Folder => 3,
+        BrowseAxis::Genre => 4,
     }
 }
 
@@ -134,11 +142,13 @@ struct Header {
     track_count: u32,
     album_count: u32,
     artist_count: u32,
+    genre_count: u32,
     folder_count: u32,
     playlist_count: u32,
     records_off: u32,
     albums_off: u32,
     artists_off: u32,
+    genres_off: u32,
     folders_off: u32,
     order_tables_off: u32,
     album_tracks_off: u32,
@@ -159,17 +169,19 @@ impl Header {
             track_count: le_u32(&h, 8),
             album_count: le_u32(&h, 12),
             artist_count: le_u32(&h, 16),
-            folder_count: le_u32(&h, 20),
-            playlist_count: le_u32(&h, 24),
-            records_off: le_u32(&h, 28),
-            albums_off: le_u32(&h, 32),
-            artists_off: le_u32(&h, 36),
-            folders_off: le_u32(&h, 40),
-            order_tables_off: le_u32(&h, 44),
-            album_tracks_off: le_u32(&h, 48),
-            playlists_off: le_u32(&h, 52),
-            string_heap_off: le_u32(&h, 56),
-            string_heap_len: le_u32(&h, 60),
+            genre_count: le_u32(&h, 20),
+            folder_count: le_u32(&h, 24),
+            playlist_count: le_u32(&h, 28),
+            records_off: le_u32(&h, 32),
+            albums_off: le_u32(&h, 36),
+            artists_off: le_u32(&h, 40),
+            genres_off: le_u32(&h, 44),
+            folders_off: le_u32(&h, 48),
+            order_tables_off: le_u32(&h, 52),
+            album_tracks_off: le_u32(&h, 56),
+            playlists_off: le_u32(&h, 60),
+            string_heap_off: le_u32(&h, 64),
+            string_heap_len: le_u32(&h, 68),
         })
     }
 }
@@ -239,6 +251,23 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
         self.header.artist_count
     }
 
+    fn genre_count(&self) -> u32 {
+        self.header.genre_count
+    }
+
+    fn genre_name(&self, id: GenreId, buf: &mut [u8]) -> Result<usize, CatalogError> {
+        if id >= self.header.genre_count {
+            return Err(CatalogError::OutOfRange);
+        }
+        let mut b = [0u8; GENRE_REF_SIZE];
+        self.read_at(self.header.genres_off + id * GENRE_REF_SIZE as u32, &mut b)?;
+        let name = StrRef {
+            off: le_u32(&b, 0),
+            len: le_u16(&b, 4),
+        };
+        self.resolve_str(name, buf)
+    }
+
     fn artist_name(&self, id: ArtistId, buf: &mut [u8]) -> Result<usize, CatalogError> {
         if id >= self.header.artist_count {
             return Err(CatalogError::OutOfRange);
@@ -287,18 +316,19 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
             artist: le_u32(&r, 10),
             album: le_u32(&r, 14),
             album_artist: le_u32(&r, 18),
-            folder: le_u32(&r, 22),
-            track_no: le_u16(&r, 26),
-            disc_no: le_u16(&r, 28),
-            duration_ms: le_u32(&r, 30),
-            sample_rate: le_u32(&r, 34),
-            channels: r[38],
-            art_id: le_u32(&r, 39),
-            flags: le_u16(&r, 43),
-            extended_off: le_u32(&r, 45),
+            genre: le_u32(&r, 22),
+            folder: le_u32(&r, 26),
+            track_no: le_u16(&r, 30),
+            disc_no: le_u16(&r, 32),
+            duration_ms: le_u32(&r, 34),
+            sample_rate: le_u32(&r, 38),
+            channels: r[42],
+            art_id: le_u32(&r, 43),
+            flags: le_u16(&r, 47),
+            extended_off: le_u32(&r, 49),
             file_name: StrRef {
-                off: le_u32(&r, 49),
-                len: le_u16(&r, 53),
+                off: le_u32(&r, 53),
+                len: le_u16(&r, 57),
             },
         })
     }
@@ -439,7 +469,7 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
 pub mod build {
     use super::{
         ALBUM_DIR_ENTRY, ALBUM_RECORD_SIZE, ARTIST_REF_SIZE, AXIS_COUNT, FOLDER_RECORD_SIZE,
-        FORMAT_VERSION, HEADER_SIZE, MAGIC, PLAYLIST_DIR_ENTRY, RECORD_SIZE,
+        FORMAT_VERSION, GENRE_REF_SIZE, HEADER_SIZE, MAGIC, PLAYLIST_DIR_ENTRY, RECORD_SIZE,
     };
     use alloc::{string::String, vec, vec::Vec};
     use core::cmp::Ordering;
@@ -453,6 +483,8 @@ pub mod build {
         pub artist: u32,
         pub album: u32,
         pub album_artist: u32,
+        /// Dense id into [`CatalogInput::genres`].
+        pub genre: u32,
         pub folder: u32,
         pub track_no: u16,
         pub disc_no: u16,
@@ -497,6 +529,10 @@ pub mod build {
         /// falls back to the display name, so an untagged library orders by
         /// display name exactly as before.
         pub artist_sorts: Vec<String>,
+        /// Genre display names; `genres[i]` is the name for genre id `i`, the
+        /// name the Genre browse order is keyed on. Each [`TrackInput::genre`]
+        /// is a dense id into this table.
+        pub genres: Vec<String>,
         pub albums: Vec<AlbumMeta>,
         pub folders: Vec<FolderInput>,
         pub playlists: Vec<PlaylistInput>,
@@ -572,6 +608,7 @@ pub mod build {
         let track_count = tracks.len() as u32;
         let album_count = input.albums.len() as u32;
         let artist_count = input.artists.len() as u32;
+        let genre_count = input.genres.len() as u32;
         let folder_count = input.folders.len() as u32;
         let playlist_count = input.playlists.len() as u32;
 
@@ -603,6 +640,8 @@ pub mod build {
                 }
             })
             .collect();
+        let genre_names: Vec<(u32, u16)> =
+            input.genres.iter().map(|g| intern(&mut heap, g)).collect();
         let folder_paths: Vec<(u32, u16)> = input
             .folders
             .iter()
@@ -653,6 +692,11 @@ pub mod build {
             .iter()
             .map(|f| crate::collation::key(&f.path))
             .collect();
+        let genre_key: Vec<Vec<u8>> = input
+            .genres
+            .iter()
+            .map(|g| crate::collation::key(g))
+            .collect();
         // An out-of-range id sorts as an empty key (never panics).
         fn key_at(keys: &[Vec<u8>], i: u32) -> &[u8] {
             keys.get(i as usize).map_or(&[], |v| v.as_slice())
@@ -695,12 +739,32 @@ pub mod build {
                 .then_with(|| x.folder.cmp(&y.folder))
                 .then_with(|| (x.disc_no, x.track_no).cmp(&(y.disc_no, y.track_no)))
         });
+        // Genre groups first by genre collation, then reuses the ArtistAlbumTrack
+        // tiebreak chain (album-artist sort → year → album → disc/track) within a
+        // genre. The `MultiCatalog` merge keys its heads on the genre key too; a
+        // union genre id belongs to exactly one source, so the within-genre chain
+        // stays intra-source and the merge reproduces this frozen order.
+        let genre_order = sorted_ids(track_count, |a, b| {
+            let (x, y) = (&tracks[a], &tracks[b]);
+            key_at(&genre_key, x.genre)
+                .cmp(key_at(&genre_key, y.genre))
+                .then_with(|| x.genre.cmp(&y.genre))
+                .then_with(|| {
+                    key_at(&artist_key, x.album_artist).cmp(key_at(&artist_key, y.album_artist))
+                })
+                .then_with(|| x.album_artist.cmp(&y.album_artist))
+                .then_with(|| year_at(&input.albums, x.album).cmp(&year_at(&input.albums, y.album)))
+                .then_with(|| key_at(&album_key, x.album).cmp(key_at(&album_key, y.album)))
+                .then_with(|| x.album.cmp(&y.album))
+                .then_with(|| (x.disc_no, x.track_no).cmp(&(y.disc_no, y.track_no)))
+        });
 
         // Section sizes + absolute offsets.
         let records_size = tracks.len() * RECORD_SIZE;
         let albums_size = n_albums * ALBUM_RECORD_SIZE;
         let artists_size = input.artists.len() * ARTIST_REF_SIZE;
         let artist_sorts_size = input.artists.len() * ARTIST_REF_SIZE;
+        let genres_size = input.genres.len() * GENRE_REF_SIZE;
         let folders_size = input.folders.len() * FOLDER_RECORD_SIZE;
         let order_size = AXIS_COUNT * tracks.len() * 4;
         let album_dir_size = n_albums * ALBUM_DIR_ENTRY;
@@ -713,7 +777,8 @@ pub mod build {
         let albums_off = records_off + records_size;
         let artists_off = albums_off + albums_size;
         let artist_sorts_off = artists_off + artists_size;
-        let folders_off = artist_sorts_off + artist_sorts_size;
+        let genres_off = artist_sorts_off + artist_sorts_size;
+        let folders_off = genres_off + genres_size;
         let order_tables_off = folders_off + folders_size;
         let album_tracks_off = order_tables_off + order_size;
         let album_runs_off = album_tracks_off + album_dir_size;
@@ -730,11 +795,13 @@ pub mod build {
         out.extend_from_slice(&track_count.to_le_bytes());
         out.extend_from_slice(&album_count.to_le_bytes());
         out.extend_from_slice(&artist_count.to_le_bytes());
+        out.extend_from_slice(&genre_count.to_le_bytes());
         out.extend_from_slice(&folder_count.to_le_bytes());
         out.extend_from_slice(&playlist_count.to_le_bytes());
         out.extend_from_slice(&(records_off as u32).to_le_bytes());
         out.extend_from_slice(&(albums_off as u32).to_le_bytes());
         out.extend_from_slice(&(artists_off as u32).to_le_bytes());
+        out.extend_from_slice(&(genres_off as u32).to_le_bytes());
         out.extend_from_slice(&(folders_off as u32).to_le_bytes());
         out.extend_from_slice(&(order_tables_off as u32).to_le_bytes());
         out.extend_from_slice(&(album_tracks_off as u32).to_le_bytes());
@@ -753,6 +820,7 @@ pub mod build {
             out.extend_from_slice(&t.artist.to_le_bytes());
             out.extend_from_slice(&t.album.to_le_bytes());
             out.extend_from_slice(&t.album_artist.to_le_bytes());
+            out.extend_from_slice(&t.genre.to_le_bytes());
             out.extend_from_slice(&t.folder.to_le_bytes());
             out.extend_from_slice(&t.track_no.to_le_bytes());
             out.extend_from_slice(&t.disc_no.to_le_bytes());
@@ -795,6 +863,13 @@ pub mod build {
             out.extend_from_slice(&soff.to_le_bytes());
             out.extend_from_slice(&slen.to_le_bytes());
         }
+        debug_assert_eq!(out.len(), genres_off);
+
+        // --- Genre name refs (StrRef per genre id) ---
+        for (noff, nlen) in &genre_names {
+            out.extend_from_slice(&noff.to_le_bytes());
+            out.extend_from_slice(&nlen.to_le_bytes());
+        }
         debug_assert_eq!(out.len(), folders_off);
 
         // --- Folder records (path StrRef + parent, per folder id) ---
@@ -812,6 +887,7 @@ pub mod build {
             &artist_album_track,
             &album_order,
             &folder_order,
+            &genre_order,
         ] {
             for &id in order {
                 out.extend_from_slice(&id.to_le_bytes());

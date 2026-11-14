@@ -131,6 +131,7 @@ fn track_input(t: &TrackData) -> TrackInput {
         artist: t.artist,
         album: t.album,
         album_artist: t.album_artist,
+        genre: 0,
         folder: t.folder,
         track_no: t.track,
         disc_no: t.disc,
@@ -147,6 +148,7 @@ fn to_input(m: &MemberData) -> CatalogInput {
         tracks: m.tracks.iter().map(track_input).collect(),
         artists: m.artists.iter().map(|a| (*a).into()).collect(),
         artist_sorts: Vec::new(),
+        genres: Vec::new(),
         albums: m
             .albums
             .iter()
@@ -281,6 +283,14 @@ fn fields(cat: &dyn Catalog, axis: BrowseAxis, id: u32) -> String {
                 t.disc_no,
                 t.track_no
             )
+        }
+        BrowseAxis::Genre => {
+            let mut buf = [0u8; 256];
+            let name = cat
+                .genre_name(t.genre, &mut buf)
+                .map(|n| String::from_utf8_lossy(&buf[..n]).into_owned())
+                .unwrap_or_default();
+            format!("{name}|{}|{}", t.disc_no, t.track_no)
         }
     }
 }
@@ -417,6 +427,7 @@ fn merge_orders_albums_chronologically_across_sources() {
                 artist: 0,
                 album: 0,
                 album_artist: 0,
+                genre: 0,
                 folder: 1,
                 track_no: 1,
                 disc_no: 1,
@@ -427,6 +438,7 @@ fn merge_orders_albums_chronologically_across_sources() {
             }],
             artists: vec![artist.into()],
             artist_sorts: Vec::new(),
+            genres: Vec::new(),
             albums: vec![AlbumMeta {
                 title: album.into(),
                 album_artist: 0,
@@ -480,6 +492,7 @@ fn merge_orders_artists_by_sort_name_across_sources() {
                 artist: 0,
                 album: 0,
                 album_artist: 0,
+                genre: 0,
                 folder: 1,
                 track_no: 1,
                 disc_no: 1,
@@ -490,6 +503,7 @@ fn merge_orders_artists_by_sort_name_across_sources() {
             }],
             artists: vec![artist.into()],
             artist_sorts: vec![sort.into()],
+            genres: Vec::new(),
             albums: vec![AlbumMeta {
                 title: album.into(),
                 album_artist: 0,
@@ -537,6 +551,80 @@ fn merge_orders_artists_by_sort_name_across_sources() {
         vec!["clapton_track".to_string(), "eno_track".to_string()],
         "sort-name order (Clapton < Eno) reverses display order, across sources"
     );
+}
+
+/// Tracks order by **genre** collation across sources, and the merge honors it
+/// in the head comparator (not just the baker). Source A is genre "Rock"; source
+/// B is genre "Ambient". By collation "Ambient" (a) precedes "Rock" (r), so the
+/// merge must emit Ambient's track first even though it lives on the second
+/// source — the genre key, not the source order, drives the grouping.
+#[test]
+fn merge_orders_tracks_by_genre_across_sources() {
+    fn one_genre(genre: &str, track: &str) -> CatalogInput {
+        CatalogInput {
+            tracks: vec![TrackInput {
+                title: track.into(),
+                artist: 0,
+                album: 0,
+                album_artist: 0,
+                genre: 0,
+                folder: 1,
+                track_no: 1,
+                disc_no: 1,
+                duration_ms: 0,
+                sample_rate: 44_100,
+                channels: 2,
+                file_name: format!("{track}.flac"),
+            }],
+            artists: vec!["Artist".into()],
+            artist_sorts: Vec::new(),
+            genres: vec![genre.into()],
+            albums: vec![AlbumMeta {
+                title: "Album".into(),
+                album_artist: 0,
+                year: 0,
+                folder: 1,
+            }],
+            folders: vec![
+                FolderInput {
+                    path: String::new(),
+                    parent: NO_FOLDER,
+                },
+                FolderInput {
+                    path: genre.into(),
+                    parent: 0,
+                },
+            ],
+            playlists: vec![],
+            covers: vec![],
+        }
+    }
+    let a: &'static [u8] = Vec::leak(write_index(&one_genre("Rock", "rock_track")));
+    let b: &'static [u8] = Vec::leak(write_index(&one_genre("Ambient", "ambient_track")));
+    let multi = MultiCatalog::new(vec![
+        Box::new(IndexReader::new(SliceSource::new(a))) as Box<dyn Catalog + Send>,
+        Box::new(IndexReader::new(SliceSource::new(b))) as Box<dyn Catalog + Send>,
+    ]);
+    // Aggregated genre count is the sum across sources.
+    assert_eq!(multi.genre_count(), 2);
+    let order: Vec<String> = (0..multi.order_len(BrowseAxis::Genre))
+        .map(|i| {
+            let id = multi.order(BrowseAxis::Genre, i).unwrap();
+            resolve(&multi, multi.track(id).unwrap().title)
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec!["ambient_track".to_string(), "rock_track".to_string()],
+        "genre collation (Ambient < Rock) drives order across sources"
+    );
+    // Each track's genre id resolves to its source's genre name through the
+    // aggregate (compound-id routing).
+    let id0 = multi.order(BrowseAxis::Genre, 0).unwrap();
+    let g = multi.track(id0).unwrap().genre;
+    let mut buf = [0u8; 64];
+    let n = multi.genre_name(g, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"Ambient");
 }
 
 /// `unpack(pack(s, l)) == (s, l)` across the valid ranges.

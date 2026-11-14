@@ -267,6 +267,8 @@ pub fn scan(root: &Path) -> std::io::Result<CatalogInput> {
             artist,
             album,
             album_artist,
+            // Genre is populated from tags in a later change; untagged for now.
+            genre: 0,
             folder,
             track_no: tags.track.unwrap_or(0) as u16,
             disc_no: tags.disc.unwrap_or(1) as u16,
@@ -288,6 +290,7 @@ pub fn scan(root: &Path) -> std::io::Result<CatalogInput> {
         tracks,
         artists: interner.artists,
         artist_sorts: interner.artist_sorts,
+        genres: Vec::new(),
         albums: interner.albums,
         folders: interner.folders,
         playlists: Vec::new(),
