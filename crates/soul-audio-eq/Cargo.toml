@@ -1,0 +1,17 @@
+[package]
+name = "soul-audio-eq"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Portable no_std parametric-EQ coefficient design (RBJ bell/shelf/cut/notch) + magnitude response, shared by the desktop host and the DAP firmware. Applies through soul-audio-core's Equalizer; the only transcendental math is libm."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Kernel primitive this designs coefficients for (Biquad/Equalizer applies them).
+soul-audio-core = { path = "../soul-audio-core" }
+# Software transcendentals (sin/cos/pow/sqrt/log) so the RBJ design runs no_std on
+# the DAP exactly as on the desktop. Pure Rust, no_std, cross-builds to thumbv7em.
+libm = "0.2"
