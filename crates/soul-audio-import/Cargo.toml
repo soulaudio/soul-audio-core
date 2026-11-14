@@ -15,3 +15,9 @@ soul-audio-catalog = { path = "../soul-audio-catalog" }
 soul-audio-index = { path = "../soul-audio-index", features = ["build"] }
 soul-audio-tags = { path = "../soul-audio-tags", features = ["std"] }
 embedded-io-adapters = { workspace = true, features = ["std"] }
+
+# Scan performance signal (incremental cache + parallel extraction). Hand-rolled
+# timer, no criterion — matches the repo's other benches' minimal-dep convention.
+[[bench]]
+name = "scan"
+harness = false
