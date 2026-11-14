@@ -3,7 +3,9 @@
 
 use std::path::{Path, PathBuf};
 
-use soul_audio_import::{ScanCache, ScanPhase, ScanProgress, bake, scan_incremental};
+use soul_audio_import::{
+    ScanCache, ScanPhase, ScanProgress, bake, scan_incremental, scan_incremental_throttled,
+};
 use soul_audio_index::build::write_index;
 
 fn testdata(name: &str) -> PathBuf {
@@ -109,6 +111,33 @@ fn thread_count_does_not_change_the_result() {
         write_index(&many.input),
         "parallel extraction must be deterministic (results placed in walk order)"
     );
+}
+
+#[test]
+fn throttled_scan_bakes_identical_index_under_a_changing_target() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = fresh_dir("throttled");
+    // Enough files that a target change can land while extraction is in flight.
+    for i in 0..40 {
+        std::fs::copy(testdata("complex.flac"), root.join(format!("{i:03}.flac"))).unwrap();
+    }
+    let target = AtomicUsize::new(1);
+    std::thread::scope(|s| {
+        // Move the concurrency target around while the scan runs.
+        s.spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(4));
+            target.store(16, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(4));
+            target.store(2, Ordering::SeqCst);
+        });
+        let out = scan_incremental_throttled(&root, &ScanCache::default(), 16, &target, &mut noop)
+            .unwrap();
+        assert_eq!(
+            write_index(&out.input),
+            bake(&root).unwrap(),
+            "a throttled scan whose target moves mid-run still bakes a byte-identical index"
+        );
+    });
 }
 
 #[test]

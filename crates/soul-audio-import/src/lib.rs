@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use soul_audio_catalog::NO_FOLDER;
 use soul_audio_index::build::{AlbumMeta, CatalogInput, FolderInput, TrackInput};
@@ -473,41 +474,77 @@ pub struct ScanOutcome {
     pub removed: Vec<PathBuf>,
 }
 
-/// Extract `paths` in parallel across `threads` scoped workers (oversubscribe for
-/// the I/O-bound small reads — the OS reorders the queued reads by physical
-/// location, so this scales on HDD *and* SSD). Work-stealing via an atomic cursor
-/// for load balance; results are placed back in `paths` order (deterministic
-/// regardless of which worker read which file). `progress(done, total)` is polled
-/// from the calling thread while the workers run.
-fn parallel_extract(
-    paths: &[PathBuf],
-    threads: usize,
+/// How often (ms) an over-target worker re-checks whether a concurrency permit has
+/// freed up. Short enough that lowering/raising the target takes effect promptly,
+/// long enough that idling workers don't busy-spin.
+const POOL_POLL_MS: u64 = 5;
+
+/// Run `work(i)` for every `i` in `0..n` across up to `max_threads` scoped workers,
+/// but with **at most `target` running at once** — and `target` is re-read *per
+/// item*, so the active concurrency follows a limit that changes mid-run (a machine
+/// that gets busy can throttle a scan already in flight, and free up again later).
+/// Results are placed back in `0..n` order, deterministic regardless of which worker
+/// ran which index. `progress(done, total)` is polled from the calling thread.
+///
+/// The limit is a soft dynamic semaphore: a worker takes a permit (a CAS on a shared
+/// active count) only while `active < target`, otherwise it idles [`POOL_POLL_MS`]
+/// and re-checks. `target` is clamped to `1..=max_threads`, so there is always at
+/// least one runnable worker (no stall) and never more than the ceiling.
+fn run_adaptive_pool<T, F>(
+    n: usize,
+    max_threads: usize,
+    target: &AtomicUsize,
+    work: F,
     progress: &mut dyn FnMut(usize, usize),
-) -> Vec<RawTrack> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let n = paths.len();
+) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize) -> T + Sync,
+{
     if n == 0 {
         return Vec::new();
     }
-    let nthreads = threads.max(1).min(n);
+    let nthreads = max_threads.max(1).min(n);
     let cursor = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
-    let mut slots: Vec<Option<RawTrack>> = (0..n).map(|_| None).collect();
+    let active = AtomicUsize::new(0);
+    let mut slots: Vec<Option<T>> = (0..n).map(|_| None).collect();
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..nthreads)
             .map(|_| {
-                let cursor = &cursor;
-                let done = &done;
+                let (cursor, done, active, work) = (&cursor, &done, &active, &work);
                 scope.spawn(move || {
-                    let mut local: Vec<(usize, RawTrack)> = Vec::new();
+                    let mut local: Vec<(usize, T)> = Vec::new();
                     loop {
-                        let i = cursor.fetch_add(1, Ordering::Relaxed);
-                        if i >= paths.len() {
-                            break;
+                        // Acquire a permit: run only while under the live target.
+                        loop {
+                            let t = target.load(Ordering::Relaxed).clamp(1, nthreads);
+                            let a = active.load(Ordering::Relaxed);
+                            if a < t {
+                                if active
+                                    .compare_exchange_weak(
+                                        a,
+                                        a + 1,
+                                        Ordering::Relaxed,
+                                        Ordering::Relaxed,
+                                    )
+                                    .is_ok()
+                                {
+                                    break; // permit held
+                                }
+                                // lost the race for the slot — retry immediately
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_millis(POOL_POLL_MS));
+                            }
                         }
-                        let rt = extract_raw(&paths[i]);
-                        local.push((i, rt));
+                        let i = cursor.fetch_add(1, Ordering::Relaxed);
+                        if i >= n {
+                            active.fetch_sub(1, Ordering::Relaxed);
+                            break; // no work left — release the permit and finish
+                        }
+                        local.push((i, work(i)));
                         done.fetch_add(1, Ordering::Relaxed);
+                        active.fetch_sub(1, Ordering::Relaxed); // release before re-acquiring
                     }
                     local
                 })
@@ -523,15 +560,35 @@ fn parallel_extract(
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
         for h in handles {
-            for (i, rt) in h.join().expect("extract worker panicked") {
-                slots[i] = Some(rt);
+            for (i, v) in h.join().expect("adaptive pool worker panicked") {
+                slots[i] = Some(v);
             }
         }
     });
     slots
         .into_iter()
-        .map(|o| o.expect("every index extracted"))
+        .map(|o| o.expect("every index produced a result"))
         .collect()
+}
+
+/// Extract `paths` in parallel, honouring a live concurrency `target` (see
+/// [`run_adaptive_pool`]). Oversubscribe `max_threads` for the I/O-bound small reads
+/// (the OS reorders queued reads by physical location, so this scales on HDD *and*
+/// SSD); the `target` throttles how many actually run at once. Results in `paths`
+/// order. `progress(done, total)` is polled from the calling thread.
+fn parallel_extract(
+    paths: &[PathBuf],
+    max_threads: usize,
+    target: &AtomicUsize,
+    progress: &mut dyn FnMut(usize, usize),
+) -> Vec<RawTrack> {
+    run_adaptive_pool(
+        paths.len(),
+        max_threads,
+        target,
+        |i| extract_raw(&paths[i]),
+        progress,
+    )
 }
 
 /// Incrementally scan `root`: walk + `stat`, diff against `prior` (so unchanged
@@ -541,11 +598,38 @@ fn parallel_extract(
 ///
 /// `threads` sets the extraction parallelism (oversubscribe, e.g. 8–32, for the
 /// I/O-bound reads). `progress` fires through the [`Discovering`](ScanPhase::Discovering)
-/// then [`Extracting`](ScanPhase::Extracting) phases.
+/// then [`Extracting`](ScanPhase::Extracting) phases. For a parallelism that adapts
+/// *while the scan runs*, use [`scan_incremental_throttled`].
 pub fn scan_incremental(
     root: &Path,
     prior: &ScanCache,
     threads: usize,
+    progress: &mut dyn FnMut(ScanProgress),
+) -> std::io::Result<ScanOutcome> {
+    let threads = threads.max(1);
+    scan_incremental_inner(root, prior, threads, &AtomicUsize::new(threads), progress)
+}
+
+/// Like [`scan_incremental`], but the extraction parallelism follows a **live**
+/// `target` (clamped to `1..=max_threads`) that the caller may change *during* the
+/// scan — so a desktop head can throttle an in-flight scan when the machine gets
+/// busy and open it back up when it frees. The output is identical to
+/// [`scan_incremental`] for the same tree regardless of how `target` moves.
+pub fn scan_incremental_throttled(
+    root: &Path,
+    prior: &ScanCache,
+    max_threads: usize,
+    target: &AtomicUsize,
+    progress: &mut dyn FnMut(ScanProgress),
+) -> std::io::Result<ScanOutcome> {
+    scan_incremental_inner(root, prior, max_threads, target, progress)
+}
+
+fn scan_incremental_inner(
+    root: &Path,
+    prior: &ScanCache,
+    max_threads: usize,
+    target: &AtomicUsize,
     progress: &mut dyn FnMut(ScanProgress),
 ) -> std::io::Result<ScanOutcome> {
     // 1. Discovery: walk (sorted, deterministic) + stat each file.
@@ -595,7 +679,7 @@ pub fn scan_incremental(
         .collect();
 
     // 3. Extract the new/changed files in parallel.
-    let fresh = parallel_extract(&to_extract, threads, &mut |done, total| {
+    let fresh = parallel_extract(&to_extract, max_threads, target, &mut |done, total| {
         progress(ScanProgress {
             phase: ScanPhase::Extracting,
             done,
@@ -671,4 +755,129 @@ pub fn export(root: &Path, out_dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join(INDEX_FILE), &bytes)?;
     std::fs::write(dir.join(ART_FILE), &art_blob)
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::run_adaptive_pool;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// A work closure that records peak concurrency: bump an active counter, note
+    /// the peak, dwell briefly, release. Returns the item index (so result order is
+    /// checkable too).
+    fn concurrency_probe<'a>(
+        active: &'a AtomicUsize,
+        peak: &'a AtomicUsize,
+        dwell: Duration,
+    ) -> impl Fn(usize) -> usize + Sync + 'a {
+        move |i| {
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(dwell);
+            active.fetch_sub(1, Ordering::SeqCst);
+            i
+        }
+    }
+
+    #[test]
+    fn never_exceeds_the_live_target_and_keeps_order() {
+        let target = AtomicUsize::new(2);
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let n = 200;
+        let out = run_adaptive_pool(
+            n,
+            16, // ceiling well above the target
+            &target,
+            concurrency_probe(&active, &peak, Duration::from_millis(1)),
+            &mut |_, _| {},
+        );
+        assert_eq!(
+            out,
+            (0..n).collect::<Vec<_>>(),
+            "results come back in order"
+        );
+        assert!(
+            peak.load(Ordering::SeqCst) <= 2,
+            "never more than target=2 ran concurrently (peak {})",
+            peak.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn widens_when_the_target_is_raised_mid_run() {
+        let target = AtomicUsize::new(1);
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let n = 600;
+        std::thread::scope(|s| {
+            // Raise the limit partway through — the running pool must pick it up.
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(40));
+                target.store(8, Ordering::SeqCst);
+            });
+            let out = run_adaptive_pool(
+                n,
+                16,
+                &target,
+                concurrency_probe(&active, &peak, Duration::from_millis(2)),
+                &mut |_, _| {},
+            );
+            assert_eq!(out, (0..n).collect::<Vec<_>>());
+        });
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak > 1,
+            "concurrency rose above the initial target of 1 after it was raised (peak {peak})"
+        );
+        assert!(
+            peak <= 8,
+            "but never above the raised target of 8 (peak {peak})"
+        );
+    }
+
+    #[test]
+    fn narrows_when_the_target_is_lowered_mid_run() {
+        let target = AtomicUsize::new(8);
+        let active = AtomicUsize::new(0);
+        // Record the peak only AFTER the target has been lowered, to prove the pool
+        // backs off (not just that it started wide).
+        let settled = AtomicUsize::new(0); // 0 until lowered, then 1
+        let peak_after = AtomicUsize::new(0);
+        let n = 800;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(40));
+                target.store(2, Ordering::SeqCst);
+                // Give in-flight items time to drain to the new target before we
+                // start sampling the post-lowering peak.
+                std::thread::sleep(Duration::from_millis(40));
+                settled.store(1, Ordering::SeqCst);
+            });
+            let probe = |i: usize| {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                if settled.load(Ordering::SeqCst) == 1 {
+                    peak_after.fetch_max(now, Ordering::SeqCst);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+                active.fetch_sub(1, Ordering::SeqCst);
+                i
+            };
+            let out = run_adaptive_pool(n, 16, &target, probe, &mut |_, _| {});
+            assert_eq!(out, (0..n).collect::<Vec<_>>());
+        });
+        let peak_after = peak_after.load(Ordering::SeqCst);
+        assert!(
+            peak_after <= 2,
+            "after the target was lowered to 2, concurrency backed off (peak-after {peak_after})"
+        );
+    }
+
+    #[test]
+    fn empty_input_is_a_no_op() {
+        let target = AtomicUsize::new(4);
+        let out = run_adaptive_pool(0, 8, &target, |i| i, &mut |_, _| {});
+        assert!(out.is_empty());
+    }
 }
