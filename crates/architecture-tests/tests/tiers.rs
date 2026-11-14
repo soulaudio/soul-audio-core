@@ -43,6 +43,7 @@ const MANIFEST: &[(&str, Tier)] = &[
     ("soul-audio-queue", Tier::NoStdAlloc),
     ("soul-audio-engine", Tier::NoStdAlloc),
     ("soul-audio-control", Tier::NoStdAlloc),
+    ("soul-audio-eq", Tier::NoStdAlloc), // RBJ coefficient design: no_std, no-alloc, uses libm
     // --- Firmware (DAP) ---
     ("soul-audio-firmware", Tier::Firmware),
     // --- Std adapters (desktop/server) ---
