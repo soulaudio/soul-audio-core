@@ -25,6 +25,7 @@ fn fixture() -> CatalogInput {
                 artist: 0,
                 album: 0,
                 album_artist: 0,
+                genre: 0,
                 folder: 1,
                 track_no: 1,
                 disc_no: 1,
@@ -38,6 +39,7 @@ fn fixture() -> CatalogInput {
                 artist: 0,
                 album: 0,
                 album_artist: 0,
+                genre: 0,
                 folder: 1,
                 track_no: 2,
                 disc_no: 1,
@@ -49,6 +51,7 @@ fn fixture() -> CatalogInput {
         ],
         artists: vec!["Kimiko Ishizaka".into()],
         artist_sorts: vec!["Ishizaka, Kimiko".into()],
+        genres: vec!["Classical".into()],
         albums: vec![AlbumMeta {
             title: "Open Goldberg Variations".into(),
             album_artist: 0,
@@ -116,6 +119,17 @@ fn soulidx_round_trips_tracks_order_and_playlists() {
     assert_eq!(rdr.artist_count(), 1);
     let n = rdr.artist_name(t0.artist, &mut buf).unwrap();
     assert_eq!(&buf[..n], b"Kimiko Ishizaka");
+
+    // Genre entity resolves through its id ref (v3), on the track record.
+    assert_eq!(rdr.genre_count(), 1);
+    assert_eq!(t0.genre, 0);
+    let n = rdr.genre_name(t0.genre, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"Classical");
+    // Out-of-range genre id is rejected, not UB.
+    assert_eq!(
+        rdr.genre_name(1, &mut buf),
+        Err(soul_audio_catalog::CatalogError::OutOfRange)
+    );
     assert_eq!(rdr.album_count(), 1);
     let album = rdr.album(t0.album).expect("album 0");
     assert_eq!(
@@ -151,6 +165,7 @@ fn baked_title_order_is_collation_sorted() {
             artist: 0,
             album: 0,
             album_artist: 0,
+            genre: 0,
             folder: 0,
             track_no: 0,
             disc_no: 1,
@@ -164,6 +179,7 @@ fn baked_title_order_is_collation_sorted() {
         tracks,
         artists: vec!["A".to_string()],
         artist_sorts: Vec::new(),
+        genres: Vec::new(),
         albums: vec![AlbumMeta {
             title: "A".to_string(),
             album_artist: 0,
@@ -222,6 +238,7 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
                 artist: 0,
                 album: 0,
                 album_artist: 0,
+                genre: 0,
                 folder: 0,
                 track_no: 1,
                 disc_no: 1,
@@ -235,6 +252,7 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
                 artist: 0,
                 album: 1,
                 album_artist: 0,
+                genre: 0,
                 folder: 0,
                 track_no: 1,
                 disc_no: 1,
@@ -246,6 +264,7 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
         ],
         artists: vec!["Artist".into()],
         artist_sorts: Vec::new(),
+        genres: Vec::new(),
         albums: vec![
             AlbumMeta {
                 title: "Covered Album".into(),
@@ -318,6 +337,7 @@ fn artist_album_track_orders_by_sort_name() {
                 artist: 0,
                 album: 0,
                 album_artist: 0,
+                genre: 0,
                 folder: 0,
                 track_no: 1,
                 disc_no: 1,
@@ -331,6 +351,7 @@ fn artist_album_track_orders_by_sort_name() {
                 artist: 1,
                 album: 1,
                 album_artist: 1,
+                genre: 0,
                 folder: 0,
                 track_no: 1,
                 disc_no: 1,
@@ -342,6 +363,7 @@ fn artist_album_track_orders_by_sort_name() {
         ],
         artists: vec!["Brian Eno".into(), "Eric Clapton".into()],
         artist_sorts: vec!["Eno, Brian".into(), "Clapton, Eric".into()],
+        genres: Vec::new(),
         albums: vec![
             AlbumMeta {
                 title: "Here Come the Warm Jets".into(),
@@ -398,6 +420,7 @@ fn artist_sort_name_falls_back_to_display_when_untagged() {
             artist: 0,
             album: 0,
             album_artist: 0,
+            genre: 0,
             folder: 0,
             track_no: 1,
             disc_no: 1,
@@ -408,6 +431,7 @@ fn artist_sort_name_falls_back_to_display_when_untagged() {
         }],
         artists: vec!["Miles Davis".into()],
         artist_sorts: Vec::new(),
+        genres: Vec::new(),
         albums: vec![AlbumMeta {
             title: "Kind of Blue".into(),
             album_artist: 0,
@@ -426,4 +450,81 @@ fn artist_sort_name_falls_back_to_display_when_untagged() {
     let mut buf = [0u8; 128];
     let n = rdr.artist_sort_name(0, &mut buf).unwrap();
     assert_eq!(&buf[..n], b"Miles Davis");
+}
+
+#[test]
+fn baked_genre_order_groups_by_genre_collation() {
+    // Two genres whose COLLATION order is the reverse of their id order:
+    //   id 0 = "Rock"    (r…)
+    //   id 1 = "Ambient" (a…)
+    // The Genre browse axis groups tracks by genre collation key, so every
+    // "Ambient" track (id 1) precedes every "Rock" track (id 0) — the opposite
+    // of id order — and within a genre the ArtistAlbumTrack chain (here same
+    // artist/album → track number) orders the tracks.
+    fn track(title: &str, genre: u32, track_no: u16) -> TrackInput {
+        TrackInput {
+            title: title.into(),
+            artist: 0,
+            album: 0,
+            album_artist: 0,
+            genre,
+            folder: 0,
+            track_no,
+            disc_no: 1,
+            duration_ms: 0,
+            sample_rate: 44_100,
+            channels: 2,
+            file_name: format!("{title}.flac"),
+        }
+    }
+    let input = CatalogInput {
+        tracks: vec![
+            track("r_track_a", 0, 1),
+            track("a_track", 1, 1),
+            track("r_track_b", 0, 2),
+        ],
+        artists: vec!["Artist".into()],
+        artist_sorts: Vec::new(),
+        genres: vec!["Rock".into(), "Ambient".into()],
+        albums: vec![AlbumMeta {
+            title: "Album".into(),
+            album_artist: 0,
+            year: 2000,
+            folder: 0,
+        }],
+        folders: vec![FolderInput {
+            path: String::new(),
+            parent: NO_FOLDER,
+        }],
+        playlists: vec![],
+        covers: Vec::new(),
+    };
+    let bytes = write_index(&input);
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+    let mut buf = [0u8; 128];
+
+    // Genre table round-trips: count + names by id.
+    assert_eq!(rdr.genre_count(), 2);
+    let n = rdr.genre_name(0, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"Rock");
+    let n = rdr.genre_name(1, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"Ambient");
+
+    // Each track record carries the right genre id.
+    assert_eq!(rdr.track(0).unwrap().genre, 0);
+    assert_eq!(rdr.track(1).unwrap().genre, 1);
+    assert_eq!(rdr.track(2).unwrap().genre, 0);
+
+    // Walking the Genre axis yields tracks grouped by genre collation order:
+    // Ambient (id 1) first, then Rock (id 0) by track number.
+    assert_eq!(rdr.order_len(BrowseAxis::Genre), 3);
+    let order: Vec<String> = (0..rdr.order_len(BrowseAxis::Genre))
+        .map(|i| {
+            let tid = rdr.order(BrowseAxis::Genre, i).unwrap();
+            let title = rdr.track(tid).unwrap().title;
+            let n = rdr.resolve_str(title, &mut buf).unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        })
+        .collect();
+    assert_eq!(order, vec!["a_track", "r_track_a", "r_track_b"]);
 }

@@ -77,7 +77,7 @@ fn index_reader_does_not_allocate() {
     use soul_audio_core::SliceSource;
     use soul_audio_index::IndexReader;
 
-    let bytes = *b"SIDX\x01\x00"; // magic + format version
+    let bytes = *b"SIDX\x03\x00"; // magic + format version (v3)
     let reader = IndexReader::new(SliceSource::new(&bytes));
     let mut buf = [0u8; 64];
 
@@ -86,9 +86,11 @@ fn index_reader_does_not_allocate() {
     let _ = reader.track_count();
     let _ = reader.album_count();
     let _ = reader.artist_count();
+    let _ = reader.genre_count();
     let _ = reader.track(0);
     let _ = reader.album(0);
     let _ = reader.artist_name(0, &mut buf);
+    let _ = reader.genre_name(0, &mut buf);
     let _ = reader.resolve_str(StrRef::default(), &mut buf);
     let _ = reader.order_len(BrowseAxis::Title);
     let _ = reader.order(BrowseAxis::ArtistAlbumTrack, 0);

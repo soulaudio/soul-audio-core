@@ -14,6 +14,7 @@ pub struct Track {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    pub genre: Option<String>,
     pub duration_secs: f64,
 }
 
@@ -120,13 +121,14 @@ impl Library {
             .into_iter()
             .enumerate()
             .map(|(i, path)| {
-                let (title, artist, album, duration_secs) = read_tags(&path);
+                let (title, artist, album, genre, duration_secs) = read_tags(&path);
                 Track {
                     id: i as u32,
                     path,
                     title,
                     artist,
                     album,
+                    genre,
                     duration_secs,
                 }
             })
@@ -150,13 +152,14 @@ impl Library {
                 title: t.title.clone(),
                 artist: t.artist.clone(),
                 album: t.album.clone(),
+                genre: t.genre.clone(),
                 duration_secs: t.duration_secs,
             })
             .collect()
     }
 }
 
-/// Read (title, artist, album, duration_secs) with `soul-audio-tags`;
+/// Read (title, artist, album, genre, duration_secs) with `soul-audio-tags`;
 /// all-`None`/`0.0` on any read error (a corrupt tag must not sink the scan).
 /// Cover art is NOT probed here — it is resolved lazily per track by
 /// [`crate::cover_bytes`] (embedded *or* external), so an eager flag here would
@@ -168,16 +171,30 @@ impl Library {
 /// falls back to `0.0` (lofty used to compute this from Xing/granule data).
 /// Fixing that (Xing header / Opus granule-position duration) is a follow-up,
 /// not in scope here.
-fn read_tags(path: &Path) -> (Option<String>, Option<String>, Option<String>, f64) {
+fn read_tags(
+    path: &Path,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    f64,
+) {
     use soul_audio_tags::read_owned;
 
     let Ok(file) = std::fs::File::open(path) else {
-        return (None, None, None, 0.0);
+        return (None, None, None, None, 0.0);
     };
     let mut src = embedded_io_adapters::std::FromStd::new(file);
     match read_owned(&mut src) {
-        Ok((tags, facts)) => (tags.title, tags.artist, tags.album, duration_secs(&facts)),
-        Err(_) => (None, None, None, 0.0),
+        Ok((tags, facts)) => (
+            tags.title,
+            tags.artist,
+            tags.album,
+            tags.genre,
+            duration_secs(&facts),
+        ),
+        Err(_) => (None, None, None, None, 0.0),
     }
 }
 
@@ -284,6 +301,58 @@ mod tests {
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].id, lib.tracks[0].id);
         assert_eq!(views[0].duration_secs, lib.tracks[0].duration_secs);
+    }
+
+    /// Minimal FLAC bytes: STREAMINFO + a VORBIS_COMMENT (last block) carrying
+    /// the given `KEY=VALUE` comments — enough for the tag read, no audio.
+    fn flac_with_comments(comments: &[&str]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"fLaC");
+        // STREAMINFO (type 0), 34-byte body, not last.
+        v.push(0x00);
+        v.extend_from_slice(&[0, 0, 34]);
+        let mut si = [0u8; 34];
+        let (sr, ch, bps, total): (u32, u32, u32, u64) = (44_100, 2, 16, 88_200);
+        si[10] = (sr >> 12) as u8;
+        si[11] = (sr >> 4) as u8;
+        si[12] =
+            (((sr & 0xF) as u8) << 4) | ((((ch - 1) & 0x7) as u8) << 1) | (((bps - 1) >> 4) as u8);
+        si[13] = ((((bps - 1) & 0xF) as u8) << 4) | (((total >> 32) & 0xF) as u8);
+        si[14] = (total >> 24) as u8;
+        si[15] = (total >> 16) as u8;
+        si[16] = (total >> 8) as u8;
+        si[17] = total as u8;
+        v.extend_from_slice(&si);
+        // VORBIS_COMMENT (type 4), LAST block (0x80 | 4 = 0x84).
+        let mut vc = Vec::new();
+        vc.extend_from_slice(&6u32.to_le_bytes());
+        vc.extend_from_slice(b"vendor");
+        vc.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+        for c in comments {
+            vc.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            vc.extend_from_slice(c.as_bytes());
+        }
+        v.push(0x84);
+        v.extend_from_slice(&(vc.len() as u32).to_be_bytes()[1..]);
+        v.extend_from_slice(&vc);
+        v
+    }
+
+    #[test]
+    fn views_carry_genre_from_tags_and_none_when_untagged() {
+        let root = tmpdir("genre");
+        // Sorted walk: a.flac (genre-tagged) before b.flac (no genre tag).
+        std::fs::write(
+            root.join("a.flac"),
+            flac_with_comments(&["TITLE=Tagged", "GENRE=Jazz"]),
+        )
+        .unwrap();
+        std::fs::write(root.join("b.flac"), flac_with_comments(&["TITLE=Plain"])).unwrap();
+        let lib = Library::scan(&root).unwrap();
+        let views = lib.views();
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].genre.as_deref(), Some("Jazz"), "tag flows to view");
+        assert_eq!(views[1].genre, None, "untagged track has no genre");
     }
     /// Path to a committed `testdata/` fixture (relative to the workspace).
     fn fixture(name: &str) -> PathBuf {

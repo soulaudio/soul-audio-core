@@ -34,8 +34,8 @@ use std::collections::BinaryHeap;
 use std::sync::Mutex;
 
 use soul_audio_catalog::{
-    AlbumId, AlbumRec, ArtistId, BrowseAxis, Catalog, CatalogError, FolderId, FolderRec, NO_FOLDER,
-    PlaylistId, StrRef, TrackId, TrackRec,
+    AlbumId, AlbumRec, ArtistId, BrowseAxis, Catalog, CatalogError, FolderId, FolderRec, GenreId,
+    NO_FOLDER, PlaylistId, StrRef, TrackId, TrackRec,
 };
 use soul_audio_index::collation::key;
 
@@ -53,7 +53,7 @@ pub const MAX_LOCAL_ID: u32 = PAYLOAD_MASK;
 
 /// Number of pre-sorted browse axes (`BrowseAxis` variants). Keep in sync with
 /// [`axis_index`].
-const AXIS_COUNT: usize = 4;
+const AXIS_COUNT: usize = 5;
 
 /// Pack a `(source, local)` pair into a compound id: source in the high
 /// [`SOURCE_BITS`], `local` in the low [`PAYLOAD_BITS`].
@@ -78,6 +78,7 @@ fn axis_index(a: BrowseAxis) -> usize {
         BrowseAxis::ArtistAlbumTrack => 1,
         BrowseAxis::Album => 2,
         BrowseAxis::Folder => 3,
+        BrowseAxis::Genre => 4,
     }
 }
 
@@ -229,6 +230,23 @@ impl MultiCatalog {
                     rec.track_no,
                 )
             }
+            BrowseAxis::Genre => {
+                // Primary key is the genre name (the baker keys the Genre order
+                // table on it too). A union genre id belongs to exactly one
+                // source, so `(source, group0 = genre id)` keeps a genre's tracks
+                // contiguous and the baker's deeper within-genre chain stays
+                // intra-source — reproduced by that member's frozen stream.
+                let genre = resolve_name(|buf| m.genre_name(rec.genre, buf))?;
+                (
+                    key(&genre),
+                    rec.genre,
+                    0u16,
+                    Vec::new(),
+                    0u32,
+                    rec.disc_no,
+                    rec.track_no,
+                )
+            }
         };
         Ok(Head {
             primary,
@@ -315,6 +333,15 @@ impl Catalog for MultiCatalog {
         self.members.iter().map(|m| m.artist_count()).sum()
     }
 
+    fn genre_count(&self) -> u32 {
+        self.members.iter().map(|m| m.genre_count()).sum()
+    }
+
+    fn genre_name(&self, id: GenreId, buf: &mut [u8]) -> Result<usize, CatalogError> {
+        let (s, local) = unpack(id);
+        self.member(s)?.genre_name(local, buf)
+    }
+
     fn track(&self, id: TrackId) -> Result<TrackRec, CatalogError> {
         let (s, local) = unpack(id);
         let mut r = self.member(s)?.track(local)?;
@@ -322,6 +349,7 @@ impl Catalog for MultiCatalog {
         r.artist = pack(s, r.artist);
         r.album = pack(s, r.album);
         r.album_artist = pack(s, r.album_artist);
+        r.genre = pack(s, r.genre);
         r.folder = pack(s, r.folder);
         r.title.off = pack(s, r.title.off);
         r.file_name.off = pack(s, r.file_name.off);

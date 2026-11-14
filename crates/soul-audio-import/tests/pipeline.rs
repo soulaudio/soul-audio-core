@@ -185,6 +185,49 @@ fn flac_with_comments(comments: &[&str]) -> Vec<u8> {
 }
 
 #[test]
+fn scan_interns_genre_from_tags_and_bakes_it() {
+    let root = std::env::temp_dir().join(format!("soul_import_genre_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let a = root.join("Album A");
+    let b = root.join("Album B");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    // Track 0 carries a real GENRE tag; track 1 has none → the importer's
+    // "Unknown Genre" fallback. "Album A" < "Album B" fixes the walk order.
+    std::fs::write(
+        a.join("01.flac"),
+        flac_with_comments(&["TITLE=Genred", "GENRE=Jazz"]),
+    )
+    .unwrap();
+    std::fs::write(b.join("01.flac"), flac_with_comments(&["TITLE=Plain"])).unwrap();
+
+    // The baked genre string table + per-track genre id survive the read-back.
+    let bytes = soul_audio_import::bake(&root).expect("bake");
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+    let mut buf = [0u8; 128];
+
+    assert_eq!(rdr.track_count(), 2);
+    assert!(
+        rdr.genre_count() >= 1,
+        "the tagged genre interned into the index"
+    );
+
+    let genre_of = |id: u32, buf: &mut [u8; 128]| -> String {
+        let g = rdr.track(id).unwrap().genre;
+        let n = rdr.genre_name(g, buf).unwrap();
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    };
+    assert_eq!(genre_of(0, &mut buf), "Jazz", "real tag interned");
+    assert_eq!(
+        genre_of(1, &mut buf),
+        "Unknown Genre",
+        "untagged track falls back"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn scan_collects_sort_names_and_bakes_sort_order() {
     let root = std::env::temp_dir().join(format!("soul_import_sort_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
