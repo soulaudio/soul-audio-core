@@ -92,6 +92,10 @@ struct Interner {
     // to the display name and upgraded in place the first time an occurrence
     // carries a sort tag.
     artist_sorts: Vec<String>,
+    // Genre names have no sort variant (unlike artists), so a plain
+    // dedupe-by-name table — `genres[id]` is the display name for genre `id`.
+    genre_ids: HashMap<String, u32>,
+    genres: Vec<String>,
     folder_ids: HashMap<PathBuf, u32>,
     folders: Vec<FolderInput>,
     // album key = (title, folder id) → folder-isolation.
@@ -123,6 +127,20 @@ impl Interner {
         self.artist_sorts
             .push(sort.filter(|s| !s.is_empty()).unwrap_or(name).to_owned());
         self.artist_ids.insert(name.to_owned(), id);
+        id
+    }
+
+    /// Intern a genre by display `name`, returning its dense id. Unlike
+    /// [`Interner::artist`] there is no sort-name variant — genres collate on
+    /// the display name itself — so this is a plain dedupe-by-name, appending to
+    /// `genres` on first sight and returning the stable id otherwise.
+    fn genre(&mut self, name: &str) -> u32 {
+        if let Some(&id) = self.genre_ids.get(name) {
+            return id;
+        }
+        let id = self.genres.len() as u32;
+        self.genres.push(name.to_owned());
+        self.genre_ids.insert(name.to_owned(), id);
         id
     }
 
@@ -261,14 +279,22 @@ pub fn scan(root: &Path) -> std::io::Result<CatalogInput> {
             .unwrap_or(0);
         let album_dir = path.parent().unwrap_or(root);
         let album = interner.album(&album_name, folder, album_artist, year, album_dir, path);
+        // Genre from the tag, trimmed; blank/absent → the "Unknown Genre"
+        // bucket (mirrors the organize crate's template fallback).
+        let genre_name = tags
+            .genre
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Unknown Genre");
+        let genre = interner.genre(genre_name);
 
         tracks.push(TrackInput {
             title,
             artist,
             album,
             album_artist,
-            // Genre is populated from tags in a later change; untagged for now.
-            genre: 0,
+            genre,
             folder,
             track_no: tags.track.unwrap_or(0) as u16,
             disc_no: tags.disc.unwrap_or(1) as u16,
@@ -290,7 +316,7 @@ pub fn scan(root: &Path) -> std::io::Result<CatalogInput> {
         tracks,
         artists: interner.artists,
         artist_sorts: interner.artist_sorts,
-        genres: Vec::new(),
+        genres: interner.genres,
         albums: interner.albums,
         folders: interner.folders,
         playlists: Vec::new(),
