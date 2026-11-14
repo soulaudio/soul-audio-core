@@ -48,6 +48,9 @@ issue — see [SECURITY.md](SECURITY.md).
 
 ## Licensing
 
-By contributing, you agree that your contributions are dual-licensed under
-[MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE), the same as the project, with
-no additional terms.
+Soul Audio is licensed under the **[Apache License 2.0](LICENSE)**.
+
+By contributing, you agree that your contributions are licensed under the Apache
+License 2.0, the same as the project, with no additional terms. You keep the
+copyright in your own contribution. You must have the right to submit the code
+you contribute (it is your own work, or you have permission to contribute it).

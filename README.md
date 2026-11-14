@@ -308,3 +308,31 @@ resampling method. The AAC (LC/SBR/PS), Vorbis, and Opus decoders are written
 from scratch against their specifications (RFC 6716/7845/8251 for Opus) and
 cross-checked against ffmpeg and libopus; the Opus decoder additionally passes
 the RFC 8251 test vectors. Decode goldens generated with ffmpeg.
+
+## License
+
+Licensed under the **[Apache License 2.0](LICENSE)** — fully open source, free to
+use, modify, and redistribute, including in commercial and closed-source
+products. Copyright © 2026 datadir s. r. o. (Sebastián Stupák). See
+[LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+### Why open source
+
+We ship this in the open because we can get things wrong — and audio codecs are
+an easy place to get things wrong. We'd rather you could read the code, check our
+math, fix it, and build on it than take our word for it. The whole point is to
+let the community build on this effort — another player, an embedded target, a
+decoder you lift into your own project — instead of reinventing it from the specs.
+
+### Credit — a request, not a requirement
+
+If you ship something built on soul-audio-core, we'd genuinely love a visible
+mention — drop this anywhere users can see it (an About / Credits screen or your
+docs):
+
+> Powered by **[Soul Audio](https://github.com/soulaudio)**
+
+It's a courtesy we appreciate, not a license condition — and please also keep the
+upstream credits in **Credits** above. The name "Soul Audio" and the logo are
+trademarks of datadir s. r. o.; please use them to credit us, not in a way that
+implies we endorse your product.
