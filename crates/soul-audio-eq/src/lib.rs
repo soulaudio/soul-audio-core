@@ -17,7 +17,12 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::f32::consts::PI;
+use core::fmt::Write as _;
 
 use soul_audio_core::Biquad;
 
@@ -250,6 +255,120 @@ pub fn eq_magnitude_db(bands: &[Band], preamp_db: f32, freq: f32, fs: f32) -> f3
     db
 }
 
+// ---- AutoEQ / Equalizer APO "ParametricEQ.txt" interchange -------------------
+//
+// The de-facto community format (AutoEQ headphone-correction profiles, Equalizer
+// APO, Peace). Both heads import/export it; the DAP can load correction profiles
+// off its filesystem with the same parser.
+//
+//   Preamp: -6.8 dB
+//   Filter 1: ON PK Fc 105 Hz Gain 5.5 dB Q 0.70
+//   Filter 2: ON LSC Fc 105 Hz Gain 5.5 dB Q 0.70
+//   Filter 3: ON HP Fc 20 Hz Q 0.70
+
+/// The shape token's mapping, or `None` for a shape this EQ doesn't model.
+fn kind_from_token(tok: &str) -> Option<BandKind> {
+    Some(match tok {
+        "PK" | "PEQ" => BandKind::Peaking,
+        "LS" | "LSC" | "LSQ" => BandKind::LowShelf,
+        "HS" | "HSC" | "HSQ" => BandKind::HighShelf,
+        "HP" | "HPQ" => BandKind::LowCut, // high-pass attenuates the lows
+        "LP" | "LPQ" => BandKind::HighCut, // low-pass attenuates the highs
+        "NO" | "NOTCH" => BandKind::Notch,
+        _ => return None,
+    })
+}
+
+/// The canonical token for a shape (Equalizer-APO flavour).
+fn token_from_kind(kind: BandKind) -> &'static str {
+    match kind {
+        BandKind::Peaking => "PK",
+        BandKind::LowShelf => "LSC",
+        BandKind::HighShelf => "HSC",
+        BandKind::LowCut => "HP",
+        BandKind::HighCut => "LP",
+        BandKind::Notch => "NO",
+    }
+}
+
+/// The number following `key` in a whitespace-tokenised line (e.g. `Fc` → 105.0).
+fn value_after(tokens: &[&str], key: &str) -> Option<f32> {
+    tokens
+        .iter()
+        .position(|&t| t == key)
+        .and_then(|i| tokens.get(i + 1))
+        .and_then(|t| t.parse::<f32>().ok())
+}
+
+/// Parse an AutoEQ / Equalizer-APO ParametricEQ profile into `(preamp_db, bands)`.
+/// Unknown filter shapes and malformed lines are skipped; the result is otherwise
+/// taken verbatim (a head clamps to [`MAX_BANDS`] and the legal ranges).
+#[must_use]
+pub fn parse_autoeq(text: &str) -> (f32, Vec<Band>) {
+    let mut preamp = 0.0;
+    let mut bands = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Preamp:") {
+            if let Some(v) = rest.split_whitespace().next().and_then(|t| t.parse().ok()) {
+                preamp = v;
+            }
+        } else if line.starts_with("Filter") {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            // The shape token follows the ON/OFF state after "Filter N:".
+            let Some(state_at) = tokens.iter().position(|&t| t == "ON" || t == "OFF") else {
+                continue;
+            };
+            let enabled = tokens[state_at] == "ON";
+            let Some(kind) = tokens.get(state_at + 1).and_then(|t| kind_from_token(t)) else {
+                continue;
+            };
+            let Some(freq) = value_after(&tokens, "Fc") else {
+                continue;
+            };
+            bands.push(Band {
+                kind,
+                freq,
+                gain_db: value_after(&tokens, "Gain").unwrap_or(0.0),
+                q: value_after(&tokens, "Q").unwrap_or(0.707),
+                enabled,
+            });
+        }
+    }
+    (preamp, bands)
+}
+
+/// Format `(preamp, bands)` as an AutoEQ / Equalizer-APO ParametricEQ profile —
+/// the inverse of [`parse_autoeq`], round-trippable for sharing presets.
+#[must_use]
+pub fn format_autoeq(preamp_db: f32, bands: &[Band]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "Preamp: {preamp_db:.1} dB");
+    for (i, b) in bands.iter().enumerate() {
+        let state = if b.enabled { "ON" } else { "OFF" };
+        let tok = token_from_kind(b.kind);
+        if b.kind.uses_gain() {
+            let _ = writeln!(
+                out,
+                "Filter {}: {state} {tok} Fc {:.0} Hz Gain {:.1} dB Q {:.2}",
+                i + 1,
+                b.freq,
+                b.gain_db,
+                b.q
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "Filter {}: {state} {tok} Fc {:.0} Hz Q {:.2}",
+                i + 1,
+                b.freq,
+                b.q
+            );
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +495,66 @@ mod tests {
             "every default band is flat"
         );
         assert!(eq_magnitude_db(&bands, 0.0, 1000.0, FS).abs() < 0.01);
+    }
+
+    #[test]
+    fn parses_an_autoeq_profile() {
+        let text = "\
+Preamp: -6.8 dB
+Filter 1: ON PK Fc 105 Hz Gain 5.5 dB Q 0.70
+Filter 2: ON LSC Fc 105 Hz Gain -2.0 dB Q 0.70
+Filter 3: ON HSC Fc 10000 Hz Gain 3.0 dB Q 0.70
+Filter 4: ON HP Fc 30 Hz Q 0.50
+Filter 5: OFF PK Fc 2000 Hz Gain 1.0 dB Q 2.00
+Filter 6: ON BP Fc 500 Hz Gain 1.0 dB Q 1.00
+";
+        let (preamp, bands) = parse_autoeq(text);
+        assert!((preamp + 6.8).abs() < 1e-4);
+        // The 6 filters: PK/LSC/HSC/HP/PK parsed, BP (unsupported) skipped → 5.
+        assert_eq!(bands.len(), 5);
+        assert_eq!(bands[0].kind, BandKind::Peaking);
+        assert!((bands[0].freq - 105.0).abs() < 1e-3 && (bands[0].gain_db - 5.5).abs() < 1e-3);
+        assert_eq!(bands[1].kind, BandKind::LowShelf);
+        assert_eq!(bands[2].kind, BandKind::HighShelf);
+        assert_eq!(bands[3].kind, BandKind::LowCut); // HP → low-cut
+        assert!((bands[3].q - 0.5).abs() < 1e-3);
+        assert!(!bands[4].enabled, "the OFF filter parses as bypassed");
+    }
+
+    #[test]
+    fn autoeq_round_trips_through_format_and_parse() {
+        let original = alloc::vec![
+            Band {
+                kind: BandKind::LowShelf,
+                freq: 90.0,
+                gain_db: 4.5,
+                q: 0.7,
+                enabled: true,
+            },
+            Band {
+                kind: BandKind::Peaking,
+                freq: 1000.0,
+                gain_db: -3.0,
+                q: 2.0,
+                enabled: true,
+            },
+            Band {
+                kind: BandKind::HighCut,
+                freq: 18_000.0,
+                gain_db: 0.0,
+                q: 0.71,
+                enabled: false,
+            },
+        ];
+        let (back_preamp, back) = parse_autoeq(&format_autoeq(-2.0, &original));
+        assert!((back_preamp + 2.0).abs() < 1e-4);
+        assert_eq!(back.len(), original.len());
+        for (a, b) in original.iter().zip(&back) {
+            assert_eq!(a.kind, b.kind);
+            assert!((a.freq - b.freq).abs() < 1.0);
+            assert!((a.gain_db - b.gain_db).abs() < 0.1);
+            assert!((a.q - b.q).abs() < 0.01);
+            assert_eq!(a.enabled, b.enabled);
+        }
     }
 }
