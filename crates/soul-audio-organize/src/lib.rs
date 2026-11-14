@@ -17,10 +17,12 @@
 //! IO layer added on top later.
 #![forbid(unsafe_code)]
 
+mod plan;
 mod sanitize;
 mod tags;
 mod template;
 
+pub use plan::{Action, OrganizePlan, PlanEntry, plan};
 pub use template::{Template, presets};
 
 /// Whether organizing a file **copies** it to the destination (leaving the

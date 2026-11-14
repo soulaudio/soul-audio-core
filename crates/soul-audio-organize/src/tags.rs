@@ -10,8 +10,6 @@ use soul_audio_tags::Tags;
 /// opened or its container cannot be parsed. Mirrors `soul-audio-import`'s
 /// private `read_meta`, discarding the
 /// [`StreamFacts`](soul_audio_tags::StreamFacts) the organizer does not need.
-// Wired into `plan` in the next layer; only the test harness exercises it today.
-#[allow(dead_code)]
 pub(crate) fn read_tags(path: &Path) -> Tags {
     match std::fs::File::open(path) {
         Ok(f) => {
