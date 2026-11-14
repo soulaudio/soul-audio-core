@@ -17,11 +17,13 @@
 //! IO layer added on top later.
 #![forbid(unsafe_code)]
 
+mod apply;
 mod plan;
 mod sanitize;
 mod tags;
 mod template;
 
+pub use apply::{Progress, Summary, apply};
 pub use plan::{Action, OrganizePlan, PlanEntry, plan};
 pub use template::{Template, presets};
 
