@@ -50,6 +50,7 @@ const MANIFEST: &[(&str, Tier)] = &[
     ("soul-audio-service", Tier::StdAdapter),
     ("soul-audio-cli", Tier::StdAdapter),
     ("soul-audio-import", Tier::StdAdapter),
+    ("soul-audio-organize", Tier::StdAdapter),
     // reserved (planned) — enforced the moment they land in the workspace:
     ("soul-audio-artbake", Tier::StdAdapter),
     ("soul-audio-remote", Tier::StdAdapter),

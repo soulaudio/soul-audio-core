@@ -82,7 +82,7 @@ build.
 | **T0 — kernel** | `no_std`, no-alloc, `forbid(unsafe)`; normal deps ⊆ {`embedded-io`} ∪ T0 | `soul-audio-core`, `soul-audio-tags`, `soul-audio-catalog`, `soul-audio-index` (reader surface), `soul-audio-loudness` |
 | **T1 — no_std + alloc** | `no_std`; may use `alloc`; no `std`-only dep; deps ⊆ {`embedded-io`} ∪ T0 ∪ T1 | `soul-audio-queue`, `soul-audio-engine`, `soul-audio-control` |
 | **Firmware** | `no_std` binary; may depend on T0/T1 + embedded HAL; **never** a std-adapter | `soul-audio-firmware` |
-| **Std adapter** | `std`; may depend on T0/T1 + std-adapters | `soul-audio-desktop`, `soul-audio-service`, `soul-audio-cli`, `soul-audio-import`; *planned:* `soul-audio-artbake`, `soul-audio-remote`, `soul-audio-server`, `soul-audio-multicatalog`, `soul-audio-mutable` |
+| **Std adapter** | `std`; may depend on T0/T1 + std-adapters | `soul-audio-desktop`, `soul-audio-service`, `soul-audio-cli`, `soul-audio-import`, `soul-audio-organize`; *planned:* `soul-audio-artbake`, `soul-audio-remote`, `soul-audio-server`, `soul-audio-multicatalog`, `soul-audio-mutable` |
 | **Tests** | may depend on anything; nothing depends on it | `architecture-tests` |
 
 > `soul-audio-index`'s **`build` feature is `std`** (the baker); its default

@@ -2056,6 +2056,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "soul-audio-organize"
+version = "0.1.0"
+dependencies = [
+ "embedded-io-adapters",
+ "soul-audio-tags",
+]
+
+[[package]]
 name = "soul-audio-queue"
 version = "0.1.0"
 dependencies = [
