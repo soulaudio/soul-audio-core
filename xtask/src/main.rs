@@ -190,6 +190,29 @@ fn verify() -> Result<(), String> {
         "thumbv7em-none-eabihf",
         "--no-default-features",
     ])?;
+    // The DSP-chain + audio-profile model the DAP reads. `--no-default-features`
+    // excludes the optional serde exchange format, so this gates the pure no_std
+    // model surface; its build also cross-compiles `soul-audio-eq` transitively.
+    run(&[
+        "build",
+        "-p",
+        "soul-audio-dsp",
+        "--target",
+        "thumbv7em-none-eabihf",
+        "--no-default-features",
+    ])?;
+    // And the full no_std surface including the serde exchange format (serde with
+    // `alloc`, no std) — the shape the DAP deserializes a baked profile from.
+    run(&[
+        "build",
+        "-p",
+        "soul-audio-dsp",
+        "--target",
+        "thumbv7em-none-eabihf",
+        "--no-default-features",
+        "--features",
+        "serde",
+    ])?;
     run(&[
         "build",
         "-p",
