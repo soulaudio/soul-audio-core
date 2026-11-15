@@ -262,7 +262,7 @@ bytes ─▶ probe ─▶ Decoder ─▶ [Resampler] ─▶ normalize ─▶ Dec
 | `crates/architecture-tests` | Runtime no-alloc + dependency-layering invariants. |
 | `xtask` | Pure-Rust automation (`verify` / `gen-resample-tables`). |
 | `testdata/` | Committed decode/resample fixtures. |
-| `app/` | **Desktop player UI** (Tauri 2 + Svelte 5) over `soul-audio-service` — isolated from the root workspace (see [`app/README.md`](app/README.md)). |
+
 ## Building & developing
 
 ```sh

@@ -8,13 +8,11 @@ use soul_audio_queue::Repeat;
 
 /// A command from the UI to the player actor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub enum Command {
     /// Play an ordered list of track ids, starting at `start`.
     PlayContext {
         ids: Vec<u32>,
-        /// Starting index into `ids` (u32: track counts fit; avoids specta's
-        /// BigInt restriction on `usize` for the TS wire type).
+        /// Starting index into `ids` (u32: track counts fit the wire type).
         start: u32,
     },
     TogglePlay,
@@ -41,7 +39,6 @@ pub enum Command {
 /// Repeat mode as seen by the UI (mirrors `soul_audio_queue::Repeat`, decoupled
 /// from that crate's `serde` feature).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub enum RepeatMode {
     #[default]
     Off,
@@ -70,7 +67,6 @@ impl From<Repeat> for RepeatMode {
 
 /// Playback state as seen by the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub enum PlayState {
     Playing,
     Paused,
@@ -89,7 +85,6 @@ impl From<DeckState> for PlayState {
 
 /// An event from the player actor to the UI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub enum Event {
     Tick(Tick),
     Queue(QueueState),
@@ -97,7 +92,6 @@ pub enum Event {
 
 /// Now-playing + transport snapshot, emitted ~8×/s and on any change.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct Tick {
     pub now_playing_id: Option<u32>,
     pub position_secs: f64,
@@ -110,17 +104,15 @@ pub struct Tick {
 
 /// Up-Next + context position, emitted on queue mutation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct QueueState {
     pub up_next_ids: Vec<u32>,
-    /// u32: positions fit; avoids specta's BigInt restriction on `usize`.
+    /// u32: positions fit the wire type.
     pub context_pos: u32,
     pub context_len: u32,
 }
 
 /// A library track as sent to the UI (no path, no cover bytes).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct TrackView {
     pub id: u32,
     pub title: Option<String>,
