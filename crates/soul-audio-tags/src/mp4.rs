@@ -33,7 +33,7 @@
 //! visited, so neither its size nor any trailing padding/garbage after it can
 //! turn a successful tag read into a spurious `Malformed`.
 
-use crate::util::{map_replaygain_key, read_exact, utf8_prefix};
+use crate::util::{map_musicbrainz_recording_key, map_replaygain_key, read_exact, utf8_prefix};
 use crate::{DataEncoding, Field, MimeType, Picture, PictureKind, StreamFacts, TagError, TagSink};
 use embedded_io::SeekFrom;
 use soul_audio_core::SeekSource;
@@ -327,7 +327,8 @@ fn handle_freeform_entry<S: SeekSource>(
     }
 
     let name = utf8_prefix(&name_buf[..name_len]);
-    let Some(field) = map_replaygain_key(name) else {
+    let Some(field) = map_replaygain_key(name).or_else(|| map_musicbrainz_recording_key(name))
+    else {
         return Ok(());
     };
     let Some((body_start, body_end)) = data_bounds else {
@@ -734,6 +735,48 @@ mod tests {
             c.fields
                 .iter()
                 .any(|(f, _, v)| *f == Some(Field::Title) && v == "Song")
+        );
+    }
+
+    #[test]
+    fn mp4_freeform_musicbrainz_recording_id() {
+        let mbid = "d6d5e8e6-1234-4abc-9def-0123456789ab";
+        // The iTunes freeform recording-id name is "MusicBrainz Track Id"; the
+        // *release-track* id ("MusicBrainz Release Track Id") must be ignored.
+        let entries = ilst(&[
+            freeform_entry("com.apple.iTunes", "MusicBrainz Track Id", mbid),
+            freeform_entry(
+                "com.apple.iTunes",
+                "MusicBrainz Release Track Id",
+                "ignored",
+            ),
+        ]);
+        let moov_body = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&mvhd_v0(44_100, 1000));
+            v.extend_from_slice(&udta(&meta(&entries)));
+            v
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&atom(b"ftyp", b"M4A \0\0\0\0M4A mp42isom"));
+        bytes.extend_from_slice(&atom(b"moov", &moov_body));
+
+        let mut src = SliceSource::new(&bytes);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        read_mp4(&mut src, &mut scratch, &mut c).unwrap();
+
+        let ids: Vec<&str> = c
+            .fields
+            .iter()
+            .filter(|(f, _, _)| *f == Some(Field::MusicBrainzRecordingId))
+            .map(|(_, _, v)| v.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![mbid],
+            "only the recording-id freeform maps: {:?}",
+            c.fields
         );
     }
 

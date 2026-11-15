@@ -48,6 +48,9 @@ pub struct Tags {
     pub track_peak: Option<f32>,
     /// ReplayGain album peak — linear full-scale (`1.0` = 0 dBFS).
     pub album_peak: Option<f32>,
+    /// MusicBrainz **recording** MBID (a UUID), if the file is tagged with one —
+    /// the stable key a later enrichment pass joins on. `None` when untagged.
+    pub musicbrainz_recording_id: Option<String>,
 }
 
 /// [`TagSink`] that collects into an owned [`Tags`].
@@ -101,6 +104,11 @@ impl TagSink for OwnedTags {
             }
             Field::Composer => {
                 self.tags.composer.get_or_insert_with(|| value.into());
+            }
+            Field::MusicBrainzRecordingId => {
+                self.tags
+                    .musicbrainz_recording_id
+                    .get_or_insert_with(|| value.into());
             }
             Field::TrackNumber if self.tags.track.is_none() => {
                 self.tags.track = value.parse().ok();
@@ -313,6 +321,29 @@ mod tests {
         assert_eq!(tags.artist.as_deref(), Some("Eric Clapton"));
         assert_eq!(tags.artist_sort.as_deref(), Some("Clapton, Eric"));
         assert_eq!(tags.album_artist_sort.as_deref(), Some("Clapton, Eric"));
+    }
+
+    #[test]
+    fn read_owned_parses_musicbrainz_recording_id_vorbis() {
+        let mbid = "d6d5e8e6-1234-4abc-9def-0123456789ab";
+        // MUSICBRAINZ_TRACKID is the *recording* id; MUSICBRAINZ_RELEASETRACKID is a
+        // different one and must NOT be picked up.
+        let bytes = flac_fixture(&[
+            "TITLE=Blue Train",
+            &format!("MUSICBRAINZ_TRACKID={mbid}"),
+            "MUSICBRAINZ_RELEASETRACKID=release-track-ignored",
+        ]);
+        let mut src = SliceSource::new(&bytes);
+        let (tags, _facts) = read_owned(&mut src).unwrap();
+        assert_eq!(tags.musicbrainz_recording_id.as_deref(), Some(mbid));
+    }
+
+    #[test]
+    fn read_owned_has_no_musicbrainz_id_when_untagged() {
+        let bytes = flac_fixture(&["TITLE=X"]);
+        let mut src = SliceSource::new(&bytes);
+        let (tags, _facts) = read_owned(&mut src).unwrap();
+        assert_eq!(tags.musicbrainz_recording_id, None);
     }
 
     #[test]

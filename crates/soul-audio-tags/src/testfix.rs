@@ -49,6 +49,21 @@ pub(crate) fn txxx_frame(desc: &str, value: &str) -> Vec<u8> {
     b
 }
 
+/// Build a v2.3 `UFID` unique-file-identifier frame: `owner` (Latin-1), a NUL,
+/// then the identifier bytes.
+pub(crate) fn ufid_frame(owner: &str, id: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(owner.as_bytes());
+    body.push(0); // NUL between owner and identifier
+    body.extend_from_slice(id.as_bytes());
+    let mut b = Vec::new();
+    b.extend_from_slice(b"UFID");
+    b.extend_from_slice(&(body.len() as u32).to_be_bytes()); // v2.3 plain size
+    b.extend_from_slice(&[0, 0]); // flags
+    b.extend_from_slice(&body);
+    b
+}
+
 /// Build an `APIC` frame (UTF-8 encoding, MIME string, picture type, empty
 /// description, then raw image bytes).
 pub(crate) fn apic(mime: &str, ptype: u8, data: &[u8]) -> Vec<u8> {

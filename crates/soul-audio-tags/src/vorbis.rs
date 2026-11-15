@@ -39,9 +39,11 @@ pub fn map_vorbis_key(key: &str) -> Option<Field> {
     } else if key.eq_ignore_ascii_case("COMPOSER") {
         Some(Field::Composer)
     } else {
-        // ReplayGain / R128 keys (REPLAYGAIN_*, R128_*) share one mapping across
-        // all comment-based containers.
+        // ReplayGain / R128 keys (REPLAYGAIN_*, R128_*) and the MusicBrainz
+        // recording id (MUSICBRAINZ_TRACKID) share one mapping across all
+        // comment-based containers.
         crate::util::map_replaygain_key(key)
+            .or_else(|| crate::util::map_musicbrainz_recording_key(key))
     }
 }
 
