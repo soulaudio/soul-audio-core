@@ -1,0 +1,42 @@
+name: CodeQL
+
+# Static analysis (SAST) for the Rust workspace. Rust CodeQL is GA and the only
+# supported build mode is `none`: the rust-analyzer-based extractor reads the
+# source (running build scripts / expanding macros) without a full `cargo build`,
+# so the `thumbv7em` firmware crate is never cross-compiled here. cargo + rustup
+# are preinstalled on the runner; `rust-toolchain.toml` pins the channel on first
+# use. Findings land in the repo's code-scanning dashboard.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, so newly-shipped queries catch latent issues without a push.
+    - cron: '41 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: CodeQL (rust)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # upload results to the code-scanning dashboard
+      contents: read
+      actions: read          # required on private repos; inert on public
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@52cf1852265d99e9bea071b03366fc777a602909 # v3 (codeql-bundle-v2.27.4)
+        with:
+          languages: rust
+          build-mode: none
+          queries: security-extended
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@52cf1852265d99e9bea071b03366fc777a602909 # v3 (codeql-bundle-v2.27.4)
+        with:
+          category: "/language:rust"
