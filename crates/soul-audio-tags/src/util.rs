@@ -24,6 +24,21 @@ pub(crate) fn map_replaygain_key(key: &str) -> Option<Field> {
     }
 }
 
+/// Map a text key to the MusicBrainz **recording** MBID field, case-insensitively.
+/// Recognizes the (confusingly-named) recording-id keys shared across containers —
+/// VorbisComment `MUSICBRAINZ_TRACKID`, MP4 freeform `MusicBrainz Track Id`, and
+/// the occasional ID3 `TXXX:MusicBrainz Recording Id`. Deliberately does NOT match
+/// the *release-track* id (`MUSICBRAINZ_RELEASETRACKID` / `MusicBrainz Release
+/// Track Id`), which is a different identifier. (ID3 `UFID` is owner-based, handled
+/// in the id3v2 reader.)
+pub(crate) fn map_musicbrainz_recording_key(key: &str) -> Option<Field> {
+    let k = key.trim();
+    (k.eq_ignore_ascii_case("MUSICBRAINZ_TRACKID")
+        || k.eq_ignore_ascii_case("MusicBrainz Track Id")
+        || k.eq_ignore_ascii_case("MusicBrainz Recording Id"))
+    .then_some(Field::MusicBrainzRecordingId)
+}
+
 /// Parse a ReplayGain gain string like `"-7.89 dB"` (or a bare `"-7.89"`) into
 /// decibels: trim whitespace, strip a trailing case-insensitive `"dB"` unit,
 /// then parse the leading signed float. `None` if no finite float is present.

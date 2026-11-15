@@ -19,7 +19,9 @@
 //!   essentially unused in the wild.
 
 use crate::locate;
-use crate::util::{discard, map_replaygain_key, read_exact, utf8_prefix};
+use crate::util::{
+    discard, map_musicbrainz_recording_key, map_replaygain_key, read_exact, utf8_prefix,
+};
 use crate::{DataEncoding, Field, MimeType, Picture, PictureKind, StreamFacts, TagError, TagSink};
 use embedded_io::SeekFrom;
 use soul_audio_core::SeekSource;
@@ -486,7 +488,41 @@ fn handle_txxx<S: embedded_io::Read>(
     let rest = &body[sep + 1..];
     let vend = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
     let value = utf8_prefix(&rest[..vend]);
-    sink.text(map_replaygain_key(desc), desc, value);
+    let field = map_replaygain_key(desc).or_else(|| map_musicbrainz_recording_key(desc));
+    sink.text(field, desc, value);
+    Ok(())
+}
+
+/// `UFID`/`UFI`: a unique file identifier frame — `owner(Latin-1) NUL identifier`.
+/// The only one mapped is MusicBrainz's (owner `http://musicbrainz.org`), whose
+/// identifier is the ASCII recording MBID → [`Field::MusicBrainzRecordingId`]. Any
+/// other owner (AcoustID, etc.) is surfaced to nothing. Malformed/truncated bodies
+/// yield nothing rather than erroring.
+fn handle_ufid<S: embedded_io::Read>(
+    src: &mut S,
+    raw_len: usize,
+    scratch: &mut [u8],
+    sink: &mut impl TagSink,
+) -> Result<(), TagError> {
+    if raw_len == 0 {
+        return Ok(());
+    }
+    let cap = raw_len.min(scratch.len());
+    read_exact(src, &mut scratch[..cap])?;
+    if raw_len > cap {
+        discard(src, raw_len - cap)?;
+    }
+    let body = &scratch[..cap];
+    let Some(nul) = body.iter().position(|&b| b == 0) else {
+        return Ok(());
+    };
+    if !body[..nul].eq_ignore_ascii_case(b"http://musicbrainz.org") {
+        return Ok(()); // some other identifier system — not the recording MBID
+    }
+    let id = utf8_prefix(&body[nul + 1..]);
+    if !id.is_empty() {
+        sink.text(Some(Field::MusicBrainzRecordingId), "UFID", id);
+    }
     Ok(())
 }
 
@@ -597,6 +633,7 @@ fn handle_frame<S: SeekSource>(
 ) -> Result<(), TagError> {
     match id {
         "TXXX" | "TXX" => handle_txxx(src, raw_len, scratch, sink),
+        "UFID" | "UFI" => handle_ufid(src, raw_len, scratch, sink),
         "RVA2" => handle_rva2(src, raw_len, scratch, sink),
         "TRCK" | "TRK" => handle_num_total(
             src,
@@ -1024,6 +1061,56 @@ mod tests {
             c.fields
                 .iter()
                 .any(|(f, k, v)| f.is_none() && k == "some_other_desc" && v == "ignored")
+        );
+    }
+
+    #[test]
+    fn id3v2_musicbrainz_recording_id_from_ufid_and_txxx() {
+        let mut scratch = [0u8; 256];
+        let mbid = "d6d5e8e6-1234-4abc-9def-0123456789ab";
+
+        // UFID with the MusicBrainz owner → the recording MBID.
+        let tag = id3v23(&[ufid_frame("http://musicbrainz.org", mbid)]);
+        let mut c = Collect::default();
+        read_id3v2(&mut SliceSource::new(&tag), &mut scratch, &mut c).unwrap();
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::MusicBrainzRecordingId) && v == mbid),
+            "UFID musicbrainz owner → recording id: {:?}",
+            c.fields
+        );
+
+        // A UFID with a different owner (e.g. an AcoustID) is NOT the recording id.
+        let tag = id3v23(&[ufid_frame("Acoustid Fingerprint", "not-an-mbid")]);
+        let mut c = Collect::default();
+        read_id3v2(&mut SliceSource::new(&tag), &mut scratch, &mut c).unwrap();
+        assert!(
+            !c.fields
+                .iter()
+                .any(|(f, _, _)| *f == Some(Field::MusicBrainzRecordingId)),
+            "a non-musicbrainz UFID owner maps to nothing: {:?}",
+            c.fields
+        );
+
+        // `TXXX:MusicBrainz Recording Id` maps; the *release-track* id does NOT.
+        let tag = id3v23(&[
+            txxx_frame("MusicBrainz Recording Id", mbid),
+            txxx_frame("MusicBrainz Release Track Id", "release-track-ignored"),
+        ]);
+        let mut c = Collect::default();
+        read_id3v2(&mut SliceSource::new(&tag), &mut scratch, &mut c).unwrap();
+        let ids: Vec<&str> = c
+            .fields
+            .iter()
+            .filter(|(f, _, _)| *f == Some(Field::MusicBrainzRecordingId))
+            .map(|(_, _, v)| v.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![mbid],
+            "only the recording-id TXXX maps: {:?}",
+            c.fields
         );
     }
 

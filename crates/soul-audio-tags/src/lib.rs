@@ -71,6 +71,12 @@ pub enum Field {
     R128TrackGain,
     /// EBU R128 album gain (Q7.8 integer dB). Vorbis/Opus `R128_ALBUM_GAIN`.
     R128AlbumGain,
+    /// The MusicBrainz **recording** MBID (a UUID) — the stable identity key for
+    /// enrichment. Despite the historical names it is the *recording* id, not the
+    /// release-track id: Vorbis `MUSICBRAINZ_TRACKID`, MP4
+    /// `----:com.apple.iTunes:MusicBrainz Track Id`, ID3 `UFID` owner
+    /// `http://musicbrainz.org` (and the occasional `TXXX:MusicBrainz Recording Id`).
+    MusicBrainzRecordingId,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
