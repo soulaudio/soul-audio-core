@@ -11,10 +11,6 @@ description = "Headless desktop-player backend service (actor around soul-audio-
 workspace = true
 [features]
 default = []
-# Plan 4: derive `specta::Type` on the IPC DTOs for tauri-specta. Off by
-# default so the headless crate + root workspace gate stay pure (only the
-# app crate enables it).
-specta = ["dep:specta"]
 
 [dependencies]
 soul-audio-core = { path = "../soul-audio-core" }
@@ -26,7 +22,6 @@ soul-audio-tags = { path = "../soul-audio-tags", features = ["std"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 embedded-io-adapters = { workspace = true, features = ["std"] }
-specta = { version = "=2.0.0-rc.25", features = ["derive"], optional = true }
 
 [dev-dependencies]
 serde_json = "1"

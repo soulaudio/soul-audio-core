@@ -1,1 +1,0 @@
-{ "compilerOptions": { "module": "ESNext", "moduleResolution": "Bundler", "target": "ES2022", "types": ["@wdio/globals/types", "@wdio/mocha-framework"], "strict": true } }

@@ -123,8 +123,8 @@ the encoder's priming delay — not bit-exact equality or a tight SFDR bar.
 Native FLAC is additionally gated in the **core** decode suite
 (`crates/soul-audio-core/tests/decode.rs::open_decodes_native_flac_bit_exact_vs_wav`)
 as a bit-exact match against `tone.wav` (the lossless source). Vorbis and the
-raw-DSD DSDIFF (`tone.dff`) are covered end-to-end in the desktop Tier-1 suite
-(`app/src-tauri/tests/`). HE-AAC/SBR (`tone-sbr.m4a`) renders pitch-only through
+raw-DSD DSDIFF (`tone.dff`) are covered end-to-end in the CLI render suite
+(`crates/soul-audio-cli/tests/e2e.rs`). HE-AAC/SBR (`tone-sbr.m4a`) renders pitch-only through
 the CLI e2e, like the other lossy AAC fixtures.
 
 ## Regenerating
