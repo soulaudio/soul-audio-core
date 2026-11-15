@@ -1,0 +1,33 @@
+[package]
+name = "soul-audio-dsp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Portable no_std DSP-chain + audio-profile model (typed DSP units, profiles, switching, and the exchange format), shared by the desktop host (soul-player-ng) and the DAP firmware (soul-listener). Applies through soul-audio-core's Equalizer; designs via soul-audio-eq."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Opt-in (de)serialization of the exchange format (the `format` module). Off by
+# default so the no_std / `--no-default-features` surface stays within the T1 external
+# set {embedded-io, libm}. serde is pulled with `alloc` + `derive`, no std.
+serde = ["dep:serde"]
+
+[dependencies]
+# The band model + RBJ coefficient design (also no_std + alloc). The chain is built
+# of EQ units whose bands are `soul_audio_eq::Band`.
+soul-audio-eq = { path = "../soul-audio-eq" }
+
+[dependencies.serde]
+version = "1"
+optional = true
+default-features = false
+features = ["derive", "alloc"]
+
+[dev-dependencies]
+# Test-only: exercise the exchange format through a concrete JSON serializer (the
+# desktop's choice). Not part of the crate's own dependency surface.
+serde_json = "1"
