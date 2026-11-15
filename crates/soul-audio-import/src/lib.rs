@@ -259,6 +259,9 @@ pub struct RawTrack {
     sample_rate: u32,
     channels: u8,
     file_name: String,
+    /// MusicBrainz recording MBID from the tags (empty when untagged) — baked into
+    /// the index (v4) as the enrichment join key.
+    mbid: String,
 }
 
 /// Read + derive one file's [`RawTrack`] — the single file-opening step. Pure
@@ -311,6 +314,7 @@ fn extract_raw(path: &Path) -> RawTrack {
         sample_rate: facts.sample_rate.unwrap_or(0),
         channels: facts.channels.unwrap_or(0) as u8,
         file_name: leaf_name(path),
+        mbid: tags.musicbrainz_recording_id.unwrap_or_default(),
     }
 }
 
@@ -351,6 +355,7 @@ fn build_catalog(raw: &[RawTrack], root: &Path) -> CatalogInput {
             sample_rate: r.sample_rate,
             channels: r.channels,
             file_name: r.file_name.clone(),
+            mbid: r.mbid.clone(),
         });
     }
     let covers: Vec<Option<Vec<u8>>> = interner
@@ -421,7 +426,7 @@ fn stamp_of(meta: &std::fs::Metadata) -> FileStamp {
 /// Bump when [`RawTrack`]/extraction changes so a persisted cache from an older
 /// build is discarded (re-extracted) instead of silently reused with stale fields.
 /// The desktop head stores this alongside the serialized cache and compares on load.
-pub const SCAN_CACHE_VERSION: u32 = 1;
+pub const SCAN_CACHE_VERSION: u32 = 2;
 
 #[derive(Default, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
