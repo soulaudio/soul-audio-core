@@ -37,12 +37,13 @@
 //!   64  string_heap_off         u32   (abs)
 //!   68  string_heap_len         u32
 //!
-//! TRACK RECORD (59 B, fixed; `record[i]` at records_off + i*59):
+//! TRACK RECORD (65 B, fixed; `record[i]` at records_off + i*65):
 //!    0 id u32 · 4 title.off u32 · 8 title.len u16 · 10 artist u32 ·
 //!   14 album u32 · 18 album_artist u32 · 22 genre u32 · 26 folder u32 ·
 //!   30 track_no u16 · 32 disc_no u16 · 34 duration_ms u32 · 38 sample_rate u32 ·
 //!   42 channels u8 · 43 art_id u32 · 47 flags u16 · 49 extended_off u32 ·
-//!   53 file_name.off u32 · 57 file_name.len u16
+//!   53 file_name.off u32 · 57 file_name.len u16 · 59 mbid.off u32 ·
+//!   63 mbid.len u16   (mbid new in format v4)
 //!
 //! ALBUM RECORD (24 B, fixed; indexed by dense album id):
 //!    0 id u32 · 4 title.off u32 · 8 title.len u16 · 10 album_artist u32 ·
@@ -102,10 +103,10 @@ use soul_audio_core::SeekSource;
 /// Magic at the head of `index.sidx` — `"SIDX"`.
 pub const MAGIC: [u8; 4] = *b"SIDX";
 /// Format version in the header.
-pub const FORMAT_VERSION: u16 = 3;
+pub const FORMAT_VERSION: u16 = 4;
 
 const HEADER_SIZE: usize = 72;
-const RECORD_SIZE: usize = 59;
+const RECORD_SIZE: usize = 65;
 const ALBUM_RECORD_SIZE: usize = 24;
 const ARTIST_REF_SIZE: usize = 6; // StrRef (off u32, len u16) per artist
 const GENRE_REF_SIZE: usize = 6; // StrRef (off u32, len u16) per genre
@@ -330,6 +331,10 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
                 off: le_u32(&r, 53),
                 len: le_u16(&r, 57),
             },
+            mbid: StrRef {
+                off: le_u32(&r, 59),
+                len: le_u16(&r, 63),
+            },
         })
     }
 
@@ -492,6 +497,8 @@ pub mod build {
         pub sample_rate: u32,
         pub channels: u8,
         pub file_name: String,
+        /// MusicBrainz recording MBID, or empty when the file carried none. (v4)
+        pub mbid: String,
     }
 
     /// One folder to bake into the folder table. `path` is relative to the card
@@ -620,6 +627,9 @@ pub mod build {
             .iter()
             .map(|t| intern(&mut heap, &t.file_name))
             .collect();
+        // MusicBrainz recording MBID per track (empty string → a (0,0) ref). (v4)
+        let track_mbids: Vec<(u32, u16)> =
+            tracks.iter().map(|t| intern(&mut heap, &t.mbid)).collect();
         let album_titles: Vec<(u32, u16)> = input
             .albums
             .iter()
@@ -833,6 +843,9 @@ pub mod build {
             out.extend_from_slice(&0u32.to_le_bytes()); // extended_off
             out.extend_from_slice(&foff.to_le_bytes()); // file_name.off
             out.extend_from_slice(&flen.to_le_bytes()); // file_name.len
+            let (moff, mlen) = track_mbids[i];
+            out.extend_from_slice(&moff.to_le_bytes()); // mbid.off (v4)
+            out.extend_from_slice(&mlen.to_le_bytes()); // mbid.len (v4)
         }
         debug_assert_eq!(out.len(), albums_off);
 

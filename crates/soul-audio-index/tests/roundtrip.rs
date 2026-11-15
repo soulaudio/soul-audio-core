@@ -33,6 +33,7 @@ fn fixture() -> CatalogInput {
                 sample_rate: 44_100,
                 channels: 2,
                 file_name: "01 - Aria.flac".into(),
+                mbid: String::new(),
             },
             TrackInput {
                 title: "Variatio 1".into(),
@@ -47,6 +48,7 @@ fn fixture() -> CatalogInput {
                 sample_rate: 44_100,
                 channels: 2,
                 file_name: "02 - Variatio 1.flac".into(),
+                mbid: String::new(),
             },
         ],
         artists: vec!["Kimiko Ishizaka".into()],
@@ -84,6 +86,25 @@ fn resolve<'a>(
 ) -> &'a str {
     let n = rdr.resolve_str(s, buf).expect("resolve_str");
     core::str::from_utf8(&buf[..n]).expect("utf8")
+}
+
+#[test]
+fn soulidx_round_trips_the_musicbrainz_recording_id() {
+    let mbid = "d6d5e8e6-1234-4abc-9def-0123456789ab";
+    let mut input = fixture();
+    input.tracks[0].mbid = mbid.into();
+    // track[1] keeps its empty mbid.
+    let bytes = write_index(&input);
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+    let mut buf = [0u8; 64];
+    let t0 = rdr.track(0).expect("track 0");
+    assert_eq!(
+        resolve(&rdr, t0.mbid, &mut buf),
+        mbid,
+        "the recording MBID bakes into the record and reads back (v4)"
+    );
+    let t1 = rdr.track(1).expect("track 1");
+    assert_eq!(t1.mbid.len, 0, "an untagged track has an empty MBID ref");
 }
 
 #[test]
@@ -173,6 +194,7 @@ fn baked_title_order_is_collation_sorted() {
             sample_rate: 44_100,
             channels: 2,
             file_name: format!("{t}.flac"),
+            mbid: String::new(),
         })
         .collect();
     let input = CatalogInput {
@@ -246,6 +268,7 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
                 sample_rate: 44_100,
                 channels: 2,
                 file_name: "a.flac".into(),
+                mbid: String::new(),
             },
             TrackInput {
                 title: "Uncovered Track".into(),
@@ -260,6 +283,7 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
                 sample_rate: 44_100,
                 channels: 2,
                 file_name: "b.flac".into(),
+                mbid: String::new(),
             },
         ],
         artists: vec!["Artist".into()],
@@ -345,6 +369,7 @@ fn artist_album_track_orders_by_sort_name() {
                 sample_rate: 44_100,
                 channels: 2,
                 file_name: "eno.flac".into(),
+                mbid: String::new(),
             },
             TrackInput {
                 title: "clapton_track".into(),
@@ -359,6 +384,7 @@ fn artist_album_track_orders_by_sort_name() {
                 sample_rate: 44_100,
                 channels: 2,
                 file_name: "clapton.flac".into(),
+                mbid: String::new(),
             },
         ],
         artists: vec!["Brian Eno".into(), "Eric Clapton".into()],
@@ -428,6 +454,7 @@ fn artist_sort_name_falls_back_to_display_when_untagged() {
             sample_rate: 44_100,
             channels: 2,
             file_name: "t.flac".into(),
+            mbid: String::new(),
         }],
         artists: vec!["Miles Davis".into()],
         artist_sorts: Vec::new(),
@@ -475,6 +502,7 @@ fn baked_genre_order_groups_by_genre_collation() {
             sample_rate: 44_100,
             channels: 2,
             file_name: format!("{title}.flac"),
+            mbid: String::new(),
         }
     }
     let input = CatalogInput {

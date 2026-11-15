@@ -228,6 +228,39 @@ fn scan_interns_genre_from_tags_and_bakes_it() {
 }
 
 #[test]
+fn scan_bakes_the_musicbrainz_recording_id_from_tags() {
+    let root = std::env::temp_dir().join(format!("soul_import_mbid_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mbid = "d6d5e8e6-1234-4abc-9def-0123456789ab";
+    let tagged = format!("MUSICBRAINZ_TRACKID={mbid}");
+    std::fs::write(
+        root.join("01.flac"),
+        flac_with_comments(&["TITLE=Tagged", tagged.as_str()]),
+    )
+    .unwrap();
+    std::fs::write(root.join("02.flac"), flac_with_comments(&["TITLE=Plain"])).unwrap();
+
+    let bytes = soul_audio_import::bake(&root).expect("bake");
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+    let mut buf = [0u8; 128];
+    let t0 = rdr.track(0).unwrap();
+    let n = rdr.resolve_str(t0.mbid, &mut buf).unwrap();
+    assert_eq!(
+        &buf[..n],
+        mbid.as_bytes(),
+        "the tagged recording MBID flows tags → importer → baked index (v4)"
+    );
+    assert_eq!(
+        rdr.track(1).unwrap().mbid.len,
+        0,
+        "the untagged track bakes an empty MBID"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn scan_collects_sort_names_and_bakes_sort_order() {
     let root = std::env::temp_dir().join(format!("soul_import_sort_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);

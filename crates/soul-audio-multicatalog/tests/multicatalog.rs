@@ -139,6 +139,7 @@ fn track_input(t: &TrackData) -> TrackInput {
         sample_rate: 44_100,
         channels: 2,
         file_name: t.file.into(),
+        mbid: String::new(),
     }
 }
 
@@ -435,6 +436,7 @@ fn merge_orders_albums_chronologically_across_sources() {
                 sample_rate: 44_100,
                 channels: 2,
                 file_name: format!("{track}.flac"),
+                mbid: String::new(),
             }],
             artists: vec![artist.into()],
             artist_sorts: Vec::new(),
@@ -500,6 +502,7 @@ fn merge_orders_artists_by_sort_name_across_sources() {
                 sample_rate: 44_100,
                 channels: 2,
                 file_name: format!("{track}.flac"),
+                mbid: String::new(),
             }],
             artists: vec![artist.into()],
             artist_sorts: vec![sort.into()],
@@ -575,6 +578,7 @@ fn merge_orders_tracks_by_genre_across_sources() {
                 sample_rate: 44_100,
                 channels: 2,
                 file_name: format!("{track}.flac"),
+                mbid: String::new(),
             }],
             artists: vec!["Artist".into()],
             artist_sorts: Vec::new(),

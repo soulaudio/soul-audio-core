@@ -63,6 +63,10 @@ pub struct TrackRec {
     /// `card_root / folder(self.folder).path / file_name` — this is what makes a
     /// track locatable and playable.
     pub file_name: StrRef,
+    /// MusicBrainz **recording** MBID, a heap ref (empty `StrRef` when the file
+    /// carried none). The stable identity key an enrichment pass joins on. (New in
+    /// format v4.)
+    pub mbid: StrRef,
 }
 
 /// Tier-1 folder record. `path` is the folder's location **relative to the card
