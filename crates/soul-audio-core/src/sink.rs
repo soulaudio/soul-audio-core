@@ -81,6 +81,28 @@ pub trait Sink {
     fn set_volume(&mut self, volume: f32) {
         let _ = volume;
     }
+
+    /// Reopen the output device at `rate` **in place** — for native-rate /
+    /// bit-perfect switching, where the engine plays each track at the device's own
+    /// native rate instead of resampling to a fixed one.
+    ///
+    /// The default is a **no-op**: a shared-mode sink keeps its fixed rate (the deck
+    /// keeps resampling to it). An **exclusive** sink must *release its device and
+    /// re-acquire it* at `rate` — exclusive mode is one-client-per-device, so it
+    /// cannot simply open a second stream alongside the current one (that fails with
+    /// device-in-use). It should fall back to its previous rate if the device refuses
+    /// the new one, so it is never left closed.
+    ///
+    /// After this call the caller re-reads [`stream_info`](Sink::stream_info) for the
+    /// rate the sink actually ended at (which equals `rate` on success, or the
+    /// previous rate on a refused switch).
+    ///
+    /// # Errors
+    /// [`SinkError`] only if the device cannot be reacquired at all.
+    fn reopen(&mut self, rate: u32) -> Result<(), SinkError> {
+        let _ = rate;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

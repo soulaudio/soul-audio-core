@@ -78,6 +78,9 @@ pub struct WasapiExclusiveSink {
     volume: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// The device this sink opened (stored so [`reopen`](Self::reopen) re-acquires the
+    /// SAME device); `None` is the system default.
+    name: Option<String>,
     rate: u32,
     channels: u16,
     format: CoreFmt,
@@ -100,43 +103,64 @@ impl WasapiExclusiveSink {
         let flush = Arc::new(AtomicBool::new(false));
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let stop = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel();
-        let (cf, cv, cs) = (Arc::clone(&flush), Arc::clone(&volume), Arc::clone(&stop));
-        let thread = thread::Builder::new()
-            .name("wasapi-exclusive".into())
-            .spawn(move || render_thread(name, rate, channels, cf, cv, cs, &tx))
-            .map_err(|e| ExclusiveError::Other(format!("spawn render thread: {e}")))?;
-        match rx.recv() {
-            Ok(Ok(s)) => Ok(Self {
-                prod: s.prod,
-                flush,
-                volume,
-                stop,
-                thread: Some(thread),
-                rate: s.rate,
-                channels: s.channels,
-                format: s.format,
-            }),
-            Ok(Err(e)) => {
-                let _ = thread.join();
-                Err(e)
-            }
-            Err(_) => {
-                let _ = thread.join();
-                Err(ExclusiveError::Other(
-                    "render thread exited during setup".into(),
-                ))
-            }
+        let (thread, s) = spawn_render(name.clone(), rate, channels, &flush, &volume, &stop)?;
+        Ok(Self {
+            prod: s.prod,
+            flush,
+            volume,
+            stop,
+            thread: Some(thread),
+            name,
+            rate: s.rate,
+            channels: s.channels,
+            format: s.format,
+        })
+    }
+
+    /// Stop + join the current render thread, releasing the exclusive device.
+    fn release(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Spawn the render thread for `name`/`rate`/`channels` and wait for it to open the
+/// device, returning the join handle + the negotiated [`Setup`] (or the typed error).
+/// Shared by [`WasapiExclusiveSink::open`] and [`reopen`](WasapiExclusiveSink::reopen).
+fn spawn_render(
+    name: Option<String>,
+    rate: u32,
+    channels: u16,
+    flush: &Arc<AtomicBool>,
+    volume: &Arc<AtomicU32>,
+    stop: &Arc<AtomicBool>,
+) -> Result<(JoinHandle<()>, Setup), ExclusiveError> {
+    let (tx, rx) = mpsc::channel();
+    let (cf, cv, cs) = (Arc::clone(flush), Arc::clone(volume), Arc::clone(stop));
+    let thread = thread::Builder::new()
+        .name("wasapi-exclusive".into())
+        .spawn(move || render_thread(name, rate, channels, cf, cv, cs, &tx))
+        .map_err(|e| ExclusiveError::Other(format!("spawn render thread: {e}")))?;
+    match rx.recv() {
+        Ok(Ok(s)) => Ok((thread, s)),
+        Ok(Err(e)) => {
+            let _ = thread.join();
+            Err(e)
+        }
+        Err(_) => {
+            let _ = thread.join();
+            Err(ExclusiveError::Other(
+                "render thread exited during setup".into(),
+            ))
         }
     }
 }
 
 impl Drop for WasapiExclusiveSink {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        self.release();
     }
 }
 
@@ -151,6 +175,41 @@ impl Sink for WasapiExclusiveSink {
 
     fn exclusive(&self) -> bool {
         true
+    }
+
+    /// Reopen the SAME device at `rate` for native-rate switching. WASAPI exclusive is
+    /// one-client-per-device, so we must fully RELEASE the current stream (stop + join
+    /// the render thread) before re-acquiring — opening a second stream alongside the
+    /// first fails with `AUDCLNT_E_DEVICE_IN_USE`. Falls back to the previous rate if
+    /// the device refuses the new one, so the sink is never left closed; errors only
+    /// if neither rate can be reacquired.
+    fn reopen(&mut self, rate: u32) -> Result<(), SinkError> {
+        if rate == self.rate {
+            return Ok(()); // already at this rate — nothing to do
+        }
+        self.release(); // release the exclusive device FIRST
+        // Try the requested rate, then fall back to the previous rate so a refused
+        // switch still leaves a working (resampling) exclusive stream.
+        for try_rate in [rate, self.rate] {
+            self.flush.store(false, Ordering::Release);
+            self.stop.store(false, Ordering::Relaxed);
+            if let Ok((thread, s)) = spawn_render(
+                self.name.clone(),
+                try_rate,
+                self.channels,
+                &self.flush,
+                &self.volume,
+                &self.stop,
+            ) {
+                self.thread = Some(thread);
+                self.prod = s.prod;
+                self.rate = s.rate;
+                self.channels = s.channels;
+                self.format = s.format;
+                return Ok(());
+            }
+        }
+        Err(SinkError::Unsupported)
     }
 
     fn write(&mut self, frames: &[i32]) -> Result<(), SinkError> {
