@@ -11,9 +11,12 @@
 //! ```
 //!
 //! It cross-checks **integrated LUFS**, **LRA**, and **true-peak (dBTP)** against
-//! ffmpeg's `ebur128=peak=true` summary, and prints our **DR** + **PLR** (ffmpeg has
-//! no DR reference). Asserts per-metric tolerances for every PCM file it finds; if
-//! the corpus or ffmpeg is absent it skips cleanly.
+//! ffmpeg's `ebur128=peak=true` summary, and **DR** against an exact (sorted
+//! order-statistics) `dr14_t.meter` reference computed over the same decoded PCM —
+//! ffmpeg has no DR scanner, so we carry the authoritative algorithm here and check
+//! our bounded-memory histogram DR against it. Also prints **PLR**. Asserts
+//! per-metric tolerances for every PCM file it finds; if the corpus or ffmpeg is
+//! absent it skips cleanly.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,6 +29,7 @@ const LIB: &str = r"D:\dev\soulaudio\testing-audio-library";
 const TOL_LUFS: f32 = 0.5; // integrated
 const TOL_LRA: f32 = 1.2; // LRA (histogram quantization vs ffmpeg's exact queue)
 const TOL_TP: f32 = 1.0; // true-peak (interpolator differences)
+const TOL_DR: i32 = 1; // DR14 integer (histogram bin quantization vs exact sort)
 /// PCM-decodable extensions we cross-check (DSD is excluded — the decimator's
 /// reported format is 1-bit, so canonical scaling doesn't apply the same way).
 const EXTS: &[&str] = &[
@@ -33,9 +37,18 @@ const EXTS: &[&str] = &[
 ];
 const MAX_FILES: usize = 8;
 
+/// Our analysis of a track: the analyzer's metrics plus the canonicalized PCM it
+/// saw (so the test can also compute the EXACT DR14 reference over the same samples).
+struct Ours {
+    metrics: LoudnessMetrics,
+    sample_rate: u32,
+    channels: usize,
+    samples: Vec<i32>,
+}
+
 /// Decode `path` through the desktop stack, canonicalize to signed 24-bit, feed the
-/// analyzer, and return the full metric set (or `None` if unsupported).
-fn our_metrics(path: &Path) -> Option<LoudnessMetrics> {
+/// analyzer, and keep the canon PCM (or `None` if unsupported).
+fn our_metrics(path: &Path) -> Option<Ours> {
     let mut d = open_track(path).ok()?;
     let si = d.stream_info();
     if si.format.is_dsd() || si.channels == 0 || si.channels > 2 {
@@ -46,6 +59,7 @@ fn our_metrics(path: &Path) -> Option<LoudnessMetrics> {
     let mut a = R128Analyzer::new(si.sample_rate, si.channels as u8);
     let mut buf = vec![0i32; 8192 * ch];
     let mut canon = vec![0i32; 8192 * ch];
+    let mut samples: Vec<i32> = Vec::new();
     loop {
         let n = d.decode_into(&mut buf).ok()?;
         if n == 0 {
@@ -60,8 +74,53 @@ fn our_metrics(path: &Path) -> Option<LoudnessMetrics> {
             };
         }
         a.feed(&canon[..n]);
+        samples.extend_from_slice(&canon[..n]);
     }
-    Some(a.metrics())
+    Some(Ours {
+        metrics: a.metrics(),
+        sample_rate: si.sample_rate,
+        channels: ch,
+        samples,
+    })
+}
+
+/// Exact Pleasurize/TT **DR14** from interleaved canonical-24-bit PCM — sorted
+/// order-statistics (no histogram), the authoritative `dr14_t.meter` algorithm the
+/// analyzer's bounded-memory histogram DR is checked against on real audio.
+fn exact_dr14(samples: &[i32], channels: usize, sample_rate: u32) -> i32 {
+    const FULL_SCALE: f64 = 8_388_608.0;
+    let delta = if sample_rate == 44_100 { 60 } else { 0 };
+    let bs = 3 * (sample_rate + delta) as usize;
+    let frames: Vec<&[i32]> = samples.chunks_exact(channels).collect();
+    let n = frames.len();
+    let (mut rms2, mut peak): (Vec<Vec<f64>>, Vec<Vec<f64>>) =
+        (vec![Vec::new(); channels], vec![Vec::new(); channels]);
+    let mut i = 0;
+    while i < n {
+        let end = (i + bs).min(n);
+        let m = (end - i) as f64;
+        for c in 0..channels {
+            let (mut sumsq, mut pk) = (0.0f64, 0.0f64);
+            for f in &frames[i..end] {
+                let x = f64::from(f[c]) / FULL_SCALE;
+                sumsq += x * x;
+                pk = pk.max(x.abs());
+            }
+            rms2[c].push(2.0 * sumsq / m);
+            peak[c].push(pk);
+        }
+        i = end;
+    }
+    let mm = rms2[0].len();
+    let n_blk = ((0.2 * mm as f64).floor() as usize).max(1);
+    let mut sum = 0.0;
+    for c in 0..channels {
+        rms2[c].sort_by(|a, b| a.partial_cmp(b).unwrap());
+        peak[c].sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let rms_top2: f64 = rms2[c][mm - n_blk..].iter().sum::<f64>() / n_blk as f64;
+        sum += 20.0 * peak[c][mm - 2].log10() - 10.0 * rms_top2.log10();
+    }
+    (sum / channels as f64).round() as i32
 }
 
 /// Integrated LUFS, LRA (LU), and true-peak (dBFS) from `ffmpeg -af ebur128=peak=true`.
@@ -143,21 +202,24 @@ fn run_crosscheck() {
     }
 
     println!(
-        "\n  file                   I (ours/ff)       LRA (ours/ff)     TP (ours/ff)     DR   PLR"
+        "\n  file                   I (ours/ff)       LRA (ours/ff)     TP (ours/ff)     DR (ours/exact)  PLR"
     );
     println!(
-        "  ----                   -----------       -------------     ------------     --   ---"
+        "  ----                   -----------       -------------     ------------     ---------------  ---"
     );
     let mut checked = 0;
     for path in corpus_files(&lib) {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-        let (Some(m), Some((fi, flra, ftp))) = (our_metrics(&path), ffmpeg_metrics(&path)) else {
+        let (Some(o), Some((fi, flra, ftp))) = (our_metrics(&path), ffmpeg_metrics(&path)) else {
             println!("  {name:<22}  (skipped)");
             continue;
         };
+        let m = o.metrics;
+        // Our histogram DR vs the exact sorted-order-statistics DR14 over the SAME PCM.
+        let exact = exact_dr14(&o.samples, o.channels, o.sample_rate);
         println!(
-            "  {name:<22} {:>6.2}/{:>6.2}    {:>5.2}/{:>5.2}    {:>6.2}/{:>6.2}   {:>2.0}  {:>4.1}",
-            m.integrated_lufs, fi, m.lra, flra, m.true_peak_dbtp, ftp, m.dr, m.plr
+            "  {name:<22} {:>6.2}/{:>6.2}    {:>5.2}/{:>5.2}    {:>6.2}/{:>6.2}     {:>3.0} / {:<3}      {:>4.1}",
+            m.integrated_lufs, fi, m.lra, flra, m.true_peak_dbtp, ftp, m.dr, exact, m.plr
         );
         checked += 1;
         let di = m.integrated_lufs - fi;
@@ -177,6 +239,12 @@ fn run_crosscheck() {
             dtp.abs() <= TOL_TP,
             "{name}: true-peak ours {:.2} vs ffmpeg {ftp:.2} (Δ {dtp:+.2}) exceeds ±{TOL_TP}",
             m.true_peak_dbtp
+        );
+        let ddr = m.dr as i32 - exact;
+        assert!(
+            ddr.abs() <= TOL_DR,
+            "{name}: DR ours {} vs exact dr14_t.meter {exact} (Δ {ddr:+}) exceeds ±{TOL_DR}",
+            m.dr
         );
     }
     assert!(checked > 0, "no PCM files were cross-checked");
