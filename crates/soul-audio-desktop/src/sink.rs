@@ -30,12 +30,12 @@ use soul_audio_core::convert::{self, CANONICAL_BITS};
 /// fade-IN on the post-seek side (`deck.rs`): old→0 here, brief silence, then new
 /// 0→full there = a click-free splice. 8 ms ≈ a few hundred samples at 48 kHz, so
 /// the ack is still released far inside `discard`'s ~200 ms bound.
-const DISCARD_FADE_MS: u32 = 8;
+pub(crate) const DISCARD_FADE_MS: u32 = 8;
 
 /// The slice of the SPSC ring consumer the real-time fill needs. Abstracting it
 /// lets the flush/fade logic in [`Fill`] be unit-tested against an in-memory fake
 /// — the cpal callback is otherwise only reachable with a live output device.
-trait Ring {
+pub(crate) trait Ring {
     /// Pop the next buffered sample, or `None` on underrun.
     fn pop(&mut self) -> Option<i32>;
     /// Drop all buffered samples.
@@ -45,7 +45,7 @@ trait Ring {
 /// Newtype over the cpal SPSC ring consumer. A concrete named type (rather than
 /// the `<HeapRb<i32> as Split>::Cons` projection) so [`Ring`] can also be
 /// implemented for the test fake without a coherence conflict.
-struct CpalRing(<HeapRb<i32> as Split>::Cons);
+pub(crate) struct CpalRing(pub(crate) <HeapRb<i32> as Split>::Cons);
 
 impl Ring for CpalRing {
     fn pop(&mut self) -> Option<i32> {
@@ -59,7 +59,7 @@ impl Ring for CpalRing {
 /// Real-time fill state shared by the f32 and i16 callbacks: the smoothed volume
 /// gain plus the seek-discard fade-out. Allocation-free; every method runs on the
 /// audio thread.
-struct Fill {
+pub(crate) struct Fill {
     /// Smoothed output gain, ramped toward the target volume per sample so a
     /// volume change is heard on already-buffered audio without a click.
     cur_gain: f32,
@@ -73,7 +73,7 @@ struct Fill {
 }
 
 impl Fill {
-    fn new(fade_len: u32) -> Self {
+    pub(crate) fn new(fade_len: u32) -> Self {
         Self {
             cur_gain: 1.0,
             fade_remaining: 0,
@@ -89,7 +89,7 @@ impl Fill {
     /// it only resumes writing post-seek audio once the clear has happened). While
     /// a fade is in flight (`fade_remaining > 0`) the flag is left set until
     /// `next` finishes the ramp, so this never re-arms mid-fade.
-    fn begin(&mut self, flush: &AtomicBool, ring: &mut impl Ring) {
+    pub(crate) fn begin(&mut self, flush: &AtomicBool, ring: &mut impl Ring) {
         if self.fade_remaining == 0 && flush.load(Ordering::Acquire) {
             if self.fade_len == 0 {
                 ring.clear();
@@ -106,7 +106,12 @@ impl Fill {
     /// the mirror of the deck's rising fade, no trig for a shared curve). When the
     /// fade completes it clears the ring's remaining pre-seek audio and releases
     /// the discard ack. `None` = ring underran (downstream fills silence).
-    fn next(&mut self, ring: &mut impl Ring, flush: &AtomicBool, target: f32) -> Option<i32> {
+    pub(crate) fn next(
+        &mut self,
+        ring: &mut impl Ring,
+        flush: &AtomicBool,
+        target: f32,
+    ) -> Option<i32> {
         self.cur_gain += (target - self.cur_gain) * 0.01;
         if self.fade_remaining == 0 {
             return ring.pop().map(|s| (s as f32 * self.cur_gain) as i32);
@@ -140,6 +145,10 @@ pub struct CpalSink {
     _stream: Stream,
     rate: u32,
     channels: u16,
+    /// The device's real output sample format (what the OS shared mixer accepts) —
+    /// reported via [`Sink::stream_info`] so the signal path shows the true output
+    /// depth, not the canonical-24 the deck feeds in.
+    format: CoreFmt,
 }
 
 impl CpalSink {
@@ -171,6 +180,17 @@ impl CpalSink {
             .default_output_config()
             .context("querying default output config")?;
         let sample_format = supported.sample_format();
+        // The device's real output format (shared-mode mixer format), reported as the
+        // true output depth. The callback only renders F32 / I16 (below).
+        let format = match sample_format {
+            SampleFormat::F32 => CoreFmt::Float { bits: 32 },
+            SampleFormat::I16 => CoreFmt::Int { bits: 16 },
+            // Anything else is rejected when the stream is built below; fall back to
+            // the canonical depth for the report so this stays total.
+            _ => CoreFmt::Int {
+                bits: CANONICAL_BITS,
+            },
+        };
         let config: StreamConfig = supported.config();
         let channels = config.channels;
         let rate = config.sample_rate.0;
@@ -260,6 +280,7 @@ impl CpalSink {
             _stream: stream,
             rate,
             channels,
+            format,
         })
     }
 }
@@ -281,14 +302,34 @@ pub fn default_output_device_name() -> Option<String> {
         .and_then(|d| d.name().ok())
 }
 
+/// The `(sample_rate, channels)` of an output device's default (shared-mixer)
+/// config — `name` picks one of [`output_device_names`], `None` the system
+/// default. `None` if the device is gone or won't report a config.
+///
+/// Used to open an exclusive-mode stream at the device's native rate: the
+/// shared mix-format rate is the one virtually every DAC also accepts
+/// exclusively, so it's the safe rate to request for bit-perfect output (a
+/// rate-matched track then plays untouched; a mismatched one is reported as
+/// resampling until per-track rate switching lands).
+pub fn default_output_config(name: Option<&str>) -> Option<(u32, u16)> {
+    let host = cpal::default_host();
+    let device = match name {
+        Some(name) => host
+            .output_devices()
+            .ok()?
+            .find(|d| d.name().map(|n| n == name).unwrap_or(false))?,
+        None => host.default_output_device()?,
+    };
+    let cfg = device.default_output_config().ok()?;
+    Some((cfg.sample_rate().0, cfg.channels()))
+}
+
 impl Sink for CpalSink {
     fn stream_info(&self) -> StreamInfo {
         StreamInfo {
             sample_rate: self.rate,
             channels: self.channels,
-            format: CoreFmt::Int {
-                bits: CANONICAL_BITS,
-            },
+            format: self.format,
         }
     }
 

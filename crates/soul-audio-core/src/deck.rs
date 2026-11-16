@@ -34,8 +34,14 @@ pub struct DecodeInfo {
     pub decoded: StreamInfo,
     /// The sink (device) sample rate the deck outputs at.
     pub device_rate: u32,
+    /// The device's **true** output format (bit depth / float), as the sink reports
+    /// it — not the canonical-24 processing format. In shared mode this is whatever
+    /// the OS mixer accepts; in exclusive mode it is the bit-perfect device format.
+    pub output_format: SampleFormat,
     /// Whether the deck resamples `decoded.sample_rate` → `device_rate`.
     pub resampling: bool,
+    /// Whether the sink drives the device in exclusive (bit-perfect) mode.
+    pub exclusive: bool,
 }
 
 /// Canonical output scale: samples are normalized to signed 24-bit (`±2^23`),
@@ -463,7 +469,9 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             codec: t.decoder.codec(),
             decoded: t.decoder.stream_info(),
             device_rate: self.sink_rate,
+            output_format: self.sink.stream_info().format,
             resampling: t.resampler.is_some(),
+            exclusive: self.sink.exclusive(),
         })
     }
 

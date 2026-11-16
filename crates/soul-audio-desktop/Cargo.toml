@@ -18,6 +18,9 @@ anyhow = "1"
 [features]
 default = []
 playback = ["dep:cpal", "dep:ringbuf"]
+# WASAPI exclusive / bit-perfect output (Windows only). Reuses the shared ring + the
+# real-time fill from `playback`; adds the `wasapi` backend for exclusive-mode streams.
+wasapi-exclusive = ["playback", "dep:wasapi"]
 
 [dependencies.cpal]
 version = "0.15"
@@ -27,4 +30,10 @@ optional = true
 # 0.6 (API-compatible traits surface with 0.4) — 0.4.x carries RUSTSEC-2026-0293,
 # a use-after-free in `Consumer::clear`/`skip` (which `sink.rs` calls). Fixed >=0.5.2.
 version = "0.6"
+optional = true
+
+# WASAPI exclusive-mode backend (Windows only, MIT-licensed). Opens the DAC with
+# AUDCLNT_SHAREMODE_EXCLUSIVE for bit-perfect output, bypassing the OS mixer.
+[target.'cfg(windows)'.dependencies.wasapi]
+version = "0.22"
 optional = true
