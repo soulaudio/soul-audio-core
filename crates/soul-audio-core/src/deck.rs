@@ -185,6 +185,9 @@ pub struct Deck<K, D, const PRELOAD: usize> {
     /// Seek de-click fade length in output frames: `round(FADE_MS * sink_rate /
     /// 1000)`. Fixed per sink; a seek arms `Track::fade_remaining` to this.
     fade_len: u32,
+    /// The live output volume (0.0..=1.0), cached so a [`swap_sink`](Deck::swap_sink)
+    /// can re-apply it — a fresh sink starts at unity and would otherwise jump.
+    volume: f32,
     /// Combined ReplayGain, in dB, applied to the deck's output (set by the
     /// caller via [`set_replay_gain`](Deck::set_replay_gain)). `0.0` is unity.
     rg_gain_db: f32,
@@ -212,6 +215,7 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             // round(FADE_MS * sink_rate / 1000) with integer rounding (no f32::round
             // in no_std). `+ 500` is the round-half-up bias for the /1000 divide.
             fade_len: (FADE_MS * si.sample_rate + 500) / 1000,
+            volume: 1.0,
             rg_gain_db: 0.0,
             rg_linear: 1.0,
             in_buf: [0; IN_FIFO * MAX_CH],
@@ -220,33 +224,50 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         }
     }
 
+    /// Resolve a source→sink channel map (identity, or mono upmixed to stereo),
+    /// rejecting anything else as [`DeckError::ChannelMismatch`]. Scratch buffers are
+    /// sized for `MAX_CH`; the equal-rate path has no resampler to reject wider
+    /// streams, so both sides are bounds-checked here (else a >8-ch device + source
+    /// would overflow `in_buf`/`rs_buf`/`out_buf`).
+    fn channel_map(src_ch: usize, sink_ch: usize) -> Result<Map, DeckError> {
+        if src_ch > MAX_CH || sink_ch > MAX_CH {
+            return Err(DeckError::ChannelMismatch);
+        }
+        if src_ch == sink_ch {
+            Ok(Map::Passthrough)
+        } else if src_ch == 1 && sink_ch == 2 {
+            Ok(Map::MonoToStereo)
+        } else {
+            Err(DeckError::ChannelMismatch)
+        }
+    }
+
+    /// Build the resampler for `src_rate` → `sink_rate`, or `None` when they match
+    /// (the bit-perfect pass-through). Rejects a ratio whose input demand would
+    /// overflow the input FIFO.
+    fn make_resampler(
+        ch: usize,
+        src_rate: u32,
+        sink_rate: u32,
+        quality: Quality,
+    ) -> Result<Option<Resampler>, DeckError> {
+        if src_rate == sink_rate {
+            return Ok(None);
+        }
+        let r = Resampler::new(ch, src_rate, sink_rate, 1.0, BLOCK, quality)
+            .map_err(DeckError::Resample)?;
+        if r.input_frames_next() > IN_FIFO {
+            return Err(DeckError::Resample(ResampleError::RatioRangeTooWide));
+        }
+        Ok(Some(r))
+    }
+
     /// Build the per-track pipeline (channel map + resampler) for `decoder`.
     fn build_track(&self, decoder: D) -> Result<Track<D>, DeckError> {
         let si = decoder.stream_info();
         let ch = si.channels as usize;
-        // Scratch buffers are sized for `MAX_CH`; the equal-rate path has no
-        // resampler to reject wider streams, so guard here (else a >8-ch device +
-        // source would overflow `in_buf`/`rs_buf`/`out_buf`).
-        if ch > MAX_CH || self.sink_channels > MAX_CH {
-            return Err(DeckError::ChannelMismatch);
-        }
-        let map = if ch == self.sink_channels {
-            Map::Passthrough
-        } else if ch == 1 && self.sink_channels == 2 {
-            Map::MonoToStereo
-        } else {
-            return Err(DeckError::ChannelMismatch);
-        };
-        let resampler = if si.sample_rate == self.sink_rate {
-            None
-        } else {
-            let r = Resampler::new(ch, si.sample_rate, self.sink_rate, 1.0, BLOCK, self.quality)
-                .map_err(DeckError::Resample)?;
-            if r.input_frames_next() > IN_FIFO {
-                return Err(DeckError::Resample(ResampleError::RatioRangeTooWide));
-            }
-            Some(r)
-        };
+        let map = Self::channel_map(ch, self.sink_channels)?;
+        let resampler = Self::make_resampler(ch, si.sample_rate, self.sink_rate, self.quality)?;
         let bits = match si.format {
             SampleFormat::Int { bits } | SampleFormat::Float { bits } => bits,
             SampleFormat::Dsd { .. } => return Err(DeckError::ChannelMismatch),
@@ -337,6 +358,52 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         self.preload_len = 0;
     }
 
+    /// Replace the output sink — e.g. reopening an exclusive device at a new native
+    /// rate so a track that was being resampled now plays bit-perfect (the engine's
+    /// native-rate switching). Re-reads the new sink's shape, recomputes the
+    /// rate-derived state (`sink_rate`/`sink_channels`/`fade_len`), re-applies the
+    /// live volume (a fresh sink starts at unity), and **rebuilds the current track's
+    /// resampler + channel map** for the new rate — a now-matched rate becomes a
+    /// bit-perfect pass-through. Staged **preloads are dropped** (they were built for
+    /// the old rate; the engine re-primes them). The old sink is dropped, stopping
+    /// its device stream.
+    ///
+    /// The new pipeline is validated and built *before* anything is mutated, so a
+    /// failure (e.g. the current track can't map onto the new sink's channels) leaves
+    /// the deck untouched — still playing on its old sink.
+    ///
+    /// # Errors
+    /// [`DeckError::ChannelMismatch`] / [`DeckError::Resample`] if the current track
+    /// is incompatible with the new sink.
+    pub fn swap_sink(&mut self, new_sink: K) -> Result<(), DeckError> {
+        let si = new_sink.stream_info();
+        let new_rate = si.sample_rate;
+        let new_channels = si.channels as usize;
+        // Pre-build the current track's new pipeline so a failure bails before any
+        // mutation (the deck stays on its old, working sink).
+        let rebuilt = match self.current.as_ref() {
+            Some(t) => Some((
+                Self::channel_map(t.channels, new_channels)?,
+                Self::make_resampler(t.channels, t.rate, new_rate, self.quality)?,
+            )),
+            None => None,
+        };
+        // Commit: install the sink and update every rate-derived field.
+        self.sink = new_sink;
+        self.sink_rate = new_rate;
+        self.sink_channels = new_channels;
+        self.fade_len = (FADE_MS * new_rate + 500) / 1000;
+        // A fresh sink is at unity — re-apply the live volume so it doesn't jump.
+        self.sink.set_volume(self.volume);
+        if let (Some(track), Some((map, resampler))) = (self.current.as_mut(), rebuilt) {
+            track.map = map;
+            track.resampler = resampler;
+        }
+        // Preloads were primed against the old rate — drop them; the engine re-primes.
+        self.clear_preloads();
+        Ok(())
+    }
+
     fn pop_preload(&mut self) -> Track<D> {
         let track = self.preloads[0].take().expect("preload present");
         for i in 1..self.preload_len {
@@ -371,7 +438,9 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
     /// Forward the target volume to the sink (0.0..=1.0), where it is applied at
     /// the output stage so the change is heard immediately.
     pub fn set_volume(&mut self, volume: f32) {
-        self.sink.set_volume(volume.clamp(0.0, 1.0));
+        let v = volume.clamp(0.0, 1.0);
+        self.volume = v;
+        self.sink.set_volume(v);
     }
 
     /// Set the combined ReplayGain, in dB, applied to the deck's output so
@@ -909,6 +978,109 @@ mod tests {
         let di2 = deck2.decode_info().unwrap();
         assert!(!di2.resampling, "48k decoder into a 48k sink: no resample");
         assert_eq!(di2.device_rate, 48_000);
+    }
+
+    #[test]
+    fn swap_sink_to_the_tracks_rate_makes_it_bit_perfect() {
+        // A 44.1 kHz track into a 48 kHz sink resamples; reopening the sink at the
+        // track's native 44.1 kHz (what native-rate exclusive output does) must
+        // rebuild the per-track resampler to the pass-through (bit-perfect) path.
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 2,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, _, 2> = Deck::new(sink, Quality::Fast);
+        deck.load(const_dec(44_100, 2, 7, 1000)).unwrap();
+        assert!(
+            deck.decode_info().unwrap().resampling,
+            "44.1k into 48k resamples before the swap"
+        );
+
+        let native = MockSink {
+            rate: 44_100,
+            ch: 2,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        deck.swap_sink(native).unwrap();
+        let di = deck.decode_info().unwrap();
+        assert_eq!(di.device_rate, 44_100, "the sink rate is now the track's");
+        assert!(
+            !di.resampling,
+            "rate-matched after the swap → bit-perfect pass-through"
+        );
+    }
+
+    #[test]
+    fn swap_sink_carries_volume_and_drops_stale_preloads() {
+        // The new sink starts at unity, so the deck must re-apply the live volume;
+        // and preloads built for the OLD rate are stale, so they're dropped (the
+        // engine re-primes against the new rate).
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 2,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, _, 2> = Deck::new(sink, Quality::Fast);
+        deck.load(const_dec(48_000, 2, 7, 1000)).unwrap();
+        deck.set_volume(0.5);
+        deck.preload(const_dec(48_000, 2, 7, 1000)).unwrap();
+        assert_eq!(deck.free_preload_slots(), 1, "one preload staged");
+
+        let next = MockSink {
+            rate: 96_000,
+            ch: 2,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        deck.swap_sink(next).unwrap();
+        assert_eq!(
+            deck.sink.last_volume,
+            Some(0.5),
+            "the live volume is re-applied to the fresh sink"
+        );
+        assert_eq!(
+            deck.free_preload_slots(),
+            2,
+            "stale (old-rate) preloads are cleared on a sink swap"
+        );
+        let di = deck.decode_info().unwrap();
+        assert_eq!(di.device_rate, 96_000);
+        assert!(di.resampling, "48k track into the new 96k sink resamples");
+    }
+
+    #[test]
+    fn swap_sink_rejecting_incompatible_channels_leaves_the_deck_intact() {
+        // A stereo track can't map onto a 4-channel sink; the swap must fail WITHOUT
+        // mutating — the deck stays on its old, working sink (pre-validated commit).
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 2,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
+        deck.load(const_dec(48_000, 2, 7, 1000)).unwrap();
+
+        let four_ch = MockSink {
+            rate: 48_000,
+            ch: 4,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        assert!(
+            matches!(deck.swap_sink(four_ch), Err(DeckError::ChannelMismatch)),
+            "stereo track onto a 4-channel sink is a channel mismatch"
+        );
+        let di = deck.decode_info().unwrap();
+        assert_eq!(
+            di.device_rate, 48_000,
+            "the old sink is retained on failure"
+        );
+        assert_eq!(deck.sink.ch, 2, "still the original stereo sink");
     }
 
     #[test]
