@@ -869,6 +869,98 @@ mod tests {
         assert!(m.dr > 8.0, "DR={} should reflect the transients", m.dr);
     }
 
+    /// Exact Pleasurize/TT **DR14** from interleaved i32 PCM — sorted order-statistics
+    /// (no histogram), the authoritative `dr14_t.meter` algorithm. The reference the
+    /// analyzer's bounded-memory histogram DR is validated against.
+    fn exact_dr14(samples: &[i32], channels: usize, sample_rate: u32) -> i32 {
+        let delta = if sample_rate == 44_100 { 60 } else { 0 };
+        let bs = 3 * (sample_rate + delta) as usize;
+        let frames: Vec<&[i32]> = samples.chunks_exact(channels).collect();
+        let n = frames.len();
+        let mut rms2: Vec<Vec<f64>> = vec![Vec::new(); channels];
+        let mut peak: Vec<Vec<f64>> = vec![Vec::new(); channels];
+        let mut i = 0;
+        while i < n {
+            let end = (i + bs).min(n);
+            let m = (end - i) as f64;
+            for c in 0..channels {
+                let (mut sumsq, mut pk) = (0.0f64, 0.0f64);
+                for f in &frames[i..end] {
+                    let x = f64::from(f[c]) / FULL_SCALE;
+                    sumsq += x * x;
+                    pk = pk.max(x.abs());
+                }
+                rms2[c].push(2.0 * sumsq / m); // factor-2 RMS²
+                peak[c].push(pk);
+            }
+            i = end;
+        }
+        let mm = rms2[0].len();
+        let n_blk = ((0.2 * mm as f64).floor() as usize).max(1);
+        let mut sum = 0.0;
+        for c in 0..channels {
+            rms2[c].sort_by(|a, b| a.partial_cmp(b).unwrap());
+            peak[c].sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let rms_top2: f64 = rms2[c][mm - n_blk..].iter().sum::<f64>() / n_blk as f64;
+            let peak2 = peak[c][mm - 2]; // 2nd-highest block peak
+            sum += 20.0 * peak2.log10() - 10.0 * rms_top2.log10();
+        }
+        (sum / channels as f64).round() as i32
+    }
+
+    /// 3-second blocks at the given per-block dBFS sine levels, each with one
+    /// full-scale spike at its centre — so block RMS varies (exercising the DR
+    /// loudest-20% selection) while every block's peak is 0 dBFS.
+    fn dr_varied_signal(fs: u32, levels: &[f64]) -> Vec<i32> {
+        let block_n = 3 * fs as usize;
+        let mut out = Vec::with_capacity(levels.len() * block_n * 2);
+        for (b, &dbfs) in levels.iter().enumerate() {
+            let amp = powf(10.0, dbfs / 20.0);
+            for k in 0..block_n {
+                let t = (b * block_n + k) as f64 / f64::from(fs);
+                let mut v = amp * (2.0 * PI64 * 1000.0 * t).sin();
+                if k == block_n / 2 {
+                    v = 1.0;
+                }
+                let s = (v * (FULL_SCALE - 1.0)).round() as i32;
+                out.push(s);
+                out.push(s);
+            }
+        }
+        out
+    }
+
+    /// The analyzer's O(1) **histogram** DR must land on the **exact** sorted-order-
+    /// statistics DR14. Checked on a varied-RMS signal (which actually exercises the
+    /// loudest-20% selection the histogram approximates) within the ±1 quantization
+    /// bound, and on a uniform-RMS signal where the two must be identical.
+    #[test]
+    fn dr_histogram_matches_the_exact_reference() {
+        let varied = dr_varied_signal(
+            48_000,
+            &[
+                -24.0, -20.0, -16.0, -12.0, -8.0, -20.0, -16.0, -12.0, -8.0, -24.0,
+            ],
+        );
+        let mut a = R128Analyzer::new(48_000, 2);
+        a.feed(&varied);
+        let ours = a.dynamic_range() as i32;
+        let exact = exact_dr14(&varied, 2, 48_000);
+        assert!(
+            (ours - exact).abs() <= 1,
+            "varied-RMS: histogram DR {ours} vs exact DR14 {exact}"
+        );
+
+        let flat = dr_signal(48_000, 12, &[3, 7]);
+        let mut b = R128Analyzer::new(48_000, 2);
+        b.feed(&flat);
+        assert_eq!(
+            b.dynamic_range() as i32,
+            exact_dr14(&flat, 2, 48_000),
+            "uniform-RMS: histogram DR must equal the exact DR14"
+        );
+    }
+
     /// A full-scale fs/4 sine sampled 45° off its peaks: the samples sit at ±0.707
     /// (−3.01 dBFS) but the reconstructed waveform reaches 0 dBFS. Sample-peak misses
     /// the inter-sample peak; the 4× true-peak meter must catch it.
