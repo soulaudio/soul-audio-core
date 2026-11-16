@@ -72,6 +72,34 @@ pub fn tan(x: f64) -> f64 {
     x * (1.0 + x2 * (1.0 / 3.0 + x2 * (2.0 / 15.0 + x2 * (17.0 / 315.0))))
 }
 
+const PI: f64 = core::f64::consts::PI;
+
+/// `sin(x)` for any finite `x`, via range reduction to `[-π/2, π/2]` and a Maclaurin
+/// series to `x¹¹/11!` (error ≈ 1e-7 at the fold edges). Used only to generate the
+/// true-peak interpolation FIR once at [`crate::R128Analyzer::new`], so a modest
+/// series suffices — the true-peak tests gate accuracy.
+pub fn sin(x: f64) -> f64 {
+    // Reduce to [-π, π].
+    let two_pi = 2.0 * PI;
+    let mut r = x - two_pi * floor(x / two_pi + 0.5);
+    // Fold [-π, π] onto [-π/2, π/2] via sin(π − r) = sin(r).
+    if r > PI / 2.0 {
+        r = PI - r;
+    } else if r < -PI / 2.0 {
+        r = -PI - r;
+    }
+    let x2 = r * r;
+    r * (1.0
+        - x2 * (1.0 / 6.0
+            - x2 * (1.0 / 120.0
+                - x2 * (1.0 / 5040.0 - x2 * (1.0 / 362_880.0 - x2 * (1.0 / 39_916_800.0))))))
+}
+
+/// `cos(x)` = `sin(x + π/2)`.
+pub fn cos(x: f64) -> f64 {
+    sin(x + PI / 2.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +173,25 @@ mod tests {
             1.584_864_2,
             1e-4
         ));
+    }
+
+    #[test]
+    fn sin_cos_known_values() {
+        let pi = core::f64::consts::PI;
+        for &(x, want) in &[
+            (0.0, 0.0),
+            (pi / 6.0, 0.5),
+            (pi / 2.0, 1.0),
+            (pi, 0.0),
+            (-pi / 2.0, -1.0),
+            (3.0 * pi / 2.0, -1.0),
+            (10.0, -0.544_021_110_889),
+        ] {
+            assert!(close(sin(x), want, 1e-6), "sin({x})={}", sin(x));
+        }
+        for &(x, want) in &[(0.0, 1.0), (pi / 3.0, 0.5), (pi, -1.0), (pi / 2.0, 0.0)] {
+            assert!(close(cos(x), want, 1e-6), "cos({x})={}", cos(x));
+        }
     }
 
     #[test]
