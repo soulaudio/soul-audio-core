@@ -302,6 +302,28 @@ pub fn default_output_device_name() -> Option<String> {
         .and_then(|d| d.name().ok())
 }
 
+/// The `(sample_rate, channels)` of an output device's default (shared-mixer)
+/// config — `name` picks one of [`output_device_names`], `None` the system
+/// default. `None` if the device is gone or won't report a config.
+///
+/// Used to open an exclusive-mode stream at the device's native rate: the
+/// shared mix-format rate is the one virtually every DAC also accepts
+/// exclusively, so it's the safe rate to request for bit-perfect output (a
+/// rate-matched track then plays untouched; a mismatched one is reported as
+/// resampling until per-track rate switching lands).
+pub fn default_output_config(name: Option<&str>) -> Option<(u32, u16)> {
+    let host = cpal::default_host();
+    let device = match name {
+        Some(name) => host
+            .output_devices()
+            .ok()?
+            .find(|d| d.name().map(|n| n == name).unwrap_or(false))?,
+        None => host.default_output_device()?,
+    };
+    let cfg = device.default_output_config().ok()?;
+    Some((cfg.sample_rate().0, cfg.channels()))
+}
+
 impl Sink for CpalSink {
     fn stream_info(&self) -> StreamInfo {
         StreamInfo {
