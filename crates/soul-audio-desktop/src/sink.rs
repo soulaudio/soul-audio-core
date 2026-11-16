@@ -30,12 +30,12 @@ use soul_audio_core::convert::{self, CANONICAL_BITS};
 /// fade-IN on the post-seek side (`deck.rs`): old→0 here, brief silence, then new
 /// 0→full there = a click-free splice. 8 ms ≈ a few hundred samples at 48 kHz, so
 /// the ack is still released far inside `discard`'s ~200 ms bound.
-const DISCARD_FADE_MS: u32 = 8;
+pub(crate) const DISCARD_FADE_MS: u32 = 8;
 
 /// The slice of the SPSC ring consumer the real-time fill needs. Abstracting it
 /// lets the flush/fade logic in [`Fill`] be unit-tested against an in-memory fake
 /// — the cpal callback is otherwise only reachable with a live output device.
-trait Ring {
+pub(crate) trait Ring {
     /// Pop the next buffered sample, or `None` on underrun.
     fn pop(&mut self) -> Option<i32>;
     /// Drop all buffered samples.
@@ -45,7 +45,7 @@ trait Ring {
 /// Newtype over the cpal SPSC ring consumer. A concrete named type (rather than
 /// the `<HeapRb<i32> as Split>::Cons` projection) so [`Ring`] can also be
 /// implemented for the test fake without a coherence conflict.
-struct CpalRing(<HeapRb<i32> as Split>::Cons);
+pub(crate) struct CpalRing(pub(crate) <HeapRb<i32> as Split>::Cons);
 
 impl Ring for CpalRing {
     fn pop(&mut self) -> Option<i32> {
@@ -59,7 +59,7 @@ impl Ring for CpalRing {
 /// Real-time fill state shared by the f32 and i16 callbacks: the smoothed volume
 /// gain plus the seek-discard fade-out. Allocation-free; every method runs on the
 /// audio thread.
-struct Fill {
+pub(crate) struct Fill {
     /// Smoothed output gain, ramped toward the target volume per sample so a
     /// volume change is heard on already-buffered audio without a click.
     cur_gain: f32,
@@ -73,7 +73,7 @@ struct Fill {
 }
 
 impl Fill {
-    fn new(fade_len: u32) -> Self {
+    pub(crate) fn new(fade_len: u32) -> Self {
         Self {
             cur_gain: 1.0,
             fade_remaining: 0,
@@ -89,7 +89,7 @@ impl Fill {
     /// it only resumes writing post-seek audio once the clear has happened). While
     /// a fade is in flight (`fade_remaining > 0`) the flag is left set until
     /// `next` finishes the ramp, so this never re-arms mid-fade.
-    fn begin(&mut self, flush: &AtomicBool, ring: &mut impl Ring) {
+    pub(crate) fn begin(&mut self, flush: &AtomicBool, ring: &mut impl Ring) {
         if self.fade_remaining == 0 && flush.load(Ordering::Acquire) {
             if self.fade_len == 0 {
                 ring.clear();
@@ -106,7 +106,12 @@ impl Fill {
     /// the mirror of the deck's rising fade, no trig for a shared curve). When the
     /// fade completes it clears the ring's remaining pre-seek audio and releases
     /// the discard ack. `None` = ring underran (downstream fills silence).
-    fn next(&mut self, ring: &mut impl Ring, flush: &AtomicBool, target: f32) -> Option<i32> {
+    pub(crate) fn next(
+        &mut self,
+        ring: &mut impl Ring,
+        flush: &AtomicBool,
+        target: f32,
+    ) -> Option<i32> {
         self.cur_gain += (target - self.cur_gain) * 0.01;
         if self.fade_remaining == 0 {
             return ring.pop().map(|s| (s as f32 * self.cur_gain) as i32);
