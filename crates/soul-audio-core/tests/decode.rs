@@ -1321,6 +1321,13 @@ fn open_decodes_aac_5p1_matching_ffmpeg() {
 /// (a 90 Hz tone is almost all low band, so it clears 40 handily despite the
 /// resampler mismatch). The 40 dB bar still decisively rejects a wrong/garbled
 /// or mis-mapped channel (those score near 0 dB).
+///
+/// Desktop profile only: `embedded-profile` drops the `MultistreamOpusDecoder`
+/// variant from `AnyDecoder` (it's the `size_of::<AnyDecoder<S>>()` ceiling),
+/// so under that feature `open()` reports surround Opus as a graceful
+/// `Unsupported` instead — skip rather than assert a decode that profile
+/// intentionally refuses.
+#[cfg(not(feature = "embedded-profile"))]
 #[test]
 fn open_decodes_opus_5p1_matching_ffmpeg() {
     const CH: usize = 6;

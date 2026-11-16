@@ -125,6 +125,18 @@ fn verify() -> Result<(), String> {
         "--features",
         "vorbis-embedded-profile",
     ])?;
+    // The embedded `AnyDecoder` profile (drops the surround-Opus variant for a
+    // stereo DAP's SRAM budget) is likewise a separate const/enum configuration
+    // from the default desktop build — run its host tests too, so the
+    // surround-Opus-is-now-`Unsupported` path and the `size_of::<AnyDecoder<S>>()`
+    // budget guard actually execute under it.
+    run(&[
+        "test",
+        "-p",
+        "soul-audio-core",
+        "--features",
+        "embedded-profile",
+    ])?;
     // The `.soulidx` baker, the Floyd-Steinberg art encoder, and the
     // art_id/art.blob round-trip live behind the `build` feature (std) and are
     // `required-features`-gated, so the default `cargo test` above SKIPS them.
@@ -165,6 +177,19 @@ fn verify() -> Result<(), String> {
         "--no-default-features",
         "--features",
         "vorbis-embedded-profile",
+    ])?;
+    // The embedded `AnyDecoder` profile must also cross-build no_std — the
+    // const configuration a stereo-SRAM-budget firmware build actually wants
+    // (drops the surround-Opus variant; implies `vorbis-embedded-profile`).
+    run(&[
+        "build",
+        "-p",
+        "soul-audio-core",
+        "--target",
+        "thumbv7em-none-eabihf",
+        "--no-default-features",
+        "--features",
+        "embedded-profile",
     ])?;
     run(&[
         "build",

@@ -13,6 +13,7 @@ use crate::demux::mp4::{Mp4Codec, Mp4Reader};
 use crate::demux::ogg::OggReader;
 use crate::formats::caf::CafDecoder;
 use crate::formats::matroska::MatroskaDecoder;
+#[cfg(not(feature = "embedded-profile"))]
 use crate::formats::opus::multistream::MultistreamOpusDecoder;
 use crate::formats::opus::{OpusDecoder, open_opus_headers};
 use crate::formats::wavpack::WavpackDecoder;
@@ -53,6 +54,13 @@ pub enum AnyDecoder<S> {
     /// Multichannel (surround) Opus — RFC 7845 mapping family 1/255. A separate,
     /// larger decoder (one core per stream); decode-only (no seek / declared
     /// length), so its `total_frames`/`seek_to` arms report `None`/`Unsupported`.
+    ///
+    /// Absent under `embedded-profile`: this is the `size_of::<AnyDecoder<S>>()`
+    /// ceiling variant (322,552 B), far past a stereo DAP's SRAM budget. With
+    /// the feature on, a surround-Opus file is a graceful
+    /// [`DecodeError::Unsupported`] from [`open`] instead — see the `open` arm
+    /// below.
+    #[cfg(not(feature = "embedded-profile"))]
     OpusMs(MultistreamOpusDecoder<S>),
     /// Matroska / WebM carrying an audio track (`A_OPUS`/`A_FLAC` in v1). The
     /// contained codec decodes the frames; decode-only for now (Cues seeking is
@@ -91,6 +99,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::Aac(d) => d.total_frames(),
             AnyDecoder::Opus(d) => d.total_frames(),
             // Surround Opus is decode-only; no declared length.
+            #[cfg(not(feature = "embedded-profile"))]
             AnyDecoder::OpusMs(_) => None,
             AnyDecoder::Matroska(d) => d.total_frames(),
             AnyDecoder::WavPack(d) => d.total_frames(),
@@ -136,6 +145,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::Aac(d) => d.seek_to(sample),
             AnyDecoder::Opus(d) => d.seek_to(sample),
             // Surround Opus seeking (per-stream pre-roll) is not implemented.
+            #[cfg(not(feature = "embedded-profile"))]
             AnyDecoder::OpusMs(_) => Err(DecodeError::Unsupported),
             // Matroska restart + forward decode-discard (Opus/FLAC/AAC).
             AnyDecoder::Matroska(d) => d.seek_to(sample),
@@ -165,6 +175,7 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
             AnyDecoder::Aac(d) => d.seek_to_time(secs),
             // Opus always decodes at 48 kHz; convert seconds at that rate.
             AnyDecoder::Opus(d) => d.seek_to(crate::decoder::secs_to_samples(secs, 48_000)),
+            #[cfg(not(feature = "embedded-profile"))]
             AnyDecoder::OpusMs(_) => Err(DecodeError::Unsupported),
             AnyDecoder::Matroska(d) => d.seek_to_time(secs),
             AnyDecoder::WavPack(d) => d.seek_to_time(secs),
@@ -193,6 +204,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::Alac(d) => d.stream_info(),
             AnyDecoder::Aac(d) => d.stream_info(),
             AnyDecoder::Opus(d) => d.stream_info(),
+            #[cfg(not(feature = "embedded-profile"))]
             AnyDecoder::OpusMs(d) => d.stream_info(),
             AnyDecoder::Matroska(d) => d.stream_info(),
             AnyDecoder::WavPack(d) => d.stream_info(),
@@ -215,7 +227,10 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::Mp3(_) => SourceCodec::Mp3,
             AnyDecoder::Alac(_) => SourceCodec::Alac,
             AnyDecoder::Aac(_) => SourceCodec::Aac,
+            #[cfg(not(feature = "embedded-profile"))]
             AnyDecoder::Opus(_) | AnyDecoder::OpusMs(_) => SourceCodec::Opus,
+            #[cfg(feature = "embedded-profile")]
+            AnyDecoder::Opus(_) => SourceCodec::Opus,
             // CAF and Matroska are containers: ask the decoder for its actual
             // payload codec (CAF lpcm/alac; Matroska A_OPUS/A_FLAC/A_AAC).
             AnyDecoder::Matroska(d) => d.codec(),
@@ -234,6 +249,7 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             AnyDecoder::Alac(d) => d.decode_into(out),
             AnyDecoder::Aac(d) => d.decode_into(out),
             AnyDecoder::Opus(d) => d.decode_into(out),
+            #[cfg(not(feature = "embedded-profile"))]
             AnyDecoder::OpusMs(d) => d.decode_into(out),
             AnyDecoder::Matroska(d) => d.decode_into(out),
             AnyDecoder::WavPack(d) => d.decode_into(out),
@@ -256,10 +272,11 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             | AnyDecoder::Flac(_)
             | AnyDecoder::OggFlac(_)
             | AnyDecoder::Opus(_)
-            | AnyDecoder::OpusMs(_)
             | AnyDecoder::Matroska(_)
             | AnyDecoder::WavPack(_)
             | AnyDecoder::Caf(_) => 0,
+            #[cfg(not(feature = "embedded-profile"))]
+            AnyDecoder::OpusMs(_) => 0,
         }
     }
 
@@ -277,10 +294,11 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
             | AnyDecoder::Flac(_)
             | AnyDecoder::OggFlac(_)
             | AnyDecoder::Opus(_)
-            | AnyDecoder::OpusMs(_)
             | AnyDecoder::Matroska(_)
             | AnyDecoder::WavPack(_)
             | AnyDecoder::Caf(_) => None,
+            #[cfg(not(feature = "embedded-profile"))]
+            AnyDecoder::OpusMs(_) => None,
         }
     }
 }
@@ -331,7 +349,20 @@ pub fn open<S: BufSource>(mut src: S) -> Result<AnyDecoder<S>, DecodeError> {
             if head.mapping_family == 0 {
                 OpusDecoder::from_parts(ogg, head).map(AnyDecoder::Opus)
             } else {
-                MultistreamOpusDecoder::from_parts(ogg, head).map(AnyDecoder::OpusMs)
+                // Surround Opus (mapping family 1/255). Under `embedded-profile`
+                // the `MultistreamOpusDecoder` variant doesn't exist in
+                // `AnyDecoder` (it's the 322,552 B size ceiling — see the
+                // variant's doc comment), so a surround file is a graceful
+                // `Unsupported` rather than ballooning every `AnyDecoder` to fit
+                // it. Mono/stereo Opus above is unaffected.
+                #[cfg(not(feature = "embedded-profile"))]
+                {
+                    MultistreamOpusDecoder::from_parts(ogg, head).map(AnyDecoder::OpusMs)
+                }
+                #[cfg(feature = "embedded-profile")]
+                {
+                    Err(DecodeError::Unsupported)
+                }
             }
         }
         // Matroska / WebM: parse the container, then build the contained codec's
@@ -484,6 +515,21 @@ mod tests {
         assert_eq!(
             open(SliceSource::new(&bytes)).err(),
             Some(DecodeError::Unsupported)
+        );
+    }
+
+    /// Guards the `embedded-profile` SRAM budget: a stereo DAP target needs
+    /// `size_of::<AnyDecoder<S>>()` at or under 288 KiB (294,912 B). Dropping
+    /// the `MultistreamOpusDecoder` variant (322,552 B on the desktop profile,
+    /// the ceiling) leaves WavPack as the new ceiling (~262 KB), well inside
+    /// the budget.
+    #[cfg(feature = "embedded-profile")]
+    #[test]
+    fn any_decoder_fits_embedded_budget() {
+        let sz = core::mem::size_of::<AnyDecoder<crate::io::SliceSource<'static>>>();
+        assert!(
+            sz <= 294_912,
+            "AnyDecoder<S> grew to {sz} B under embedded-profile (budget 294,912 B / 288 KiB)"
         );
     }
 
