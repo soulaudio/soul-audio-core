@@ -40,6 +40,14 @@ impl core::error::Error for SinkError {}
 pub trait Sink {
     /// The rate / channels / format the device consumes.
     fn stream_info(&self) -> StreamInfo;
+
+    /// Whether this sink drives the device in **exclusive** (bit-perfect) mode,
+    /// bypassing the OS mixer so the device receives the stream untouched. Default
+    /// `false` (shared mode, the OS may resample). The signal-path projection reads
+    /// this to report whether output is truly bit-perfect.
+    fn exclusive(&self) -> bool {
+        false
+    }
     /// Write **all** of `frames` (interleaved `i32`, length = frame count ×
     /// channels), blocking as needed for buffer space. Returns on completion.
     ///

@@ -140,6 +140,10 @@ pub struct CpalSink {
     _stream: Stream,
     rate: u32,
     channels: u16,
+    /// The device's real output sample format (what the OS shared mixer accepts) —
+    /// reported via [`Sink::stream_info`] so the signal path shows the true output
+    /// depth, not the canonical-24 the deck feeds in.
+    format: CoreFmt,
 }
 
 impl CpalSink {
@@ -171,6 +175,17 @@ impl CpalSink {
             .default_output_config()
             .context("querying default output config")?;
         let sample_format = supported.sample_format();
+        // The device's real output format (shared-mode mixer format), reported as the
+        // true output depth. The callback only renders F32 / I16 (below).
+        let format = match sample_format {
+            SampleFormat::F32 => CoreFmt::Float { bits: 32 },
+            SampleFormat::I16 => CoreFmt::Int { bits: 16 },
+            // Anything else is rejected when the stream is built below; fall back to
+            // the canonical depth for the report so this stays total.
+            _ => CoreFmt::Int {
+                bits: CANONICAL_BITS,
+            },
+        };
         let config: StreamConfig = supported.config();
         let channels = config.channels;
         let rate = config.sample_rate.0;
@@ -260,6 +275,7 @@ impl CpalSink {
             _stream: stream,
             rate,
             channels,
+            format,
         })
     }
 }
@@ -286,9 +302,7 @@ impl Sink for CpalSink {
         StreamInfo {
             sample_rate: self.rate,
             channels: self.channels,
-            format: CoreFmt::Int {
-                bits: CANONICAL_BITS,
-            },
+            format: self.format,
         }
     }
 
