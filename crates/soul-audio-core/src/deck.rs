@@ -404,6 +404,45 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         Ok(())
     }
 
+    /// Reopen the output device at `rate` **in place** — the exclusive native-rate
+    /// switch. Unlike [`swap_sink`](Self::swap_sink), the SAME sink object releases
+    /// and re-acquires its device: WASAPI exclusive is one-client-per-device, so a
+    /// new exclusive stream can't be opened *alongside* the current one (that fails
+    /// with device-in-use). Then recomputes the rate-derived state and rebuilds the
+    /// current track's resampler for whatever rate the sink actually ended at — an
+    /// exclusive sink falls back to its previous rate if the device refuses `rate`,
+    /// so this can be a no-op change.
+    ///
+    /// # Errors
+    /// [`DeckError::Sink`] if the device can't be reacquired at all;
+    /// [`DeckError::ChannelMismatch`] / [`DeckError::Resample`] if the current track
+    /// can't be re-piped to the resulting rate.
+    pub fn reopen_sink_at(&mut self, rate: u32) -> Result<(), DeckError> {
+        self.sink.reopen(rate).map_err(DeckError::Sink)?;
+        self.resync_to_sink()
+    }
+
+    /// Recompute all rate-derived state from the sink's CURRENT `stream_info` — after
+    /// an in-place [`reopen_sink_at`](Self::reopen_sink_at) changed its rate. Rebuilds
+    /// the current track's channel map + resampler (a now-matched rate becomes a
+    /// bit-perfect pass-through), re-applies the live volume (a freshly reopened
+    /// device is at unity), and drops stale preloads (primed against the old rate).
+    fn resync_to_sink(&mut self) -> Result<(), DeckError> {
+        let si = self.sink.stream_info();
+        let (rate, channels) = (si.sample_rate, si.channels as usize);
+        self.sink_rate = rate;
+        self.sink_channels = channels;
+        self.fade_len = (FADE_MS * rate + 500) / 1000;
+        self.sink.set_volume(self.volume);
+        let quality = self.quality;
+        if let Some(track) = self.current.as_mut() {
+            track.map = Self::channel_map(track.channels, channels)?;
+            track.resampler = Self::make_resampler(track.channels, track.rate, rate, quality)?;
+        }
+        self.clear_preloads();
+        Ok(())
+    }
+
     fn pop_preload(&mut self) -> Track<D> {
         let track = self.preloads[0].take().expect("preload present");
         for i in 1..self.preload_len {
@@ -909,6 +948,12 @@ mod tests {
         fn set_volume(&mut self, volume: f32) {
             self.last_volume = Some(volume);
         }
+        fn reopen(&mut self, rate: u32) -> Result<(), SinkError> {
+            // An in-place reopen: the same sink object just changes its reported rate
+            // (a real exclusive sink releases + re-acquires the device here).
+            self.rate = rate;
+            Ok(())
+        }
     }
 
     fn const_dec(rate: u32, ch: usize, value: i32, frames: u64) -> ConstDecoder {
@@ -1050,6 +1095,49 @@ mod tests {
         let di = deck.decode_info().unwrap();
         assert_eq!(di.device_rate, 96_000);
         assert!(di.resampling, "48k track into the new 96k sink resamples");
+    }
+
+    #[test]
+    fn reopen_sink_at_rebuilds_the_resampler_in_place() {
+        // The native-rate switch on a real exclusive device: the SAME sink object is
+        // reopened at the track's rate (it can't open a second exclusive client), so
+        // a resampled path becomes bit-perfect — without building a new sink.
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 2,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, _, 2> = Deck::new(sink, Quality::Fast);
+        deck.load(const_dec(44_100, 2, 7, 1000)).unwrap();
+        deck.set_volume(0.5);
+        deck.preload(const_dec(44_100, 2, 7, 1000)).unwrap();
+        assert!(
+            deck.decode_info().unwrap().resampling,
+            "44.1k into 48k resamples before the reopen"
+        );
+
+        deck.reopen_sink_at(44_100).unwrap();
+
+        let di = deck.decode_info().unwrap();
+        assert_eq!(
+            di.device_rate, 44_100,
+            "the sink is now at the track's rate"
+        );
+        assert!(
+            !di.resampling,
+            "rate-matched after the in-place reopen → bit-perfect"
+        );
+        assert_eq!(
+            deck.sink.last_volume,
+            Some(0.5),
+            "the live volume is re-applied after the reopen"
+        );
+        assert_eq!(
+            deck.free_preload_slots(),
+            2,
+            "stale (old-rate) preloads are cleared on a reopen"
+        );
     }
 
     #[test]
