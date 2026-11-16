@@ -1141,6 +1141,75 @@ mod tests {
     }
 
     #[test]
+    fn reopen_sink_at_preserves_position_and_replay_gain() {
+        // A native-rate reopen happens WHILE a track plays; it must not restart the
+        // track or drop the applied ReplayGain — only the output rate/resampler change.
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 2,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, _, 2> = Deck::new(sink, Quality::Fast);
+        deck.load(const_dec(44_100, 2, 7, 100_000)).unwrap(); // long, resampling track
+        deck.set_replay_gain(-3.0);
+        for _ in 0..5 {
+            deck.pump().unwrap(); // advance the playback position
+        }
+        let pos = deck.position_frames();
+        assert!(pos > 0, "pumped some audio before the reopen");
+
+        deck.reopen_sink_at(44_100).unwrap();
+
+        assert_eq!(
+            deck.position_frames(),
+            pos,
+            "the reopen preserves the playback position (no restart)"
+        );
+        assert_eq!(
+            deck.replay_gain_db(),
+            -3.0,
+            "the reopen preserves the applied ReplayGain"
+        );
+        assert!(
+            !deck.decode_info().unwrap().resampling,
+            "and the now-matched rate is bit-perfect"
+        );
+    }
+
+    #[test]
+    fn swap_sink_preserves_position_on_a_mid_track_device_change() {
+        // `swap_sink` (a device CHANGE, not a rate reopen) can also happen mid-track;
+        // it must keep the playback position too.
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 2,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, _, 2> = Deck::new(sink, Quality::Fast);
+        deck.load(const_dec(48_000, 2, 7, 100_000)).unwrap();
+        for _ in 0..5 {
+            deck.pump().unwrap();
+        }
+        let pos = deck.position_frames();
+        assert!(pos > 0);
+        let other = MockSink {
+            rate: 96_000,
+            ch: 2,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        deck.swap_sink(other).unwrap();
+        assert_eq!(
+            deck.position_frames(),
+            pos,
+            "a device swap preserves the playback position"
+        );
+        assert_eq!(deck.decode_info().unwrap().device_rate, 96_000);
+    }
+
+    #[test]
     fn swap_sink_rejecting_incompatible_channels_leaves_the_deck_intact() {
         // A stereo track can't map onto a 4-channel sink; the swap must fail WITHOUT
         // mutating — the deck stays on its old, working sink (pre-validated commit).
