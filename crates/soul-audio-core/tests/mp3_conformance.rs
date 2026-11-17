@@ -60,7 +60,7 @@ fn decode(bytes: Vec<u8>) -> Vec<i32> {
         .spawn(move || {
             let mut dec = open(
                 SliceSource::new(&bytes),
-                vec![0i32; soul_audio_core::wavpack_pcm_len()],
+                vec![0i32; soul_audio_core::decoder_scratch_len()],
             )
             .expect("probe + construct MPEG decoder");
             let mut out = Vec::new();

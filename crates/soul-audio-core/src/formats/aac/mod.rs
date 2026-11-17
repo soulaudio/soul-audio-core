@@ -917,7 +917,7 @@ mod tests {
             .spawn(move || {
                 let mut dec = crate::dispatch::open(
                     SliceSource::new(bytes),
-                    vec![0i32; crate::dispatch::wavpack_pcm_len()],
+                    vec![0i32; crate::dispatch::decoder_scratch_len()],
                 )
                 .expect("probe + construct");
                 let rate_up_front = dec.stream_info().sample_rate;

@@ -74,7 +74,7 @@ fn bench(label: &str, f: impl Fn() -> (usize, u32, u16) + Send + 'static) {
 fn open_decode(bytes: &'static [u8]) -> (usize, u32, u16) {
     let mut d = open(
         SliceSource::new(bytes),
-        vec![0i32; soul_audio_core::wavpack_pcm_len()],
+        vec![0i32; soul_audio_core::decoder_scratch_len()],
     )
     .expect("open");
     let si = d.stream_info();

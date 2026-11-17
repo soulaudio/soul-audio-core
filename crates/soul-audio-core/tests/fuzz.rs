@@ -230,7 +230,7 @@ fn drive_one(bytes: &[u8], stage: &AtomicUsize) {
     stage.store(stage::OPEN, Ordering::Relaxed);
     if let Ok(mut dec) = open(
         SliceSource::new(bytes),
-        vec![0i32; soul_audio_core::wavpack_pcm_len()],
+        vec![0i32; soul_audio_core::decoder_scratch_len()],
     ) {
         let _ = dec.total_frames();
         dec.resolve_lengths();
@@ -249,7 +249,7 @@ fn drive_one(bytes: &[u8], stage: &AtomicUsize) {
         stage.store(stage::OPEN_DECODE, Ordering::Relaxed);
         if let Ok(mut d2) = open(
             SliceSource::new(bytes),
-            vec![0i32; soul_audio_core::wavpack_pcm_len()],
+            vec![0i32; soul_audio_core::decoder_scratch_len()],
         ) {
             drain_pcm(&mut d2);
         }
@@ -260,7 +260,7 @@ fn drive_one(bytes: &[u8], stage: &AtomicUsize) {
     stage.store(stage::OPEN_SEEKABLE, Ordering::Relaxed);
     if let Ok(mut dec) = open_seekable(
         SliceSource::new(bytes),
-        vec![0i32; soul_audio_core::wavpack_pcm_len()],
+        vec![0i32; soul_audio_core::decoder_scratch_len()],
     ) {
         let _ = dec.total_frames();
         stage.store(stage::OPEN_SEEKABLE_DECODE, Ordering::Relaxed);

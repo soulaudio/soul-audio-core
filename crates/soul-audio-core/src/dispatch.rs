@@ -48,11 +48,11 @@ pub enum AnyDecoder<S, P> {
     /// AIFF / AIFF-C (big-endian PCM, plus `sowt`, IEEE float, and G.711).
     Aiff(AiffDecoder<S>),
     /// Native FLAC.
-    Flac(FlacDecoder<S>),
+    Flac(FlacDecoder<S, P>),
     /// MPEG Layer III.
     Mp3(Mp3Decoder<S>),
     /// FLAC in an Ogg container.
-    OggFlac(FlacDecoder<OggReader<S>>),
+    OggFlac(FlacDecoder<OggReader<S>, P>),
     /// Apple Lossless in an MP4/M4A container.
     Alac(AlacDecoder<S>),
     /// AAC-LC in an MP4/M4A container or a raw ADTS (`.aac`) elementary stream.
@@ -75,7 +75,7 @@ pub enum AnyDecoder<S, P> {
     /// Matroska / WebM carrying an audio track (`A_OPUS`/`A_FLAC` in v1). The
     /// contained codec decodes the frames; decode-only for now (Cues seeking is
     /// a follow-up), so `total_frames`/`seek_to` report `None`/`Unsupported`.
-    Matroska(MatroskaDecoder<S>),
+    Matroska(MatroskaDecoder<S, P>),
     /// WavPack (`.wv`) lossless. Length comes from the stream header; block-index
     /// seeking is a follow-up, so `seek_to` reports `Unsupported`. Its block-staging
     /// PCM buffer is the caller-provided `P` (see the enum's doc comment) — the
@@ -317,20 +317,20 @@ impl<S: crate::io::Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for AnyDecode
     }
 }
 
-/// The required length of [`open`]/[`open_seekable`]'s `wavpack_pcm` storage
+/// The required length of [`open`]/[`open_seekable`]'s `scratch` storage
 /// parameter (equivalently [`crate::formats::wavpack::MAX_BLOCK_PCM`]) — call
 /// this instead of hardcoding the constant when sizing the buffer, e.g.
-/// `vec![0i32; wavpack_pcm_len()]`.
+/// `vec![0i32; decoder_scratch_len()]`.
 #[must_use]
-pub const fn wavpack_pcm_len() -> usize {
+pub const fn decoder_scratch_len() -> usize {
     crate::formats::wavpack::MAX_BLOCK_PCM
 }
 
 /// Probe `src`, then construct the matching PCM decoder.
 ///
-/// `wavpack_pcm` is the block-staging storage the `WavPack` variant needs (see
+/// `scratch` is the block-staging storage the `WavPack` variant needs (see
 /// [`AnyDecoder`]'s doc comment) — every other format ignores it. It must be at
-/// least [`wavpack_pcm_len`] samples long; a shorter buffer makes a WavPack
+/// least [`decoder_scratch_len`] samples long; a shorter buffer makes a WavPack
 /// file decline as `Unsupported` rather than panicking, and costs nothing for
 /// every other format (the parameter is simply dropped).
 ///
@@ -340,14 +340,16 @@ pub const fn wavpack_pcm_len() -> usize {
 /// - Whatever the chosen decoder's `new` reports.
 pub fn open<S: BufSource, P: AsRef<[i32]> + AsMut<[i32]>>(
     mut src: S,
-    wavpack_pcm: P,
+    scratch: P,
 ) -> Result<AnyDecoder<S, P>, DecodeError> {
     match probe(&mut src)? {
         Format::Wav => WavDecoder::new(src).map(AnyDecoder::Wav),
         Format::Aiff => AiffDecoder::new(src).map(AnyDecoder::Aiff),
-        Format::Flac => FlacDecoder::new(src).map(AnyDecoder::Flac),
+        Format::Flac => FlacDecoder::new_in(src, scratch).map(AnyDecoder::Flac),
         Format::Mp3 => Mp3Decoder::new(src).map(AnyDecoder::Mp3),
-        Format::OggFlac => FlacDecoder::new(OggReader::new(src)?).map(AnyDecoder::OggFlac),
+        Format::OggFlac => {
+            FlacDecoder::new_in(OggReader::new(src)?, scratch).map(AnyDecoder::OggFlac)
+        }
         // One MP4 container carries either codec; the `stsd` sample entry
         // decides. Parse the header once, then branch on it: `alac`→ALAC,
         // `mp4a`(AAC-LC)→AAC.
@@ -399,10 +401,10 @@ pub fn open<S: BufSource, P: AsRef<[i32]> + AsMut<[i32]>>(
         }
         // Matroska / WebM: parse the container, then build the contained codec's
         // decoder (Opus/FLAC in v1) — see `MatroskaDecoder::new`.
-        Format::Matroska => MatroskaDecoder::new(src).map(AnyDecoder::Matroska),
+        Format::Matroska => MatroskaDecoder::new_in(src, scratch).map(AnyDecoder::Matroska),
         // WavPack lossless (.wv): the one format that uses the caller-provided
-        // `wavpack_pcm` storage.
-        Format::WavPack => WavpackDecoder::new_in(src, wavpack_pcm).map(AnyDecoder::WavPack),
+        // `scratch` storage.
+        Format::WavPack => WavpackDecoder::new_in(src, scratch).map(AnyDecoder::WavPack),
         // Apple CAF (lpcm / alac).
         Format::Caf => CafDecoder::new(src).map(AnyDecoder::Caf),
     }
@@ -419,14 +421,14 @@ pub fn open<S: BufSource, P: AsRef<[i32]> + AsMut<[i32]>>(
 /// `open` itself keeps its forward-only [`BufSource`] bound — this is an
 /// additive, opt-in path for seekable callers, not a change to `open`.
 ///
-/// `wavpack_pcm` is the same WavPack block-staging storage [`open`] takes —
+/// `scratch` is the same WavPack block-staging storage [`open`] takes —
 /// see its doc comment.
 ///
 /// # Errors
 /// As [`open`]; additionally propagates the seekable MP4 reader's errors.
 pub fn open_seekable<S: BufSource + crate::io::SeekSource, P: AsRef<[i32]> + AsMut<[i32]>>(
     mut src: S,
-    wavpack_pcm: P,
+    scratch: P,
 ) -> Result<AnyDecoder<S, P>, DecodeError> {
     match probe(&mut src)? {
         // The one format that benefits from random access: parse the `moov`
@@ -440,7 +442,7 @@ pub fn open_seekable<S: BufSource + crate::io::SeekSource, P: AsRef<[i32]> + AsM
         }
         // `probe` consumed nothing (it peeks via `fill_buf`), so `src` is still
         // at byte 0 — every other format routes through the existing `open`.
-        _ => open(src, wavpack_pcm),
+        _ => open(src, scratch),
     }
 }
 
@@ -451,9 +453,9 @@ mod tests {
 
     /// WavPack block-staging storage for `open()`/`open_seekable()` calls in
     /// this suite that don't care about WavPack specifically — sized exactly
-    /// right via `wavpack_pcm_len()` rather than hardcoding the constant.
+    /// right via `decoder_scratch_len()` rather than hardcoding the constant.
     fn pcm_scratch() -> Vec<i32> {
-        vec![0i32; wavpack_pcm_len()]
+        vec![0i32; decoder_scratch_len()]
     }
 
     /// A minimal valid 16-bit mono WAV carrying `samples`.

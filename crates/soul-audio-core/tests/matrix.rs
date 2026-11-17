@@ -52,7 +52,7 @@ use soul_audio_core::{
 /// `wavpack` row itself) don't need per-row storage tuning, so they go through
 /// one real call site here.
 fn open<S: BufSource>(src: S) -> Result<AnyDecoder<S, Vec<i32>>, DecodeError> {
-    soul_audio_core::open(src, vec![0i32; soul_audio_core::wavpack_pcm_len()])
+    soul_audio_core::open(src, vec![0i32; soul_audio_core::decoder_scratch_len()])
 }
 
 // ===========================================================================

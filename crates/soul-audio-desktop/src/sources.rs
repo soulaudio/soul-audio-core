@@ -75,7 +75,7 @@ mod tests {
 
         let mut buf = [0u8; 64];
         let src = bytes_source(flac, &mut buf);
-        assert!(open(src, vec![0i32; soul_audio_core::wavpack_pcm_len()]).is_ok()); // fLaC → FLAC variant, real StreamInfo
+        assert!(open(src, vec![0i32; soul_audio_core::decoder_scratch_len()]).is_ok()); // fLaC → FLAC variant, real StreamInfo
     }
 
     #[test]
@@ -83,7 +83,7 @@ mod tests {
         let mut buf = [0u8; 64];
         let src = bytes_source(b"XXXXYYYY".to_vec(), &mut buf);
         assert_eq!(
-            open(src, vec![0i32; soul_audio_core::wavpack_pcm_len()]).err(),
+            open(src, vec![0i32; soul_audio_core::decoder_scratch_len()]).err(),
             Some(DecodeError::Unsupported)
         );
     }

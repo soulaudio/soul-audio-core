@@ -55,7 +55,7 @@ const MAX_TERMS: usize = 16;
 /// Covers the common ~0.5–1 s blocks encoders emit (ffmpeg uses 22050 stereo /
 /// 44100 mono); a larger block declines as `Unsupported`. This is also the
 /// minimum length the caller-provided block-staging storage (`P`, see
-/// [`WavpackDecoder::new_in`]) must meet — [`crate::dispatch::wavpack_pcm_len`]
+/// [`WavpackDecoder::new_in`]) must meet — [`crate::dispatch::decoder_scratch_len`]
 /// exposes it without hardcoding.
 pub const MAX_BLOCK_PCM: usize = 65536;
 

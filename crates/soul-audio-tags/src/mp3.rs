@@ -571,7 +571,7 @@ mod tests {
             // PLAYBACK path: the decoder's CBR byte estimate.
             let mut dec = open(
                 SliceSource::new(bytes),
-                vec![0i32; soul_audio_core::wavpack_pcm_len()],
+                vec![0i32; soul_audio_core::decoder_scratch_len()],
             )
             .expect("open MP1/MP2");
             dec.resolve_lengths();

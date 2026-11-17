@@ -99,7 +99,7 @@ fn located_tracks_decode_to_pcm_matching_the_catalog() {
         let bytes = std::fs::read(&path).expect("read located audio file");
         let mut decoder = open(
             SliceSource::new(&bytes),
-            vec![0i32; soul_audio_core::wavpack_pcm_len()],
+            vec![0i32; soul_audio_core::decoder_scratch_len()],
         )
         .unwrap_or_else(|e| panic!("open {path:?}: {e:?}"));
 

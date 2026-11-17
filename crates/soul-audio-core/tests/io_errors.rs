@@ -94,7 +94,7 @@ fn open_drive(data: &'static [u8], fail_at: usize) -> Result<(), DecodeError> {
     let mut scratch = [0u8; 8192];
     let mut dec = open(
         BufReader::new(ErrAt::new(data, fail_at), &mut scratch),
-        vec![0i32; soul_audio_core::wavpack_pcm_len()],
+        vec![0i32; soul_audio_core::decoder_scratch_len()],
     )?;
     drain_pcm(&mut dec)
 }

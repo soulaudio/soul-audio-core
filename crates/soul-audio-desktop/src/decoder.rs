@@ -56,11 +56,11 @@ pub fn vorbis_arena() -> Box<[u8]> {
 
 /// Build the block-staging storage `open`/`open_seekable`'s `WavPack` variant
 /// needs (decoder-memory-externalization spec, Lever B — see
-/// `soul_audio_core::wavpack_pcm_len`). Shared by [`open_track`] and the CLI's
+/// `soul_audio_core::decoder_scratch_len`). Shared by [`open_track`] and the CLI's
 /// `decode` command, same sizing policy as [`vorbis_arena`].
 #[must_use]
 pub fn wavpack_pcm() -> Box<[i32]> {
-    vec![0i32; soul_audio_core::wavpack_pcm_len()].into_boxed_slice()
+    vec![0i32; soul_audio_core::decoder_scratch_len()].into_boxed_slice()
 }
 
 /// A playable owned decoder: multi-bit PCM (WAV/FLAC/MP3/Ogg-FLAC/AAC/ALAC),
@@ -202,7 +202,7 @@ pub fn open_track(path: &Path) -> Result<OwnedDecoder> {
                 ))
             } else {
                 Ok(OwnedDecoder::Pcm(AnyDecoder::Matroska(
-                    MatroskaDecoder::from_demuxer(demux)
+                    MatroskaDecoder::from_demuxer_in(demux, wavpack_pcm())
                         .map_err(|e| anyhow!("Matroska {}: {e:?}", path.display()))?,
                 )))
             }

@@ -237,7 +237,7 @@ fn resolve_bin(f: &Fmt) -> Option<String> {
 fn decode_ours(bytes: &[u8]) -> Option<Vec<i32>> {
     let mut dec = open_seekable(
         SliceSource::new(bytes),
-        vec![0i32; soul_audio_core::wavpack_pcm_len()],
+        vec![0i32; soul_audio_core::decoder_scratch_len()],
     )
     .ok()?;
     let ch = usize::from(dec.stream_info().channels).max(1);

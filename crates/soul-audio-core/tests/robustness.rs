@@ -116,7 +116,7 @@ fn drive_all(bytes: &[u8]) -> Result<(), &'static str> {
     // Dispatch path (probe → AnyDecoder).
     if let Ok(mut dec) = open(
         SliceSource::new(bytes),
-        vec![0i32; soul_audio_core::wavpack_pcm_len()],
+        vec![0i32; soul_audio_core::decoder_scratch_len()],
     ) {
         if !drain_pcm(&mut dec, len) {
             return Err("open");
@@ -128,7 +128,10 @@ fn drive_all(bytes: &[u8]) -> Result<(), &'static str> {
             return Err("wav");
         }
     }
-    if let Ok(mut d) = FlacDecoder::new(SliceSource::new(bytes)) {
+    if let Ok(mut d) = FlacDecoder::new_in(
+        SliceSource::new(bytes),
+        vec![0i32; soul_audio_core::decoder_scratch_len()],
+    ) {
         if !drain_pcm(&mut d, len) {
             return Err("flac");
         }
@@ -184,7 +187,7 @@ fn drive_all(bytes: &[u8]) -> Result<(), &'static str> {
     // WavPack: the block parser + adaptive-median entropy decoder + decorrelation.
     if let Ok(mut d) = WavpackDecoder::new_in(
         SliceSource::new(bytes),
-        vec![0i32; soul_audio_core::wavpack_pcm_len()],
+        vec![0i32; soul_audio_core::decoder_scratch_len()],
     ) {
         if !drain_pcm(&mut d, len) {
             return Err("wavpack");
@@ -199,7 +202,10 @@ fn drive_all(bytes: &[u8]) -> Result<(), &'static str> {
     // Matroska: the EBML tiling + cluster/SimpleBlock walk + lacing, feeding the
     // Opus/FLAC/AAC seams. (Reached via `open` too, but this hits the decoder even
     // when a mutation breaks the EBML magic that `probe` keys on.)
-    if let Ok(mut d) = MatroskaDecoder::new(SliceSource::new(bytes)) {
+    if let Ok(mut d) = MatroskaDecoder::new_in(
+        SliceSource::new(bytes),
+        vec![0i32; soul_audio_core::decoder_scratch_len()],
+    ) {
         if !drain_pcm(&mut d, len) {
             return Err("matroska");
         }
@@ -225,7 +231,10 @@ fn drive_all(bytes: &[u8]) -> Result<(), &'static str> {
             let _ = d.seek_to(t);
             probe_pcm(&mut d);
         }
-        if let Ok(mut d) = FlacDecoder::new(SliceSource::new(bytes)) {
+        if let Ok(mut d) = FlacDecoder::new_in(
+            SliceSource::new(bytes),
+            vec![0i32; soul_audio_core::decoder_scratch_len()],
+        ) {
             let _ = d.seek_to(t);
             probe_pcm(&mut d);
         }
@@ -257,7 +266,7 @@ fn drive_all(bytes: &[u8]) -> Result<(), &'static str> {
         // per-codec seeks above don't touch.
         if let Ok(mut d) = open(
             SliceSource::new(bytes),
-            vec![0i32; soul_audio_core::wavpack_pcm_len()],
+            vec![0i32; soul_audio_core::decoder_scratch_len()],
         ) {
             let _ = d.seek_to(t);
             probe_pcm(&mut d);
@@ -275,7 +284,10 @@ fn drive_all(bytes: &[u8]) -> Result<(), &'static str> {
             let _ = d.seek_to_time(secs);
             probe_pcm(&mut d);
         }
-        if let Ok(mut d) = FlacDecoder::new(SliceSource::new(bytes)) {
+        if let Ok(mut d) = FlacDecoder::new_in(
+            SliceSource::new(bytes),
+            vec![0i32; soul_audio_core::decoder_scratch_len()],
+        ) {
             let _ = d.seek_to_time(secs);
             probe_pcm(&mut d);
         }

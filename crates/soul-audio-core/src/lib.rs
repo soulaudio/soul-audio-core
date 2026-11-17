@@ -24,7 +24,7 @@ pub mod sink;
 pub use deck::{Deck, DeckError, DeckState, DecodeInfo, Progress};
 pub use decoder::{DecodeError, Decoder, DsdDecoder, DsdSeek, SeekableDecoder};
 pub use demux::{Demuxer, FlacDemuxer, Mp3Demuxer, Packet, WavDemuxer};
-pub use dispatch::{AnyDecoder, open, open_seekable, wavpack_pcm_len};
+pub use dispatch::{AnyDecoder, decoder_scratch_len, open, open_seekable};
 pub use dsd::{DecimateAdapter, DopAdapter, PlaybackDecimateAdapter};
 pub use eq::{Biquad, Equalizer};
 pub use io::{BufReader, BufSource, SeekSource, SliceSource, Source};

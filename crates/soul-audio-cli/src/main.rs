@@ -138,8 +138,10 @@ fn decode(input: &Path, out: &Path) -> Result<()> {
                 // `_` arm below), so it needs an explicit annotation — the one
                 // variant that isn't `WavPack` doesn't care which storage type,
                 // but `AnyDecoder<S, P>` still names the parameter.
-                let mut decoder: AnyDecoder<_, Box<[i32]>> =
-                    AnyDecoder::Matroska(MatroskaDecoder::from_demuxer(demux).map_err(fail)?);
+                let mut decoder: AnyDecoder<_, Box<[i32]>> = AnyDecoder::Matroska(
+                    MatroskaDecoder::from_demuxer_in(demux, soul_audio_desktop::wavpack_pcm())
+                        .map_err(fail)?,
+                );
                 stream_pcm(&mut decoder, &mut w).map_err(fail)?;
             }
         }

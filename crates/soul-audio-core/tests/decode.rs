@@ -13,7 +13,7 @@ use soul_audio_core::{AnyDecoder, BufSource, DecodeError, Decoder, SeekableDecod
 /// about WavPack specifically, so they go through one real call site here
 /// rather than threading a `Vec<i32>` literal into each of them.
 fn open<S: BufSource>(src: S) -> Result<AnyDecoder<S, Vec<i32>>, DecodeError> {
-    soul_audio_core::open(src, vec![0i32; soul_audio_core::wavpack_pcm_len()])
+    soul_audio_core::open(src, vec![0i32; soul_audio_core::decoder_scratch_len()])
 }
 
 /// A minimal valid 16-bit mono WAV carrying `samples`.
@@ -966,7 +966,7 @@ fn decode_all_seekable(bytes: &[u8]) -> Vec<i32> {
             .spawn_scoped(scope, || {
                 let mut dec = soul_audio_core::open_seekable(
                     SliceSource::new(bytes),
-                    vec![0i32; soul_audio_core::wavpack_pcm_len()],
+                    vec![0i32; soul_audio_core::decoder_scratch_len()],
                 )
                 .expect("probe + construct (seekable)");
                 let mut out = Vec::new();

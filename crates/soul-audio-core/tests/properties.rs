@@ -45,7 +45,7 @@ fn decode_open(bytes: &'static [u8], buf_len: usize) -> Decoded {
     on_big_stack(move || {
         let mut d = open(
             SliceSource::new(bytes),
-            vec![0i32; soul_audio_core::wavpack_pcm_len()],
+            vec![0i32; soul_audio_core::decoder_scratch_len()],
         )
         .expect("open");
         let total_frames = d.total_frames();

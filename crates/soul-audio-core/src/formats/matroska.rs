@@ -69,40 +69,51 @@ const MAX_FLAC_CODEC_PRIVATE: usize = 1024;
 /// A Matroska / WebM decoder: the container plus whichever per-codec core the
 /// track's `CodecID` selects.
 ///
-/// The `Flac` variant is much larger than `Opus` (it embeds `FlacDecoder`'s
-/// inline no-alloc block buffers plus the frame-staging adapter). Boxing is
+/// The `Aac` variant is much larger than `Opus`/`Flac` (it embeds
+/// `AacDecoder`'s inline no-alloc filterbank/SBR buffers — AAC isn't
+/// externalized yet, decoder-memory-externalization spec Phase 4). Boxing is
 /// impossible under `#![no_std]`, so — like [`AnyDecoder`](crate::dispatch::AnyDecoder)
 /// itself — the size gap is accepted.
+///
+/// `P` is the shared scratch store [`FlacDecoder`] carves its channel-planar
+/// decode buffer from (see [`AnyDecoder`](crate::dispatch::AnyDecoder)'s doc
+/// comment) — only the `Flac` variant uses it; `Opus`/`Aac` ignore it, but
+/// still have to name the type parameter (every parameter in scope is used by
+/// *some* variant).
 #[allow(clippy::large_enum_variant)]
-pub enum MatroskaDecoder<S> {
+pub enum MatroskaDecoder<S, P> {
     /// `A_OPUS` — the shared Opus core driven per `SimpleBlock`.
     Opus(MatroskaOpus<S>),
-    /// `A_FLAC` — [`FlacDecoder`] over a native-FLAC byte adapter.
-    Flac(FlacDecoder<MatroskaFlacReader<S>>),
+    /// `A_FLAC` — [`FlacDecoder`] over a native-FLAC byte adapter, carving its
+    /// decode planes from the shared `P` scratch.
+    Flac(FlacDecoder<MatroskaFlacReader<S>, P>),
     /// `A_AAC` — [`AacDecoder`] fed one `SimpleBlock` (= raw access unit) at a
     /// time; config from the `CodecPrivate` `AudioSpecificConfig`.
     Aac(AacDecoder<S>),
 }
 
-impl<S: Source> MatroskaDecoder<S> {
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> MatroskaDecoder<S, P> {
     /// Parse the Matroska header and build the decoder for its audio track.
+    /// `scratch` is the shared working-buffer storage the `A_FLAC` track uses
+    /// (see [`AnyDecoder`](crate::dispatch::AnyDecoder)'s doc comment);
+    /// `A_OPUS`/`A_AAC` ignore it.
     ///
     /// # Errors
     /// [`DecodeError::Unsupported`] for a non-audio / unsupported `CodecID`
-    /// (only Opus and FLAC in v1), plus the demuxer's own errors.
-    pub fn new(src: S) -> Result<Self, DecodeError> {
-        Self::from_demuxer(MatroskaDemuxer::new(src)?)
+    /// (only Opus, FLAC, and AAC in v1), plus the demuxer's own errors.
+    pub fn new_in(src: S, scratch: P) -> Result<Self, DecodeError> {
+        Self::from_demuxer_in(MatroskaDemuxer::new(src)?, scratch)
     }
 
     /// Build from an already-parsed demuxer — lets a consumer peek
     /// [`MatroskaDemuxer::codec_id`] (e.g. to route `A_VORBIS` to the arena-backed
     /// Vorbis path) and hand the demuxer here for everything else, without
-    /// re-reading the container.
+    /// re-reading the container. `scratch` is as [`Self::new_in`].
     ///
     /// # Errors
     /// [`DecodeError::Unsupported`] for an unsupported `CodecID` — including
     /// `A_VORBIS`, which is consumer-dispatched via [`MatroskaVorbisOgg`].
-    pub fn from_demuxer(demux: MatroskaDemuxer<S>) -> Result<Self, DecodeError> {
+    pub fn from_demuxer_in(demux: MatroskaDemuxer<S>, scratch: P) -> Result<Self, DecodeError> {
         match demux.codec_id() {
             b"A_OPUS" => {
                 let head = OpusHead::parse(demux.codec_private())?;
@@ -115,7 +126,7 @@ impl<S: Source> MatroskaDecoder<S> {
             }
             b"A_FLAC" => {
                 let reader = MatroskaFlacReader::new(demux)?;
-                Ok(MatroskaDecoder::Flac(FlacDecoder::new(reader)?))
+                Ok(MatroskaDecoder::Flac(FlacDecoder::new_in(reader, scratch)?))
             }
             b"A_AAC" => {
                 let config = parse_audio_specific_config(demux.codec_private())?;
@@ -134,7 +145,7 @@ impl<S: Source> MatroskaDecoder<S> {
     }
 }
 
-impl<S: SeekSource> MatroskaDecoder<S> {
+impl<S: SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> MatroskaDecoder<S, P> {
     /// Seek to per-channel `sample`: a Cues-index jump to the covering Cluster
     /// plus a short forward decode-discard within it (linear fallback when the
     /// file carries no Cues).
@@ -159,7 +170,7 @@ impl<S: SeekSource> MatroskaDecoder<S> {
     }
 }
 
-impl<S: Source> Decoder for MatroskaDecoder<S> {
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for MatroskaDecoder<S, P> {
     fn stream_info(&self) -> StreamInfo {
         match self {
             MatroskaDecoder::Opus(d) => d.stream_info(),

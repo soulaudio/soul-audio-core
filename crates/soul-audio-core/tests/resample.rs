@@ -79,7 +79,7 @@ fn end_to_end_decode_then_resample() {
     let wav = include_bytes!("../testdata/ima-adpcm-stereo.wav");
     let mut dec = open(
         SliceSource::new(wav),
-        vec![0i32; soul_audio_core::wavpack_pcm_len()],
+        vec![0i32; soul_audio_core::decoder_scratch_len()],
     )
     .unwrap();
     let ch = dec.stream_info().channels as usize;
