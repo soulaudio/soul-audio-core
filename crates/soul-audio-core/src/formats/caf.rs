@@ -438,11 +438,18 @@ impl<S: SeekSource> CafPcm<S> {
 
 /// `alac` CAF: drive the shared ALAC [`decode_packet`] core over the `data`
 /// chunk's self-delimiting packets, with the `kuki` config.
+///
+/// `scratch` is a fixed-size `[i32; alac::SCRATCH_LEN]` for now (not yet
+/// caller-provided) — [`alac::Scratch`] itself is externalized (carved from a
+/// generic `P`, decoder-memory-externalization spec §7), but threading an
+/// external `P` through `CafDecoder`'s own public API is a follow-up; a plain
+/// array still satisfies `P`'s `AsRef<[i32]> + AsMut<[i32]>` bound, so
+/// `CafAlac` keeps its current (unexternalized) RAM cost here in the interim.
 pub struct CafAlac<S> {
     src: S,
     info: StreamInfo,
     cfg: AlacCfg,
-    scratch: Scratch,
+    scratch: Scratch<[i32; alac::SCRATCH_LEN]>,
     inbuf: [u8; PACKET_CAP],
     filled: usize,
     used: usize,
@@ -478,7 +485,8 @@ impl<S: Source> CafAlac<S> {
                 },
             },
             cfg,
-            scratch: Scratch::new(),
+            // Exactly `alac::SCRATCH_LEN` slots, so this can never fail.
+            scratch: Scratch::new_in([0i32; alac::SCRATCH_LEN])?,
             inbuf: [0; PACKET_CAP],
             filled: 0,
             used: 0,
@@ -549,7 +557,7 @@ impl<S: Source> CafAlac<S> {
             let avail = self.out_len - self.out_pos;
             let take = avail.min(out.len() - written);
             out[written..written + take]
-                .copy_from_slice(&self.scratch.out[self.out_pos..self.out_pos + take]);
+                .copy_from_slice(&self.scratch.out_ref()[self.out_pos..self.out_pos + take]);
             self.out_pos += take;
             written += take;
         }
@@ -593,7 +601,9 @@ impl<S: SeekSource> CafAlac<S> {
 
     /// Reset the decode buffers/EOF flag after a seek repositions the source.
     fn reset_for_seek(&mut self) {
-        self.scratch = Scratch::new();
+        // Exactly `alac::SCRATCH_LEN` slots, so this can never fail.
+        self.scratch =
+            Scratch::new_in([0i32; alac::SCRATCH_LEN]).expect("fixed-size scratch always fits");
         self.filled = 0;
         self.used = 0;
         self.out_len = 0;

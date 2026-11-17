@@ -54,7 +54,7 @@ pub enum AnyDecoder<S, P> {
     /// FLAC in an Ogg container.
     OggFlac(FlacDecoder<OggReader<S>, P>),
     /// Apple Lossless in an MP4/M4A container.
-    Alac(AlacDecoder<S>),
+    Alac(AlacDecoder<S, P>),
     /// AAC-LC in an MP4/M4A container or a raw ADTS (`.aac`) elementary stream.
     Aac(AacDecoder<S>),
     /// Opus audio in an Ogg container (RFC 7845/6716). Unlike Vorbis, every
@@ -356,7 +356,9 @@ pub fn open<S: BufSource, P: AsRef<[i32]> + AsMut<[i32]>>(
         Format::Mp4 => {
             let reader = Mp4Reader::new(src)?;
             match reader.codec() {
-                Mp4Codec::Alac(_) => AlacDecoder::from_reader(reader).map(AnyDecoder::Alac),
+                Mp4Codec::Alac(_) => {
+                    AlacDecoder::from_reader_in(reader, scratch).map(AnyDecoder::Alac)
+                }
                 Mp4Codec::Aac(_) => AacDecoder::new_mp4(reader).map(AnyDecoder::Aac),
             }
         }
@@ -436,7 +438,9 @@ pub fn open_seekable<S: BufSource + crate::io::SeekSource, P: AsRef<[i32]> + AsM
         Format::Mp4 => {
             let reader = Mp4Reader::new_seekable(src)?;
             match reader.codec() {
-                Mp4Codec::Alac(_) => AlacDecoder::from_reader(reader).map(AnyDecoder::Alac),
+                Mp4Codec::Alac(_) => {
+                    AlacDecoder::from_reader_in(reader, scratch).map(AnyDecoder::Alac)
+                }
                 Mp4Codec::Aac(_) => AacDecoder::new_mp4(reader).map(AnyDecoder::Aac),
             }
         }
