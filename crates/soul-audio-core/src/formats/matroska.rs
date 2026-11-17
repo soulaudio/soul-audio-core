@@ -28,6 +28,7 @@ use crate::formats::opus::conformance::OpusFrameDecoder;
 use crate::formats::opus::container::OpusHead;
 use crate::formats::opus::linear_output_gain;
 use crate::formats::opus::toc;
+use crate::formats::scratch::ScratchCursor;
 use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
 
@@ -69,14 +70,16 @@ const MAX_FLAC_CODEC_PRIVATE: usize = 1024;
 /// A Matroska / WebM decoder: the container plus whichever per-codec core the
 /// track's `CodecID` selects.
 ///
-/// `P` is the shared scratch store [`FlacDecoder`]/[`AacDecoder`] carve their
-/// decode buffers from (see [`AnyDecoder`](crate::dispatch::AnyDecoder)'s doc
-/// comment) — `Opus` ignores it, but still has to name the type parameter
-/// (every parameter in scope is used by *some* variant).
+/// `P` is the shared scratch store [`MatroskaOpus`]/[`FlacDecoder`]/[`AacDecoder`]
+/// each carve their own decode buffer(s) from (see
+/// [`AnyDecoder`](crate::dispatch::AnyDecoder)'s doc comment) — every variant
+/// uses it now, each independently (only one variant is ever live per
+/// `MatroskaDecoder`, so they never contend for the same storage).
 #[allow(clippy::large_enum_variant)]
 pub enum MatroskaDecoder<S, P> {
-    /// `A_OPUS` — the shared Opus core driven per `SimpleBlock`.
-    Opus(MatroskaOpus<S>),
+    /// `A_OPUS` — the shared Opus core driven per `SimpleBlock`, carving its
+    /// decoded-PCM buffer from the shared `P` scratch.
+    Opus(MatroskaOpus<S, P>),
     /// `A_FLAC` — [`FlacDecoder`] over a native-FLAC byte adapter, carving its
     /// decode planes from the shared `P` scratch.
     Flac(FlacDecoder<MatroskaFlacReader<S>, P>),
@@ -88,13 +91,14 @@ pub enum MatroskaDecoder<S, P> {
 
 impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> MatroskaDecoder<S, P> {
     /// Parse the Matroska header and build the decoder for its audio track.
-    /// `scratch` is the shared working-buffer storage the `A_FLAC`/`A_AAC`
-    /// tracks use (see [`AnyDecoder`](crate::dispatch::AnyDecoder)'s doc
-    /// comment); `A_OPUS` ignores it.
+    /// `scratch` is the shared working-buffer storage the `A_OPUS`/`A_FLAC`/
+    /// `A_AAC` tracks each carve their own decode buffer(s) from (see
+    /// [`AnyDecoder`](crate::dispatch::AnyDecoder)'s doc comment).
     ///
     /// # Errors
     /// [`DecodeError::Unsupported`] for a non-audio / unsupported `CodecID`
-    /// (only Opus, FLAC, and AAC in v1), plus the demuxer's own errors.
+    /// (only Opus, FLAC, and AAC in v1), a `scratch` too small for the chosen
+    /// codec's decode buffer(s), plus the demuxer's own errors.
     pub fn new_in(src: S, scratch: P) -> Result<Self, DecodeError> {
         Self::from_demuxer_in(MatroskaDemuxer::new(src)?, scratch)
     }
@@ -116,7 +120,9 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> MatroskaDecoder<S, P> {
                 if head.mapping_family != 0 {
                     return Err(DecodeError::Unsupported);
                 }
-                Ok(MatroskaDecoder::Opus(MatroskaOpus::new(demux, &head)))
+                Ok(MatroskaDecoder::Opus(MatroskaOpus::new_in(
+                    demux, &head, scratch,
+                )?))
             }
             b"A_FLAC" => {
                 let reader = MatroskaFlacReader::new(demux)?;
@@ -197,7 +203,16 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for MatroskaDecoder<S, P
 /// stream-global pre-skip and output gain. No Ogg granule end-trim (Matroska
 /// uses the `DiscardPadding` element, a follow-up); the few ms of trailing
 /// encoder padding are emitted.
-pub struct MatroskaOpus<S> {
+///
+/// The decoded-PCM-for-the-current-packet buffer is **caller-provided
+/// scratch** `P` (`AsRef<[i32]> + AsMut<[i32]>`), carved by a bump cursor in
+/// [`Self::new_in`] — the SAME shared scratch
+/// [`FlacDecoder`]/[`AacDecoder`]/[`crate::formats::opus::OpusDecoder`] use
+/// (decoder-memory-externalization spec §7), exactly mirroring the standalone
+/// Ogg-Opus decoder's `pcm_buf` carve. `packet` (the pre-decode `SimpleBlock`
+/// byte staging) stays an inline fixed-size array — it's raw encoded bytes,
+/// not PCM.
+pub struct MatroskaOpus<S, P> {
     demux: MatroskaDemuxer<S>,
     core: OpusFrameDecoder,
     channels: usize,
@@ -207,15 +222,32 @@ pub struct MatroskaOpus<S> {
     /// Per-channel samples still to discard as leading pre-skip (RFC 7845 §4.2).
     skip_remaining: u64,
     packet: [u8; MAX_OPUS_PACKET],
-    pcm: [i32; MAX_OPUS_PCM],
+    /// Caller-provided scratch the decoded-PCM-for-the-current-packet buffer
+    /// is carved from (see the struct doc comment).
+    scratch: P,
+    /// i32-slot offset of the `MAX_OPUS_PCM`-long PCM buffer within
+    /// [`Self::scratch`] (see [`Self::pcm_ref`]/[`Self::pcm_mut`]).
+    pcm_off: usize,
+    /// Number of valid samples in the scratch PCM buffer.
     pcm_len: usize,
+    /// Read cursor into the scratch PCM buffer.
     pcm_pos: usize,
 }
 
-impl<S: Source> MatroskaOpus<S> {
-    fn new(demux: MatroskaDemuxer<S>, head: &OpusHead) -> Self {
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> MatroskaOpus<S, P> {
+    /// Build over an already-positioned demuxer and parsed `OpusHead`, carving
+    /// the decoded-PCM buffer from `scratch` (must be at least `MAX_OPUS_PCM`
+    /// samples long — [`crate::dispatch::decoder_scratch_len`] is comfortably
+    /// larger).
+    ///
+    /// # Errors
+    /// [`DecodeError::Unsupported`] if `scratch` is too small to hold the PCM
+    /// buffer (never a panic / out-of-bounds index on undersized storage).
+    fn new_in(demux: MatroskaDemuxer<S>, head: &OpusHead, scratch: P) -> Result<Self, DecodeError> {
         let channels = usize::from(head.channels).clamp(1, 2);
-        Self {
+        let mut cursor = ScratchCursor::new(scratch.as_ref().len());
+        let pcm_off = cursor.alloc(MAX_OPUS_PCM)?;
+        Ok(Self {
             demux,
             core: OpusFrameDecoder::new(channels),
             channels,
@@ -223,10 +255,11 @@ impl<S: Source> MatroskaOpus<S> {
             pre_skip: u64::from(head.pre_skip),
             skip_remaining: u64::from(head.pre_skip),
             packet: [0; MAX_OPUS_PACKET],
-            pcm: [0; MAX_OPUS_PCM],
+            scratch,
+            pcm_off,
             pcm_len: 0,
             pcm_pos: 0,
-        }
+        })
     }
 
     fn stream_info(&self) -> StreamInfo {
@@ -237,8 +270,13 @@ impl<S: Source> MatroskaOpus<S> {
         }
     }
 
-    /// Decode the next Opus packet into [`Self::pcm`], applying the leading
-    /// pre-skip. Leaves `pcm_len == 0` at a clean end of stream.
+    /// Read-only view of the `MAX_OPUS_PCM`-long scratch PCM buffer.
+    fn pcm_ref(&self) -> &[i32] {
+        &self.scratch.as_ref()[self.pcm_off..self.pcm_off + MAX_OPUS_PCM]
+    }
+
+    /// Decode the next Opus packet into the scratch PCM buffer, applying the
+    /// leading pre-skip. Leaves `pcm_len == 0` at a clean end of stream.
     fn fill(&mut self) -> Result<(), DecodeError> {
         self.pcm_len = 0;
         self.pcm_pos = 0;
@@ -254,7 +292,11 @@ impl<S: Source> MatroskaOpus<S> {
                 Err(_) => continue, // skip a malformed packet rather than abort
             };
             let frame_pch = usize::from(config.frame_size_48k);
-            let mut scratch = [0i32; MAX_OPUS_FRAME];
+            // One decoded frame's worth of interleaved PCM, gain already applied
+            // by the core. A plain stack-local temporary (not struct-embedded
+            // scratch): it lives only for this one loop iteration, reused across
+            // the packet's frames.
+            let mut frame_pcm = [0i32; MAX_OPUS_FRAME];
             for &frame in frames.iter().take(count) {
                 // Per-channel samples this frame yields (a DTX/empty frame is
                 // concealed as silence for its nominal span).
@@ -262,7 +304,7 @@ impl<S: Source> MatroskaOpus<S> {
                     frame_pch
                 } else {
                     self.core
-                        .decode_frame(frame, config, self.output_gain, &mut scratch)
+                        .decode_frame(frame, config, self.output_gain, &mut frame_pcm)
                         / channels
                 };
                 // Leading pre-skip: drop whole-or-partial frames below the skip.
@@ -272,13 +314,18 @@ impl<S: Source> MatroskaOpus<S> {
                 if emit == 0 {
                     continue;
                 }
-                let end = (self.pcm_len + emit * channels).min(self.pcm.len());
+                let end = (self.pcm_len + emit * channels).min(MAX_OPUS_PCM);
                 let take = end - self.pcm_len;
+                // Direct `self.scratch`/`self.pcm_off` field access (not the
+                // `Self::pcm_mut` helper) — `frames`'s slices still borrow
+                // `self.packet` here, and a method call would need all of
+                // `self`, not just the disjoint `scratch` field.
+                let off = self.pcm_off;
                 if frame.is_empty() {
-                    self.pcm[self.pcm_len..end].fill(0);
+                    self.scratch.as_mut()[off + self.pcm_len..off + end].fill(0);
                 } else {
-                    let src = &scratch[skip * channels..skip * channels + take];
-                    self.pcm[self.pcm_len..end].copy_from_slice(src);
+                    let src = &frame_pcm[skip * channels..skip * channels + take];
+                    self.scratch.as_mut()[off + self.pcm_len..off + end].copy_from_slice(src);
                 }
                 self.pcm_len = end;
             }
@@ -300,7 +347,7 @@ impl<S: Source> MatroskaOpus<S> {
             }
             let avail = self.pcm_len - self.pcm_pos;
             let take = avail.min(out.len() - w);
-            out[w..w + take].copy_from_slice(&self.pcm[self.pcm_pos..self.pcm_pos + take]);
+            out[w..w + take].copy_from_slice(&self.pcm_ref()[self.pcm_pos..self.pcm_pos + take]);
             self.pcm_pos += take;
             w += take;
         }
@@ -308,7 +355,7 @@ impl<S: Source> MatroskaOpus<S> {
     }
 }
 
-impl<S: SeekSource> MatroskaOpus<S> {
+impl<S: SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> MatroskaOpus<S, P> {
     /// Seek to per-channel `sample`. With a Cues index the demuxer jumps straight
     /// to the Cluster covering the target ([`MatroskaDemuxer::seek_to_cue`]) and
     /// the decoder forward-decode-discards only within it — O(1) on the index +
