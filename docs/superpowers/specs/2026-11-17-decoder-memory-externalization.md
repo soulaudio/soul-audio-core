@@ -199,3 +199,62 @@ plumbing; generalize the type.
   only the updated core. Propagate by re-pinning soul-player-ng to this branch (or
   a local path) for desktop testing, then merging to core `main` once validated.
   Desktop test = the same core the DAP runs, exercised on the desktop player.
+
+## 8. AAC slice (Option A) — SBR gated off + PCM externalized
+
+Phase 3's AAC work landed as **Option A**: rather than externalize AAC's SBR
+state into the shared scratch (`sbr::SbrState`/`SbrOutput` are `f32` QMF
+state, not `i32` — externalizing them through `ScratchCursor`'s i32-slot
+cursor would need bytemuck-style reinterpretation, for a feature the DAP
+target doesn't use), **gate SBR off entirely under `embedded-profile`** and
+externalize only AAC's i32 PCM carry buffer:
+
+- `sbr`/`ps` (the whole submodule tree, QMF state + const tables) are
+  `#[cfg(not(feature = "embedded-profile"))]` — dropped from the embedded
+  build, not just unused. `syntax::decode_fil` skip-consumes any
+  `EXT_SBR_DATA`/`EXT_SBR_DATA_CRC` fill-element payload as a no-op there (same
+  bits read, no location recorded), so the AAC-LC core always decodes and the
+  bitstream never desyncs; `stream_info()` reports the **core** rate.
+- `AacDecoder<S, P>` carves its decoded-PCM carry buffer from the same shared
+  `P` scratch FLAC/ALAC/WavPack/Matroska use (`ScratchCursor`, one `usize`
+  offset — the established pattern from this doc's §3/§7).
+- MP4/Matroska `total_frames`/`encoder_delay`/`playable_frames`: an
+  explicit-ASC HE-AAC file's container-declared values are in the 2× SBR
+  output domain; `embedded-profile` halves them back to the core domain it
+  actually decodes at (otherwise a HE-AAC `.m4a` would report ~2× its real
+  duration under the profile that can't produce that duration).
+- An HE-AAC source should be **transcoded to AAC-LC or FLAC at desktop
+  import** for full quality under `embedded-profile` — mirroring the existing
+  surround→stereo downmix-at-import design (see the dap-index doc's "HE-AAC
+  fold-down" note).
+
+### Measured (this repo, `size_of::<T<SliceSource<'static>, &'static mut [i32]>>()`)
+
+| | Desktop (no feature) | `embedded-profile` |
+|---|---|---|
+| `AacDecoder` before (SBR inline, `pcm` inline) | 241,504 B | 200,536 B |
+| `AacDecoder` after (SBR gated off on embedded; `pcm` externalized both) | 208,760 B | **34,056 B** |
+| `AnyDecoder` ceiling | 322,552 B (`OpusMs`, unchanged) | 96,184 B |
+
+Desktop's drop (241,504 → 208,760) is PCM-externalization only (SBR/PS stay
+inline and fully intact — same codec, byte-identical decode). Embedded's drop
+(200,536 → 34,056, ~83%) is SBR gating (the bulk: `SbrState` 133,712 B +
+`SbrOutput` 16,400 B) plus PCM externalization plus the `embedded-profile`
+`PCM_CAP` formula no longer needing to size for SBR's 2×-rate stereo write.
+
+### Finding: the `embedded-profile` ceiling is NOT Mp3 — it's Matroska's inline Opus path
+
+The AAC work's own target (`AacDecoder` ≈ 34 KB) is hit, but **`AnyDecoder`'s
+embedded-profile ceiling does not drop to Mp3 (44,240 B)** as assumed when this
+slice was scoped. It drops to **96,184 B**, pinned by `MatroskaDecoder`'s
+`Opus` variant (`MatroskaOpus<S>`, `formats/matroska.rs`): an **inline**,
+never-externalized Opus-in-Matroska decoder — `OpusFrameDecoder` (24,288 B)
++ `MatroskaDemuxer` (17,576 B) + an 8,192 B packet buffer + an 11,520-sample
+(46,080 B) PCM buffer, none of which route through the shared `P` scratch the
+way the top-level dispatch `OpusDecoder<S, P>` variant does. This predates the
+AAC slice — it was already the #2-largest variant, just hidden behind AAC's
+larger 200,536 B. Mp3 (44,240 B) is the **actual** runner-up once both AAC and
+Matroska-Opus are accounted for. Externalizing `MatroskaOpus`'s packet/PCM
+buffers into the shared `P` scratch (the same treatment `OpusDecoder` already
+has) is the natural next slice to reach a true ~44 KB ceiling; out of scope
+here (AAC-only), flagged for Phase 4.

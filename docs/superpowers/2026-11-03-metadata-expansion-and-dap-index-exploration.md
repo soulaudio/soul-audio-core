@@ -212,6 +212,42 @@ is FAT/space-limited and the original should never be destroyed. Whether to also
 keep the surround original on the card (for a future on-device downmix, if ever)
 is deferred; default is stereo-rendition-only on the DAP.
 
+### HE-AAC fold-down (SBR → transcode at import)
+
+**Device constraint:** the DAP's `embedded-profile` firmware build gates AAC's
+SBR (Spectral Band Replication) decode off entirely (decoder-memory-
+externalization spec §8, Option A) — `AacDecoder`'s SBR state alone was
+133,712 B + 16,400 B of its pre-externalization 200,536 B, the single largest
+chunk gated to hit the DAP's SRAM budget. The firmware still decodes an
+HE-AAC (AAC+SBR / `.m4a`/`.aac` with `audioObjectType 5/29`) file's **AAC-LC
+core** — never panics, never rejects it — but it never reconstructs the high
+band: the file plays back at half bandwidth (the core sample rate, no 2×
+upsampling), a real audible quality loss for anything originally encoded
+assuming SBR fills in the top octave.
+
+**Import responsibility (desktop — same split as the channel fold-down
+above):** during *import to the DAP*, detect an HE-AAC source (the ASC's
+explicit SBR signal, or an implicit `EXT_SBR_DATA` fill element found while
+probing) and **transcode it to AAC-LC or FLAC** using the desktop's full
+SBR-capable decoder, writing the full-bandwidth result to the card. The DAP
+then plays an ordinary AAC-LC (or FLAC) file and never needs SBR — exactly
+the same "heavy lifting happens once, on the desktop" shape as the surround
+downmix.
+
+**Make it visible:** same `flags`-bit treatment as `DOWNMIXED` — a
+`TRANSCODED_FROM_HE_AAC` (or similarly named) flag so the DAP UI can indicate
+the track was re-encoded from an HE-AAC source rather than played back as
+its original codec, and the desktop library can list which tracks got this
+treatment. As with the surround case, this should not be silent: the SBR-less
+embedded decode is a real fidelity change, not a transparent format
+normalization.
+
+**Scope note:** unlike the channel fold-down (already implemented/designed),
+this HE-AAC transcode-at-import path is a **flag for the importer**, not yet
+built — the AAC decoder-memory-externalization slice (spec §8) only covers
+the firmware-side decode behavior (gate SBR off, decode the LC core cleanly).
+Wiring the actual import-time detection + transcode + flag is a follow-up.
+
 ## Part 3 — "Properly e2e test it"
 
 - **Reader (Tier 1–3):** extend the `lofty` differential test to the new fields;
