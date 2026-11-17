@@ -69,17 +69,10 @@ const MAX_FLAC_CODEC_PRIVATE: usize = 1024;
 /// A Matroska / WebM decoder: the container plus whichever per-codec core the
 /// track's `CodecID` selects.
 ///
-/// The `Aac` variant is much larger than `Opus`/`Flac` (it embeds
-/// `AacDecoder`'s inline no-alloc filterbank/SBR buffers — AAC isn't
-/// externalized yet, decoder-memory-externalization spec Phase 4). Boxing is
-/// impossible under `#![no_std]`, so — like [`AnyDecoder`](crate::dispatch::AnyDecoder)
-/// itself — the size gap is accepted.
-///
-/// `P` is the shared scratch store [`FlacDecoder`] carves its channel-planar
-/// decode buffer from (see [`AnyDecoder`](crate::dispatch::AnyDecoder)'s doc
-/// comment) — only the `Flac` variant uses it; `Opus`/`Aac` ignore it, but
-/// still have to name the type parameter (every parameter in scope is used by
-/// *some* variant).
+/// `P` is the shared scratch store [`FlacDecoder`]/[`AacDecoder`] carve their
+/// decode buffers from (see [`AnyDecoder`](crate::dispatch::AnyDecoder)'s doc
+/// comment) — `Opus` ignores it, but still has to name the type parameter
+/// (every parameter in scope is used by *some* variant).
 #[allow(clippy::large_enum_variant)]
 pub enum MatroskaDecoder<S, P> {
     /// `A_OPUS` — the shared Opus core driven per `SimpleBlock`.
@@ -88,15 +81,16 @@ pub enum MatroskaDecoder<S, P> {
     /// decode planes from the shared `P` scratch.
     Flac(FlacDecoder<MatroskaFlacReader<S>, P>),
     /// `A_AAC` — [`AacDecoder`] fed one `SimpleBlock` (= raw access unit) at a
-    /// time; config from the `CodecPrivate` `AudioSpecificConfig`.
-    Aac(AacDecoder<S>),
+    /// time; config from the `CodecPrivate` `AudioSpecificConfig`. Carves its
+    /// decoded-PCM carry buffer from the same shared `P` scratch.
+    Aac(AacDecoder<S, P>),
 }
 
 impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> MatroskaDecoder<S, P> {
     /// Parse the Matroska header and build the decoder for its audio track.
-    /// `scratch` is the shared working-buffer storage the `A_FLAC` track uses
-    /// (see [`AnyDecoder`](crate::dispatch::AnyDecoder)'s doc comment);
-    /// `A_OPUS`/`A_AAC` ignore it.
+    /// `scratch` is the shared working-buffer storage the `A_FLAC`/`A_AAC`
+    /// tracks use (see [`AnyDecoder`](crate::dispatch::AnyDecoder)'s doc
+    /// comment); `A_OPUS` ignores it.
     ///
     /// # Errors
     /// [`DecodeError::Unsupported`] for a non-audio / unsupported `CodecID`
@@ -130,8 +124,8 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> MatroskaDecoder<S, P> {
             }
             b"A_AAC" => {
                 let config = parse_audio_specific_config(demux.codec_private())?;
-                Ok(MatroskaDecoder::Aac(AacDecoder::new_matroska(
-                    demux, config,
+                Ok(MatroskaDecoder::Aac(AacDecoder::new_matroska_in(
+                    demux, config, scratch,
                 )?))
             }
             _ => Err(DecodeError::Unsupported),

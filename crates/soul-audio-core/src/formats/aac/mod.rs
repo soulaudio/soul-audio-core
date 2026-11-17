@@ -38,6 +38,7 @@ use crate::decoder::{DecodeError, Decoder, SeekableDecoder};
 use crate::demux::adts::{AacConfig, AdtsReader};
 use crate::demux::mp4::{Mp4Codec, Mp4Reader};
 use crate::demux::{Demuxer, MatroskaDemuxer};
+use crate::formats::scratch::ScratchCursor;
 use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
 
@@ -73,8 +74,12 @@ pub(crate) const MAX_CHANNELS: usize = 8;
 #[cfg(feature = "embedded-profile")]
 pub(crate) const MAX_CHANNELS: usize = 2;
 
-/// Interleaved PCM scratch for one decoded frame. `decode_rdb` overwrites it
-/// per frame and never accumulates.
+/// Interleaved PCM scratch for one decoded frame, carved from the caller-
+/// provided `scratch: P` (decoder-memory-externalization spec §7 — the same
+/// `ScratchCursor` pattern [`crate::formats::flac::FlacDecoder`]/
+/// [`crate::formats::alac::AlacDecoder`] use). `decode_rdb` overwrites it per
+/// frame and never accumulates, so this sizes the scratch requirement, not
+/// `AacDecoder` itself.
 ///
 /// Desktop: the larger of the LC multichannel write (1024 samples ×
 /// `MAX_CHANNELS`) and the ≤2-channel SBR write (2048 × 2 at the doubled
@@ -327,9 +332,17 @@ enum FrameSrc<S> {
 /// A streaming AAC-LC decoder over an MP4/`.m4a` or raw ADTS [`Source`],
 /// producing interleaved 16-bit-range `i32` PCM. Mono through 7.1 (up to
 /// [`MAX_CHANNELS`]); on desktop, HE-AAC (SBR/PS) is mono/stereo only. No
-/// allocation: every buffer is fixed-size and owned by value; the
-/// [`Filterbank`] overlap state and the decoded-PCM carry buffer persist
-/// across `decode_into` calls.
+/// allocation: every buffer is fixed-size and owned by value except the
+/// decoded-PCM carry buffer (see below); the [`Filterbank`] overlap state and
+/// the decoded-PCM carry buffer persist across `decode_into` calls.
+///
+/// The decoded-PCM carry buffer is **caller-provided scratch** `P`
+/// (`AsRef<[i32]> + AsMut<[i32]>`), carved via [`crate::formats::scratch::ScratchCursor`]
+/// — the SAME shared scratch [`crate::formats::flac::FlacDecoder`]/
+/// [`crate::formats::alac::AlacDecoder`]/[`crate::formats::wavpack::WavpackDecoder`]
+/// use (decoder-memory-externalization spec §7). The [`Filterbank`]'s own
+/// f32 overlap state (8 KB) stays inline — small enough that externalizing it
+/// would need f32/bytemuck handling in `P` for no real size win.
 ///
 /// **`embedded-profile`** (decoder-memory externalization spec, Option A):
 /// SBR is gated off entirely — the decoder reconstructs the AAC-LC core only
@@ -340,7 +353,7 @@ enum FrameSrc<S> {
 /// `docs/superpowers/2026-11-03-metadata-expansion-and-dap-index-exploration.md`'s
 /// "HE-AAC fold-down" note, mirroring the existing surround→stereo downmix).
 /// Desktop (no feature) keeps SBR/PS fully intact and byte-identical.
-pub struct AacDecoder<S> {
+pub struct AacDecoder<S, P> {
     src: FrameSrc<S>,
     config: AacConfig,
     sfi: u8,
@@ -374,23 +387,32 @@ pub struct AacDecoder<S> {
     /// Desktop only; see [`Self::he_aac_active`].
     #[cfg(not(feature = "embedded-profile"))]
     sbr_confirmed: bool,
-    /// Decoded interleaved PCM awaiting hand-off, `[pcm_pos, pcm_len)`.
-    pcm: [i32; PCM_CAP],
+    /// Caller-provided scratch the decoded-PCM carry buffer is carved from
+    /// (see the struct doc comment).
+    scratch: P,
+    /// i32-slot offset of the `PCM_CAP`-long decoded-PCM buffer within
+    /// [`Self::scratch`].
+    pcm_off: usize,
+    /// Decoded interleaved PCM awaiting hand-off, `[pcm_pos, pcm_len)` within
+    /// the `scratch[pcm_off..pcm_off + PCM_CAP]` window.
     pcm_len: usize,
     pcm_pos: usize,
     eof: bool,
 }
 
-impl<S: Source> AacDecoder<S> {
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> AacDecoder<S, P> {
     /// Build over a parsed MP4 reader positioned at `mdat`. Its sample entry
     /// must be `mp4a` (AAC); an `alac` reader is [`DecodeError::Unsupported`]
-    /// (route it to `AlacDecoder` instead).
+    /// (route it to `AlacDecoder` instead). `scratch` is carved for the
+    /// decoded-PCM carry buffer (see the struct doc comment); it must be at
+    /// least [`crate::dispatch::decoder_scratch_len`] samples long.
     ///
     /// # Errors
     /// [`DecodeError::Unsupported`] for a non-AAC sample entry, a non-LC object
-    /// type, or a channel count outside 1..=2; [`DecodeError::Malformed`] for an
-    /// unresolvable sample rate.
-    pub fn new_mp4(reader: Mp4Reader<S>) -> Result<Self, DecodeError> {
+    /// type, a channel count outside 1..=2, or a `scratch` too small to hold
+    /// the decoded-PCM buffer; [`DecodeError::Malformed`] for an unresolvable
+    /// sample rate.
+    pub fn new_mp4_in(reader: Mp4Reader<S>, scratch: P) -> Result<Self, DecodeError> {
         let config = match reader.codec() {
             Mp4Codec::Aac(c) => c,
             Mp4Codec::Alac(_) => return Err(DecodeError::Unsupported),
@@ -402,36 +424,41 @@ impl<S: Source> AacDecoder<S> {
         } else {
             Some(reader.total_samples())
         };
-        Self::build(FrameSrc::Mp4(reader), config, total)
+        Self::build(FrameSrc::Mp4(reader), config, total, scratch)
     }
 
     /// Build over an ADTS reader (its first header already validated). ADTS is
     /// streaming, so there's no declared length ([`Self::total_frames`] is
-    /// `None`).
+    /// `None`). `scratch` is as [`Self::new_mp4_in`].
     ///
     /// # Errors
-    /// As [`Self::new_mp4`] (config validation).
-    pub fn new_adts(reader: AdtsReader<S>) -> Result<Self, DecodeError> {
+    /// As [`Self::new_mp4_in`] (config validation).
+    pub fn new_adts_in(reader: AdtsReader<S>, scratch: P) -> Result<Self, DecodeError> {
         let config = reader.config();
-        Self::build(FrameSrc::Adts(reader), config, None)
+        Self::build(FrameSrc::Adts(reader), config, None, scratch)
     }
 
     /// Build over a Matroska/WebM demuxer positioned at the first audio block.
     /// `config` is the track's `AudioSpecificConfig` (from `CodecPrivate`, parsed
     /// by [`crate::demux::mp4::parse_audio_specific_config`]). Each `SimpleBlock`
     /// is one raw access unit; no declared length ([`Self::total_frames`] =
-    /// `None`), mirroring ADTS.
+    /// `None`), mirroring ADTS. `scratch` is as [`Self::new_mp4_in`].
     ///
     /// # Errors
-    /// As [`Self::new_mp4`] (config validation).
-    pub fn new_matroska(demux: MatroskaDemuxer<S>, config: AacConfig) -> Result<Self, DecodeError> {
-        Self::build(FrameSrc::Matroska(demux), config, None)
+    /// As [`Self::new_mp4_in`] (config validation).
+    pub fn new_matroska_in(
+        demux: MatroskaDemuxer<S>,
+        config: AacConfig,
+        scratch: P,
+    ) -> Result<Self, DecodeError> {
+        Self::build(FrameSrc::Matroska(demux), config, None, scratch)
     }
 
     fn build(
         src: FrameSrc<S>,
         config: AacConfig,
         total_samples: Option<u64>,
+        scratch: P,
     ) -> Result<Self, DecodeError> {
         if config.object_type != 2 {
             return Err(DecodeError::Unsupported); // AAC-LC only
@@ -451,6 +478,8 @@ impl<S: Source> AacDecoder<S> {
         let output_rate = config
             .ext_sample_rate
             .unwrap_or_else(|| config.sample_rate.saturating_mul(2));
+        let mut cursor = ScratchCursor::new(scratch.as_ref().len());
+        let pcm_off = cursor.alloc(PCM_CAP)?;
         Ok(Self {
             src,
             config,
@@ -469,11 +498,18 @@ impl<S: Source> AacDecoder<S> {
             output_rate,
             #[cfg(not(feature = "embedded-profile"))]
             sbr_confirmed: config.sbr_signalled,
-            pcm: [0; PCM_CAP],
+            scratch,
+            pcm_off,
             pcm_len: 0,
             pcm_pos: 0,
             eof: false,
         })
+    }
+
+    /// Read-only view of the decoded-PCM carry buffer (`PCM_CAP` i32 slots
+    /// carved from [`Self::scratch`]).
+    fn pcm_ref(&self) -> &[i32] {
+        &self.scratch.as_ref()[self.pcm_off..self.pcm_off + PCM_CAP]
     }
 
     /// Total per-channel output frames from the container's `mdhd` (MP4), or —
@@ -673,6 +709,7 @@ impl<S: Source> AacDecoder<S> {
         if self.mp4_filled == 0 {
             return Ok(None); // mdat drained
         }
+        let pcm_off = self.pcm_off;
         let (samples, consumed, sbr_applied) = {
             #[cfg(not(feature = "embedded-profile"))]
             {
@@ -684,7 +721,7 @@ impl<S: Source> AacDecoder<S> {
                     &mut self.sbr,
                     &mut self.sbr_out,
                     self.output_rate,
-                    &mut self.pcm,
+                    &mut self.scratch.as_mut()[pcm_off..pcm_off + PCM_CAP],
                 )?
             }
             #[cfg(feature = "embedded-profile")]
@@ -694,7 +731,7 @@ impl<S: Source> AacDecoder<S> {
                     self.config,
                     self.sfi,
                     &mut self.fb,
-                    &mut self.pcm,
+                    &mut self.scratch.as_mut()[pcm_off..pcm_off + PCM_CAP],
                 )?
             }
         };
@@ -723,6 +760,7 @@ impl<S: Source> AacDecoder<S> {
                 None => return Ok(None),
             }
         };
+        let pcm_off = self.pcm_off;
         let (samples, _consumed, sbr_applied) = {
             #[cfg(not(feature = "embedded-profile"))]
             {
@@ -734,7 +772,7 @@ impl<S: Source> AacDecoder<S> {
                     &mut self.sbr,
                     &mut self.sbr_out,
                     self.output_rate,
-                    &mut self.pcm,
+                    &mut self.scratch.as_mut()[pcm_off..pcm_off + PCM_CAP],
                 )?
             }
             #[cfg(feature = "embedded-profile")]
@@ -744,7 +782,7 @@ impl<S: Source> AacDecoder<S> {
                     self.config,
                     self.sfi,
                     &mut self.fb,
-                    &mut self.pcm,
+                    &mut self.scratch.as_mut()[pcm_off..pcm_off + PCM_CAP],
                 )?
             }
         };
@@ -771,6 +809,7 @@ impl<S: Source> AacDecoder<S> {
                 None => return Ok(None),
             }
         };
+        let pcm_off = self.pcm_off;
         let (samples, _consumed, sbr_applied) = {
             #[cfg(not(feature = "embedded-profile"))]
             {
@@ -782,7 +821,7 @@ impl<S: Source> AacDecoder<S> {
                     &mut self.sbr,
                     &mut self.sbr_out,
                     self.output_rate,
-                    &mut self.pcm,
+                    &mut self.scratch.as_mut()[pcm_off..pcm_off + PCM_CAP],
                 )?
             }
             #[cfg(feature = "embedded-profile")]
@@ -792,7 +831,7 @@ impl<S: Source> AacDecoder<S> {
                     self.config,
                     self.sfi,
                     &mut self.fb,
-                    &mut self.pcm,
+                    &mut self.scratch.as_mut()[pcm_off..pcm_off + PCM_CAP],
                 )?
             }
         };
@@ -822,7 +861,7 @@ impl<S: Source> AacDecoder<S> {
     }
 }
 
-impl<S: SeekSource> AacDecoder<S> {
+impl<S: SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> AacDecoder<S, P> {
     /// Resolve a CBR byte-estimate length for a raw ADTS stream, so
     /// [`Self::total_frames`] reports a duration and [`Self::seek_to`] can use the
     /// O(1) byte-estimate path instead of a linear decode-discard from the start.
@@ -1065,7 +1104,7 @@ impl<S: SeekSource> AacDecoder<S> {
     }
 }
 
-impl<S: SeekSource> SeekableDecoder for AacDecoder<S> {
+impl<S: SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> SeekableDecoder for AacDecoder<S, P> {
     fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
         AacDecoder::seek_to(self, sample)
     }
@@ -1074,7 +1113,7 @@ impl<S: SeekSource> SeekableDecoder for AacDecoder<S> {
     }
 }
 
-impl<S: Source> Decoder for AacDecoder<S> {
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for AacDecoder<S, P> {
     fn stream_info(&self) -> StreamInfo {
         StreamInfo {
             // SBR doubles the output rate (dual-rate HE-AAC). Report 2× once
@@ -1101,7 +1140,8 @@ impl<S: Source> Decoder for AacDecoder<S> {
                 }
             }
             let n = (out.len() - written).min(self.pcm_len - self.pcm_pos);
-            out[written..written + n].copy_from_slice(&self.pcm[self.pcm_pos..self.pcm_pos + n]);
+            out[written..written + n]
+                .copy_from_slice(&self.pcm_ref()[self.pcm_pos..self.pcm_pos + n]);
             self.pcm_pos += n;
             written += n;
         }
@@ -1123,6 +1163,13 @@ mod tests {
     use crate::demux::adts::AdtsReader;
     use crate::io::SliceSource;
 
+    /// Scratch storage for `AacDecoder::new_*_in` in this suite, sized via the
+    /// shared [`crate::dispatch::decoder_scratch_len`] helper — the same
+    /// storage `open()`'s callers provide.
+    fn scratch() -> Vec<i32> {
+        vec![0i32; crate::dispatch::decoder_scratch_len()]
+    }
+
     /// Decode a whole stream through `AacDecoder` on a generous stack (the SBR
     /// state + per-frame DSP scratch are large — see MEMORY.md / the CLI's own
     /// big-stack loader), returning the interleaved PCM and final stream rate.
@@ -1131,7 +1178,7 @@ mod tests {
             .stack_size(16 * 1024 * 1024)
             .spawn(move || {
                 let reader = AdtsReader::new(SliceSource::new(bytes)).expect("adts header");
-                let mut dec = AacDecoder::new_adts(reader).expect("aac decoder");
+                let mut dec = AacDecoder::new_adts_in(reader, scratch()).expect("aac decoder");
                 let mut out = Vec::new();
                 let mut buf = [0i32; 4096];
                 loop {
@@ -1291,7 +1338,7 @@ mod tests {
             bytes.extend_from_slice(&adts_frame(300)); // large tail frames
         }
         let reader = AdtsReader::new(SliceSource::new(&bytes)).expect("adts header");
-        let mut dec = AacDecoder::new_adts(reader).expect("aac decoder");
+        let mut dec = AacDecoder::new_adts_in(reader, scratch()).expect("aac decoder");
         assert_eq!(
             dec.total_frames(),
             None,
@@ -1401,7 +1448,13 @@ mod seek_tests {
         })
     }
 
-    fn drain<S: Source>(d: &mut AacDecoder<S>) -> Vec<i32> {
+    /// Scratch storage for `AacDecoder::new_*_in` in this suite (see the
+    /// sibling helper in `mod tests`).
+    fn scratch() -> Vec<i32> {
+        vec![0i32; crate::dispatch::decoder_scratch_len()]
+    }
+
+    fn drain<S: Source, P: AsRef<[i32]> + AsMut<[i32]>>(d: &mut AacDecoder<S, P>) -> Vec<i32> {
         let mut out = Vec::new();
         let mut buf = [0i32; 4096];
         loop {
@@ -1417,7 +1470,8 @@ mod seek_tests {
     fn full_mp4(bytes: &'static [u8]) -> Vec<i32> {
         on_big_stack(|| {
             let mut d =
-                AacDecoder::new_mp4(Mp4Reader::new(SliceSource::new(bytes)).unwrap()).unwrap();
+                AacDecoder::new_mp4_in(Mp4Reader::new(SliceSource::new(bytes)).unwrap(), scratch())
+                    .unwrap();
             drain(&mut d)
         })
     }
@@ -1425,7 +1479,8 @@ mod seek_tests {
     fn seek_tail_mp4(bytes: &'static [u8], target: u64) -> (u64, Vec<i32>) {
         on_big_stack(move || {
             let mut d =
-                AacDecoder::new_mp4(Mp4Reader::new(SliceSource::new(bytes)).unwrap()).unwrap();
+                AacDecoder::new_mp4_in(Mp4Reader::new(SliceSource::new(bytes)).unwrap(), scratch())
+                    .unwrap();
             let landed = d.seek_to(target).unwrap();
             (landed, drain(&mut d))
         })
@@ -1433,16 +1488,22 @@ mod seek_tests {
 
     fn full_adts(bytes: &'static [u8]) -> Vec<i32> {
         on_big_stack(|| {
-            let mut d =
-                AacDecoder::new_adts(AdtsReader::new(SliceSource::new(bytes)).unwrap()).unwrap();
+            let mut d = AacDecoder::new_adts_in(
+                AdtsReader::new(SliceSource::new(bytes)).unwrap(),
+                scratch(),
+            )
+            .unwrap();
             drain(&mut d)
         })
     }
 
     fn seek_tail_adts(bytes: &'static [u8], target: u64) -> (u64, Vec<i32>) {
         on_big_stack(move || {
-            let mut d =
-                AacDecoder::new_adts(AdtsReader::new(SliceSource::new(bytes)).unwrap()).unwrap();
+            let mut d = AacDecoder::new_adts_in(
+                AdtsReader::new(SliceSource::new(bytes)).unwrap(),
+                scratch(),
+            )
+            .unwrap();
             let landed = d.seek_to(target).unwrap();
             (landed, drain(&mut d))
         })

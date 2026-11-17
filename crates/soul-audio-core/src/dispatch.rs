@@ -56,7 +56,9 @@ pub enum AnyDecoder<S, P> {
     /// Apple Lossless in an MP4/M4A container.
     Alac(AlacDecoder<S, P>),
     /// AAC-LC in an MP4/M4A container or a raw ADTS (`.aac`) elementary stream.
-    Aac(AacDecoder<S>),
+    /// Carves its decoded-PCM carry buffer from the same shared `P` scratch
+    /// FLAC/ALAC/WavPack/Matroska use.
+    Aac(AacDecoder<S, P>),
     /// Opus audio in an Ogg container (RFC 7845/6716). Unlike Vorbis, every
     /// Opus table is RFC-fixed (no per-file setup), so it needs no
     /// caller-provided arena and is a normal by-value variant here.
@@ -359,12 +361,12 @@ pub fn open<S: BufSource, P: AsRef<[i32]> + AsMut<[i32]>>(
                 Mp4Codec::Alac(_) => {
                     AlacDecoder::from_reader_in(reader, scratch).map(AnyDecoder::Alac)
                 }
-                Mp4Codec::Aac(_) => AacDecoder::new_mp4(reader).map(AnyDecoder::Aac),
+                Mp4Codec::Aac(_) => AacDecoder::new_mp4_in(reader, scratch).map(AnyDecoder::Aac),
             }
         }
         // Raw ADTS (`.aac`) AAC-LC elementary stream.
         Format::Adts => AdtsReader::new(src)
-            .and_then(AacDecoder::new_adts)
+            .and_then(|r| AacDecoder::new_adts_in(r, scratch))
             .map(AnyDecoder::Aac),
         // DSD containers need an explicit DsdMode (native / DoP / decimate);
         // they are not routed through the PCM `open`.
@@ -446,7 +448,7 @@ pub fn open_seekable<S: BufSource + crate::io::SeekSource, P: AsRef<[i32]> + AsM
                 Mp4Codec::Alac(_) => {
                     AlacDecoder::from_reader_in(reader, scratch).map(AnyDecoder::Alac)
                 }
-                Mp4Codec::Aac(_) => AacDecoder::new_mp4(reader).map(AnyDecoder::Aac),
+                Mp4Codec::Aac(_) => AacDecoder::new_mp4_in(reader, scratch).map(AnyDecoder::Aac),
             }
         }
         // `probe` consumed nothing (it peeks via `fill_buf`), so `src` is still
