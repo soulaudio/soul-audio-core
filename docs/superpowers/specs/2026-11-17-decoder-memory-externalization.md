@@ -258,3 +258,49 @@ Matroska-Opus are accounted for. Externalizing `MatroskaOpus`'s packet/PCM
 buffers into the shared `P` scratch (the same treatment `OpusDecoder` already
 has) is the natural next slice to reach a true ~44 KB ceiling; out of scope
 here (AAC-only), flagged for Phase 4.
+
+## 9. Phase 4 — Matroska-Opus PCM externalized; the ceiling moves again (not to Mp3)
+
+`MatroskaOpus<S, P>` now carves its decoded-PCM buffer (the 11,520-sample /
+46,080 B `pcm` field §8 found) from the same shared `P` scratch the
+standalone `OpusDecoder<S, P>` (§7) and FLAC/AAC-in-Matroska already use —
+`new` → `new_in(demux, head, scratch)`, fallible via `ScratchCursor`. The
+8,192 B `packet` byte buffer and the 17,576 B `MatroskaDemuxer` container
+state stay inline per this doc's own scope rule (§4 Lever B is for `i32`
+working buffers; there is no byte-scratch arena here to carve a `u8` buffer
+from — that would be new machinery, not this lever). `OpusFrameDecoder` (the
+core both the standalone and Matroska Opus paths wrap) was checked for a
+carvable buffer of its own and has none: its CELT/SILK fields are `f32`
+cross-frame decode *state* (overlap-add history, LPC memory), not a
+per-call `i32` working buffer, so — like the Opus/FLAC/AAC decoder state
+already left in place — it isn't in scope for this lever either.
+
+### Measured (`size_of::<T<SliceSource<'static>, &'static mut [i32]>>()`, `embedded-profile`)
+
+| | Before | After |
+|---|---|---|
+| `MatroskaOpus<S, P>` | ~96,136 B (inline: `OpusFrameDecoder` 24,288 + `MatroskaDemuxer` 17,576 + packet 8,192 + pcm 46,080) | **50,128 B** |
+| `MatroskaDecoder<S, P>` / `AnyDecoder<S, P>` ceiling | 96,184 B | **80,240 B** |
+
+### Finding: the ceiling still isn't Mp3 — `A_FLAC`-in-Matroska takes over
+
+§8 predicted this slice would reach "a true ~44 KB ceiling." It doesn't:
+`AnyDecoder`'s `embedded-profile` ceiling drops from 96,184 B to **80,240 B**,
+but stays pinned to `MatroskaDecoder` — just via a different one of its own
+variants now. `FlacDecoder<MatroskaFlacReader<S>, P>` measures 80,240 B on
+the nose (`MatroskaOpus<S, P>`'s new 50,128 B is comfortably under it), driven
+by `MatroskaFlacReader`'s own inline `frame: [u8; 49_152]` (48 KiB) `SimpleBlock`
+staging buffer plus its embedded 17,576 B `MatroskaDemuxer` — 67,792 B just
+for the reader, predating this slice and untouched by it (it's `A_FLAC`'s
+native-FLAC-byte-adapter path, not `A_OPUS`'s). It was already the
+enum's #2-largest variant (visible once Opus's 96,136 B dropped below it),
+exactly the same "hidden behind the bigger sibling" pattern §8 found AAC
+hiding Matroska-Opus behind. Mp3 (44,240 B) is still the **actual** runner-up
+underneath both.
+
+Externalizing it would need a **byte** scratch arena (`MatroskaFlacReader`'s
+`frame` buffer is `u8`, like the Vorbis byte `Arena`, not `i32` like
+`ScratchCursor`) shared with — or separate from — the existing `i32` `P`,
+which is new machinery this doc's `ScratchCursor` lever doesn't cover; a
+candidate Phase 5 if the ~44 KB ceiling is still wanted, out of scope here
+(this slice is Opus-only, per its own task scope).
