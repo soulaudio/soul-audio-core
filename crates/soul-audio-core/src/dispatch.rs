@@ -60,7 +60,7 @@ pub enum AnyDecoder<S, P> {
     /// Opus audio in an Ogg container (RFC 7845/6716). Unlike Vorbis, every
     /// Opus table is RFC-fixed (no per-file setup), so it needs no
     /// caller-provided arena and is a normal by-value variant here.
-    Opus(OpusDecoder<S>),
+    Opus(OpusDecoder<S, P>),
     /// Multichannel (surround) Opus — RFC 7845 mapping family 1/255. A separate,
     /// larger decoder (one core per stream); decode-only (no seek / declared
     /// length), so its `total_frames`/`seek_to` arms report `None`/`Unsupported`.
@@ -377,13 +377,15 @@ pub fn open<S: BufSource, P: AsRef<[i32]> + AsMut<[i32]>>(
         // in `AnyDecoder`").
         Format::Vorbis => Err(DecodeError::Unsupported),
         // Opus has no per-file setup (every RFC 6716 table is fixed-capacity),
-        // so — unlike Vorbis — it needs no caller-provided arena. Parse the
+        // so — unlike Vorbis — it needs no caller-provided arena of its own;
+        // it DOES, since this commit, carve its decoded-PCM buffer from the
+        // same shared `scratch` WavPack/FLAC/Matroska/ALAC/CAF use. Parse the
         // header once and branch on the channel-mapping family: 0 = mono/stereo
         // (the single-stream decoder), 1/255 = multichannel surround.
         Format::Opus => {
             let (ogg, head) = open_opus_headers(src)?;
             if head.mapping_family == 0 {
-                OpusDecoder::from_parts(ogg, head).map(AnyDecoder::Opus)
+                OpusDecoder::from_parts_in(ogg, head, scratch).map(AnyDecoder::Opus)
             } else {
                 // Surround Opus (mapping family 1/255). Under `embedded-profile`
                 // the `MultistreamOpusDecoder` variant doesn't exist in

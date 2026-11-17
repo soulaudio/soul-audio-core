@@ -2,7 +2,7 @@
 //! `docs/superpowers/specs/2026-09-06-opus-decoder-design.md`), over an
 //! Ogg-Opus container (RFC 7845).
 //!
-//! [`OpusDecoder::new`] parses the two Opus header packets — `OpusHead`
+//! [`OpusDecoder::new_in`] parses the two Opus header packets — `OpusHead`
 //! ([`container::OpusHead`], channels/pre-skip/gain/mapping family) and
 //! `OpusTags` (validated by magic, otherwise skipped) — so
 //! [`Decoder::stream_info`] is real (Opus always decodes at 48 kHz). Per-packet
@@ -43,6 +43,7 @@ use container::OpusHead;
 
 use crate::decoder::{DecodeError, Decoder, SeekableDecoder};
 use crate::demux::ogg_packets::OggPackets;
+use crate::formats::scratch::ScratchCursor;
 use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
 
@@ -120,7 +121,15 @@ const TAGS_PREFIX_BUF: usize = 8;
 /// A from-scratch Opus decoder over an Ogg-Opus [`Source`] (RFC 7845 framing,
 /// RFC 6716 codec). See the module docs for why this is fixed-capacity,
 /// no-alloc, and arena-free (unlike Vorbis).
-pub struct OpusDecoder<S> {
+///
+/// The decoded-PCM-for-the-current-packet buffer is **caller-provided
+/// scratch** `P` (`AsRef<[i32]> + AsMut<[i32]>`), carved by a bump cursor in
+/// [`Self::from_parts_in`] — the SAME shared scratch
+/// [`crate::formats::wavpack::WavpackDecoder`]/[`crate::formats::flac::FlacDecoder`]/
+/// [`crate::formats::alac::AlacDecoder`] use (decoder-memory-externalization
+/// spec §7). `packet_buf` (the pre-decode Ogg-packet byte staging) stays an
+/// inline fixed-size array — it's raw encoded bytes, not PCM.
+pub struct OpusDecoder<S, P> {
     /// The packet-preserving Ogg demuxer. `RefCell`-wrapped so
     /// [`SeekableDecoder::total_frames`] (an `&self` method) can drive
     /// [`OggPackets::end_granule`], which needs `&mut` — the same seam
@@ -164,12 +173,15 @@ pub struct OpusDecoder<S> {
     output_gain: f32,
     /// Reassembly scratch for one Ogg packet.
     packet_buf: [u8; MAX_PACKET_BYTES],
-    /// Decoded interleaved PCM for the current packet, drained across
-    /// [`Decoder::decode_into`] calls.
-    pcm_buf: [i32; MAX_PACKET_SAMPLES],
-    /// Number of valid samples in [`Self::pcm_buf`].
+    /// Caller-provided scratch the decoded-PCM-for-the-current-packet buffer
+    /// is carved from (see the struct doc comment).
+    scratch: P,
+    /// i32-slot offset of the `MAX_PACKET_SAMPLES`-long PCM buffer within
+    /// [`Self::scratch`] (see [`Self::pcm_ref`]/[`Self::pcm_mut`]).
+    pcm_off: usize,
+    /// Number of valid samples in the scratch PCM buffer.
     pcm_len: usize,
-    /// Read cursor into [`Self::pcm_buf`].
+    /// Read cursor into the scratch PCM buffer.
     pcm_pos: usize,
 }
 
@@ -177,7 +189,7 @@ pub struct OpusDecoder<S> {
 /// mandatory header packets (RFC 7845 §5) — the identification header
 /// (`OpusHead`, parsed) and the comment header (`OpusTags`, validated by magic
 /// and skipped). Returns the reader positioned at the first audio packet plus
-/// the parsed [`OpusHead`]. Shared by [`OpusDecoder::new`],
+/// the parsed [`OpusHead`]. Shared by [`OpusDecoder::new_in`],
 /// [`multistream::MultistreamOpusDecoder::new`], and [`crate::dispatch`] (which
 /// parses the header once, then routes by mapping family).
 ///
@@ -205,32 +217,41 @@ pub(crate) fn open_opus_headers<S: Source>(
     Ok((ogg, head))
 }
 
-impl<S: Source> OpusDecoder<S> {
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> OpusDecoder<S, P> {
     /// Open an Ogg-Opus stream by consuming its two header packets (RFC 7845
     /// §5): the identification header (`OpusHead`) and the comment header
     /// (`OpusTags`, validated by magic only and otherwise skipped). Leaves the
-    /// Ogg reader positioned at the first audio packet.
+    /// Ogg reader positioned at the first audio packet, and carves the decoded-
+    /// PCM buffer from `scratch` (must be at least
+    /// [`crate::dispatch::decoder_scratch_len`] samples long).
     ///
     /// # Errors
-    /// Propagates Ogg framing errors ([`OggPackets::new`]/`next_packet`) and
+    /// [`DecodeError::Unsupported`] if `scratch` is too small to hold the PCM
+    /// buffer (never a panic / out-of-bounds index on undersized storage);
+    /// propagates Ogg framing errors ([`OggPackets::new`]/`next_packet`) and
     /// [`OpusHead::parse`]'s validation errors. [`DecodeError::Malformed`] if
     /// the second packet isn't `OpusTags`.
-    pub fn new(src: S) -> Result<Self, DecodeError> {
+    pub fn new_in(src: S, scratch: P) -> Result<Self, DecodeError> {
         let (ogg, head) = open_opus_headers(src)?;
-        Self::from_parts(ogg, head)
+        Self::from_parts_in(ogg, head, scratch)
     }
 
     /// Build a **single-stream** Opus decoder from an already-opened Ogg reader
     /// (positioned at the first audio packet) and its parsed [`OpusHead`]. Split
-    /// out of [`Self::new`] so [`crate::dispatch`] can parse the header once and
-    /// route by mapping family — family 0 here, families 1/255 to
-    /// [`MultistreamOpusDecoder`](multistream::MultistreamOpusDecoder).
+    /// out of [`Self::new_in`] so [`crate::dispatch`] can parse the header once
+    /// and route by mapping family — family 0 here, families 1/255 to
+    /// [`MultistreamOpusDecoder`](multistream::MultistreamOpusDecoder). `scratch`
+    /// is as [`Self::new_in`].
     ///
     /// # Errors
     /// [`DecodeError::Unsupported`] for a non-zero mapping family (this type only
     /// decodes mono/stereo family 0; multichannel is the multistream decoder's
-    /// job).
-    pub(crate) fn from_parts(ogg: OggPackets<S>, head: OpusHead) -> Result<Self, DecodeError> {
+    /// job) or a `scratch` too small for the decoded-PCM buffer.
+    pub(crate) fn from_parts_in(
+        ogg: OggPackets<S>,
+        head: OpusHead,
+        scratch: P,
+    ) -> Result<Self, DecodeError> {
         if head.mapping_family != 0 {
             return Err(DecodeError::Unsupported);
         }
@@ -248,6 +269,9 @@ impl<S: Source> OpusDecoder<S> {
         // cubic approximation is 0.9999252, a ~0.0075% systematic attenuation).
         let output_gain = linear_output_gain(head.output_gain_q8);
 
+        let mut cursor = ScratchCursor::new(scratch.as_ref().len());
+        let pcm_off = cursor.alloc(MAX_PACKET_SAMPLES)?;
+
         Ok(Self {
             ogg: RefCell::new(ogg),
             head,
@@ -258,13 +282,19 @@ impl<S: Source> OpusDecoder<S> {
             skip_to: u64::from(head.pre_skip),
             output_gain,
             packet_buf: [0; MAX_PACKET_BYTES],
-            pcm_buf: [0; MAX_PACKET_SAMPLES],
+            scratch,
+            pcm_off,
             pcm_len: 0,
             pcm_pos: 0,
         })
     }
 
-    /// Decode the next audio packet into [`Self::pcm_buf`], delegating each
+    /// Read-only view of the `MAX_PACKET_SAMPLES`-long scratch PCM buffer.
+    fn pcm_ref(&self) -> &[i32] {
+        &self.scratch.as_ref()[self.pcm_off..self.pcm_off + MAX_PACKET_SAMPLES]
+    }
+
+    /// Decode the next audio packet into the scratch PCM buffer, delegating each
     /// internal Opus frame to the shared [`OpusFrameDecoder`] core and wrapping
     /// it with the Ogg-container concerns: the stream-global pre-skip / seek-skip
     /// ([`Self::skip_to`]), the Ogg granule end-trim ([`trim_frame`]), the
@@ -278,7 +308,8 @@ impl<S: Source> OpusDecoder<S> {
     /// mode-transition handling on a mode switch (redundant CELT frame,
     /// `smooth_fade` cross-fades, `OPUS_RESET_STATE`) — the same logic the
     /// raw-packet conformance path uses. This wrapper then trims that frame to
-    /// its kept `[s, e)` per-channel sub-range and copies it into `pcm_buf`.
+    /// its kept `[s, e)` per-channel sub-range and copies it into the scratch
+    /// PCM buffer.
     ///
     /// **Pre-skip / seek run-in** (RFC 7845 §4.2, §4.4): a frame whose whole span
     /// sits below [`Self::skip_to`] is still fully decoded through the core — so
@@ -316,11 +347,13 @@ impl<S: Source> OpusDecoder<S> {
             // granule-accounting/PLC size, independent of a successful decode.
             let frame_pch = usize::from(config.frame_size_48k);
             // One decoded frame's worth of interleaved PCM, gain already applied
-            // by the core. Reused across the packet's frames. The disjoint field
-            // borrows (`self.core` vs `self.packet_buf` the `frames` slices
-            // borrow vs `self.granule_pos`/`self.pcm_buf`) let the core call and
-            // the trim/copy stay inline in this loop.
-            let mut scratch = [0i32; MAX_FRAME_SAMPLES];
+            // by the core. A plain stack-local temporary (not struct-embedded
+            // scratch): it lives only for this one loop iteration, reused across
+            // the packet's frames. The disjoint field borrows (`self.core` vs
+            // `self.packet_buf` the `frames` slices borrow vs
+            // `self.granule_pos`/`self.scratch`) let the core call and the
+            // trim/copy stay inline in this loop.
+            let mut frame_pcm = [0i32; MAX_FRAME_SAMPLES];
             for &frame in frames.iter().take(count) {
                 let (s, e) =
                     trim_frame(&mut self.granule_pos, self.skip_to, page_granule, frame_pch);
@@ -328,8 +361,9 @@ impl<S: Source> OpusDecoder<S> {
                     // DTX / lost frame: conceal as silence for its nominal span
                     // (the core is NOT invoked, so its transition state is left
                     // untouched across the gap — the documented minimal PLC).
+                    let off = self.pcm_off;
                     emit_silence(
-                        &mut self.pcm_buf,
+                        &mut self.scratch.as_mut()[off..off + MAX_PACKET_SAMPLES],
                         &mut self.pcm_len,
                         e.saturating_sub(s) * channels,
                     );
@@ -340,15 +374,16 @@ impl<S: Source> OpusDecoder<S> {
                 // then keep only the `[s, e)` per-channel sub-range.
                 let produced = self
                     .core
-                    .decode_frame(frame, config, output_gain, &mut scratch);
+                    .decode_frame(frame, config, output_gain, &mut frame_pcm);
                 let e = e.min(produced / channels);
                 if e <= s {
                     continue; // wholly pre-skipped / trimmed (state still built)
                 }
-                let keep = &scratch[s * channels..e * channels];
-                let end = (self.pcm_len + keep.len()).min(self.pcm_buf.len());
+                let keep = &frame_pcm[s * channels..e * channels];
+                let end = (self.pcm_len + keep.len()).min(MAX_PACKET_SAMPLES);
                 let take = end - self.pcm_len;
-                self.pcm_buf[self.pcm_len..end].copy_from_slice(&keep[..take]);
+                let off = self.pcm_off;
+                self.scratch.as_mut()[off + self.pcm_len..off + end].copy_from_slice(&keep[..take]);
                 self.pcm_len = end;
             }
             if self.pcm_len > 0 {
@@ -450,7 +485,7 @@ pub(crate) fn trim_frame(
     )
 }
 
-impl<S: Source> Decoder for OpusDecoder<S> {
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for OpusDecoder<S, P> {
     fn stream_info(&self) -> StreamInfo {
         self.stream_info
     }
@@ -473,13 +508,13 @@ impl<S: Source> Decoder for OpusDecoder<S> {
         }
         let avail = self.pcm_len - self.pcm_pos;
         let take = avail.min(out.len());
-        out[..take].copy_from_slice(&self.pcm_buf[self.pcm_pos..self.pcm_pos + take]);
+        out[..take].copy_from_slice(&self.pcm_ref()[self.pcm_pos..self.pcm_pos + take]);
         self.pcm_pos += take;
         Ok(take)
     }
 }
 
-impl<S: SeekSource> SeekableDecoder for OpusDecoder<S> {
+impl<S: SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> SeekableDecoder for OpusDecoder<S, P> {
     /// Seek to per-channel output `sample` (post-pre-skip; RFC 7845 §4.4).
     ///
     /// Opus output sample `k` sits at absolute granule `k + pre_skip`, so the
@@ -575,6 +610,13 @@ mod tests {
     use super::*;
     use crate::io::SliceSource;
 
+    /// Scratch storage for `OpusDecoder::new_in` in this suite, sized via the
+    /// shared [`crate::dispatch::decoder_scratch_len`] helper — the same
+    /// storage `open()`'s callers provide.
+    fn scratch() -> Vec<i32> {
+        vec![0i32; crate::dispatch::decoder_scratch_len()]
+    }
+
     /// Build one minimal Ogg page (mirrors `demux::ogg_packets`'s own test
     /// helper) — `packet` must be under 255 bytes (true for every fixture
     /// below).
@@ -635,7 +677,7 @@ mod tests {
     #[test]
     fn new_parses_headers_and_reports_48k_stream_info() {
         let bytes = minimal_opus_stream(2, 312);
-        let dec = OpusDecoder::new(SliceSource::new(&bytes)).expect("open");
+        let dec = OpusDecoder::new_in(SliceSource::new(&bytes), scratch()).expect("open");
         let info = dec.stream_info();
         assert_eq!(info.sample_rate, 48_000);
         assert_eq!(info.channels, 2);
@@ -645,7 +687,7 @@ mod tests {
     #[test]
     fn decode_into_is_ok_zero_until_codec_lands() {
         let bytes = minimal_opus_stream(1, 0);
-        let mut dec = OpusDecoder::new(SliceSource::new(&bytes)).expect("open");
+        let mut dec = OpusDecoder::new_in(SliceSource::new(&bytes), scratch()).expect("open");
         let mut out = [7i32; 8];
         assert_eq!(dec.decode_into(&mut out).unwrap(), 0);
     }
@@ -657,7 +699,7 @@ mod tests {
         // reporting output sample 0 — no longer `Unsupported`. A subsequent
         // decode is a clean end of stream (nothing to decode).
         let bytes = minimal_opus_stream(2, 0);
-        let mut dec = OpusDecoder::new(SliceSource::new(&bytes)).expect("open");
+        let mut dec = OpusDecoder::new_in(SliceSource::new(&bytes), scratch()).expect("open");
         assert_eq!(dec.seek_to(0).unwrap(), 0);
         let mut out = [7i32; 8];
         assert_eq!(dec.decode_into(&mut out).unwrap(), 0);
@@ -669,7 +711,7 @@ mod tests {
         // A trailing audio page whose granule (48 kHz units) is the total
         // sample count through the stream's end.
         bytes.extend(ogg_page(0x04, 4_100, 7, 2, b"audio-packet"));
-        let dec = OpusDecoder::new(SliceSource::new(&bytes)).expect("open");
+        let dec = OpusDecoder::new_in(SliceSource::new(&bytes), scratch()).expect("open");
         assert_eq!(dec.total_frames(), Some(4_000));
     }
 
@@ -681,7 +723,7 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend(ogg_page(0x02, u64::MAX, 7, 0, &opus_head_packet(1, 0)));
         bytes.extend(ogg_page(0x04, u64::MAX, 7, 1, &opus_tags_packet()));
-        let dec = OpusDecoder::new(SliceSource::new(&bytes)).expect("open");
+        let dec = OpusDecoder::new_in(SliceSource::new(&bytes), scratch()).expect("open");
         assert_eq!(dec.total_frames(), None);
     }
 
@@ -698,7 +740,7 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend(ogg_page(0x02, u64::MAX, 7, 0, &opus_head_packet(2, 312)));
         bytes.extend(ogg_page(0x04, u64::MAX, 7, 1, &opus_tags_packet()));
-        let mut dec = OpusDecoder::new(SliceSource::new(&bytes)).expect("open");
+        let mut dec = OpusDecoder::new_in(SliceSource::new(&bytes), scratch()).expect("open");
         assert_eq!(dec.total_frames(), None, "precondition: length is unknown");
         // Must return gracefully (Ok/Err), never panic on the granule add.
         let _ = dec.seek_to(u64::MAX);
@@ -721,7 +763,7 @@ mod tests {
         let toc = 12u8 << 3; // mode=Hybrid, stereo=0, code=0
         let audio_packet = [toc, 0xAA, 0xBB, 0xCC];
         bytes.extend(ogg_page(0x04, 480, 7, 2, &audio_packet));
-        let mut dec = OpusDecoder::new(SliceSource::new(&bytes)).expect("open");
+        let mut dec = OpusDecoder::new_in(SliceSource::new(&bytes), scratch()).expect("open");
         let mut out = [7i32; 4096];
         // Must not panic; whatever it returns must be interleaved-stereo-sized
         // and inside the i16 range.
@@ -742,7 +784,7 @@ mod tests {
         bytes.extend(ogg_page(0x02, 0, 7, 0, &opus_head_packet(1, 0)));
         bytes.extend(ogg_page(0x00, 0, 7, 1, b"not-opus-tags-at-all"));
         assert_eq!(
-            OpusDecoder::new(SliceSource::new(&bytes)).err(),
+            OpusDecoder::new_in(SliceSource::new(&bytes), scratch()).err(),
             Some(DecodeError::Malformed)
         );
     }

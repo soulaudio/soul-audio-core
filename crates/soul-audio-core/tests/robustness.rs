@@ -165,7 +165,10 @@ fn drive_all(bytes: &[u8]) -> Result<(), &'static str> {
     // Opus (Ogg): the whole range-decoder → CELT/SILK → resampler pipeline, which
     // has no error channel in the CELT core — any out-of-range decoded value must
     // stay a bounded `Ok`/graceful `Err`, never a debug-assert panic or OOB.
-    if let Ok(mut d) = OpusDecoder::new(SliceSource::new(bytes)) {
+    if let Ok(mut d) = OpusDecoder::new_in(
+        SliceSource::new(bytes),
+        vec![0i32; soul_audio_core::decoder_scratch_len()],
+    ) {
         if !drain_pcm(&mut d, len) {
             return Err("opus");
         }
