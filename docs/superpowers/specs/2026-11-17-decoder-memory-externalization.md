@@ -135,3 +135,67 @@ smaller `AnyDecoder` × fewer hops compounds. Verify with the release stack prob
   `stack_highwater.rs` conclusion to the real release numbers; re-run the probe.
 
 Commits `sebastianstupak`, Conventional Commits, no AI trailers, hooks enforced.
+
+## 7. Research verdict + finalized design (supersedes §3–§6 where they differ)
+
+After Phase 1+2 landed, a deeper read raised a question: is `AnyDecoder` a tagged
+*union* (variants share space), so inline decoders are already memory-efficient
+and the real fix is just reducing the open-path **move count** (construct in
+place) rather than externalizing? Web research settled it:
+
+- **Move-count / NRVO reduction is NOT reliable.** Rust has **no guaranteed copy
+  elision in any circumstance**; NRVO is entirely optional and was *disabled* in
+  rustc ≤ 1.74 over an unsoundness bug ([rust#111005](https://github.com/rust-lang/rust/issues/111005)).
+  Betting a constrained embedded stack (overflow = hard crash) on an unguaranteed
+  optimization that has regressed before is unacceptable. REJECTED.
+- **Externalizing to caller-provided scratch is the embedded standard.** Every
+  comparable no_std codec does it ([audio-codec](https://lib.rs/crates/audio-codec)
+  — whose Opus "~250 KB working set is boxed", our exact case; [nanoaudio](https://github.com/AlixANNERAUD/nanoaudio);
+  [lc3-codec](https://lib.rs/crates/lc3-codec)), with a helper to size the buffer.
+  It is also this crate's own Vorbis pattern. CHOSEN.
+
+**On the union/at-rest concern:** *partial* externalization double-counts (the
+WavPack pool + still-inline AAC are both reserved → ~1.05 MB). The fix is to do it
+**fully**: one **shared scratch per Deck slot** that *all* externalized decoders
+carve from. Sized for the max decoder (~256 KB), × (1+PRELOAD) slots ≈ **512 KB
+at-rest — better than inline's 664 KB** — with a reliably tiny open transient. Not
+worse than inline; strictly better and robust.
+
+### Finalized design — one shared scratch store `A`
+- `AnyDecoder<S, A>` — a **single** extra type param `A` (the shared scratch
+  backing store), NOT one param per decoder (which would explode the signature).
+  `A: AsMut<[u8]> + AsRef<[u8]>` (byte store; desktop `Vec<u8>`/`Box<[u8]>`,
+  embedded `&'static mut [u8]` from a board `StaticCell`). Only one enum variant
+  is live at a time, so the active decoder owns `A`.
+- Each large decoder (`WavPack`, `Aac`, `Alac`/`Caf`, `Opus`, `Flac`) carves its
+  working buffers from `A` at construction using the **existing Vorbis
+  `arena::Arena`** (transient view → bump-allocate → record `usize` offsets → owned
+  `A` + offsets, never a stored borrow → no self-reference under `forbid(unsafe)`),
+  and does typed (i32/f32) access through `A` exactly as `formats/vorbis` already
+  does. `decode_into` signature is UNCHANGED.
+- A helper `pub fn decoder_scratch_len() -> usize` sizes `A` for the largest
+  decoder, so callers never hardcode. `MAX_BLOCK`/`MAX_FRAME` etc. gated to stereo
+  (Phase 1) keep the scratch small.
+- Small decoders (`Mp3` 44 KB, `Wav` 18 KB, `Aiff`) stay inline — the enum ceiling
+  settles at ~44 KB, so the moved `AnyDecoder` is small regardless of move count.
+
+### Reconcile Phase 2
+Phase 2's WavPack-specific `P: AsMut<[i32]>` becomes the shared `A` byte store
+(WavPack carves its `[i32; 65536]` from `A` via the arena). Keep Phase 2's caller
+plumbing; generalize the type.
+
+### Corrected rollout
+- **Phase 3 — shared `A` + AAC**: introduce `AnyDecoder<S, A>` with the shared
+  byte store; reconcile WavPack onto it; externalize AAC into it (ceiling 200→~124
+  KB, ALAC). Establishes the pattern.
+- **Phase 4 — ALAC/Caf + Opus + FLAC** into `A` (ceiling → ~44 KB, Mp3).
+- **Phase 5 — measure**: DAP release stack probe must show the open transient
+  ≤ ~256 KB (from 1.44 MB); update `dap-arch-tests` budgets + `stack_highwater.rs`.
+- **Phase 6 — DAP + soul-player-ng propagation**: board wires a `StaticCell`
+  scratch pool into the open path. Desktop (`soul-audio-desktop`) allocates `A`
+  internally (heap), so **`soul-player-ng` — which consumes the high-level
+  `soul-audio-control`/`soul-audio-desktop` API via `git = …/soul-audio-core,
+  branch = main`, with no raw `open()` in its source — needs no source change**,
+  only the updated core. Propagate by re-pinning soul-player-ng to this branch (or
+  a local path) for desktop testing, then merging to core `main` once validated.
+  Desktop test = the same core the DAP runs, exercised on the desktop player.
