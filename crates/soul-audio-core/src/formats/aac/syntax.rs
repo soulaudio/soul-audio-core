@@ -30,7 +30,14 @@ const ID_END: u32 = 7;
 /// `extension_type` values in a `fill_element` `extension_payload` carrying
 /// SBR side data (`sbr-reference.md` §1 / faad2 `sbr_syntax.h`). Every other
 /// `extension_type` is length-skipped exactly as before.
+///
+/// Desktop only: under `embedded-profile` SBR is gated off entirely (decoder-
+/// memory-externalization spec, Option A) — [`decode_fil`] skip-consumes the
+/// fill-element payload regardless of its `extension_type` without inspecting
+/// it, so these values (and [`SbrLoc`]) have no reader there.
+#[cfg(not(feature = "embedded-profile"))]
 const EXT_SBR_DATA: u32 = 13;
+#[cfg(not(feature = "embedded-profile"))]
 const EXT_SBR_DATA_CRC: u32 = 14;
 
 /// Where the SBR extension payload sits inside the current `raw_data_block`,
@@ -40,6 +47,10 @@ const EXT_SBR_DATA_CRC: u32 = 14;
 /// `extension_type`); `crc` marks `EXT_SBR_DATA_CRC`; `id_cpe` is whether the
 /// element preceding this fill element was a CPE (vs SCE), which selects the
 /// SBR channel count.
+///
+/// Desktop only (`embedded-profile` never reconstructs SBR — see
+/// [`EXT_SBR_DATA`]).
+#[cfg(not(feature = "embedded-profile"))]
 #[derive(Clone, Copy)]
 pub(crate) struct SbrLoc {
     pub(crate) start_bit: usize,
@@ -303,6 +314,12 @@ pub(crate) struct DecodedFrame {
     /// LC-only path stays byte-identical. [`super::decode_rdb`] runs the SBR
     /// drive from this location after the LC core PCM is reconstructed (mono/
     /// stereo only — multichannel HE-AAC is out of scope).
+    ///
+    /// Desktop only: under `embedded-profile` SBR is gated off entirely (see
+    /// [`EXT_SBR_DATA`]) — [`decode_fil`] never records a location, so this
+    /// field would always be `None` there and is dropped rather than carried
+    /// as dead weight.
+    #[cfg(not(feature = "embedded-profile"))]
     pub(crate) sbr: Option<SbrLoc>,
 }
 
@@ -313,6 +330,7 @@ impl Default for DecodedFrame {
             n_channels: 0,
             stereo: core::array::from_fn(|_| StereoPair::default()),
             n_stereo: 0,
+            #[cfg(not(feature = "embedded-profile"))]
             sbr: None,
         }
     }
@@ -718,11 +736,22 @@ fn decode_dse(r: &mut BitReader) -> Result<(), DecodeError> {
 /// the element loop stays byte-accurate — every other extension type is
 /// length-skipped exactly as before (LC-only path unchanged). `id_cpe` is the
 /// preceding audio element's type (CPE vs SCE), which the SBR decode needs.
+///
+/// Under `embedded-profile` (decoder-memory-externalization spec, Option A)
+/// SBR is gated off entirely: this still reads the 4-bit `extension_type` (so
+/// the bit position matches the desktop build exactly) but never inspects it
+/// or records a location — every `fill_element`, SBR or not, is a pure
+/// skip-consume. The LC core always decodes; the bitstream never desyncs.
 fn decode_fil(
     r: &mut BitReader,
     frame: &mut DecodedFrame,
     id_cpe: bool,
 ) -> Result<(), DecodeError> {
+    // Only read on the desktop profile (the `frame.sbr = Some(SbrLoc { ..
+    // id_cpe })` write below); these keep both params "used" under
+    // `embedded-profile` too, where nothing else touches them.
+    let _ = id_cpe;
+    let _ = &frame;
     let mut count = r.read(4);
     if count == 15 {
         let esc = r.read(8);
@@ -733,6 +762,7 @@ fn decode_fil(
         // extension_type is the first 4 bits of the payload.
         let ext_type = r.read(4);
         let remaining = payload_bits - 4;
+        #[cfg(not(feature = "embedded-profile"))]
         if ext_type == EXT_SBR_DATA || ext_type == EXT_SBR_DATA_CRC {
             let start_bit = r.bit_pos();
             frame.sbr = Some(SbrLoc {
@@ -742,6 +772,11 @@ fn decode_fil(
                 id_cpe,
             });
         }
+        // `embedded-profile`: every extension type (SBR included) is ignored —
+        // no high-band reconstruction, no location recorded — but still
+        // skip-consumed below so the element loop stays byte-accurate.
+        #[cfg(feature = "embedded-profile")]
+        let _ = ext_type;
         skip_bits(r, remaining);
     } else {
         skip_bits(r, payload_bits);

@@ -17,7 +17,19 @@ pub(crate) mod bits;
 pub(super) mod dsp;
 pub(crate) mod filterbank;
 mod huffman;
+// `ps` (Parametric Stereo) is only ever driven from inside `sbr::SbrState`
+// (HE-AACv2) — it has no purpose without SBR, so it's gated off alongside it
+// under `embedded-profile` (decoder-memory-externalization spec, Option A).
+#[cfg(not(feature = "embedded-profile"))]
 pub(crate) mod ps;
+/// SBR (HE-AAC) decode. Desktop only: under `embedded-profile` the whole
+/// module (and its substantial const tables / per-channel QMF state) is
+/// dropped from the build — the LC core decodes and the extension payload is
+/// skip-consumed as a no-op (see `syntax::decode_fil`) instead of
+/// reconstructing the high band. This is the bulk of AAC's embedded-profile
+/// size win: `sbr::SbrState` (133,712 B) + `sbr::SbrOutput` (16,400 B) is most
+/// of the pre-externalization 200,536 B `AacDecoder`.
+#[cfg(not(feature = "embedded-profile"))]
 pub(crate) mod sbr;
 mod syntax;
 mod tables;
@@ -61,25 +73,30 @@ pub(crate) const MAX_CHANNELS: usize = 8;
 #[cfg(feature = "embedded-profile")]
 pub(crate) const MAX_CHANNELS: usize = 2;
 
-/// Interleaved PCM scratch for one decoded frame: the larger of the LC
-/// multichannel write (1024 samples × `MAX_CHANNELS`) and the ≤2-channel SBR
-/// write (2048 × 2 at the doubled HE-AAC rate). `decode_rdb` overwrites `pcm`
+/// Interleaved PCM scratch for one decoded frame. `decode_rdb` overwrites it
 /// per frame and never accumulates.
 ///
-/// Explicitly `max`'d rather than just `1024 * MAX_CHANNELS`: SBR/PS stay
-/// mono/stereo-only regardless of the active channel cap
+/// Desktop: the larger of the LC multichannel write (1024 samples ×
+/// `MAX_CHANNELS`) and the ≤2-channel SBR write (2048 × 2 at the doubled
+/// HE-AAC rate). Explicitly `max`'d rather than just `1024 * MAX_CHANNELS`:
+/// SBR/PS stay mono/stereo-only regardless of the active channel cap
 /// ([`sbr::SbrOutput::pcm`] is a fixed `[[f32; 2048]; 2]`, and `decode_rdb`'s
 /// SBR branch only runs when `n <= 2`), so that write's size (4096) does
-/// **not** shrink under the `embedded-profile` feature's `MAX_CHANNELS = 2`.
-/// Without the `max`, `PCM_CAP` would drop to `1024 * 2 = 2048` — smaller
-/// than the 4096-sample SBR write — and a stereo HE-AAC stream (well within
-/// the embedded profile's own channel cap) would write out of bounds instead
-/// of decoding.
+/// **not** shrink with `MAX_CHANNELS`. Without the `max`, `PCM_CAP` would drop
+/// to `1024 * 2 = 2048` — smaller than the 4096-sample SBR write — and a
+/// stereo HE-AAC stream would write out of bounds instead of decoding.
+///
+/// `embedded-profile`: SBR is gated off entirely (Option A), so there is no
+/// 2×-rate write to size for — just the LC write, `1024 * MAX_CHANNELS` (=
+/// 2048, `MAX_CHANNELS` = 2), half the desktop-formula's 4096-sample floor.
+#[cfg(not(feature = "embedded-profile"))]
 const PCM_CAP: usize = if 1024 * MAX_CHANNELS > 2048 * 2 {
     1024 * MAX_CHANNELS
 } else {
     2048 * 2
 };
+#[cfg(feature = "embedded-profile")]
+const PCM_CAP: usize = 1024 * MAX_CHANNELS;
 
 /// Input byte buffer: one whole `raw_data_block` must fit. ADTS's 13-bit
 /// `aac_frame_length` caps a frame at 8191 bytes (payload a little less), and a
@@ -112,42 +129,50 @@ fn round_i16(s: f32) -> i32 {
     }
 }
 
-/// Decode one `raw_data_block` all the way to interleaved 16-bit-range PCM in
-/// `pcm`, returning `(interleaved_samples_written, bytes_consumed)`. The byte
-/// count (from the reader's byte-aligned end position) is what the MP4 sliding
-/// window advances by; ADTS ignores it (its header already framed the block).
+/// [`decode_rdb_lc`]'s return shape: the parsed frame, the per-channel LC
+/// time-domain output, the channel count, and the consumed byte length.
+/// Factored into a named alias (clippy `type_complexity`).
+type LcCoreDecode = (
+    syntax::DecodedFrame,
+    [[f32; 1024]; MAX_CHANNELS],
+    usize,
+    usize,
+);
+
+/// Shared LC-core decode stage (desktop AND `embedded-profile`): syntax parse
+/// → per-channel `dequantize` → per-CPE `apply_stereo` (M/S + intensity, needs
+/// both of a pair's dequantized spectra; a 5.1/7.1 block has several CPEs) →
+/// per-channel `apply_tns` → per-channel `imdct_and_overlap`. Returns the
+/// parsed [`syntax::DecodedFrame`] (its `sbr` field, present on desktop only —
+/// see the field's doc comment — is read by the desktop [`decode_rdb`] after
+/// this returns), the per-channel LC time-domain output, the channel count,
+/// and the exact access-unit byte length consumed (from the reader's
+/// byte-aligned end position — what the MP4 sliding window advances by; ADTS
+/// ignores it, its header already framed the block).
 ///
-/// Pipeline order (matters — the ISO 14496-3 decoder block diagram): syntax
-/// parse → per-channel `dequantize` → per-CPE `apply_stereo` (M/S + intensity,
-/// needs both of a pair's dequantized spectra; a 5.1/7.1 block has several
-/// CPEs) → per-channel `apply_tns` → per-channel `imdct_and_overlap` →
-/// interleave + round. The caller's [`Filterbank`] is stateful (per-channel
-/// overlap carried across frames), so a channel keeps the same index every
-/// frame.
-///
-/// Never panics: `decode_raw_data_block` bounds-checks every field, and every
-/// DSP stage independently re-clamps its indices (see `dsp`/`filterbank`).
-#[allow(clippy::too_many_arguments)]
-fn decode_rdb(
+/// The caller's [`Filterbank`] is stateful (per-channel overlap carried across
+/// frames), so a channel keeps the same index every frame. Never panics:
+/// `decode_raw_data_block` bounds-checks every field, and every DSP stage
+/// independently re-clamps its indices (see `dsp`/`filterbank`).
+fn decode_rdb_lc(
     rdb: &[u8],
     config: AacConfig,
     sfi: u8,
     fb: &mut Filterbank,
-    sbr: &mut sbr::SbrState,
-    sbr_out: &mut sbr::SbrOutput,
-    output_rate: u32,
-    pcm: &mut [i32],
-) -> Result<(usize, usize, bool), DecodeError> {
+) -> Result<LcCoreDecode, DecodeError> {
     let mut r = bits::BitReader::new(rdb);
     let mut frame = syntax::decode_raw_data_block(&mut r, config)?;
     // `decode_raw_data_block` byte-aligns before returning, so this is the exact
     // access-unit length in bytes.
     let consumed = r.bit_pos().div_ceil(8);
     let n = frame.n_channels as usize;
+    let mut outs = [[0f32; 1024]; MAX_CHANNELS];
     if n == 0 {
-        // A block carrying only DSE/FIL/PCE (no audio element) — no samples, but
-        // real bytes were consumed, so the MP4 window still advances.
-        return Ok((0, consumed, false));
+        // A block carrying only DSE/FIL/PCE (no audio element) — no samples,
+        // but real bytes were consumed, so the MP4 window still advances. The
+        // loops below are no-ops for `n == 0` anyway; returning early just
+        // skips the (pointless) dequant/stereo/tns/imdct calls.
+        return Ok((frame, outs, n, consumed));
     }
 
     for ch in 0..n {
@@ -172,19 +197,43 @@ fn decode_rdb(
         dsp::apply_tns(&mut frame.channels[ch], sfi);
     }
 
-    // LC core PCM for every channel (also the SBR analysis QMF's input).
-    let mut outs = [[0f32; 1024]; MAX_CHANNELS];
+    // LC core PCM for every channel (also the SBR analysis QMF's input on
+    // desktop).
     for (ch, out) in outs.iter_mut().enumerate().take(n) {
         fb.imdct_and_overlap(ch, &frame.channels[ch], out);
     }
 
-    // SBR (HE-AAC): a fill element in this block carried EXT_SBR_DATA. Run the
-    // §10 drive over the core PCM; when it produces output, emit **2048**
-    // interleaved samples/channel (2× rate) instead of 1024. Mono/stereo only
-    // — the SBR drive and its QMF scratch are sized for ≤2 channels, so a
-    // (rare) multichannel HE-AAC stream decodes its LC core without SBR rather
-    // than misindex. The LC-only path below is byte-identical when no SBR fill
-    // element was present.
+    Ok((frame, outs, n, consumed))
+}
+
+/// Decode one `raw_data_block` all the way to interleaved 16-bit-range PCM in
+/// `pcm`, returning `(interleaved_samples_written, bytes_consumed, sbr_applied)`.
+///
+/// Desktop: runs [`decode_rdb_lc`], then — if a fill element in this block
+/// carried `EXT_SBR_DATA` — drives the §10 SBR reconstruction over the core
+/// PCM, emitting **2048** interleaved samples/channel (2× rate) instead of
+/// 1024. Mono/stereo only — the SBR drive and its QMF scratch are sized for
+/// ≤2 channels, so a (rare) multichannel HE-AAC stream decodes its LC core
+/// without SBR rather than misindex. The LC-only path is byte-identical when
+/// no SBR fill element was present.
+#[cfg(not(feature = "embedded-profile"))]
+#[allow(clippy::too_many_arguments)]
+fn decode_rdb(
+    rdb: &[u8],
+    config: AacConfig,
+    sfi: u8,
+    fb: &mut Filterbank,
+    sbr: &mut sbr::SbrState,
+    sbr_out: &mut sbr::SbrOutput,
+    output_rate: u32,
+    pcm: &mut [i32],
+) -> Result<(usize, usize, bool), DecodeError> {
+    let (frame, outs, n, consumed) = decode_rdb_lc(rdb, config, sfi, fb)?;
+    if n == 0 {
+        return Ok((0, consumed, false));
+    }
+
+    // SBR (HE-AAC): a fill element in this block carried EXT_SBR_DATA.
     if let Some(loc) = frame.sbr.filter(|_| n <= 2) {
         // SBR consumes the ≤2 core channels; hand it a fixed 2-element view of
         // the wider multichannel `outs` (always in range — `outs` is length
@@ -232,6 +281,32 @@ fn decode_rdb(
     Ok((frames * n, consumed, false))
 }
 
+/// `embedded-profile`: AAC-LC core only — SBR is gated off entirely (Option
+/// A), so this is [`decode_rdb_lc`] plus the interleave/round, nothing else.
+/// The returned `bool` is always `false` (no SBR path exists here); kept so
+/// the three `decode_next_rdb_*` callers share one return shape with the
+/// desktop build.
+#[cfg(feature = "embedded-profile")]
+fn decode_rdb(
+    rdb: &[u8],
+    config: AacConfig,
+    sfi: u8,
+    fb: &mut Filterbank,
+    pcm: &mut [i32],
+) -> Result<(usize, usize, bool), DecodeError> {
+    let (_frame, outs, n, consumed) = decode_rdb_lc(rdb, config, sfi, fb)?;
+    if n == 0 {
+        return Ok((0, consumed, false));
+    }
+    let frames = 1024usize;
+    for i in 0..frames {
+        for ch in 0..n {
+            pcm[i * n + ch] = round_i16(outs[ch][i] * OUTPUT_GAIN);
+        }
+    }
+    Ok((frames * n, consumed, false))
+}
+
 /// The frame-source seam: yields the next access unit's `raw_data_block` bytes
 /// plus (at construction) the stream config, over either container.
 ///
@@ -251,9 +326,20 @@ enum FrameSrc<S> {
 
 /// A streaming AAC-LC decoder over an MP4/`.m4a` or raw ADTS [`Source`],
 /// producing interleaved 16-bit-range `i32` PCM. Mono through 7.1 (up to
-/// [`MAX_CHANNELS`]); HE-AAC (SBR/PS) is mono/stereo only. No allocation: every
-/// buffer is fixed-size and owned by value; the [`Filterbank`] overlap state
-/// and the decoded-PCM carry buffer persist across `decode_into` calls.
+/// [`MAX_CHANNELS`]); on desktop, HE-AAC (SBR/PS) is mono/stereo only. No
+/// allocation: every buffer is fixed-size and owned by value; the
+/// [`Filterbank`] overlap state and the decoded-PCM carry buffer persist
+/// across `decode_into` calls.
+///
+/// **`embedded-profile`** (decoder-memory externalization spec, Option A):
+/// SBR is gated off entirely — the decoder reconstructs the AAC-LC core only
+/// and skip-consumes any `EXT_SBR_DATA` extension payload as a no-op (never a
+/// panic, reject, or bitstream desync); `stream_info()` reports the **core**
+/// rate (no SBR 2× doubling). An HE-AAC source should be transcoded to AAC-LC
+/// or FLAC at desktop import for full quality on that profile (see
+/// `docs/superpowers/2026-11-03-metadata-expansion-and-dap-index-exploration.md`'s
+/// "HE-AAC fold-down" note, mirroring the existing surround→stereo downmix).
+/// Desktop (no feature) keeps SBR/PS fully intact and byte-identical.
 pub struct AacDecoder<S> {
     src: FrameSrc<S>,
     config: AacConfig,
@@ -269,13 +355,24 @@ pub struct AacDecoder<S> {
     /// SBR (HE-AAC) decode state — always present, starts inactive (pure
     /// upsample-only, `kx=32 M=0`). Costs nothing on an LC-only stream: the
     /// drive only runs when a fill element carries `EXT_SBR_DATA`.
+    ///
+    /// Desktop only — gated off under `embedded-profile` (see the struct doc
+    /// comment); this is the bulk of AAC's embedded-profile size win.
+    #[cfg(not(feature = "embedded-profile"))]
     sbr: sbr::SbrState,
-    /// 2×-rate PCM scratch the SBR drive fills (reused each frame).
+    /// 2×-rate PCM scratch the SBR drive fills (reused each frame). Desktop only.
+    #[cfg(not(feature = "embedded-profile"))]
     sbr_out: sbr::SbrOutput,
     /// SBR operating/output rate (= 2×core, or the explicit `ext_sample_rate`).
+    /// Desktop only — under `embedded-profile` [`Self::reported_rate`]/
+    /// [`Self::output_samples_per_au`] always use the core rate, so there is
+    /// nothing for this field to hold.
+    #[cfg(not(feature = "embedded-profile"))]
     output_rate: u32,
     /// `true` once SBR output has been produced (explicit ASC signal, or the
     /// first `EXT_SBR_DATA` frame) — flips `stream_info().sample_rate` to 2×.
+    /// Desktop only; see [`Self::he_aac_active`].
+    #[cfg(not(feature = "embedded-profile"))]
     sbr_confirmed: bool,
     /// Decoded interleaved PCM awaiting hand-off, `[pcm_pos, pcm_len)`.
     pcm: [i32; PCM_CAP],
@@ -348,7 +445,9 @@ impl<S: Source> AacDecoder<S> {
         // SBR output rate: the explicit ASC extension rate if signalled, else
         // 2×core (the dual-rate default). Reported by `stream_info` only once
         // SBR is confirmed (up front for explicit ASC, after the first
-        // EXT_SBR_DATA frame for implicit ADTS).
+        // EXT_SBR_DATA frame for implicit ADTS). Desktop only — embedded-profile
+        // never promotes off the core rate.
+        #[cfg(not(feature = "embedded-profile"))]
         let output_rate = config
             .ext_sample_rate
             .unwrap_or_else(|| config.sample_rate.saturating_mul(2));
@@ -362,9 +461,13 @@ impl<S: Source> AacDecoder<S> {
             mp4_filled: 0,
             mp4_used: 0,
             total_samples,
+            #[cfg(not(feature = "embedded-profile"))]
             sbr: sbr::SbrState::default(),
+            #[cfg(not(feature = "embedded-profile"))]
             sbr_out: sbr::SbrOutput::default(),
+            #[cfg(not(feature = "embedded-profile"))]
             output_rate,
+            #[cfg(not(feature = "embedded-profile"))]
             sbr_confirmed: config.sbr_signalled,
             pcm: [0; PCM_CAP],
             pcm_len: 0,
@@ -382,7 +485,15 @@ impl<S: Source> AacDecoder<S> {
     /// confirmed). Either way it stays consistent with the reported output rate,
     /// so a duration computed as `total_frames / sample_rate` is correct in both
     /// states.
+    ///
+    /// The MP4/Matroska value is the container's declared `mdhd` duration — for
+    /// an explicit-ASC HE-AAC file (`config.sbr_signalled`) that's already in
+    /// the 2× SBR output domain (desktop's actual decode domain, so no
+    /// adjustment needed there). `embedded-profile` never reconstructs SBR
+    /// (decodes the core at 1×), so it halves that declared total back to the
+    /// core domain — see the `embedded-profile` sibling below.
     #[must_use]
+    #[cfg(not(feature = "embedded-profile"))]
     pub fn total_frames(&self) -> Option<u64> {
         match &self.src {
             FrameSrc::Adts(r) => r.cbr_frames().map(|f| f * self.output_samples_per_au()),
@@ -390,8 +501,24 @@ impl<S: Source> AacDecoder<S> {
         }
     }
 
+    /// `embedded-profile` sibling of the above: see its doc comment for the
+    /// MP4/Matroska halving rationale. ADTS is unaffected — `output_samples_per_au`
+    /// is already the core-only 1024 there.
+    #[must_use]
+    #[cfg(feature = "embedded-profile")]
+    pub fn total_frames(&self) -> Option<u64> {
+        match &self.src {
+            FrameSrc::Adts(r) => r.cbr_frames().map(|f| f * self.output_samples_per_au()),
+            FrameSrc::Mp4(_) | FrameSrc::Matroska(_) => self
+                .total_samples
+                .map(|t| if self.config.sbr_signalled { t / 2 } else { t }),
+        }
+    }
+
     /// Output samples per access unit: 1024 core samples, doubled once dual-rate
-    /// SBR is confirmed (output rate = 2× core).
+    /// SBR is confirmed (output rate = 2× core). Desktop only; `embedded-profile`
+    /// never leaves the core rate — see the `embedded-profile` sibling below.
+    #[cfg(not(feature = "embedded-profile"))]
     fn output_samples_per_au(&self) -> u64 {
         if self.sbr_confirmed && self.config.sample_rate != 0 {
             1024 * u64::from((self.output_rate / self.config.sample_rate).max(1))
@@ -400,25 +527,86 @@ impl<S: Source> AacDecoder<S> {
         }
     }
 
+    /// `embedded-profile`: always the AAC-LC core rate's 1024 samples/AU — SBR
+    /// (which would double this) is gated off entirely.
+    #[cfg(feature = "embedded-profile")]
+    fn output_samples_per_au(&self) -> u64 {
+        1024
+    }
+
+    /// The sample rate [`Decoder::stream_info`]/the time-based seeks report:
+    /// the 2× SBR output rate once confirmed on desktop, the core rate
+    /// otherwise (and always on `embedded-profile`, which never confirms SBR).
+    #[cfg(not(feature = "embedded-profile"))]
+    fn reported_rate(&self) -> u32 {
+        if self.sbr_confirmed {
+            self.output_rate
+        } else {
+            self.config.sample_rate
+        }
+    }
+    #[cfg(feature = "embedded-profile")]
+    fn reported_rate(&self) -> u32 {
+        self.config.sample_rate
+    }
+
+    /// Whether HE-AAC (SBR) output is active — `embedded-profile` never
+    /// activates it (SBR is gated off entirely), so this is a hardwired
+    /// `false` there; on desktop it mirrors `sbr_confirmed`.
+    #[cfg(not(feature = "embedded-profile"))]
+    fn he_aac_active(&self) -> bool {
+        self.sbr_confirmed
+    }
+    #[cfg(feature = "embedded-profile")]
+    fn he_aac_active(&self) -> bool {
+        false
+    }
+
     /// Gapless encoder delay (leading priming, per-channel samples) from the
     /// MP4 `elst` edit list; `0` for raw ADTS (no container edit list) or an MP4
     /// without one. The decoder emits the full decode — the [`Deck`] trims this
     /// many samples off the front for gapless playback.
     ///
+    /// Like [`Self::total_frames`], an explicit-ASC HE-AAC file's `elst` is
+    /// declared in the 2× SBR output domain; `embedded-profile` (core-only, no
+    /// SBR reconstruction) halves it back to the core domain it actually
+    /// decodes at.
+    ///
     /// [`Deck`]: crate::deck::Deck
     fn mp4_encoder_delay(&self) -> u64 {
         match &self.src {
-            FrameSrc::Mp4(r) => r.encoder_delay(),
+            FrameSrc::Mp4(r) => {
+                let d = r.encoder_delay();
+                #[cfg(feature = "embedded-profile")]
+                {
+                    if self.config.sbr_signalled { d / 2 } else { d }
+                }
+                #[cfg(not(feature = "embedded-profile"))]
+                {
+                    d
+                }
+            }
             FrameSrc::Adts(_) | FrameSrc::Matroska(_) => 0,
         }
     }
 
     /// Gapless presented length (per-channel frames to emit after the delay)
     /// from the MP4 `elst`; `None` for ADTS (no container edit list) or an MP4
-    /// without one.
+    /// without one. See [`Self::mp4_encoder_delay`]'s note on the
+    /// `embedded-profile` domain halving.
     fn mp4_playable_frames(&self) -> Option<u64> {
         match &self.src {
-            FrameSrc::Mp4(r) => r.playable_frames(),
+            FrameSrc::Mp4(r) => {
+                let p = r.playable_frames();
+                #[cfg(feature = "embedded-profile")]
+                {
+                    p.map(|v| if self.config.sbr_signalled { v / 2 } else { v })
+                }
+                #[cfg(not(feature = "embedded-profile"))]
+                {
+                    p
+                }
+            }
             FrameSrc::Adts(_) | FrameSrc::Matroska(_) => None,
         }
     }
@@ -485,20 +673,38 @@ impl<S: Source> AacDecoder<S> {
         if self.mp4_filled == 0 {
             return Ok(None); // mdat drained
         }
-        let (samples, consumed, sbr_applied) = decode_rdb(
-            &self.inbuf[..self.mp4_filled],
-            self.config,
-            self.sfi,
-            &mut self.fb,
-            &mut self.sbr,
-            &mut self.sbr_out,
-            self.output_rate,
-            &mut self.pcm,
-        )?;
+        let (samples, consumed, sbr_applied) = {
+            #[cfg(not(feature = "embedded-profile"))]
+            {
+                decode_rdb(
+                    &self.inbuf[..self.mp4_filled],
+                    self.config,
+                    self.sfi,
+                    &mut self.fb,
+                    &mut self.sbr,
+                    &mut self.sbr_out,
+                    self.output_rate,
+                    &mut self.pcm,
+                )?
+            }
+            #[cfg(feature = "embedded-profile")]
+            {
+                decode_rdb(
+                    &self.inbuf[..self.mp4_filled],
+                    self.config,
+                    self.sfi,
+                    &mut self.fb,
+                    &mut self.pcm,
+                )?
+            }
+        };
         self.mp4_used = consumed;
         if sbr_applied {
-            self.sbr_confirmed = true;
-            self.promote_channels_if_ps();
+            #[cfg(not(feature = "embedded-profile"))]
+            {
+                self.sbr_confirmed = true;
+                self.promote_channels_if_ps();
+            }
         }
         Ok(Some(samples))
     }
@@ -517,19 +723,37 @@ impl<S: Source> AacDecoder<S> {
                 None => return Ok(None),
             }
         };
-        let (samples, _consumed, sbr_applied) = decode_rdb(
-            &self.inbuf[..len],
-            self.config,
-            self.sfi,
-            &mut self.fb,
-            &mut self.sbr,
-            &mut self.sbr_out,
-            self.output_rate,
-            &mut self.pcm,
-        )?;
+        let (samples, _consumed, sbr_applied) = {
+            #[cfg(not(feature = "embedded-profile"))]
+            {
+                decode_rdb(
+                    &self.inbuf[..len],
+                    self.config,
+                    self.sfi,
+                    &mut self.fb,
+                    &mut self.sbr,
+                    &mut self.sbr_out,
+                    self.output_rate,
+                    &mut self.pcm,
+                )?
+            }
+            #[cfg(feature = "embedded-profile")]
+            {
+                decode_rdb(
+                    &self.inbuf[..len],
+                    self.config,
+                    self.sfi,
+                    &mut self.fb,
+                    &mut self.pcm,
+                )?
+            }
+        };
         if sbr_applied {
-            self.sbr_confirmed = true;
-            self.promote_channels_if_ps();
+            #[cfg(not(feature = "embedded-profile"))]
+            {
+                self.sbr_confirmed = true;
+                self.promote_channels_if_ps();
+            }
         }
         Ok(Some(samples))
     }
@@ -547,19 +771,37 @@ impl<S: Source> AacDecoder<S> {
                 None => return Ok(None),
             }
         };
-        let (samples, _consumed, sbr_applied) = decode_rdb(
-            &self.inbuf[..len],
-            self.config,
-            self.sfi,
-            &mut self.fb,
-            &mut self.sbr,
-            &mut self.sbr_out,
-            self.output_rate,
-            &mut self.pcm,
-        )?;
+        let (samples, _consumed, sbr_applied) = {
+            #[cfg(not(feature = "embedded-profile"))]
+            {
+                decode_rdb(
+                    &self.inbuf[..len],
+                    self.config,
+                    self.sfi,
+                    &mut self.fb,
+                    &mut self.sbr,
+                    &mut self.sbr_out,
+                    self.output_rate,
+                    &mut self.pcm,
+                )?
+            }
+            #[cfg(feature = "embedded-profile")]
+            {
+                decode_rdb(
+                    &self.inbuf[..len],
+                    self.config,
+                    self.sfi,
+                    &mut self.fb,
+                    &mut self.pcm,
+                )?
+            }
+        };
         if sbr_applied {
-            self.sbr_confirmed = true;
-            self.promote_channels_if_ps();
+            #[cfg(not(feature = "embedded-profile"))]
+            {
+                self.sbr_confirmed = true;
+                self.promote_channels_if_ps();
+            }
         }
         Ok(Some(samples))
     }
@@ -569,6 +811,10 @@ impl<S: Source> AacDecoder<S> {
     /// sample-rate promotion. `SbrOutput.channels` is set to 2 by the SBR drive
     /// whenever PS ran; from then on `stream_info().channels` reports 2 and
     /// `decode_rdb` interleaves every frame as stereo.
+    ///
+    /// Desktop only (SBR/PS are gated off under `embedded-profile`, and every
+    /// call site is itself desktop-only).
+    #[cfg(not(feature = "embedded-profile"))]
     fn promote_channels_if_ps(&mut self) {
         if self.sbr_out.channels == 2 && self.channels < 2 {
             self.channels = 2;
@@ -613,12 +859,7 @@ impl<S: SeekSource> AacDecoder<S> {
     /// # Errors
     /// As [`Self::seek_to`].
     pub fn seek_to_time(&mut self, secs: f64) -> Result<u64, DecodeError> {
-        let rate = if self.sbr_confirmed {
-            self.output_rate
-        } else {
-            self.config.sample_rate
-        };
-        self.seek_to(crate::decoder::secs_to_samples(secs, rate))
+        self.seek_to(crate::decoder::secs_to_samples(secs, self.reported_rate()))
     }
 
     /// Reset all cross-frame decode state to a clean post-seek baseline. Keeps
@@ -626,8 +867,11 @@ impl<S: SeekSource> AacDecoder<S> {
     /// pre-roll re-establishes the SBR/PS state they describe).
     fn reset_decode_state(&mut self) {
         self.fb = Filterbank::new();
-        self.sbr = sbr::SbrState::default();
-        self.sbr_out = sbr::SbrOutput::default();
+        #[cfg(not(feature = "embedded-profile"))]
+        {
+            self.sbr = sbr::SbrState::default();
+            self.sbr_out = sbr::SbrOutput::default();
+        }
         self.pcm_len = 0;
         self.pcm_pos = 0;
         self.eof = false;
@@ -665,7 +909,9 @@ impl<S: SeekSource> AacDecoder<S> {
         // start instead (correct + bit-exact; O(target), acceptable on the rarer
         // HE-AAC seek). (Implicit-SBR MP4, where `sbr_confirmed` is still false
         // here, uses the pre-roll path — no such fixture ships; documented.)
-        let land = if self.sbr_confirmed {
+        // `embedded-profile` never activates HE-AAC (`he_aac_active` is a
+        // hardwired `false`), so this always takes the pre-roll path there.
+        let land = if self.he_aac_active() {
             0
         } else {
             au_index.saturating_sub(PREROLL)
@@ -708,7 +954,7 @@ impl<S: SeekSource> AacDecoder<S> {
             FrameSrc::Adts(r) => r.cbr_frames(),
             FrameSrc::Mp4(_) | FrameSrc::Matroska(_) => None,
         };
-        if !self.sbr_confirmed {
+        if !self.he_aac_active() {
             if let Some(total) = adts_total {
                 let per_au = self.output_samples_per_au();
                 let target_frame = (sample / per_au).min(total.saturating_sub(1));
@@ -758,11 +1004,7 @@ impl<S: SeekSource> AacDecoder<S> {
         // sample base needs no pre-skip adjustment (AAC has none). Falls back to a
         // linear restart when the file carries no Cues. The landed Cluster's first
         // access unit warms up the filterbank over the run-in before the target.
-        let rate = if self.sbr_confirmed {
-            self.output_rate
-        } else {
-            self.config.sample_rate
-        };
+        let rate = self.reported_rate();
         // Look up a Cue a short pre-roll *before* the target so the landed Cluster
         // gives the filterbank (and any SBR/PS state) a run-in to warm up before
         // the emitted tail — a target near a Cluster boundary would otherwise emit
@@ -838,12 +1080,9 @@ impl<S: Source> Decoder for AacDecoder<S> {
             // SBR doubles the output rate (dual-rate HE-AAC). Report 2× once
             // SBR is confirmed — up front for an explicit ASC signal, or after
             // the first EXT_SBR_DATA frame for implicit ADTS; the core rate
-            // otherwise (pure AAC-LC, byte-identical to before).
-            sample_rate: if self.sbr_confirmed {
-                self.output_rate
-            } else {
-                self.config.sample_rate
-            },
+            // otherwise (pure AAC-LC, byte-identical to before). Always the
+            // core rate under `embedded-profile` (SBR never activates there).
+            sample_rate: self.reported_rate(),
             channels: self.channels,
             format: SampleFormat::Int { bits: 16 },
         }
@@ -945,6 +1184,11 @@ mod tests {
     /// Explicit HE-AAC in MP4 (`sbr.m4a`): the ASC advertises SBR (AOT 5), so
     /// the decoder reports the 2× output rate (44100) *up front* — before any
     /// frame is decoded — and produces 2048 samples/channel of non-silent audio.
+    ///
+    /// Desktop only: `embedded-profile` gates SBR off entirely (decoder-memory-
+    /// externalization spec, Option A), so this file decodes its AAC-LC core
+    /// instead — see `he_aac_decodes_lc_core_only_under_embedded_profile`.
+    #[cfg(not(feature = "embedded-profile"))]
     #[test]
     fn sbr_m4a_explicit_decodes_2x_non_silent() {
         let m4a = include_bytes!("../../../testdata/sbr.m4a");
@@ -968,6 +1212,10 @@ mod tests {
     /// no panic, SBR activates (output rate doubles to 2×core = 44100), every
     /// frame yields 2048 samples/channel, and the reconstructed audio is
     /// non-silent and finite. Structural only — Task 12 calibrates SNR.
+    ///
+    /// Desktop only: see `sbr_m4a_explicit_decodes_2x_non_silent`'s note on the
+    /// `embedded-profile` counterpart.
+    #[cfg(not(feature = "embedded-profile"))]
     #[test]
     fn sbr_adts_smoke_decodes_2x_non_silent() {
         let aac = include_bytes!("../../../testdata/sbr.aac");
@@ -1081,6 +1329,54 @@ mod tests {
         );
         assert!(pcm.iter().any(|&s| s != 0), "LC decode was all-silent");
     }
+
+    /// `embedded-profile` only: the inverse of `sbr_m4a_explicit_decodes_2x_non_silent`
+    /// / `sbr_adts_smoke_decodes_2x_non_silent` above. SBR is gated off entirely
+    /// under this feature (decoder-memory-externalization spec, Option A), so
+    /// an HE-AAC source — explicit ASC signalling (`sbr.m4a`) and implicit
+    /// fill-element signalling (`sbr.aac`) alike — must decode its **AAC-LC
+    /// core** end to end with no panic, no rejection, and no bitstream desync
+    /// (`EXT_SBR_DATA` is skip-consumed as a no-op, per `syntax::decode_fil`).
+    /// `stream_info().sample_rate` reports the **core** rate (22050) — never
+    /// the 2× SBR rate (44100) a desktop decode of the same files produces.
+    #[cfg(feature = "embedded-profile")]
+    #[test]
+    fn he_aac_decodes_lc_core_only_under_embedded_profile() {
+        let m4a = include_bytes!("../../../testdata/sbr.m4a");
+        let (pcm_m4a, rate_m4a, channels_m4a) = decode_all_open(m4a);
+        assert_eq!(channels_m4a, 2);
+        assert_eq!(
+            rate_m4a, 22_050,
+            "embedded-profile must report the AAC-LC core rate, never the 2x SBR rate"
+        );
+        assert!(!pcm_m4a.is_empty(), "no audio decoded from sbr.m4a");
+        assert_eq!(
+            pcm_m4a.len() % 2,
+            0,
+            "stereo interleave must stay even-length"
+        );
+        assert!(
+            pcm_m4a.iter().any(|&s| s != 0),
+            "LC-core decode of sbr.m4a (MP4/explicit ASC) was all-silent"
+        );
+
+        let aac = include_bytes!("../../../testdata/sbr.aac");
+        let (pcm_aac, rate_aac, channels_aac) = decode_all_adts(aac);
+        assert_eq!(channels_aac, 2, "sbr.aac is stereo (CPE)");
+        assert_eq!(
+            rate_aac, 22_050,
+            "embedded-profile must report the AAC-LC core rate, never the 2x SBR rate"
+        );
+        assert!(!pcm_aac.is_empty(), "no audio decoded from sbr.aac");
+        assert!(
+            pcm_aac.iter().any(|&s| s != 0),
+            "LC-core decode of sbr.aac (ADTS/implicit fill element) was all-silent"
+        );
+        assert!(
+            pcm_aac.iter().all(|&s| (-32768..=32767).contains(&s)),
+            "LC-core decode produced a sample outside i16 range"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1192,6 +1488,11 @@ mod seek_tests {
     /// SBR header + delta-time envelopes are always seen, making the tail
     /// bit-identical to the from-start decode (the output position is
     /// sample-accurate at the dual rate).
+    ///
+    /// Desktop only: `embedded-profile` gates SBR off entirely, so this file's
+    /// seek exercises the plain AAC-LC pre-roll path instead — see
+    /// `aac_mp4_he_aac_seek_decodes_lc_core_under_embedded_profile`.
+    #[cfg(not(feature = "embedded-profile"))]
     #[test]
     fn aac_mp4_sbr_seek_bit_exact() {
         const CH: usize = 2;
@@ -1222,6 +1523,10 @@ mod seek_tests {
 
     /// ADTS HE-AAC decode-discards from the start too → also bit-exact (no
     /// reconvergence gap, unlike the sample-table pre-roll path).
+    ///
+    /// Desktop only: see `aac_mp4_sbr_seek_bit_exact`'s note on the
+    /// `embedded-profile` counterpart.
+    #[cfg(not(feature = "embedded-profile"))]
     #[test]
     fn aac_adts_sbr_seek_bit_exact() {
         const CH: usize = 2;
@@ -1233,5 +1538,46 @@ mod seek_tests {
             let from = t as usize * CH;
             assert_eq!(tail, &full[from..], "ADTS SBR tail bit-exact at {t}");
         }
+    }
+
+    /// `embedded-profile` only: seeking an HE-AAC source still works — SBR is
+    /// gated off, so the seek exercises the plain AAC-LC pre-roll/decode-discard
+    /// paths over `sbr.m4a`/`sbr.aac`'s LC core, landing exactly and never
+    /// panicking or desyncing the bitstream (decoder-memory-externalization
+    /// spec, Option A).
+    #[cfg(feature = "embedded-profile")]
+    #[test]
+    fn aac_he_aac_seek_decodes_lc_core_under_embedded_profile() {
+        const CH: usize = 2;
+        let full = full_mp4(include_bytes!("../../../testdata/sbr.m4a"));
+        assert!(!full.is_empty(), "no audio decoded from sbr.m4a");
+        let pc = (full.len() / CH) as u64;
+        let (landed, tail) = seek_tail_mp4(include_bytes!("../../../testdata/sbr.m4a"), pc / 2);
+        assert_eq!(
+            landed,
+            pc / 2,
+            "LC-core seek landing on an HE-AAC MP4 source"
+        );
+        assert_eq!(
+            tail,
+            &full[(pc / 2) as usize * CH..],
+            "LC-core MP4 seek tail"
+        );
+
+        let full_a = full_adts(include_bytes!("../../../testdata/sbr.aac"));
+        assert!(!full_a.is_empty(), "no audio decoded from sbr.aac");
+        let pc_a = (full_a.len() / CH) as u64;
+        let (landed_a, tail_a) =
+            seek_tail_adts(include_bytes!("../../../testdata/sbr.aac"), pc_a / 2);
+        assert_eq!(
+            landed_a,
+            pc_a / 2,
+            "LC-core seek landing on an HE-AAC ADTS source"
+        );
+        assert_eq!(
+            tail_a,
+            &full_a[(pc_a / 2) as usize * CH..],
+            "LC-core ADTS seek tail"
+        );
     }
 }

@@ -1495,6 +1495,13 @@ fn id3_prefixed_adts_routes_to_aac_not_mp3() {
 /// f32 QMF math against the s16le reference; it is far above the ~25-40 dB a
 /// conformant HE-AAC decode needs, and decisively distinguishes the fix from any
 /// per-band phase regression (which drops SNR by tens of dB).
+///
+/// Desktop only: `embedded-profile` gates SBR off entirely (decoder-memory-
+/// externalization spec, Option A), so these files decode their AAC-LC core
+/// at the core rate instead of the 2× SBR rate — see
+/// `formats::aac::tests::he_aac_decodes_lc_core_only_under_embedded_profile`
+/// for that profile's equivalent gate.
+#[cfg(not(feature = "embedded-profile"))]
 #[test]
 fn open_decodes_he_aac_sbr_matching_ffmpeg() {
     for (label, data, refpcm) in [
@@ -1529,6 +1536,10 @@ fn open_decodes_he_aac_sbr_matching_ffmpeg() {
 /// the output must be at the **2× SBR rate** (per-channel length within a frame
 /// of ffmpeg's 2× reference), non-silent, entirely within the i16 range, and not
 /// pinned to full-scale (a clipped/garbage decode).
+///
+/// Desktop only: see `open_decodes_he_aac_sbr_matching_ffmpeg`'s note on the
+/// `embedded-profile` counterpart (no 2× SBR rate there).
+#[cfg(not(feature = "embedded-profile"))]
 #[test]
 fn sbr_output_is_2x_and_non_silent() {
     let aac = include_bytes!("../testdata/sbr.aac");
@@ -1759,6 +1770,11 @@ fn open_decodes_layer1_conformance_vector() {
 /// Load the gitignored local PS fixture at test runtime. `None` (→ the caller
 /// skips) when either file is absent — the CI / clean-checkout case. NEVER
 /// `include_bytes!` (the files are not committed).
+///
+/// Desktop only: PS (HE-AACv2) only ever runs inside an active SBR frame,
+/// which `embedded-profile` gates off entirely (decoder-memory-externalization
+/// spec, Option A) — its two callers below are gated the same way.
+#[cfg(not(feature = "embedded-profile"))]
 fn ps_local_fixture() -> Option<(Vec<u8>, Vec<i32>)> {
     let dir = env!("CARGO_MANIFEST_DIR");
     let m4a = std::fs::read(format!("{dir}/testdata/ps-local.m4a")).ok()?;
@@ -1808,6 +1824,9 @@ fn seg_snr_at(ours: &[i32], refr: &[i32], off: usize) -> f64 {
 /// comfortably clears a conformant decode yet still drops tens of dB — failing
 /// the gate — under any per-channel PS regression (a wrong mixing matrix,
 /// dropped decorrelation, or a mono-collapsed channel).
+///
+/// Desktop only — see `ps_local_fixture`'s note.
+#[cfg(not(feature = "embedded-profile"))]
 const PS_SNR_BAR: f64 = 28.0;
 
 /// Local-only HE-AACv2/PS conformance: each channel of our decode matches
@@ -1821,6 +1840,9 @@ const PS_SNR_BAR: f64 = 28.0;
 /// de-interleaved and scored **independently** at that offset — a one-channel
 /// bug (e.g. a mono-collapsed right channel) cannot average out against a good
 /// channel, because *both* must clear `PS_SNR_BAR` on their own.
+///
+/// Desktop only — see `ps_local_fixture`'s note.
+#[cfg(not(feature = "embedded-profile"))]
 #[test]
 fn ps_local_matches_ffmpeg_per_channel() {
     let Some((data, refr)) = ps_local_fixture() else {
@@ -1859,6 +1881,9 @@ fn ps_local_matches_ffmpeg_per_channel() {
 /// decode (`ps-synth.ref.pcm`). Measured L ≈ 48.8 dB, R ≈ 46.3 dB at the
 /// 384-frame offset (a clean synthetic tone scores well above the real-music
 /// `ps-local`'s ~34 dB), comfortably over `PS_SNR_BAR`.
+///
+/// Desktop only — see `ps_local_fixture`'s note.
+#[cfg(not(feature = "embedded-profile"))]
 #[test]
 fn open_decodes_ps_synth_matching_ffmpeg_per_channel() {
     let aac = include_bytes!("../testdata/ps-synth.aac");
@@ -1897,6 +1922,9 @@ fn open_decodes_ps_synth_matching_ffmpeg_per_channel() {
 /// differ**. `RMS(L−R)/RMS(L)` measured ≈ 0.80 (ffmpeg ref ≈ 0.808); a
 /// mono-duplicated / PS-silently-disabled decode would pass every other check
 /// but collapse this ratio to ~0. Skip-if-absent (see above).
+///
+/// Desktop only — see `ps_local_fixture`'s note.
+#[cfg(not(feature = "embedded-profile"))]
 #[test]
 fn ps_local_output_is_stereo_and_channels_differ() {
     let Some((data, refr)) = ps_local_fixture() else {
