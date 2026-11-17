@@ -25,16 +25,27 @@ use crate::model::{SampleFormat, StreamInfo};
 /// 4608 covers every standard-block-size encoder (the subset limit at ≤48 kHz);
 /// larger blocks are declined with [`DecodeError::Unsupported`].
 const MAX_BLOCK: usize = 4608;
-/// Maximum channels the inline decode buffer supports (up to 7.1 surround).
-/// FLAC's inter-channel decorrelation is stereo-only, so >2 channels are always
-/// coded independently and decode with no cross-channel dependency.
+/// Maximum channels the inline decode buffer supports (up to 7.1 surround on
+/// the desktop profile). FLAC's inter-channel decorrelation is stereo-only,
+/// so anything past 2 channels is always coded independently and decodes
+/// with no cross-channel dependency.
 ///
 /// **RAM cost:** the `channels × MAX_BLOCK × 4`-byte plane buffer must persist
 /// between `decode_into` calls, and it sizes both `FlacDecoder` and — via the
 /// `Wav`/`Flac`/`Mp3` enum — [`AnyDecoder`](crate::dispatch::AnyDecoder). At the
-/// default it is `8 × 4608 × 4 ≈ 147 KiB`; lower this const to trade channel
-/// support for footprint on RAM-constrained targets.
+/// desktop default it is `8 × 4608 × 4 ≈ 147 KiB`.
+///
+/// The **`embedded-profile`** feature (decoder-memory externalization spec,
+/// Lever A) tightens this to stereo (`2 × 4608 × 4 ≈ 36 KiB`): the DAP
+/// consumer this profile targets is stereo-only and downmixes surround to
+/// stereo at import, so a >2-channel inline buffer is pure waste on that
+/// target. [`FlacDecoder::new`]'s existing `channels > MAX_CHANNELS` check
+/// already turns a wider stream into a graceful [`DecodeError::Unsupported`]
+/// under either cap, never a panic.
+#[cfg(not(feature = "embedded-profile"))]
 const MAX_CHANNELS: usize = 8;
+#[cfg(feature = "embedded-profile")]
+const MAX_CHANNELS: usize = 2;
 /// Maximum predictor order (LPC tops out at 32).
 const MAX_ORDER: usize = 32;
 /// Raw-byte refill buffer size for the bit reader.
@@ -1997,6 +2008,11 @@ mod tests {
 
     // -- multichannel ---------------------------------------------------------
 
+    /// Desktop profile only: `embedded-profile` tightens [`MAX_CHANNELS`] to
+    /// stereo (decoder-memory externalization spec, Lever A), so a 4-channel
+    /// FLAC stream is a graceful `Unsupported` there instead — skip rather
+    /// than assert a decode that profile intentionally refuses.
+    #[cfg(not(feature = "embedded-profile"))]
     #[test]
     fn decodes_4_independent_channels() {
         // FLAC >2 channels are always independent (decorrelation is stereo-only).
@@ -2027,6 +2043,20 @@ mod tests {
                 assert_eq!(out[i * 4 + c], (c as i32) * 100 + i as i32);
             }
         }
+    }
+
+    /// Embedded profile only: the inverse of `decodes_4_independent_channels`
+    /// above — under the stereo `MAX_CHANNELS` cap, the same 4-channel stream
+    /// must be a clean `Unsupported` at construction, never a panic
+    /// (decoder-memory externalization spec §5 acceptance gate).
+    #[cfg(feature = "embedded-profile")]
+    #[test]
+    fn embedded_profile_rejects_more_than_stereo() {
+        let bytes = flac_file(44_100, 4, 16, 0, &[]);
+        assert_eq!(
+            FlacDecoder::new(SliceSource::new(&bytes)).err(),
+            Some(DecodeError::Unsupported)
+        );
     }
 }
 

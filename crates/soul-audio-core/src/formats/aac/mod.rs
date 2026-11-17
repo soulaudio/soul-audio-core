@@ -40,18 +40,46 @@ use filterbank::Filterbank;
 /// accumulates, so a second frame's headroom was pure slack. Keeping
 /// `AacDecoder` compact matters because it is the largest [`AnyDecoder`]
 /// variant, embedded by value on the (default-stack) construction path.
-/// Maximum channels this decoder reconstructs: 7.1 (`channel_configuration` 7).
-/// Covers mono/stereo (1/2), 5.1 (6), and 7.1 (8) — every standard AAC layout.
-/// The large per-channel [`syntax::DecodedFrame`] scales with this but stays a
-/// transient on the (big-stack) decode path, never embedded in the persistent
+/// Maximum channels this decoder reconstructs. The desktop profile (default)
+/// covers up to 7.1 (`channel_configuration` 7): mono/stereo (1/2), 5.1 (6),
+/// and 7.1 (8) — every standard AAC layout. The large per-channel
+/// [`syntax::DecodedFrame`] scales with this but stays a transient on the
+/// (big-stack) decode path, never embedded in the persistent
 /// `AacDecoder`/[`AnyDecoder`](crate::AnyDecoder) value.
+///
+/// The **`embedded-profile`** feature (decoder-memory externalization spec,
+/// Lever A) tightens this to stereo: the DAP consumer this profile targets
+/// is stereo-only and downmixes surround to stereo at import, so the
+/// `MAX_CHANNELS`-scaled filterbank/SBR/`DecodedFrame` buffers never need
+/// more than 2 channels on that target. [`AacDecoder::build`]'s
+/// `channels > MAX_CHANNELS` check, and `decode_element`'s own per-block
+/// `next_ch >= MAX_CHANNELS` bound (`syntax.rs`), already turn a wider stream
+/// into a graceful [`DecodeError::Unsupported`] under either cap, never a
+/// panic.
+#[cfg(not(feature = "embedded-profile"))]
 pub(crate) const MAX_CHANNELS: usize = 8;
+#[cfg(feature = "embedded-profile")]
+pub(crate) const MAX_CHANNELS: usize = 2;
 
 /// Interleaved PCM scratch for one decoded frame: the larger of the LC
 /// multichannel write (1024 samples × `MAX_CHANNELS`) and the ≤2-channel SBR
 /// write (2048 × 2 at the doubled HE-AAC rate). `decode_rdb` overwrites `pcm`
 /// per frame and never accumulates.
-const PCM_CAP: usize = 1024 * MAX_CHANNELS;
+///
+/// Explicitly `max`'d rather than just `1024 * MAX_CHANNELS`: SBR/PS stay
+/// mono/stereo-only regardless of the active channel cap
+/// ([`sbr::SbrOutput::pcm`] is a fixed `[[f32; 2048]; 2]`, and `decode_rdb`'s
+/// SBR branch only runs when `n <= 2`), so that write's size (4096) does
+/// **not** shrink under the `embedded-profile` feature's `MAX_CHANNELS = 2`.
+/// Without the `max`, `PCM_CAP` would drop to `1024 * 2 = 2048` — smaller
+/// than the 4096-sample SBR write — and a stereo HE-AAC stream (well within
+/// the embedded profile's own channel cap) would write out of bounds instead
+/// of decoding.
+const PCM_CAP: usize = if 1024 * MAX_CHANNELS > 2048 * 2 {
+    1024 * MAX_CHANNELS
+} else {
+    2048 * 2
+};
 
 /// Input byte buffer: one whole `raw_data_block` must fit. ADTS's 13-bit
 /// `aac_frame_length` caps a frame at 8191 bytes (payload a little less), and a

@@ -1214,6 +1214,14 @@ fn open_decodes_fragmented_aac_mp4() {
 /// channels to ffmpeg's by best SNR and require a **bijection** (no channel
 /// collapsed/duplicated/swapped) with every match clearing 40 dB. Distinct
 /// per-channel tones (300/500/700/90/1300/1700 Hz) make the mapping unambiguous.
+///
+/// Desktop profile only: `embedded-profile` tightens AAC's `MAX_CHANNELS` to
+/// stereo (decoder-memory externalization spec, Lever A — the DAP consumer
+/// is stereo-only and downmixes surround at import), so a 5.1 file is a
+/// graceful `Unsupported` there instead — skip rather than assert a decode
+/// that profile intentionally refuses. See
+/// `open_rejects_aac_5p1_under_embedded_profile` for the inverse check.
+#[cfg(not(feature = "embedded-profile"))]
 #[test]
 fn open_decodes_aac_5p1_matching_ffmpeg() {
     const CH: usize = 6;
@@ -1296,6 +1304,20 @@ fn open_decodes_aac_5p1_matching_ffmpeg() {
     assert!(
         seen.iter().all(|&s| s),
         "the 6 channels must map one-to-one onto ffmpeg's; got {matched:?} (collapse/swap)"
+    );
+}
+
+/// Embedded profile only: the inverse of `open_decodes_aac_5p1_matching_ffmpeg`
+/// above — under the stereo `MAX_CHANNELS` cap (decoder-memory externalization
+/// spec, Lever A), the same 5.1 AAC-LC file is a clean `Unsupported` at
+/// `open()`, never a panic.
+#[cfg(feature = "embedded-profile")]
+#[test]
+fn open_rejects_aac_5p1_under_embedded_profile() {
+    let m4a = include_bytes!("../testdata/aac-5p1.m4a");
+    assert_eq!(
+        open(SliceSource::new(m4a)).err(),
+        Some(DecodeError::Unsupported)
     );
 }
 
