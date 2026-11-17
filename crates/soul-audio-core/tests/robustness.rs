@@ -194,7 +194,10 @@ fn drive_all(bytes: &[u8]) -> Result<(), &'static str> {
         }
     }
     // CAF: the chunk walk + lpcm/ALAC seams (the ALAC `kuki` cookie parse).
-    if let Ok(mut d) = CafDecoder::new(SliceSource::new(bytes)) {
+    if let Ok(mut d) = CafDecoder::new_in(
+        SliceSource::new(bytes),
+        vec![0i32; soul_audio_core::decoder_scratch_len()],
+    ) {
         if !drain_pcm(&mut d, len) {
             return Err("caf");
         }

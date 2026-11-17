@@ -360,11 +360,6 @@ pub(crate) struct AlacCfg {
 /// The wasted-bits buffer is logically `u16`-valued but stored as `i32` slots
 /// (every value is <= 16 bits, so the round-trip is exact) — simpler than a
 /// mixed-width scratch store, and `ScratchCursor` only ever hands out i32 slots.
-///
-/// Minimum i32-slot length a `P` must meet: `mix_u + mix_v + resid +
-/// shift + out`, i.e. `MAX_FRAME * 3 + MAX_FRAME * MAX_CHANNELS * 2`.
-pub(crate) const SCRATCH_LEN: usize = MAX_FRAME * 3 + MAX_FRAME * MAX_CHANNELS * 2;
-
 pub(crate) struct Scratch<P> {
     scratch: P,
     mix_u_off: usize,

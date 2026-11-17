@@ -83,7 +83,7 @@ pub enum AnyDecoder<S, P> {
     WavPack(WavpackDecoder<S, P>),
     /// Apple CAF carrying `lpcm` or `alac`; decode-only for now (seeking is a
     /// follow-up), so `seek_to` reports `Unsupported`.
-    Caf(CafDecoder<S>),
+    Caf(CafDecoder<S, P>),
 }
 
 impl<S: crate::io::SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> AnyDecoder<S, P> {
@@ -407,8 +407,11 @@ pub fn open<S: BufSource, P: AsRef<[i32]> + AsMut<[i32]>>(
         // WavPack lossless (.wv): the one format that uses the caller-provided
         // `scratch` storage.
         Format::WavPack => WavpackDecoder::new_in(src, scratch).map(AnyDecoder::WavPack),
-        // Apple CAF (lpcm / alac).
-        Format::Caf => CafDecoder::new(src).map(AnyDecoder::Caf),
+        // Apple CAF (lpcm / alac): the one other format (besides WavPack/FLAC/
+        // Matroska/ALAC) that uses the caller-provided `scratch` — only its
+        // `alac` payload does (via `CafAlac`'s embedded `alac::Scratch`);
+        // `lpcm` ignores it.
+        Format::Caf => CafDecoder::new_in(src, scratch).map(AnyDecoder::Caf),
     }
 }
 
