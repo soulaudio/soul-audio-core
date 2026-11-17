@@ -436,6 +436,10 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         self.sink.set_volume(self.volume);
         let quality = self.quality;
         if let Some(track) = self.current.as_mut() {
+            // Re-read the decoder's LIVE rate: it can change after load (implicit HE-AAC
+            // SBR flips to 2× once decoding starts), and a stale rate here would build
+            // the wrong resampler for the reopened device → wrong playback speed.
+            track.rate = track.decoder.stream_info().sample_rate;
             track.map = Self::channel_map(track.channels, channels)?;
             track.resampler = Self::make_resampler(track.channels, track.rate, rate, quality)?;
         }
@@ -642,10 +646,34 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         Ok(())
     }
 
+    /// Rebuild the current track's resampler if the decoder now reports a different
+    /// rate than when its pipeline was built. Some decoders only learn their true
+    /// output rate after decoding the first frame — implicit HE-AAC (SBR) reports the
+    /// AAC core rate at load, then flips to the 2× SBR rate once a frame is decoded.
+    /// Without this the resampler keeps the stale source rate and playback runs at the
+    /// wrong speed (≈2× slow); keeping `rate` live also lets a native-rate reopen
+    /// ([`resync_to_sink`](Self::resync_to_sink)) build the resampler against the real
+    /// rate rather than the stale one.
+    fn sync_decoder_rate(&mut self) -> Result<(), DeckError> {
+        let quality = self.quality;
+        let sink_rate = self.sink_rate;
+        let Some(track) = self.current.as_mut() else {
+            return Ok(());
+        };
+        let live = track.decoder.stream_info().sample_rate;
+        if live == track.rate {
+            return Ok(());
+        }
+        track.rate = live;
+        track.resampler = Self::make_resampler(track.channels, live, sink_rate, quality)?;
+        Ok(())
+    }
+
     /// Produce and write one output block from the current track. Returns `true`
     /// when the track has fully finished (decoder EOF + resampler tail drained).
     fn produce_block(&mut self) -> Result<bool, DeckError> {
         self.drain_encoder_delay()?;
+        self.sync_decoder_rate()?;
         let sink_ch = self.sink_channels;
         // Decide the resampled/plain source block and how many frames it yields.
         let (out_frames, finished) = if self.current.as_ref().unwrap().resampler.is_some() {
@@ -980,6 +1008,85 @@ mod tests {
         swaps
     }
 
+    /// Mimics **implicit HE-AAC (SBR)**: reports the AAC *core* rate at load, then
+    /// flips `stream_info().sample_rate` to the 2× SBR output rate once the first
+    /// frame has been decoded — the post-load rate change the deck must track. It has
+    /// been emitting output-rate content all along.
+    struct SbrDecoder {
+        core_rate: u32,
+        out_rate: u32,
+        ch: usize,
+        frames: u64,
+        pos: u64,
+        confirmed: bool,
+    }
+    impl Decoder for SbrDecoder {
+        fn stream_info(&self) -> StreamInfo {
+            StreamInfo {
+                sample_rate: if self.confirmed {
+                    self.out_rate
+                } else {
+                    self.core_rate
+                },
+                channels: self.ch as u16,
+                format: SampleFormat::Int { bits: 24 },
+            }
+        }
+        fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {
+            self.confirmed = true; // decoding the first frame confirms SBR → rate is 2×
+            let want = ((out.len() / self.ch) as u64).min(self.frames - self.pos) as usize;
+            for s in &mut out[..want * self.ch] {
+                *s = 1_000_000;
+            }
+            self.pos += want as u64;
+            Ok(want * self.ch)
+        }
+    }
+    impl SeekableDecoder for SbrDecoder {
+        fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
+            self.pos = sample.min(self.frames);
+            Ok(self.pos)
+        }
+        fn total_frames(&self) -> Option<u64> {
+            Some(self.frames)
+        }
+    }
+
+    /// A decoder whose reported rate changes AFTER load (implicit HE-AAC SBR: core
+    /// rate → 2× once decoding starts) must not desync playback speed. The content is
+    /// 48 kHz into a 48 kHz sink, so the correct output is bit-perfect (~`frames`). The
+    /// bug keeps the stale 24 kHz source rate in the resampler → a 24k→48k 2× upsample
+    /// → ~2×`frames` output = playback at half speed.
+    #[test]
+    fn a_post_load_decoder_rate_change_does_not_desync_playback_speed() {
+        let frames = 9_600u64;
+        let dec = SbrDecoder {
+            core_rate: 24_000,
+            out_rate: 48_000,
+            ch: 2,
+            frames,
+            pos: 0,
+            confirmed: false,
+        };
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 2,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
+        deck.load(dec).unwrap();
+        deck.play();
+        run(&mut deck);
+        let out_frames = (deck.sink().written.len() / 2) as i64;
+        assert!(
+            (out_frames - frames as i64).abs() < 1_024,
+            "a post-load rate change desynced playback: {out_frames} output frames \
+             (want ~{frames}; the stale-rate bug gives ~{})",
+            frames * 2
+        );
+    }
+
     #[test]
     fn decode_info_reports_source_decoded_device_and_resampling() {
         let sink = MockSink {
@@ -1138,6 +1245,75 @@ mod tests {
             2,
             "stale (old-rate) preloads are cleared on a reopen"
         );
+    }
+
+    #[test]
+    fn reopen_sink_at_preserves_position_and_replay_gain() {
+        // A native-rate reopen happens WHILE a track plays; it must not restart the
+        // track or drop the applied ReplayGain — only the output rate/resampler change.
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 2,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, _, 2> = Deck::new(sink, Quality::Fast);
+        deck.load(const_dec(44_100, 2, 7, 100_000)).unwrap(); // long, resampling track
+        deck.set_replay_gain(-3.0);
+        for _ in 0..5 {
+            deck.pump().unwrap(); // advance the playback position
+        }
+        let pos = deck.position_frames();
+        assert!(pos > 0, "pumped some audio before the reopen");
+
+        deck.reopen_sink_at(44_100).unwrap();
+
+        assert_eq!(
+            deck.position_frames(),
+            pos,
+            "the reopen preserves the playback position (no restart)"
+        );
+        assert_eq!(
+            deck.replay_gain_db(),
+            -3.0,
+            "the reopen preserves the applied ReplayGain"
+        );
+        assert!(
+            !deck.decode_info().unwrap().resampling,
+            "and the now-matched rate is bit-perfect"
+        );
+    }
+
+    #[test]
+    fn swap_sink_preserves_position_on_a_mid_track_device_change() {
+        // `swap_sink` (a device CHANGE, not a rate reopen) can also happen mid-track;
+        // it must keep the playback position too.
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 2,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, _, 2> = Deck::new(sink, Quality::Fast);
+        deck.load(const_dec(48_000, 2, 7, 100_000)).unwrap();
+        for _ in 0..5 {
+            deck.pump().unwrap();
+        }
+        let pos = deck.position_frames();
+        assert!(pos > 0);
+        let other = MockSink {
+            rate: 96_000,
+            ch: 2,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        deck.swap_sink(other).unwrap();
+        assert_eq!(
+            deck.position_frames(),
+            pos,
+            "a device swap preserves the playback position"
+        );
+        assert_eq!(deck.decode_info().unwrap().device_rate, 96_000);
     }
 
     #[test]
