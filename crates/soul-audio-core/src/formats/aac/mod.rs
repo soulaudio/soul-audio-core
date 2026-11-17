@@ -915,8 +915,11 @@ mod tests {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
             .spawn(move || {
-                let mut dec =
-                    crate::dispatch::open(SliceSource::new(bytes)).expect("probe + construct");
+                let mut dec = crate::dispatch::open(
+                    SliceSource::new(bytes),
+                    vec![0i32; crate::dispatch::wavpack_pcm_len()],
+                )
+                .expect("probe + construct");
                 let rate_up_front = dec.stream_info().sample_rate;
                 let mut out = Vec::new();
                 let mut buf = [0i32; 4096];

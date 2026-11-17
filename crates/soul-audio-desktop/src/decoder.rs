@@ -54,6 +54,15 @@ pub fn vorbis_arena() -> Box<[u8]> {
     vec![0u8; size].into_boxed_slice()
 }
 
+/// Build the block-staging storage `open`/`open_seekable`'s `WavPack` variant
+/// needs (decoder-memory-externalization spec, Lever B — see
+/// `soul_audio_core::wavpack_pcm_len`). Shared by [`open_track`] and the CLI's
+/// `decode` command, same sizing policy as [`vorbis_arena`].
+#[must_use]
+pub fn wavpack_pcm() -> Box<[i32]> {
+    vec![0i32; soul_audio_core::wavpack_pcm_len()].into_boxed_slice()
+}
+
 /// A playable owned decoder: multi-bit PCM (WAV/FLAC/MP3/Ogg-FLAC/AAC/ALAC),
 /// Vorbis, or DSD (DSF/DFF) decimated to PCM. DSD is decimated in-decoder
 /// (DSD64 → 352.8 kHz 24-bit) and the deck then resamples it to the device
@@ -70,7 +79,7 @@ pub fn vorbis_arena() -> Box<[u8]> {
 /// this growing further unnoticed.
 #[allow(clippy::large_enum_variant)]
 pub enum OwnedDecoder {
-    Pcm(AnyDecoder<Src>),
+    Pcm(AnyDecoder<Src, Box<[i32]>>),
     Vorbis(VorbisDecoder<Src, Box<[u8]>>),
     /// Vorbis inside Matroska/WebM — also arena-backed (consumer-dispatched like
     /// bare Vorbis), over the Ogg-synthesizing [`MatroskaVorbisOgg`] adapter.
@@ -203,8 +212,8 @@ pub fn open_track(path: &Path) -> Result<OwnedDecoder> {
         // through the seekable reader (decoding non-faststart `.m4a` too); every
         // other format delegates to the same `open` path as before.
         _ => {
-            let mut any =
-                open_seekable(src).map_err(|e| anyhow!("decoding {}: {e:?}", path.display()))?;
+            let mut any = open_seekable(src, wavpack_pcm())
+                .map_err(|e| anyhow!("decoding {}: {e:?}", path.display()))?;
             // A CBR MP1/MP2 (or a Xing-less MP3) carries no in-band length, so
             // `total_frames()` would be `None` and the player would show an
             // unknown/0 duration. Resolve a CBR byte-size estimate now (a no-op

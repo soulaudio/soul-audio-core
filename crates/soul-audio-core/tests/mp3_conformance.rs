@@ -58,7 +58,11 @@ fn decode(bytes: Vec<u8>) -> Vec<i32> {
     std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(move || {
-            let mut dec = open(SliceSource::new(&bytes)).expect("probe + construct MPEG decoder");
+            let mut dec = open(
+                SliceSource::new(&bytes),
+                vec![0i32; soul_audio_core::wavpack_pcm_len()],
+            )
+            .expect("probe + construct MPEG decoder");
             let mut out = Vec::new();
             let mut buf = [0i32; 8192];
             loop {

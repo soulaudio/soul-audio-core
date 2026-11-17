@@ -77,7 +77,11 @@ fn end_to_end_decode_then_resample() {
     use soul_audio_core::{Decoder, SliceSource, open};
     // Decode a real stereo fixture and resample it to 48 kHz (an upsample).
     let wav = include_bytes!("../testdata/ima-adpcm-stereo.wav");
-    let mut dec = open(SliceSource::new(wav)).unwrap();
+    let mut dec = open(
+        SliceSource::new(wav),
+        vec![0i32; soul_audio_core::wavpack_pcm_len()],
+    )
+    .unwrap();
     let ch = dec.stream_info().channels as usize;
     let src_rate = dec.stream_info().sample_rate;
     assert!(src_rate < 48_000, "fixture should be below the target rate");

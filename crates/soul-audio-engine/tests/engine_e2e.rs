@@ -22,7 +22,7 @@ const BLOCK_TOL: usize = 256 * OUT_CH as usize;
 /// Preload depth used by every engine in this suite.
 const PRELOAD: usize = 1;
 
-type Dec = AnyDecoder<SliceSource<'static>>;
+type Dec = AnyDecoder<SliceSource<'static>, Vec<i32>>;
 
 /// A std sink that captures every written frame. Fixed 48 kHz / 2ch / 24-bit,
 /// no backpressure (renders as fast as the pump decodes).
@@ -57,7 +57,11 @@ fn open_fixture(name: &str) -> Dec {
             .expect("read fixture")
             .into_boxed_slice(),
     );
-    open(SliceSource::new(bytes)).expect("open fixture")
+    open(
+        SliceSource::new(bytes),
+        vec![0i32; soul_audio_core::wavpack_pcm_len()],
+    )
+    .expect("open fixture")
 }
 
 /// Run `f` on a 16 MiB stack (`AnyDecoder` is large by value: the `Engine`

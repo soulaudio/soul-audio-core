@@ -114,7 +114,10 @@ fn drive_all(bytes: &[u8]) -> Result<(), &'static str> {
     let len = bytes.len();
 
     // Dispatch path (probe → AnyDecoder).
-    if let Ok(mut dec) = open(SliceSource::new(bytes)) {
+    if let Ok(mut dec) = open(
+        SliceSource::new(bytes),
+        vec![0i32; soul_audio_core::wavpack_pcm_len()],
+    ) {
         if !drain_pcm(&mut dec, len) {
             return Err("open");
         }
@@ -179,7 +182,10 @@ fn drive_all(bytes: &[u8]) -> Result<(), &'static str> {
         }
     }
     // WavPack: the block parser + adaptive-median entropy decoder + decorrelation.
-    if let Ok(mut d) = WavpackDecoder::new(SliceSource::new(bytes)) {
+    if let Ok(mut d) = WavpackDecoder::new_in(
+        SliceSource::new(bytes),
+        vec![0i32; soul_audio_core::wavpack_pcm_len()],
+    ) {
         if !drain_pcm(&mut d, len) {
             return Err("wavpack");
         }
@@ -249,7 +255,10 @@ fn drive_all(bytes: &[u8]) -> Result<(), &'static str> {
         // input — i.e. the MP4 `stsc`/`stsz`/`stco` sample-table arithmetic and
         // the Ogg-granule bisection running over corrupt streams, a surface the
         // per-codec seeks above don't touch.
-        if let Ok(mut d) = open(SliceSource::new(bytes)) {
+        if let Ok(mut d) = open(
+            SliceSource::new(bytes),
+            vec![0i32; soul_audio_core::wavpack_pcm_len()],
+        ) {
             let _ = d.seek_to(t);
             probe_pcm(&mut d);
         }

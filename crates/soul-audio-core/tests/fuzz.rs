@@ -228,7 +228,10 @@ fn drive_one(bytes: &[u8], stage: &AtomicUsize) {
 
     // --- open → total_frames → seek surface → bounded decode (one decoder).
     stage.store(stage::OPEN, Ordering::Relaxed);
-    if let Ok(mut dec) = open(SliceSource::new(bytes)) {
+    if let Ok(mut dec) = open(
+        SliceSource::new(bytes),
+        vec![0i32; soul_audio_core::wavpack_pcm_len()],
+    ) {
         let _ = dec.total_frames();
         dec.resolve_lengths();
         let _ = dec.total_frames();
@@ -244,7 +247,10 @@ fn drive_one(bytes: &[u8], stage: &AtomicUsize) {
         // Re-open for a clean, uninterrupted full decode (post-seek state is
         // valid, but a fresh decode exercises the straight-through path).
         stage.store(stage::OPEN_DECODE, Ordering::Relaxed);
-        if let Ok(mut d2) = open(SliceSource::new(bytes)) {
+        if let Ok(mut d2) = open(
+            SliceSource::new(bytes),
+            vec![0i32; soul_audio_core::wavpack_pcm_len()],
+        ) {
             drain_pcm(&mut d2);
         }
     }
@@ -252,7 +258,10 @@ fn drive_one(bytes: &[u8], stage: &AtomicUsize) {
     // --- open_seekable (the seekable superset; the only path that builds a
     //     non-faststart MP4). One construct + decode + seeks.
     stage.store(stage::OPEN_SEEKABLE, Ordering::Relaxed);
-    if let Ok(mut dec) = open_seekable(SliceSource::new(bytes)) {
+    if let Ok(mut dec) = open_seekable(
+        SliceSource::new(bytes),
+        vec![0i32; soul_audio_core::wavpack_pcm_len()],
+    ) {
         let _ = dec.total_frames();
         stage.store(stage::OPEN_SEEKABLE_DECODE, Ordering::Relaxed);
         drain_pcm(&mut dec);

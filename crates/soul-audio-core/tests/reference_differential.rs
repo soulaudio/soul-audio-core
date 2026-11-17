@@ -235,7 +235,11 @@ fn resolve_bin(f: &Fmt) -> Option<String> {
 /// harness skips them rather than reporting a false failure — they belong in a
 /// desktop-side harness.
 fn decode_ours(bytes: &[u8]) -> Option<Vec<i32>> {
-    let mut dec = open_seekable(SliceSource::new(bytes)).ok()?;
+    let mut dec = open_seekable(
+        SliceSource::new(bytes),
+        vec![0i32; soul_audio_core::wavpack_pcm_len()],
+    )
+    .ok()?;
     let ch = usize::from(dec.stream_info().channels).max(1);
     // Trim to the PLAYABLE audio, matching what a reference's MP4 edit list
     // presents: drop the leading encoder-delay priming and cap at the playable

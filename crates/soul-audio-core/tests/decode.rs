@@ -5,7 +5,16 @@ use soul_audio_core::demux::ogg_packets::OggPackets;
 use soul_audio_core::formats::matroska::MatroskaVorbisOgg;
 use soul_audio_core::formats::opus::toc::{self, Mode};
 use soul_audio_core::formats::vorbis::VorbisDecoder;
-use soul_audio_core::{DecodeError, Decoder, SeekableDecoder, SliceSource, open};
+use soul_audio_core::{AnyDecoder, BufSource, DecodeError, Decoder, SeekableDecoder, SliceSource};
+
+/// Thin shim over `soul_audio_core::open` that supplies the WavPack
+/// block-staging storage (decoder-memory-externalization spec, Lever B)
+/// every caller must now provide — this file's ~40 call sites don't care
+/// about WavPack specifically, so they go through one real call site here
+/// rather than threading a `Vec<i32>` literal into each of them.
+fn open<S: BufSource>(src: S) -> Result<AnyDecoder<S, Vec<i32>>, DecodeError> {
+    soul_audio_core::open(src, vec![0i32; soul_audio_core::wavpack_pcm_len()])
+}
 
 /// A minimal valid 16-bit mono WAV carrying `samples`.
 fn wav16(samples: &[i16]) -> Vec<u8> {
@@ -955,8 +964,11 @@ fn decode_all_seekable(bytes: &[u8]) -> Vec<i32> {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
             .spawn_scoped(scope, || {
-                let mut dec = soul_audio_core::open_seekable(SliceSource::new(bytes))
-                    .expect("probe + construct (seekable)");
+                let mut dec = soul_audio_core::open_seekable(
+                    SliceSource::new(bytes),
+                    vec![0i32; soul_audio_core::wavpack_pcm_len()],
+                )
+                .expect("probe + construct (seekable)");
                 let mut out = Vec::new();
                 let mut buf = [0i32; 4096];
                 loop {
@@ -3298,7 +3310,9 @@ mod adts_cbr_seek {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use embedded_io::{BufRead, ErrorType, Read, Seek, SeekFrom};
-    use soul_audio_core::{Decoder, SliceSource, open};
+    use soul_audio_core::{Decoder, SliceSource};
+
+    use super::open;
 
     const AAC: &[u8] = include_bytes!("../testdata/aac.aac");
     const AAC_ID3: &[u8] = include_bytes!("../testdata/aac-id3.aac");
@@ -3587,7 +3601,9 @@ mod matroska_cue_seek {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use embedded_io::{BufRead, ErrorType, Read, Seek, SeekFrom};
-    use soul_audio_core::{Decoder, SliceSource, open};
+    use soul_audio_core::{Decoder, SliceSource};
+
+    use super::open;
 
     const OPUS_WEBM: &[u8] = include_bytes!("../../../testdata/tone-opus-cues.webm");
     const OPUS_MKA: &[u8] = include_bytes!("../../../testdata/tone-opus-cues.mka");

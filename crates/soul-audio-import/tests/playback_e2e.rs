@@ -97,8 +97,11 @@ fn located_tracks_decode_to_pcm_matching_the_catalog() {
         // Open the located file through the SAME entry point the CLI/firmware use
         // (`open` over an in-memory `SliceSource`, the DAP's no-alloc source).
         let bytes = std::fs::read(&path).expect("read located audio file");
-        let mut decoder =
-            open(SliceSource::new(&bytes)).unwrap_or_else(|e| panic!("open {path:?}: {e:?}"));
+        let mut decoder = open(
+            SliceSource::new(&bytes),
+            vec![0i32; soul_audio_core::wavpack_pcm_len()],
+        )
+        .unwrap_or_else(|e| panic!("open {path:?}: {e:?}"));
 
         // The located file *is* the file the catalog described: the decoder's own
         // stream facts must match the baked record (not merely "some audio").

@@ -31,8 +31,18 @@ use crate::probe::probe;
 /// far larger than the other variants. Clippy's suggested remedy (boxing) is
 /// impossible here — this crate is `#![no_std]` with no allocator — so the size
 /// difference is accepted deliberately.
+///
+/// `P` is the caller-provided, owned block-staging storage for the `WavPack`
+/// variant only (`AsRef<[i32]> + AsMut<[i32]>`, e.g. `Vec<i32>`/`Box<[i32]>` on
+/// desktop, a `&'static mut [i32]` from a board `StaticCell` on embedded) — see
+/// [`crate::formats::wavpack::WavpackDecoder`]'s doc comment and
+/// `docs/superpowers/specs/2026-11-17-decoder-memory-externalization.md`. Every
+/// other variant ignores `P`; it still has to be threaded through the enum
+/// (every type parameter in scope is used by *some* variant), so constructing
+/// a non-`WavPack` variant directly (bypassing [`open`]/[`open_seekable`]) may
+/// need an explicit `P` at the call site if nothing else pins it down.
 #[allow(clippy::large_enum_variant)]
-pub enum AnyDecoder<S> {
+pub enum AnyDecoder<S, P> {
     /// RIFF/WAVE.
     Wav(WavDecoder<S>),
     /// AIFF / AIFF-C (big-endian PCM, plus `sowt`, IEEE float, and G.711).
@@ -67,14 +77,16 @@ pub enum AnyDecoder<S> {
     /// a follow-up), so `total_frames`/`seek_to` report `None`/`Unsupported`.
     Matroska(MatroskaDecoder<S>),
     /// WavPack (`.wv`) lossless. Length comes from the stream header; block-index
-    /// seeking is a follow-up, so `seek_to` reports `Unsupported`.
-    WavPack(WavpackDecoder<S>),
+    /// seeking is a follow-up, so `seek_to` reports `Unsupported`. Its block-staging
+    /// PCM buffer is the caller-provided `P` (see the enum's doc comment) — the
+    /// one variant that uses the second type parameter.
+    WavPack(WavpackDecoder<S, P>),
     /// Apple CAF carrying `lpcm` or `alac`; decode-only for now (seeking is a
     /// follow-up), so `seek_to` reports `Unsupported`.
     Caf(CafDecoder<S>),
 }
 
-impl<S: crate::io::SeekSource> AnyDecoder<S> {
+impl<S: crate::io::SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> AnyDecoder<S, P> {
     /// Total per-channel frames, if the stream declares a length. `None` for a
     /// raw MP3 without a Xing/Info/VBRI header, or for an Opus stream with no
     /// discoverable final granule.
@@ -184,7 +196,9 @@ impl<S: crate::io::SeekSource> AnyDecoder<S> {
     }
 }
 
-impl<S: crate::io::SeekSource> crate::decoder::SeekableDecoder for AnyDecoder<S> {
+impl<S: crate::io::SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> crate::decoder::SeekableDecoder
+    for AnyDecoder<S, P>
+{
     fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
         AnyDecoder::seek_to(self, sample)
     }
@@ -193,7 +207,7 @@ impl<S: crate::io::SeekSource> crate::decoder::SeekableDecoder for AnyDecoder<S>
     }
 }
 
-impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
+impl<S: crate::io::Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for AnyDecoder<S, P> {
     fn stream_info(&self) -> StreamInfo {
         match self {
             AnyDecoder::Wav(d) => d.stream_info(),
@@ -303,13 +317,31 @@ impl<S: crate::io::Source> Decoder for AnyDecoder<S> {
     }
 }
 
+/// The required length of [`open`]/[`open_seekable`]'s `wavpack_pcm` storage
+/// parameter (equivalently [`crate::formats::wavpack::MAX_BLOCK_PCM`]) — call
+/// this instead of hardcoding the constant when sizing the buffer, e.g.
+/// `vec![0i32; wavpack_pcm_len()]`.
+#[must_use]
+pub const fn wavpack_pcm_len() -> usize {
+    crate::formats::wavpack::MAX_BLOCK_PCM
+}
+
 /// Probe `src`, then construct the matching PCM decoder.
+///
+/// `wavpack_pcm` is the block-staging storage the `WavPack` variant needs (see
+/// [`AnyDecoder`]'s doc comment) — every other format ignores it. It must be at
+/// least [`wavpack_pcm_len`] samples long; a shorter buffer makes a WavPack
+/// file decline as `Unsupported` rather than panicking, and costs nothing for
+/// every other format (the parameter is simply dropped).
 ///
 /// # Errors
 /// - [`DecodeError::Unsupported`] if the container is unknown, or is a DSD
 ///   container (which needs an explicit mode — see [`crate::dsd`]).
 /// - Whatever the chosen decoder's `new` reports.
-pub fn open<S: BufSource>(mut src: S) -> Result<AnyDecoder<S>, DecodeError> {
+pub fn open<S: BufSource, P: AsRef<[i32]> + AsMut<[i32]>>(
+    mut src: S,
+    wavpack_pcm: P,
+) -> Result<AnyDecoder<S, P>, DecodeError> {
     match probe(&mut src)? {
         Format::Wav => WavDecoder::new(src).map(AnyDecoder::Wav),
         Format::Aiff => AiffDecoder::new(src).map(AnyDecoder::Aiff),
@@ -368,8 +400,9 @@ pub fn open<S: BufSource>(mut src: S) -> Result<AnyDecoder<S>, DecodeError> {
         // Matroska / WebM: parse the container, then build the contained codec's
         // decoder (Opus/FLAC in v1) — see `MatroskaDecoder::new`.
         Format::Matroska => MatroskaDecoder::new(src).map(AnyDecoder::Matroska),
-        // WavPack lossless (.wv).
-        Format::WavPack => WavpackDecoder::new(src).map(AnyDecoder::WavPack),
+        // WavPack lossless (.wv): the one format that uses the caller-provided
+        // `wavpack_pcm` storage.
+        Format::WavPack => WavpackDecoder::new_in(src, wavpack_pcm).map(AnyDecoder::WavPack),
         // Apple CAF (lpcm / alac).
         Format::Caf => CafDecoder::new(src).map(AnyDecoder::Caf),
     }
@@ -386,11 +419,15 @@ pub fn open<S: BufSource>(mut src: S) -> Result<AnyDecoder<S>, DecodeError> {
 /// `open` itself keeps its forward-only [`BufSource`] bound — this is an
 /// additive, opt-in path for seekable callers, not a change to `open`.
 ///
+/// `wavpack_pcm` is the same WavPack block-staging storage [`open`] takes —
+/// see its doc comment.
+///
 /// # Errors
 /// As [`open`]; additionally propagates the seekable MP4 reader's errors.
-pub fn open_seekable<S: BufSource + crate::io::SeekSource>(
+pub fn open_seekable<S: BufSource + crate::io::SeekSource, P: AsRef<[i32]> + AsMut<[i32]>>(
     mut src: S,
-) -> Result<AnyDecoder<S>, DecodeError> {
+    wavpack_pcm: P,
+) -> Result<AnyDecoder<S, P>, DecodeError> {
     match probe(&mut src)? {
         // The one format that benefits from random access: parse the `moov`
         // wherever it sits (incl. after `mdat`), then decode from the `mdat`.
@@ -403,7 +440,7 @@ pub fn open_seekable<S: BufSource + crate::io::SeekSource>(
         }
         // `probe` consumed nothing (it peeks via `fill_buf`), so `src` is still
         // at byte 0 — every other format routes through the existing `open`.
-        _ => open(src),
+        _ => open(src, wavpack_pcm),
     }
 }
 
@@ -411,6 +448,13 @@ pub fn open_seekable<S: BufSource + crate::io::SeekSource>(
 mod tests {
     use super::*;
     use crate::io::SliceSource;
+
+    /// WavPack block-staging storage for `open()`/`open_seekable()` calls in
+    /// this suite that don't care about WavPack specifically — sized exactly
+    /// right via `wavpack_pcm_len()` rather than hardcoding the constant.
+    fn pcm_scratch() -> Vec<i32> {
+        vec![0i32; wavpack_pcm_len()]
+    }
 
     /// A minimal valid 16-bit mono WAV carrying `samples`.
     fn wav16(samples: &[i16]) -> Vec<u8> {
@@ -439,7 +483,7 @@ mod tests {
     #[test]
     fn open_routes_and_decodes_wav() {
         let wav = wav16(&[100, -100, 32767]);
-        let mut dec = open(SliceSource::new(&wav)).expect("probe + construct");
+        let mut dec = open(SliceSource::new(&wav), pcm_scratch()).expect("probe + construct");
         assert!(matches!(dec, AnyDecoder::Wav(_))); // routed to the WAV variant
         let mut out = [0i32; 8];
         let n = dec.decode_into(&mut out).unwrap();
@@ -462,7 +506,7 @@ mod tests {
     #[test]
     fn open_routes_flac_with_real_stream_info() {
         let bytes = flac_min();
-        let dec = open(SliceSource::new(&bytes)).expect("probe + construct");
+        let dec = open(SliceSource::new(&bytes), pcm_scratch()).expect("probe + construct");
         assert_eq!(dec.stream_info().sample_rate, 44_100);
         assert_eq!(dec.stream_info().channels, 2);
         assert!(matches!(dec, AnyDecoder::Flac(_)));
@@ -473,7 +517,7 @@ mod tests {
         // DSF is a valid container but needs an explicit DsdMode, so `open` (the
         // PCM path) declines it.
         assert_eq!(
-            open(SliceSource::new(b"DSD \0\0\0\0")).err(),
+            open(SliceSource::new(b"DSD \0\0\0\0"), pcm_scratch()).err(),
             Some(DecodeError::Unsupported)
         );
     }
@@ -483,7 +527,7 @@ mod tests {
         // 8 mono frames; total is known from the data-chunk size, and seek lands
         // exactly (WAV is sample-accurate).
         let wav = wav16(&[10, 20, 30, 40, 50, 60, 70, 80]);
-        let mut dec = open(SliceSource::new(&wav)).expect("open");
+        let mut dec = open(SliceSource::new(&wav), pcm_scratch()).expect("open");
         assert_eq!(dec.total_frames(), Some(8));
         assert_eq!(dec.seek_to(4).unwrap(), 4);
         let mut out = [0i32; 8];
@@ -513,30 +557,30 @@ mod tests {
         bytes.push(packet.len() as u8);
         bytes.extend_from_slice(&packet);
         assert_eq!(
-            open(SliceSource::new(&bytes)).err(),
+            open(SliceSource::new(&bytes), pcm_scratch()).err(),
             Some(DecodeError::Unsupported)
         );
     }
 
     /// Guards the `embedded-profile` SRAM budget: a stereo DAP target needs
-    /// `size_of::<AnyDecoder<S>>()` at or under 288 KiB (294,912 B). Dropping
+    /// `size_of::<AnyDecoder<S, P>>()` at or under 288 KiB (294,912 B). Dropping
     /// the `MultistreamOpusDecoder` variant (322,552 B on the desktop profile,
     /// the ceiling) leaves WavPack as the new ceiling (~262 KB), well inside
     /// the budget.
     #[cfg(feature = "embedded-profile")]
     #[test]
     fn any_decoder_fits_embedded_budget() {
-        let sz = core::mem::size_of::<AnyDecoder<crate::io::SliceSource<'static>>>();
+        let sz = core::mem::size_of::<AnyDecoder<crate::io::SliceSource<'static>, Vec<i32>>>();
         assert!(
             sz <= 294_912,
-            "AnyDecoder<S> grew to {sz} B under embedded-profile (budget 294,912 B / 288 KiB)"
+            "AnyDecoder<S, P> grew to {sz} B under embedded-profile (budget 294,912 B / 288 KiB)"
         );
     }
 
     #[test]
     fn open_rejects_unknown() {
         assert_eq!(
-            open(SliceSource::new(b"XXXXYYYY")).err(),
+            open(SliceSource::new(b"XXXXYYYY"), pcm_scratch()).err(),
             Some(DecodeError::Unsupported)
         );
     }
@@ -548,7 +592,7 @@ mod tests {
         // 48 kHz/stereo/Int16 (Opus always decodes at 48 kHz regardless of the
         // container's informational input rate).
         let bytes = include_bytes!("../../../testdata/tone.opus");
-        let mut dec = open(SliceSource::new(bytes)).expect("probe + construct Opus");
+        let mut dec = open(SliceSource::new(bytes), pcm_scratch()).expect("probe + construct Opus");
         assert!(matches!(dec, AnyDecoder::Opus(_)));
         assert_eq!(dec.stream_info().sample_rate, 48_000);
         assert_eq!(dec.stream_info().channels, 2);
@@ -573,7 +617,8 @@ mod tests {
     #[test]
     fn open_routes_and_decodes_alac() {
         let bytes = include_bytes!("../testdata/alac.m4a");
-        let mut dec = open(crate::io::SliceSource::new(bytes)).expect("probe + construct");
+        let mut dec =
+            open(crate::io::SliceSource::new(bytes), pcm_scratch()).expect("probe + construct");
         assert!(matches!(dec, AnyDecoder::Alac(_)));
         assert_eq!(dec.stream_info().sample_rate, 44_100);
         assert_eq!(dec.total_frames(), Some(13_230));
