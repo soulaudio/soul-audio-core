@@ -110,6 +110,121 @@ fn end_to_end_decode_then_resample() {
     assert!(out.iter().any(|&s| s != 0), "resampled output is silent");
 }
 
+/// Steady-state gain (dB) the resampler applies to a `tone_hz` sine (`in_rate`→
+/// `out_rate`). A transparent converter is unity (0 dB) across its passband; the
+/// spread of this across frequencies is the **passband ripple**. RMS-based: images
+/// sit ≳80 dB down, so they add negligibly to the steady-state RMS, leaving the tone's
+/// own gain. The startup transient (filter history fill) is skipped.
+fn passband_gain_db(quality: Quality, in_rate: u32, out_rate: u32, tone_hz: f64) -> f64 {
+    let amp = 6_000_000.0; // well below 24-bit full scale — headroom for any ripple
+    let mut r = Resampler::new(1, in_rate, out_rate, 1.1, 1024, quality).unwrap();
+    let skip = r.latency() * 4 + 2048;
+    let want = skip + 32_768;
+    let mut out: Vec<f64> = Vec::with_capacity(want + 2048);
+    let mut g = 0usize;
+    let mut block = vec![0i32; 1024];
+    let dph = 2.0 * std::f64::consts::PI * tone_hz / f64::from(in_rate);
+    while out.len() < want {
+        let need = r.input_frames_next();
+        let input: Vec<i32> = (0..need)
+            .map(|f| ((g + f) as f64 * dph).sin() * amp)
+            .map(|s| s as i32)
+            .collect();
+        g += need;
+        r.process(&input, &mut block).unwrap();
+        out.extend(block.iter().map(|&s| f64::from(s)));
+    }
+    let steady = &out[skip..want];
+    let out_rms = (steady.iter().map(|&s| s * s).sum::<f64>() / steady.len() as f64).sqrt();
+    let in_rms = amp / std::f64::consts::SQRT_2;
+    20.0 * (out_rms / in_rms).log10()
+}
+
+#[test]
+fn hq_passband_is_flat_and_unity() {
+    // Across the flat passband (up to ~0.4·Nyquist, clear of the transition band), the
+    // HQ resampler must be unity-gain with negligible ripple — the audiophile bar is
+    // << 0.1 dB. Tested on the 44.1→48 upsample (a ratio every CD-on-48k-DAC hits).
+    let (in_r, out_r) = (44_100u32, 48_000u32);
+    let nyq = f64::from(in_r.min(out_r)) / 2.0;
+    let freqs = [
+        100.0,
+        500.0,
+        1_000.0,
+        2_000.0,
+        3_000.0,
+        5_000.0,
+        7_000.0,
+        nyq * 0.4,
+    ];
+    let gains: Vec<f64> = freqs
+        .iter()
+        .map(|&f| passband_gain_db(Quality::Hq, in_r, out_r, f))
+        .collect();
+    let max = gains.iter().copied().fold(f64::MIN, f64::max);
+    let min = gains.iter().copied().fold(f64::MAX, f64::min);
+    let ripple = max - min;
+    println!("HQ 44.1->48 passband gains (dB): {gains:?}  ripple={ripple:.5} dB");
+    assert!(
+        ripple < 0.1,
+        "HQ passband ripple {ripple:.5} dB exceeds 0.1 dB (gains {gains:?})"
+    );
+    assert!(
+        max.abs() < 0.15 && min.abs() < 0.15,
+        "HQ passband gain not unity (gains {gains:?})"
+    );
+}
+
+#[test]
+fn fast_passband_is_reasonably_flat() {
+    // The Fast (embedded/DAP) tier trades stopband depth for size, but its passband must
+    // still be essentially flat — no audible coloration from the converter.
+    let (in_r, out_r) = (44_100u32, 48_000u32);
+    let nyq = f64::from(in_r.min(out_r)) / 2.0;
+    let freqs = [100.0, 1_000.0, 4_000.0, 7_000.0, nyq * 0.4];
+    let gains: Vec<f64> = freqs
+        .iter()
+        .map(|&f| passband_gain_db(Quality::Fast, in_r, out_r, f))
+        .collect();
+    let ripple = gains.iter().copied().fold(f64::MIN, f64::max)
+        - gains.iter().copied().fold(f64::MAX, f64::min);
+    println!("Fast 44.1->48 passband ripple: {ripple:.5} dB  gains={gains:?}");
+    assert!(
+        ripple < 0.2,
+        "Fast passband ripple {ripple:.5} dB too high (gains {gains:?})"
+    );
+}
+
+#[test]
+fn hq_alias_rejection_across_rate_ratios() {
+    // The image/alias rejection measured in `hq_tier_beats_fast_on_downsample` must hold
+    // across the full spread of real conversions (CD/hi-res families, up AND down), not
+    // just 96→44.1. Measured at 14 kHz: the hard non-integer 44.1 ratios sit ~102 dB,
+    // integer downsamples 137–143 dB — worst case ~102 dB. Require 100 dB everywhere (a
+    // deterministic regression guard well above the 96 dB high-quality SRC threshold).
+    let cases = [
+        (44_100u32, 48_000u32),
+        (48_000, 44_100),
+        (44_100, 96_000),
+        (96_000, 48_000),
+        (88_200, 44_100),
+        (176_400, 44_100),
+        (44_100, 192_000),
+        (192_000, 48_000),
+    ];
+    let mut worst = f64::INFINITY;
+    for (in_r, out_r) in cases {
+        let db = alias_rejection_db(Quality::Hq, in_r, out_r, 14_000.0);
+        println!("HQ {in_r}->{out_r} @14kHz: alias rejection {db:.1} dB");
+        worst = worst.min(db);
+        assert!(
+            db > 100.0,
+            "HQ {in_r}->{out_r}: alias rejection only {db:.1} dB (want >100 — regressed below the high-quality SRC bar)"
+        );
+    }
+    println!("HQ worst-case alias rejection across ratios: {worst:.1} dB");
+}
+
 #[test]
 fn fast_tier_alias_rejection() {
     // Upsample 44.1k→48k of a 6 kHz tone: Fast tier ≳ 80 dB image rejection.
