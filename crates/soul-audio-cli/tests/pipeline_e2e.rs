@@ -427,3 +427,125 @@ fn live_output_swap_keeps_the_signal_correct() {
     });
     assert_two_tone("post-swap@44.1k", &out, 44_100);
 }
+
+// ---------------------------------------------------------------------------
+// ffmpeg reference cross-check (opt-in: needs ffmpeg on PATH or $FFMPEG_BIN)
+// ---------------------------------------------------------------------------
+
+/// `$FFMPEG_BIN`, else bare `ffmpeg` if it answers `-version`, else `None` (skip).
+fn resolve_ffmpeg() -> Option<String> {
+    if let Ok(b) = std::env::var("FFMPEG_BIN") {
+        return Some(b);
+    }
+    let ok = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    ok.then(|| "ffmpeg".to_string())
+}
+
+/// Decode `path`'s first audio stream to interleaved 24-bit samples (in `i32`) via ffmpeg.
+fn ffmpeg_decode_s24(bin: &str, path: &std::path::Path) -> Vec<i32> {
+    let out = std::process::Command::new(bin)
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(path)
+        .args(["-map", "0:a:0", "-c:a", "pcm_s24le", "-f", "s24le", "-"])
+        .output()
+        .expect("spawn reference ffmpeg");
+    assert!(
+        out.status.success(),
+        "ffmpeg decode failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+        .chunks_exact(3)
+        .map(|b| {
+            let v = i32::from(b[0]) | (i32::from(b[1]) << 8) | (i32::from(b[2]) << 16);
+            (v << 8) >> 8 // sign-extend the 24-bit value
+        })
+        .collect()
+}
+
+/// Scale-invariant SNR (dB) of `ours` vs `refr` for one deinterleaved channel, at the
+/// best alignment offset in `0..=max_shift` frames. `+inf` when identical. Fits the best
+/// scalar `k` (so a benign overall gain difference doesn't count as error), then
+/// `10·log10(‖ref‖² / ‖ref − k·ours‖²)`.
+fn best_align_snr(ours: &[i32], refr: &[i32], max_shift: usize) -> f64 {
+    let mut best = f64::NEG_INFINITY;
+    for shift in 0..=max_shift {
+        if shift >= ours.len() || shift >= refr.len() {
+            break;
+        }
+        // Align by shifting whichever is late; here we trim the SAME shift off both and
+        // also try trimming only `ours` / only `refr` to absorb an encoder-delay offset.
+        for (a, b) in [(&ours[shift..], refr), (ours, &refr[shift..])] {
+            let n = a.len().min(b.len());
+            if n < 4000 {
+                continue;
+            }
+            let (a, b) = (&a[..n], &b[..n]);
+            let dot: f64 = a
+                .iter()
+                .zip(b)
+                .map(|(&x, &y)| f64::from(x) * f64::from(y))
+                .sum();
+            let ener_a: f64 = a.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
+            let ener_b: f64 = b.iter().map(|&y| f64::from(y) * f64::from(y)).sum();
+            if ener_a == 0.0 {
+                continue;
+            }
+            let k = dot / ener_a; // best scale for `ours`
+            let resid: f64 = a
+                .iter()
+                .zip(b)
+                .map(|(&x, &y)| {
+                    let e = f64::from(y) - k * f64::from(x);
+                    e * e
+                })
+                .sum();
+            let snr = if resid <= 0.0 {
+                f64::INFINITY
+            } else {
+                10.0 * (ener_b / resid).log10()
+            };
+            best = best.max(snr);
+        }
+    }
+    best
+}
+
+/// FFMPEG REFERENCE: our EQ-off, rate-MATCHED pipeline (decode → Deck, no resampling) must
+/// reproduce ffmpeg's decode of the same file — a high scale-invariant SNR on a steady
+/// window past the deck's fade-in. This grounds the whole pipeline's output against an
+/// independent decoder. Opt-in (needs ffmpeg); run:
+///   `cargo test -p soul-audio-cli --test pipeline_e2e -- --ignored --nocapture`
+#[test]
+#[ignore = "needs ffmpeg on PATH or $FFMPEG_BIN; run with --ignored"]
+fn pipeline_matches_ffmpeg_decode() {
+    let Some(bin) = resolve_ffmpeg() else {
+        eprintln!("no ffmpeg — skipping");
+        return;
+    };
+    // Our pipeline, rate-matched (no resample) + EQ off = decode + 24-bit normalize.
+    let ours = run_pipeline("tone.flac", CaptureSink::shared(TONE_RATE), |s| {
+        s.written.clone()
+    });
+    let refr = ffmpeg_decode_s24(&bin, &testdata("tone.flac"));
+
+    // Compare the LEFT channel on a steady window (skip ~50 ms to clear the deck's
+    // fade-in + any encoder-delay priming), aligning within ±1024 frames.
+    let skip = (TONE_RATE as usize / 20).min(ours.len() / 4); // ~50 ms
+    let lo = deinterleave(&ours[skip * 2..], 2, 0);
+    let lr = deinterleave(&refr[skip * 2..], 2, 0);
+    let snr = best_align_snr(&lo, &lr, 1024);
+    println!(
+        "pipeline vs ffmpeg: LEFT SNR = {snr:.1} dB (ours={} refr={} samples)",
+        lo.len(),
+        lr.len()
+    );
+    assert!(
+        snr > 40.0,
+        "pipeline output diverges from ffmpeg's decode: LEFT SNR {snr:.1} dB (<40 dB)"
+    );
+}
