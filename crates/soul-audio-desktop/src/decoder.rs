@@ -4,6 +4,7 @@
 
 use std::fs::File;
 use std::io::BufReader as IoBufReader;
+use std::io::{Read, Seek};
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
@@ -18,10 +19,21 @@ use soul_audio_core::{
     SeekableDecoder, SourceCodec, StreamInfo, open_seekable, probe,
 };
 
-/// A fully **owned**, `Send` byte source: std buffers the file, so the decoder
-/// built on it holds no borrowed scratch and can live in the deck and move
-/// across threads.
-pub type Src = FromStd<IoBufReader<File>>;
+/// Any `std::io::Read + Seek` byte source — a local `File`, an in-memory
+/// `Cursor`, or a network reader (e.g. an HTTP range client) that fetches
+/// bytes on demand. Blanket-implemented, so nothing needs to implement it by
+/// hand; it only exists to name the trait object [`Src`] boxes.
+pub trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek + ?Sized> ReadSeek for T {}
+
+/// A fully **owned**, `Send` byte source: std buffers the reader, so the
+/// decoder built on it holds no borrowed scratch and can live in the deck and
+/// move across threads. Boxed so the same `Src` — and therefore the same
+/// `OwnedDecoder` — serves a local file ([`open_track`]) or any other seekable
+/// source such as a network stream ([`open_seekable_src`]); the vtable call
+/// through the box happens once per 64 KiB buffer fill (see the capacity
+/// below), negligible next to the cost of decoding that buffer.
+pub type Src = FromStd<IoBufReader<Box<dyn ReadSeek + Send>>>;
 
 /// Default byte size of the heap arena [`VorbisDecoder::new`] bump-allocates
 /// its setup-header tables (codebooks/floors/residues/mappings/modes) into.
@@ -163,9 +175,29 @@ impl SeekableDecoder for OwnedDecoder {
 /// DSD→PCM decimator.
 pub fn open_track(path: &Path) -> Result<OwnedDecoder> {
     let file = File::open(path).map_err(|e| anyhow!("opening {}: {e}", path.display()))?;
+    let boxed: Box<dyn ReadSeek + Send> = Box::new(file);
+    build_owned_decoder(boxed, &path.display().to_string())
+}
+
+/// Open any `Read + Seek` byte source into an owned decoder — the same
+/// container-probe → codec-dispatch path as [`open_track`], but for a source
+/// that isn't a local file: a network reader (e.g. an HTTP range client), an
+/// in-memory `Cursor`, or anything else that can seek. Lets a downstream
+/// player stream a remote track through the exact same [`OwnedDecoder`] type
+/// local playback uses.
+pub fn open_seekable_src<R: Read + Seek + Send + 'static>(reader: R) -> Result<OwnedDecoder> {
+    let boxed: Box<dyn ReadSeek + Send> = Box::new(reader);
+    build_owned_decoder(boxed, "stream")
+}
+
+/// Shared probe → match → build body for [`open_track`] and
+/// [`open_seekable_src`], so the two entry points can never drift: `label` is
+/// only used to name the source in error messages (a path for the former, a
+/// generic "stream" for the latter).
+fn build_owned_decoder(reader: Box<dyn ReadSeek + Send>, label: &str) -> Result<OwnedDecoder> {
     // 64 KiB of std buffering; the decoder reads through it via embedded-io.
-    let mut src = FromStd::new(IoBufReader::with_capacity(64 * 1024, file));
-    let format = probe(&mut src).map_err(|e| anyhow!("probing {}: {e:?}", path.display()))?;
+    let mut src = FromStd::new(IoBufReader::with_capacity(64 * 1024, reader));
+    let format = probe(&mut src).map_err(|e| anyhow!("probing {label}: {e:?}"))?;
     match format {
         // DSD playback: decimate all the way to the native 44.1 kHz family (not the
         // archival 352.8 kHz `DecimateAdapter`) so the deck's device-rate resample is
@@ -173,10 +205,10 @@ pub fn open_track(path: &Path) -> Result<OwnedDecoder> {
         // ~0.5× real-time even in release and starves the audio callback (stutter heard
         // as slowed/stretched playback). See `PlaybackDecimateAdapter`.
         Format::Dsf => Ok(OwnedDecoder::Dsf(PlaybackDecimateAdapter::new(
-            DsfDecoder::new(src).map_err(|e| anyhow!("DSF {}: {e:?}", path.display()))?,
+            DsfDecoder::new(src).map_err(|e| anyhow!("DSF {label}: {e:?}"))?,
         ))),
         Format::Dff => Ok(OwnedDecoder::Dff(PlaybackDecimateAdapter::new(
-            DffDecoder::new(src).map_err(|e| anyhow!("DFF {}: {e:?}", path.display()))?,
+            DffDecoder::new(src).map_err(|e| anyhow!("DFF {label}: {e:?}"))?,
         ))),
         // Vorbis needs a caller-provided arena (`VorbisDecoder<S, A>`), so it
         // is not an `AnyDecoder` variant `open` can build — special-cased
@@ -184,36 +216,36 @@ pub fn open_track(path: &Path) -> Result<OwnedDecoder> {
         // (design spec, "Dispatch: per-platform, NOT `AnyDecoder`").
         Format::Vorbis => Ok(OwnedDecoder::Vorbis(
             VorbisDecoder::new(src, vorbis_arena())
-                .map_err(|e| anyhow!("Vorbis {}: {e:?}", path.display()))?,
+                .map_err(|e| anyhow!("Vorbis {label}: {e:?}"))?,
         )),
         // Matroska/WebM: peek the track codec. `A_VORBIS` needs the arena (like
         // bare Vorbis), so it's built here over the Ogg-synthesizing adapter;
         // Opus/FLAC/AAC ride the arena-free `AnyDecoder::Matroska` path, built
         // from the same already-parsed demuxer (no re-read).
         Format::Matroska => {
-            let demux = MatroskaDemuxer::new(src)
-                .map_err(|e| anyhow!("Matroska {}: {e:?}", path.display()))?;
+            let demux =
+                MatroskaDemuxer::new(src).map_err(|e| anyhow!("Matroska {label}: {e:?}"))?;
             if demux.codec_id() == b"A_VORBIS" {
                 let adapter = MatroskaVorbisOgg::new(demux)
-                    .map_err(|e| anyhow!("Vorbis-in-Matroska {}: {e:?}", path.display()))?;
+                    .map_err(|e| anyhow!("Vorbis-in-Matroska {label}: {e:?}"))?;
                 Ok(OwnedDecoder::MatroskaVorbis(
                     VorbisDecoder::new(adapter, vorbis_arena())
-                        .map_err(|e| anyhow!("Vorbis-in-Matroska {}: {e:?}", path.display()))?,
+                        .map_err(|e| anyhow!("Vorbis-in-Matroska {label}: {e:?}"))?,
                 ))
             } else {
                 Ok(OwnedDecoder::Pcm(AnyDecoder::Matroska(
                     MatroskaDecoder::from_demuxer_in(demux, wavpack_pcm())
-                        .map_err(|e| anyhow!("Matroska {}: {e:?}", path.display()))?,
+                        .map_err(|e| anyhow!("Matroska {label}: {e:?}"))?,
                 )))
             }
         }
         // WAV/FLAC/MP3/Ogg-FLAC/AAC/ALAC/CAF — `open_seekable` re-probes (cheap)
-        // and builds the codec. The file source is always seekable, so MP4 goes
+        // and builds the codec. The source is always seekable, so MP4 goes
         // through the seekable reader (decoding non-faststart `.m4a` too); every
         // other format delegates to the same `open` path as before.
         _ => {
             let mut any = open_seekable(src, wavpack_pcm())
-                .map_err(|e| anyhow!("decoding {}: {e:?}", path.display()))?;
+                .map_err(|e| anyhow!("decoding {label}: {e:?}"))?;
             // A CBR MP1/MP2 (or a Xing-less MP3) carries no in-band length, so
             // `total_frames()` would be `None` and the player would show an
             // unknown/0 duration. Resolve a CBR byte-size estimate now (a no-op
@@ -355,6 +387,54 @@ mod tests {
             .expect("spawn codec thread")
             .join()
             .expect("codec thread panicked");
+    }
+
+    /// `open_seekable_src` over an in-memory `Cursor` must decode identically
+    /// to `open_track` reading the same bytes from disk — proving the
+    /// non-file path (what a network/HTTP-range reader would use) really
+    /// decodes real audio, not just that it builds without erroring.
+    #[test]
+    fn open_seekable_src_matches_open_track() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tone.wav");
+        let bytes = std::fs::read(&path).expect("read tone.wav fixture");
+
+        // 64 MiB, like the sibling tests above: two `OwnedDecoder`s by value in
+        // one frame multiplies through debug-build move frames further still.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let mut from_file = open_track(&path).expect("open_track on tone.wav");
+                let mut from_cursor = open_seekable_src(std::io::Cursor::new(bytes))
+                    .expect("open_seekable_src on tone.wav bytes");
+
+                assert_eq!(
+                    from_file.stream_info().channels,
+                    from_cursor.stream_info().channels,
+                    "channel count differs between file and cursor sources"
+                );
+
+                let mut buf_a = [0i32; 4096];
+                let mut buf_b = [0i32; 4096];
+                let n_a = from_file
+                    .decode_into(&mut buf_a)
+                    .expect("decode block from file source");
+                let n_b = from_cursor
+                    .decode_into(&mut buf_b)
+                    .expect("decode block from cursor source");
+                assert!(n_a > 0, "decoded no samples from the file source");
+                assert_eq!(
+                    n_a, n_b,
+                    "block sizes differ between file and cursor sources"
+                );
+                assert_eq!(
+                    &buf_a[..n_a],
+                    &buf_b[..n_b],
+                    "decoded samples differ between file and cursor sources"
+                );
+            })
+            .expect("spawn decode thread")
+            .join()
+            .expect("decode thread panicked");
     }
 
     /// `OwnedDecoder`'s size is dominated by whichever variant is largest: the
