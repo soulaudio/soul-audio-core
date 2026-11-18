@@ -293,6 +293,8 @@ fn map_name(name: &[u8]) -> Option<Field> {
         Some(Field::Album)
     } else if name.eq_ignore_ascii_case(b"DATE") || name.eq_ignore_ascii_case(b"DATE_RELEASED") {
         Some(Field::Date)
+    } else if name.eq_ignore_ascii_case(b"DATE_RECORDED") {
+        Some(Field::OriginalDate)
     } else if name.eq_ignore_ascii_case(b"GENRE") {
         Some(Field::Genre)
     } else if name.eq_ignore_ascii_case(b"PART_NUMBER") {

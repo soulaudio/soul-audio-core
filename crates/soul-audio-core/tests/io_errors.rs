@@ -92,7 +92,10 @@ fn drain_pcm(dec: &mut impl Decoder) -> Result<(), DecodeError> {
 /// Full `open()` dispatch + drain over a reader that fails at byte `fail_at`.
 fn open_drive(data: &'static [u8], fail_at: usize) -> Result<(), DecodeError> {
     let mut scratch = [0u8; 8192];
-    let mut dec = open(BufReader::new(ErrAt::new(data, fail_at), &mut scratch))?;
+    let mut dec = open(
+        BufReader::new(ErrAt::new(data, fail_at), &mut scratch),
+        vec![0i32; soul_audio_core::decoder_scratch_len()],
+    )?;
     drain_pcm(&mut dec)
 }
 

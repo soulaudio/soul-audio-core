@@ -131,6 +131,35 @@ impl core::error::Error for DeckError {
 enum Map {
     Passthrough,
     MonoToStereo,
+    /// Multichannel (3.0 / 5.1 / 7.1) folded down to a stereo sink with the ITU-R BS.775
+    /// coefficients (see [`downmix_sample`]). Only the unambiguous standard layouts are
+    /// mapped; [`Deck::channel_map`] rejects the layout-ambiguous channel counts.
+    DownmixToStereo,
+}
+
+/// ITU-R BS.775 stereo downmix: the value for output `oc` (0 = Lo, 1 = Ro) from one source
+/// `frame` of `src_ch` channels in canonical WAVEFORMATEXTENSIBLE order
+/// (FL FR FC LFE BL BR SL SR). Center and surrounds fold in at −3 dB (`1/√2`); the LFE is
+/// dropped (standard for stereo downmix). No normalization — the shared output clamp
+/// handles the rare case where summed in-phase surround content exceeds full scale, the
+/// same way ReplayGain boosts hard-clip. Only 3 / 6 / 8 channels reach here
+/// ([`Deck::channel_map`] gates the rest), so the fallthrough is unreachable.
+#[inline]
+fn downmix_sample(frame: &[i32], src_ch: usize, oc: usize) -> f32 {
+    const C: f32 = core::f32::consts::FRAC_1_SQRT_2; // -3 dB
+    let s = |i: usize| frame[i] as f32;
+    match (src_ch, oc) {
+        // 3.0 — FL FR FC
+        (3, 0) => s(0) + C * s(2),
+        (3, 1) => s(1) + C * s(2),
+        // 5.1 — FL FR FC LFE BL BR (LFE = 3 dropped)
+        (6, 0) => s(0) + C * s(2) + C * s(4),
+        (6, 1) => s(1) + C * s(2) + C * s(5),
+        // 7.1 — FL FR FC LFE BL BR SL SR (LFE = 3 dropped)
+        (8, 0) => s(0) + C * s(2) + C * s(6) + C * s(4),
+        (8, 1) => s(1) + C * s(2) + C * s(7) + C * s(5),
+        _ => s(oc.min(src_ch - 1)),
+    }
 }
 
 /// The currently-playing track and its per-track pipeline state.
@@ -237,6 +266,11 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             Ok(Map::Passthrough)
         } else if src_ch == 1 && sink_ch == 2 {
             Ok(Map::MonoToStereo)
+        } else if sink_ch == 2 && matches!(src_ch, 3 | 6 | 8) {
+            // Multichannel → stereo: the unambiguous standard layouts (3.0 / 5.1 / 7.1).
+            // Counts 4/5/7 are layout-ambiguous (quad vs 3.1, 5.0 vs 4.1, 6.1 variants)
+            // without a channel mask, so they stay rejected rather than risk mis-mixing.
+            Ok(Map::DownmixToStereo)
         } else {
             Err(DeckError::ChannelMismatch)
         }
@@ -708,12 +742,14 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             } else {
                 1.0
             };
+            let frame = &self.rs_buf[f * src_ch..f * src_ch + src_ch];
             for oc in 0..sink_ch {
-                let sc = match map {
-                    Map::Passthrough => oc,
-                    Map::MonoToStereo => 0,
+                let mixed = match map {
+                    Map::Passthrough => frame[oc] as f32,
+                    Map::MonoToStereo => frame[0] as f32,
+                    Map::DownmixToStereo => downmix_sample(frame, src_ch, oc),
                 };
-                let s = self.rs_buf[f * src_ch + sc] as f32 * g * fade;
+                let s = mixed * g * fade;
                 // Round to nearest without `f32::round` (std-only in no_std).
                 let r = if s >= 0.0 { s + 0.5 } else { s - 0.5 };
                 self.out_buf[f * sink_ch + oc] =
@@ -1873,9 +1909,10 @@ mod tests {
         };
         let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
         deck.load(const_dec(48_000, 2, 100, 500)).unwrap(); // stereo → OK
-        // 3 channels is neither passthrough (≠ 2) nor mono→stereo.
+        // 4 channels is layout-ambiguous (quad vs 3.1), so it's rejected — unlike 3/6/8,
+        // which now downmix to stereo (see tests/downmix.rs).
         assert_eq!(
-            deck.preload(const_dec(48_000, 3, 100, 500)).err(),
+            deck.preload(const_dec(48_000, 4, 100, 500)).err(),
             Some(DeckError::ChannelMismatch)
         );
         // The deck keeps playing the current track; the bad preload never staged.

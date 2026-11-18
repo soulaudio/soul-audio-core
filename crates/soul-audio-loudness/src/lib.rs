@@ -1,5 +1,6 @@
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![forbid(unsafe_code)]
+#![deny(unconditional_recursion)]
 
 //! `soul-audio-loudness` — a portable `no_std`, no-alloc, `libm`-free streaming
 //! loudness analyzer implementing **ITU-R BS.1770-4** integrated loudness (the

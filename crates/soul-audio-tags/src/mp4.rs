@@ -290,6 +290,17 @@ fn handle_data_atom<S: SeekSource>(
     Ok(())
 }
 
+/// Map a freeform `----` entry's `name` to [`Field::OriginalDate`] — iTunes
+/// has no standard atom for the original-release date, so taggers (e.g.
+/// MusicBrainz Picard) write it as a freeform `ORIGINALDATE`/`ORIGINALYEAR`.
+fn map_original_date_key(name: &str) -> Option<Field> {
+    if name.eq_ignore_ascii_case("ORIGINALDATE") || name.eq_ignore_ascii_case("ORIGINALYEAR") {
+        Some(Field::OriginalDate)
+    } else {
+        None
+    }
+}
+
 /// A freeform `----` ilst entry carries `mean` (reverse-DNS namespace), `name`
 /// (the tag name) and `data` child atoms (ISO/IEC 14496-12 / iTunes). The
 /// `name` selects the [`Field`] — the only ones recognized today are
@@ -327,7 +338,9 @@ fn handle_freeform_entry<S: SeekSource>(
     }
 
     let name = utf8_prefix(&name_buf[..name_len]);
-    let Some(field) = map_replaygain_key(name).or_else(|| map_musicbrainz_recording_key(name))
+    let Some(field) = map_replaygain_key(name)
+        .or_else(|| map_musicbrainz_recording_key(name))
+        .or_else(|| map_original_date_key(name))
     else {
         return Ok(());
     };

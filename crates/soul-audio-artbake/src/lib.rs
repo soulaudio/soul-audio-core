@@ -1,5 +1,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
+#![deny(unconditional_recursion)]
 
 #[cfg(feature = "build")]
 pub mod build;

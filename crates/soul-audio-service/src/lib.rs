@@ -6,6 +6,7 @@
 //! Sink-generic: the actor builds the sink on the pump thread, so a `!Send`
 //! device sink works, and this crate stays free of `cpal` (Plan 4 injects it).
 #![forbid(unsafe_code)]
+#![deny(unconditional_recursion)]
 
 pub mod actor;
 pub mod art;

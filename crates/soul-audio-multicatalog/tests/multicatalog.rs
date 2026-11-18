@@ -6,7 +6,7 @@
 //! uses globally-distinct, collation-non-colliding names so every order is
 //! unambiguous.
 
-use soul_audio_catalog::{BrowseAxis, Catalog, CatalogError, NO_FOLDER, StrRef};
+use soul_audio_catalog::{BrowseAxis, Catalog, CatalogError, NO_FOLDER, PackedDate, StrRef};
 use soul_audio_core::SliceSource;
 use soul_audio_index::IndexReader;
 use soul_audio_index::build::write_index;
@@ -156,7 +156,8 @@ fn to_input(m: &MemberData) -> CatalogInput {
             .map(|(title, aa, folder)| AlbumMeta {
                 title: (*title).into(),
                 album_artist: *aa,
-                year: 0,
+                original_date: PackedDate::UNKNOWN,
+                release_date: PackedDate::UNKNOWN,
                 folder: *folder,
             })
             .collect(),
@@ -201,7 +202,8 @@ fn to_union(ms: &[MemberData]) -> CatalogInput {
             u.albums.push(AlbumMeta {
                 title: (*title).into(),
                 album_artist: *aa + artist_base,
-                year: 0,
+                original_date: PackedDate::UNKNOWN,
+                release_date: PackedDate::UNKNOWN,
                 folder: *folder + folder_base,
             });
         }
@@ -415,8 +417,8 @@ fn multicatalog_is_send() {
 }
 
 /// Albums order **chronologically** within an artist (the collector default), and
-/// the merge honors it ACROSS sources — exercising the `year` field in the head
-/// comparator, not just the baker. Same artist "X" on two sources: album "Zzz"
+/// the merge honors it ACROSS sources — exercising the `original_sort` field in the
+/// head comparator, not just the baker. Same artist "X" on two sources: album "Zzz"
 /// from 1990 and "Aaa" from 2000; chronological puts 1990 first, the opposite of
 /// album-title-alphabetical (Aaa < Zzz).
 #[test]
@@ -444,7 +446,8 @@ fn merge_orders_albums_chronologically_across_sources() {
             albums: vec![AlbumMeta {
                 title: album.into(),
                 album_artist: 0,
-                year,
+                original_date: PackedDate::from_year(year),
+                release_date: PackedDate::from_year(year),
                 folder: 1,
             }],
             folders: vec![
@@ -510,7 +513,8 @@ fn merge_orders_artists_by_sort_name_across_sources() {
             albums: vec![AlbumMeta {
                 title: album.into(),
                 album_artist: 0,
-                year: 0,
+                original_date: PackedDate::UNKNOWN,
+                release_date: PackedDate::UNKNOWN,
                 folder: 1,
             }],
             folders: vec![
@@ -586,7 +590,8 @@ fn merge_orders_tracks_by_genre_across_sources() {
             albums: vec![AlbumMeta {
                 title: "Album".into(),
                 album_artist: 0,
-                year: 0,
+                original_date: PackedDate::UNKNOWN,
+                release_date: PackedDate::UNKNOWN,
                 folder: 1,
             }],
             folders: vec![

@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
+#![deny(unconditional_recursion)]
 
 //! `soul-audio-control` — a portable `no_std` playback controller. [`Player`]
 //! owns a [`soul_audio_engine::Engine`] over a

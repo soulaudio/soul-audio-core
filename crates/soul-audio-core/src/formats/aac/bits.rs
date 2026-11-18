@@ -27,6 +27,10 @@ impl<'a> BitReader<'a> {
     /// (`formats::aac::decode_rdb`). Reads past the end of `data` are still
     /// zero-padded, so an out-of-range `bit_pos` degrades to zero reads rather
     /// than panicking.
+    ///
+    /// Desktop only — its one caller ([`sbr::decode_fill_sbr`](super::sbr::decode_fill_sbr))
+    /// doesn't exist under `embedded-profile` (SBR gated off entirely).
+    #[cfg(not(feature = "embedded-profile"))]
     pub(crate) fn new_at(data: &'a [u8], bit_pos: usize) -> Self {
         Self { data, bit_pos }
     }

@@ -16,6 +16,7 @@
 //! - the DAP firmware calls [`design`] per band and feeds `Equalizer::set_band`.
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
+#![deny(unconditional_recursion)]
 
 extern crate alloc;
 
