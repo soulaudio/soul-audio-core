@@ -175,6 +175,93 @@ fn hq_passband_is_flat_and_unity() {
     );
 }
 
+/// Round-trip SNR (dB): `base`→`mid`→`base` of an in-band `tone_hz` sine, measured as
+/// signal power / (all other spectral power) on the final output. A transparent
+/// converter returns the tone essentially untouched — the cascade of two band-limiting
+/// filters adds only quantization + negligible in-band noise. Alignment-free (frequency
+/// domain, Kaiser-windowed).
+fn round_trip_snr(quality: Quality, base: u32, mid: u32, tone_hz: f64) -> f64 {
+    let n = 65_536usize;
+    // Pass 1: base → mid.
+    let mut up = Resampler::new(1, base, mid, 1.1, 1024, quality).unwrap();
+    let dph = 2.0 * std::f64::consts::PI * tone_hz / f64::from(base);
+    let mut midbuf: Vec<i32> = Vec::new();
+    let mut g = 0usize;
+    let mut block = vec![0i32; 1024];
+    // Pass 2 downsamples mid→base, so to end up with n base-rate samples we need
+    // ~n·(mid/base) mid-rate samples (plus margin for both resamplers' latency).
+    let mid_needed = (n as u64 * u64::from(mid) / u64::from(base)) as usize + 16_384;
+    while midbuf.len() < mid_needed {
+        let need = up.input_frames_next();
+        let input: Vec<i32> = (0..need)
+            .map(|f| (((g + f) as f64 * dph).sin() * 8_000_000.0) as i32)
+            .collect();
+        g += need;
+        up.process(&input, &mut block).unwrap();
+        midbuf.extend_from_slice(&block);
+    }
+    // Pass 2: mid → base.
+    let mut down = Resampler::new(1, mid, base, 1.1, 1024, quality).unwrap();
+    let mut out: Vec<f64> = Vec::new();
+    let mut cursor = 0usize;
+    while out.len() < n && cursor + down.input_frames_next() <= midbuf.len() {
+        let need = down.input_frames_next();
+        down.process(&midbuf[cursor..cursor + need], &mut block)
+            .unwrap();
+        cursor += need;
+        out.extend(block.iter().map(|&s| f64::from(s)));
+    }
+    out.truncate(n);
+
+    // Kaiser(beta=22) window, then FFT; SNR = signal-bin power vs all other power.
+    let beta = 22.0;
+    let denom = i0(beta);
+    for (i, s) in out.iter_mut().enumerate() {
+        let r = 2.0 * i as f64 / (n - 1) as f64 - 1.0;
+        *s *= i0(beta * (1.0 - r * r).sqrt()) / denom;
+    }
+    let mut buf: Vec<Complex<f64>> = out.iter().map(|&re| Complex { re, im: 0.0 }).collect();
+    FftPlanner::new().plan_fft_forward(n).process(&mut buf);
+    let mag: Vec<f64> = buf[..n / 2].iter().map(|c| c.norm()).collect();
+    let sig_bin = (tone_hz / f64::from(base) * n as f64).round() as usize;
+    // ±16 bins = the Kaiser(beta=22) main-lobe width; narrower would leak lobe skirt
+    // into the "noise" and understate the SNR.
+    let sig_power: f64 = mag[sig_bin - 16..=sig_bin + 16].iter().map(|m| m * m).sum();
+    let noise_power: f64 = mag
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i > 16 && (*i as isize - sig_bin as isize).unsigned_abs() > 16)
+        .map(|(_, m)| m * m)
+        .sum();
+    10.0 * (sig_power / noise_power).log10()
+}
+
+#[test]
+fn hq_round_trip_is_transparent() {
+    // Up- then down-sample an in-band tone and get it back intact. The cascade of two
+    // band-limiting filters must be effectively lossless — **quantization-limited**: the
+    // 24-bit per-bin floor (~-140 dB) summed over n/2 ≈ 32768 FFT bins is ~-95 dB, so a
+    // transparent converter lands near 90-95 dB total-noise SNR (it adds nothing above
+    // the quantization floor). HQ through 96 k / 192 k / 88.2 k intermediaries.
+    let cases = [
+        (96_000u32, 1_000.0),
+        (96_000, 5_000.0),
+        (192_000, 2_000.0),
+        (88_200, 1_000.0),
+    ];
+    let mut worst = f64::INFINITY;
+    for (mid, tone) in cases {
+        let snr = round_trip_snr(Quality::Hq, 44_100, mid, tone);
+        println!("HQ round-trip 44.1->{mid}->44.1 @ {tone} Hz: SNR {snr:.1} dB");
+        worst = worst.min(snr);
+        assert!(
+            snr > 90.0,
+            "HQ round-trip via {mid} @ {tone} Hz: SNR only {snr:.1} dB (want >90 — the ~95 dB 24-bit quantization floor)"
+        );
+    }
+    println!("HQ worst-case round-trip SNR: {worst:.1} dB");
+}
+
 #[test]
 fn fast_passband_is_reasonably_flat() {
     // The Fast (embedded/DAP) tier trades stopband depth for size, but its passband must
