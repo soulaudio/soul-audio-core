@@ -61,9 +61,36 @@ const MAX_OPUS_FRAME: usize = 2880 * 2;
 /// One Opus packet's decoded interleaved samples: 120 ms × stereo.
 const MAX_OPUS_PCM: usize = 5760 * 2;
 /// Largest FLAC frame (one `SimpleBlock`) buffered by [`MatroskaFlacReader`].
-/// Covers CD-style content (≤ 4096-block / ≤ 2 ch / ≤ 24-bit ≈ 25 KiB); an
-/// over-long frame is a graceful `Unsupported` rather than a silent truncation.
+/// Covers the full range [`crate::formats::flac::FlacDecoder`] accepts on the
+/// desktop profile (≤ 4608-block / ≤ 8 ch / ≤ 32-bit VERBATIM worst case); an
+/// over-long frame is a graceful `Unsupported` rather than a silent
+/// truncation.
+///
+/// **`embedded-profile`** (Lever A') tightens this to the realistic stereo
+/// ceiling (≤ 4608-block / ≤ 2 ch / ≤ 24-bit ≈ 27.6 KiB, rounded up to 28 KiB):
+/// [`MatroskaFlacReader`] is this module's one remaining *inline* decode
+/// buffer (48 KiB), and it can't be externalized to the shared scratch `P`
+/// [`FlacDecoder`]/[`AacDecoder`]/[`MatroskaOpus`] carve their own buffers
+/// from — doing so would need the inner `FlacDecoder<MatroskaFlacReader<S,
+/// P>, P>` and this reader to each independently *own* a disjoint slice of
+/// the SAME `P` while both stay alive for the decoder's whole lifetime, and
+/// `P` is taken **by value** everywhere in this crate (`Vec<i32>`/`Box<[i32]>`
+/// on desktop, a `&'static mut [i32]` StaticCell slice on embedded) — there's
+/// no owned value that splits into two further owned values without either
+/// `unsafe` (forbidden here) or restructuring the shared
+/// [`crate::demux::Demuxer::next_packet`] trait (used identically by
+/// Opus/FLAC/Vorbis-in-Matroska) away from its whole-packet-into-one-buffer
+/// contract. So this buffer stays inline, just capped smaller under
+/// `embedded-profile` — the same graceful-`Unsupported` tradeoff
+/// [`crate::formats::flac::FlacDecoder`]'s own `MAX_CHANNELS` cap already
+/// makes for >2-channel FLAC. A 32-bit or >2-channel FLAC-in-Matroska stream
+/// (vanishingly rare in practice) declines cleanly instead of fitting; every
+/// real-world stereo/≤24-bit stream (including CD-style ≤4096-block content)
+/// still decodes unchanged.
+#[cfg(not(feature = "embedded-profile"))]
 const MAX_FLAC_FRAME: usize = 48 * 1024;
+#[cfg(feature = "embedded-profile")]
+const MAX_FLAC_FRAME: usize = 28 * 1024;
 /// Largest `CodecPrivate` (FLAC's `fLaC` + STREAMINFO is tens of bytes).
 const MAX_FLAC_CODEC_PRIVATE: usize = 1024;
 
