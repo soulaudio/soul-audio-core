@@ -313,6 +313,34 @@ fn hq_alias_rejection_across_rate_ratios() {
 }
 
 #[test]
+fn fast_alias_rejection_across_rate_ratios() {
+    // The Fast (embedded/DAP) tier across the same conversion matrix as HQ: it trades
+    // stopband depth for size/CPU, yet measures surprisingly deep — worst case ~90.8 dB
+    // on the hard non-integer 44.1 ratios, 141–145 dB on integer downsamples. The DAP
+    // head relies on this. Bar 88 dB (a deterministic regression guard near the ~90 dB
+    // worst, comfortably past the 80 dB class the tier nominally targets).
+    let cases = [
+        (44_100u32, 48_000u32),
+        (48_000, 44_100),
+        (44_100, 96_000),
+        (96_000, 48_000),
+        (88_200, 44_100),
+        (44_100, 192_000),
+    ];
+    let mut worst = f64::INFINITY;
+    for (in_r, out_r) in cases {
+        let db = alias_rejection_db(Quality::Fast, in_r, out_r, 14_000.0);
+        println!("Fast {in_r}->{out_r} @14kHz: alias rejection {db:.1} dB");
+        worst = worst.min(db);
+        assert!(
+            db > 88.0,
+            "Fast {in_r}->{out_r}: alias rejection only {db:.1} dB (want >88)"
+        );
+    }
+    println!("Fast worst-case alias rejection across ratios: {worst:.1} dB");
+}
+
+#[test]
 fn fast_tier_alias_rejection() {
     // Upsample 44.1k→48k of a 6 kHz tone: Fast tier ≳ 80 dB image rejection.
     let db = alias_rejection_db(Quality::Fast, 44_100, 48_000, 6_000.0);
