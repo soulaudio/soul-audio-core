@@ -23,6 +23,9 @@ playback = ["soul-audio-desktop/playback"]
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+# Parametric-EQ band design for the full-pipeline signal E2E (pipeline_e2e.rs) —
+# the host's DspSink applies EQ through soul-audio-core's Equalizer, designed here.
+soul-audio-eq = { path = "../soul-audio-eq" }
 # FFT for signal-analysis E2E (tone pitch / SNR / channel routing on rendered
 # audio). Host tests only — never shipped.
 rustfft = "6"
