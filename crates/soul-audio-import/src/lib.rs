@@ -6,6 +6,7 @@
 //! device reads" split from the architecture spec — the heavy scan happens here,
 //! never on the DAP.
 #![forbid(unsafe_code)]
+#![deny(unconditional_recursion)]
 
 use std::collections::HashMap;
 use std::collections::HashSet;

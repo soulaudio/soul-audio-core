@@ -137,23 +137,33 @@ fn locate_alac_config(kuki: &[u8]) -> Option<&[u8]> {
 /// Apple CAF decoder over a byte [`Source`].
 ///
 /// The `Alac` variant is much larger than `Pcm` (it embeds the ALAC decode
-/// scratch + packet buffer). Boxing is impossible under `#![no_std]`, so — like
+/// core). Boxing is impossible under `#![no_std]`, so — like
 /// [`AnyDecoder`](crate::dispatch::AnyDecoder) — the size gap is accepted.
+///
+/// `P` is the caller-provided scratch [`CafAlac`]'s embedded [`alac::Scratch`]
+/// carves its decode buffers from (decoder-memory-externalization spec §7) —
+/// the SAME shared scratch [`crate::formats::wavpack::WavpackDecoder`]/
+/// [`crate::formats::flac::FlacDecoder`]/[`crate::formats::alac::AlacDecoder`]
+/// use. `Pcm` ignores it, but still has to name the type parameter (every
+/// parameter in scope is used by *some* variant).
 #[allow(clippy::large_enum_variant)]
-pub enum CafDecoder<S> {
+pub enum CafDecoder<S, P> {
     /// Linear PCM (`lpcm`).
     Pcm(CafPcm<S>),
     /// Apple Lossless (`alac`).
-    Alac(CafAlac<S>),
+    Alac(CafAlac<S, P>),
 }
 
-impl<S: Source> CafDecoder<S> {
-    /// Parse the CAF header + chunks and build the decoder for the `data` chunk.
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> CafDecoder<S, P> {
+    /// Parse the CAF header + chunks and build the decoder for the `data`
+    /// chunk. `scratch` is the ALAC decode-buffer storage the `alac` payload
+    /// needs (see the enum's doc comment); `lpcm` ignores it.
     ///
     /// # Errors
     /// [`DecodeError::Malformed`] for a non-CAF / headerless file;
-    /// [`DecodeError::Unsupported`] for a format other than `lpcm`/`alac`.
-    pub fn new(mut src: S) -> Result<Self, DecodeError> {
+    /// [`DecodeError::Unsupported`] for a format other than `lpcm`/`alac`, or a
+    /// `scratch` too small for an `alac` payload's decode buffers.
+    pub fn new_in(mut src: S, scratch: P) -> Result<Self, DecodeError> {
         let mut hdr = [0u8; 8];
         read_exact(&mut src, &mut hdr)?;
         if &hdr[0..4] != b"caff" {
@@ -212,7 +222,14 @@ impl<S: Source> CafDecoder<S> {
                     } else {
                         (size as u64).saturating_sub(4)
                     };
-                    return Self::build(src, desc, &kuki[..kuki_len], data_bytes, data_start);
+                    return Self::build(
+                        src,
+                        desc,
+                        &kuki[..kuki_len],
+                        data_bytes,
+                        data_start,
+                        scratch,
+                    );
                 }
                 _ => {
                     if size < 0 {
@@ -231,13 +248,14 @@ impl<S: Source> CafDecoder<S> {
         kuki: &[u8],
         data_bytes: u64,
         data_start: u64,
+        scratch: P,
     ) -> Result<Self, DecodeError> {
         match &desc.format_id {
             b"lpcm" => Ok(CafDecoder::Pcm(CafPcm::new(
                 src, &desc, data_bytes, data_start,
             )?)),
-            b"alac" => Ok(CafDecoder::Alac(CafAlac::new(
-                src, kuki, data_bytes, data_start,
+            b"alac" => Ok(CafDecoder::Alac(CafAlac::new_in(
+                src, kuki, data_bytes, data_start, scratch,
             )?)),
             _ => Err(DecodeError::Unsupported),
         }
@@ -252,7 +270,7 @@ impl<S: Source> CafDecoder<S> {
     }
 }
 
-impl<S: SeekSource> CafDecoder<S> {
+impl<S: SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> CafDecoder<S, P> {
     /// Seek to per-channel `sample`: PCM is a direct byte offset; ALAC rewinds
     /// and decode-discards forward.
     ///
@@ -275,7 +293,7 @@ impl<S: SeekSource> CafDecoder<S> {
     }
 }
 
-impl<S: Source> Decoder for CafDecoder<S> {
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for CafDecoder<S, P> {
     fn stream_info(&self) -> StreamInfo {
         match self {
             CafDecoder::Pcm(d) => d.info,
@@ -438,11 +456,17 @@ impl<S: SeekSource> CafPcm<S> {
 
 /// `alac` CAF: drive the shared ALAC [`decode_packet`] core over the `data`
 /// chunk's self-delimiting packets, with the `kuki` config.
-pub struct CafAlac<S> {
+///
+/// The decode scratch is **caller-provided** `P`, carved by
+/// [`alac::Scratch::new_in`] — the SAME shared scratch
+/// [`alac::AlacDecoder`] uses (decoder-memory-externalization spec §7);
+/// `inbuf` stays an inline byte buffer (raw packet staging, not PCM), like
+/// [`alac::AlacDecoder`]'s own `inbuf`.
+pub struct CafAlac<S, P> {
     src: S,
     info: StreamInfo,
     cfg: AlacCfg,
-    scratch: Scratch,
+    scratch: Scratch<P>,
     inbuf: [u8; PACKET_CAP],
     filled: usize,
     used: usize,
@@ -456,8 +480,14 @@ pub struct CafAlac<S> {
     eof: bool,
 }
 
-impl<S: Source> CafAlac<S> {
-    fn new(src: S, kuki: &[u8], data_bytes: u64, data_start: u64) -> Result<Self, DecodeError> {
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> CafAlac<S, P> {
+    fn new_in(
+        src: S,
+        kuki: &[u8],
+        data_bytes: u64,
+        data_start: u64,
+        scratch: P,
+    ) -> Result<Self, DecodeError> {
         let (cfg, sample_rate) = parse_alac_cookie(kuki)?;
         if cfg.channels == 0 || cfg.channels > alac::MAX_CHANNELS {
             return Err(DecodeError::Unsupported);
@@ -478,7 +508,7 @@ impl<S: Source> CafAlac<S> {
                 },
             },
             cfg,
-            scratch: Scratch::new(),
+            scratch: Scratch::new_in(scratch)?,
             inbuf: [0; PACKET_CAP],
             filled: 0,
             used: 0,
@@ -549,7 +579,7 @@ impl<S: Source> CafAlac<S> {
             let avail = self.out_len - self.out_pos;
             let take = avail.min(out.len() - written);
             out[written..written + take]
-                .copy_from_slice(&self.scratch.out[self.out_pos..self.out_pos + take]);
+                .copy_from_slice(&self.scratch.out_ref()[self.out_pos..self.out_pos + take]);
             self.out_pos += take;
             written += take;
         }
@@ -557,7 +587,7 @@ impl<S: Source> CafAlac<S> {
     }
 }
 
-impl<S: SeekSource> CafAlac<S> {
+impl<S: SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> CafAlac<S, P> {
     /// Seek to per-channel `sample`. Fast path: the CAF `pakt` chunk lists each
     /// packet's byte size, and ALAC packets are a constant `frame_length` frames
     /// and independently decodable — so packet `k` begins at exactly
@@ -591,9 +621,13 @@ impl<S: SeekSource> CafAlac<S> {
         self.discard_forward(0, sample)
     }
 
-    /// Reset the decode buffers/EOF flag after a seek repositions the source.
+    /// Reset the packet-staging cursors/EOF flag after a seek repositions the
+    /// source. The decode scratch itself is left as-is (not re-zeroed): every
+    /// ALAC packet is self-contained (its own predictor coefficients) and
+    /// fully overwrites every scratch buffer it reads before reading it — the
+    /// same invariant [`alac::AlacDecoder::seek_to`] relies on — so no stale
+    /// pre-seek content can leak into the first post-seek decode.
     fn reset_for_seek(&mut self) {
-        self.scratch = Scratch::new();
         self.filled = 0;
         self.used = 0;
         self.out_len = 0;

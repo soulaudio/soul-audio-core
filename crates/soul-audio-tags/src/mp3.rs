@@ -569,7 +569,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name}: tag scan reported no duration"));
 
             // PLAYBACK path: the decoder's CBR byte estimate.
-            let mut dec = open(SliceSource::new(bytes)).expect("open MP1/MP2");
+            let mut dec = open(
+                SliceSource::new(bytes),
+                vec![0i32; soul_audio_core::decoder_scratch_len()],
+            )
+            .expect("open MP1/MP2");
             dec.resolve_lengths();
             let dec_total = dec
                 .total_frames()

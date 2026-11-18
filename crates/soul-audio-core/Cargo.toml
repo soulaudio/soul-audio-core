@@ -19,6 +19,16 @@ default = []
 # panic. The default (no feature) is the desktop profile: the full Vorbis I
 # spec ceiling (8192-sample long blocks) and a 4-channel cap.
 vorbis-embedded-profile = []
+# Embedded `AnyDecoder` profile (stereo DAP SRAM budget): drops the
+# multichannel (surround) Opus variant — `MultistreamOpusDecoder`, the current
+# `size_of::<AnyDecoder<S>>()` ceiling at 322,552 B — from the dispatch enum,
+# so a surround-Opus file is a graceful `DecodeError::Unsupported` instead of
+# sizing every `AnyDecoder` for a 322 KiB variant. Mono/stereo Opus
+# (`OpusDecoder`, mapping family 0) is unaffected. Implies
+# `vorbis-embedded-profile` (a stereo DAP target wants both caps together);
+# with both on, `size_of::<AnyDecoder<S>>()` drops well under the 288 KiB
+# (294,912 B) target — see `dispatch.rs`'s `any_decoder_fits_embedded_budget`.
+embedded-profile = ["vorbis-embedded-profile"]
 
 [dependencies]
 embedded-io = { workspace = true }

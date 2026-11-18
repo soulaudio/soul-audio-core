@@ -42,9 +42,18 @@ use soul_audio_core::formats::dff::DffDecoder;
 use soul_audio_core::formats::dsf::DsfDecoder;
 use soul_audio_core::formats::vorbis::VorbisDecoder;
 use soul_audio_core::{
-    AnyDecoder, Deck, Decoder, DsdDecoder, DsdSeek, Progress, Quality, SampleFormat,
-    SeekableDecoder, Sink, SinkError, SliceSource, StreamInfo, open,
+    AnyDecoder, BufSource, Deck, DecodeError, Decoder, DsdDecoder, DsdSeek, Progress, Quality,
+    SampleFormat, SeekableDecoder, Sink, SinkError, SliceSource, StreamInfo,
 };
+
+/// Thin shim over `soul_audio_core::open` that supplies the WavPack
+/// block-staging storage (decoder-memory-externalization spec, Lever B) every
+/// caller must now provide — this matrix's `Engine::Pcm` rows (including the
+/// `wavpack` row itself) don't need per-row storage tuning, so they go through
+/// one real call site here.
+fn open<S: BufSource>(src: S) -> Result<AnyDecoder<S, Vec<i32>>, DecodeError> {
+    soul_audio_core::open(src, vec![0i32; soul_audio_core::decoder_scratch_len()])
+}
 
 // ===========================================================================
 // Shared helpers (ported verbatim from tests/decode.rs + tests/seek_cost.rs).
@@ -1243,7 +1252,7 @@ fn channel(xs: &[i32], ch: usize, c: usize) -> Vec<i32> {
     xs.chunks_exact(ch).map(|f| f[c]).collect()
 }
 
-fn declick_decoder(bytes: &'static [u8]) -> AnyDecoder<SliceSource<'static>> {
+fn declick_decoder(bytes: &'static [u8]) -> AnyDecoder<SliceSource<'static>, Vec<i32>> {
     open(SliceSource::new(bytes)).expect("open declick fixture")
 }
 

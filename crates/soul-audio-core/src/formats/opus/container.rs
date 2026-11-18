@@ -1,7 +1,7 @@
 //! RFC 7845 Ogg-Opus container headers: the `OpusHead` identification packet
 //! (§5.1) this module parses, and `OpusTags` (§5.2, parsed-and-skipped by
-//! [`super::OpusDecoder::new`] — its vendor/comment strings carry no field the
-//! decoder needs).
+//! [`super::OpusDecoder::new_in`] — its vendor/comment strings carry no field
+//! the decoder needs).
 
 use crate::decoder::DecodeError;
 

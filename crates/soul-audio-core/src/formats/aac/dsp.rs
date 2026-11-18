@@ -24,6 +24,53 @@ use super::syntax::{EIGHT_SHORT, Ics, MAX_WINDOWS};
 use super::tables;
 use crate::formats::mp3_codec::{ldexp_q2, pow_43};
 
+/// No-libm `f32` square root: extract the IEEE-754 exponent and build a
+/// coarse seed `2^floor(exp/2) · (√2 if exp is odd else 1)` — this ignores
+/// the mantissa entirely (one constant seed per whole octave of `x`), so
+/// it's accurate only to within the octave's spread: at the top of an
+/// even-exponent octave the seed undershoots by a factor of `1/√2`
+/// (`≈29.3%` relative error), which is the worst case across the whole
+/// domain. Three Newton-Raphson refinements (`y = 0.5·(y + x/y)`, which for
+/// this iteration roughly *squares* the relative error each step:
+/// `e_{n+1} ≈ e_n²/2`) take that `≈0.29` down through `≈0.042 → ≈0.00088 →
+/// ≈2e-7` — well past `f32` precision, hence "2–3" iterations sufficing per
+/// the brief. `x<0`/NaN (`x > 0.0` is false for both, since NaN comparisons
+/// are always false) and `x == 0.0` (`0.0 > 0.0` is false too) all return
+/// exactly `0.0` — the exponent-seed path would only asymptotically
+/// approach `0.0` through the iteration for a genuine `0.0` input, never
+/// hit it bit-exact, which the brief's test requires.
+///
+/// Lives here (the LC-core `dsp` module, always compiled) rather than in
+/// `sbr::hfadj` (where it originated) because [`fill_pns`] — part of the
+/// AAC-LC core, compiled under BOTH profiles — needs it too; `sbr::hfadj`
+/// (desktop-only under `embedded-profile`, decoder-memory-externalization
+/// spec Option A) re-imports it from here instead of holding its own copy.
+// The negated `!(x > 0.0)` (rather than `x <= 0.0`) is deliberate: it also
+// catches NaN (every comparison against NaN, including `<=`, is false, so
+// `x <= 0.0` would NOT catch a NaN input, but `!(x > 0.0)` does since
+// `x > 0.0` is false for NaN too) -- exactly the guard this fn's doc comment
+// and the brief's test (`sqrtf(-1.0) == 0.0`, "guarded") require.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
+pub(crate) fn sqrtf(x: f32) -> f32 {
+    if !(x > 0.0) {
+        return 0.0;
+    }
+    let bits = x.to_bits();
+    let exp = ((bits >> 23) & 0xFF) as i32 - 127;
+    let half_exp = exp >> 1; // arithmetic (floor) shift -- correct for negative exp too
+    let remainder = exp - 2 * half_exp; // 0 or 1
+    let pow2_half = f32::from_bits(((half_exp + 127) as u32) << 23);
+    let mut y = if remainder != 0 {
+        pow2_half * core::f32::consts::SQRT_2
+    } else {
+        pow2_half
+    };
+    y = 0.5 * (y + x / y);
+    y = 0.5 * (y + x / y);
+    y = 0.5 * (y + x / y);
+    y
+}
+
 /// Section codebooks whose bands carry no spectral energy at this stage,
 /// per `aac-reference.md` §5/§6 (`cb 13=PNS, 14/15=intensity`). Mirrors
 /// `syntax.rs`'s private `HCB_*` constants of the same names/values;
@@ -222,8 +269,8 @@ fn fill_pns(dst: &mut [f32], gain: f32, seed: u32) {
     }
     if energy > 0.0 {
         // scale·√(Σr²/N) == gain  ⇒  scale = gain·√(N/energy). `f32::sqrt` is
-        // std-only; the crate's no_std software sqrt is in `sbr::hfadj`.
-        let scale = gain * super::sbr::hfadj::sqrtf(dst.len() as f32 / energy);
+        // std-only; the crate's no_std software sqrt is `sqrtf` above.
+        let scale = gain * sqrtf(dst.len() as f32 / energy);
         for v in dst.iter_mut() {
             *v *= scale;
         }
@@ -601,6 +648,40 @@ pub(crate) fn apply_tns(ics: &mut Ics, sfi: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    // The brief's own literal pinned value (`1.4142135`, one digit short of
+    // `core::f32::consts::SQRT_2`'s full precision) -- clippy would rather
+    // this used the named constant, but the test is transcribed verbatim
+    // from the task brief's mandated Step-1 text.
+    #[allow(clippy::approx_constant)]
+    fn sqrtf_known_values() {
+        assert!((sqrtf(4.0) - 2.0).abs() < 1e-4);
+        assert!((sqrtf(2.0) - 1.4142135).abs() < 1e-4);
+        assert_eq!(sqrtf(0.0), 0.0);
+        assert_eq!(sqrtf(-1.0), 0.0); // guarded
+    }
+
+    #[test]
+    fn sqrtf_matches_std_across_a_wide_range() {
+        // Broader regression beyond the brief's 2 pinned values: every
+        // power-of-two-ish magnitude across the practical f32 domain, to
+        // catch a seed/iteration-count regression the two pinned values
+        // alone might not exercise (both 2.0 and 4.0 happen to converge in
+        // zero extra NR steps -- see the fn doc's worked derivation).
+        let cases = [
+            0.001_f32, 0.1, 0.5, 1.0, 3.0, 10.0, 123.456, 1.0e6, 1.0e10, 1.0e20,
+        ];
+        for &x in &cases {
+            let got = sqrtf(x);
+            let want = (x as f64).sqrt() as f32;
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel < 1e-5,
+                "sqrtf({x}) = {got}, want ~{want} (rel err {rel})"
+            );
+        }
+    }
 
     #[test]
     fn dequant_applies_power_and_scalefactor() {

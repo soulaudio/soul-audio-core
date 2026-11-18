@@ -53,8 +53,11 @@ const ID_WV_BITSTREAM: u8 = 0x0a;
 const MAX_TERMS: usize = 16;
 /// Largest decoded block we buffer: `block_samples × channels` interleaved i32.
 /// Covers the common ~0.5–1 s blocks encoders emit (ffmpeg uses 22050 stereo /
-/// 44100 mono); a larger block declines as `Unsupported`.
-const MAX_BLOCK_PCM: usize = 65536;
+/// 44100 mono); a larger block declines as `Unsupported`. This is also the
+/// minimum length the caller-provided block-staging storage (`P`, see
+/// [`WavpackDecoder::new_in`]) must meet — [`crate::dispatch::decoder_scratch_len`]
+/// exposes it without hardcoding.
+pub const MAX_BLOCK_PCM: usize = 65536;
 
 const SAMPLE_RATES: [u32; 15] = [
     6000, 8000, 9600, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000,
@@ -641,25 +644,41 @@ fn skip<S: Source>(src: &mut S, mut n: u64) -> Result<(), DecodeError> {
 }
 
 /// WavPack lossless decoder over a byte [`Source`].
-pub struct WavpackDecoder<S> {
+///
+/// The block-staging PCM buffer is **caller-provided, owned storage** `P`
+/// (generic over `AsRef<[i32]> + AsMut<[i32]>`) rather than an inline
+/// `[i32; MAX_BLOCK_PCM]` array: the decoder owns a fat pointer into storage
+/// the caller allocated (a `Vec`/`Box<[i32]>` on desktop, a `&'static mut
+/// [i32]` from a board `StaticCell` on embedded), not the 256 KB block itself.
+/// This keeps `WavpackDecoder<S, P>` — and therefore `AnyDecoder<S, P>` — small
+/// and cheap to move; see `docs/superpowers/specs/2026-11-17-decoder-memory-externalization.md`
+/// §3 for why this (owned generic storage) rather than a borrowed reference is
+/// the self-reference-safe shape.
+pub struct WavpackDecoder<S, P> {
     src: S,
     info: StreamInfo,
     total_frames: Option<u64>,
     channels: usize,
     shift: u32,
-    pcm: [i32; MAX_BLOCK_PCM],
+    pcm: P,
     pcm_len: usize,
     pcm_pos: usize,
     eof: bool,
 }
 
-impl<S: Source> WavpackDecoder<S> {
-    /// Parse the first block's header for stream parameters and decode it.
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> WavpackDecoder<S, P> {
+    /// Parse the first block's header for stream parameters and decode it,
+    /// using `pcm` as the block-staging buffer.
     ///
     /// # Errors
+    /// [`DecodeError::Unsupported`] if `pcm` is shorter than [`MAX_BLOCK_PCM`]
+    /// (never panics / indexes out of bounds on undersized storage).
     /// [`DecodeError::Malformed`] for a non-WavPack / bad stream;
     /// [`DecodeError::Unsupported`] for hybrid/float/DSD/>2-ch/oversized blocks.
-    pub fn new(src: S) -> Result<Self, DecodeError> {
+    pub fn new_in(src: S, pcm: P) -> Result<Self, DecodeError> {
+        if pcm.as_ref().len() < MAX_BLOCK_PCM {
+            return Err(DecodeError::Unsupported);
+        }
         let mut d = Self {
             src,
             info: StreamInfo {
@@ -670,7 +689,7 @@ impl<S: Source> WavpackDecoder<S> {
             total_frames: None,
             channels: 0,
             shift: 0,
-            pcm: [0; MAX_BLOCK_PCM],
+            pcm,
             pcm_len: 0,
             pcm_pos: 0,
             eof: false,
@@ -846,7 +865,7 @@ impl<S: Source> WavpackDecoder<S> {
                         let mut bits = WvBits::new(src, payload as usize);
                         get_words_lossless(
                             &mut bits,
-                            &mut pcm[..n_samples],
+                            &mut pcm.as_mut()[..n_samples],
                             &mut words,
                             !decode_mono,
                         );
@@ -878,9 +897,9 @@ impl<S: Source> WavpackDecoder<S> {
             // Decorrelation passes, in array order.
             for p in passes[..num_terms].iter_mut() {
                 if decode_mono {
-                    p.run_mono(&mut self.pcm[..n_samples]);
+                    p.run_mono(&mut self.pcm.as_mut()[..n_samples]);
                 } else {
-                    p.run_stereo(&mut self.pcm[..n_samples]);
+                    p.run_stereo(&mut self.pcm.as_mut()[..n_samples]);
                 }
             }
 
@@ -888,12 +907,13 @@ impl<S: Source> WavpackDecoder<S> {
             // stream can decorrelate to out-of-range samples that must stay
             // bounded garbage, not a debug overflow panic).
             if joint && !decode_mono {
+                let pcm = self.pcm.as_mut();
                 for i in 0..n_samples / 2 {
-                    let s = self.pcm[2 * i];
-                    let d = self.pcm[2 * i + 1];
+                    let s = pcm[2 * i];
+                    let d = pcm[2 * i + 1];
                     let r = d.wrapping_sub(s >> 1);
-                    self.pcm[2 * i + 1] = r;
-                    self.pcm[2 * i] = s.wrapping_add(r);
+                    pcm[2 * i + 1] = r;
+                    pcm[2 * i] = s.wrapping_add(r);
                 }
             }
 
@@ -912,7 +932,7 @@ impl<S: Source> WavpackDecoder<S> {
                     // `wrapping_shl` masks them to < 32 and the ±1 wraps, so a
                     // crafted value can't panic (the reference's int32 math wraps).
                     let (zeros, ones, dups) = (u32::from(zeros), u32::from(ones), u32::from(dups));
-                    for v in self.pcm[..n_samples].iter_mut() {
+                    for v in self.pcm.as_mut()[..n_samples].iter_mut() {
                         if zeros != 0 {
                             *v = v.wrapping_shl(zeros);
                         } else if ones != 0 {
@@ -930,17 +950,18 @@ impl<S: Source> WavpackDecoder<S> {
             }
             let shift = shift & 0x1f;
             if shift != 0 {
-                for v in self.pcm[..n_samples].iter_mut() {
+                for v in self.pcm.as_mut()[..n_samples].iter_mut() {
                     *v = v.wrapping_shl(shift);
                 }
             }
 
             // FALSE_STEREO: duplicate the single decoded channel to two.
             if false_stereo {
+                let pcm = self.pcm.as_mut();
                 for i in (0..block_samples as usize).rev() {
-                    let v = self.pcm[i];
-                    self.pcm[2 * i] = v;
-                    self.pcm[2 * i + 1] = v;
+                    let v = pcm[i];
+                    pcm[2 * i] = v;
+                    pcm[2 * i + 1] = v;
                 }
             }
 
@@ -971,7 +992,7 @@ impl<S: Source> WavpackDecoder<S> {
     }
 }
 
-impl<S: SeekSource> WavpackDecoder<S> {
+impl<S: SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> WavpackDecoder<S, P> {
     /// Seek to per-channel `sample` by walking block **headers** (no entropy
     /// decode) to the block that contains it, then decoding only that block and
     /// discarding the within-block head. WavPack blocks are independently
@@ -1054,7 +1075,7 @@ impl<S: SeekSource> WavpackDecoder<S> {
     }
 }
 
-impl<S: Source> Decoder for WavpackDecoder<S> {
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for WavpackDecoder<S, P> {
     fn stream_info(&self) -> StreamInfo {
         self.info
     }
@@ -1081,7 +1102,7 @@ impl<S: Source> Decoder for WavpackDecoder<S> {
             }
             let avail = self.pcm_len - self.pcm_pos;
             let take = avail.min(out.len() - w);
-            out[w..w + take].copy_from_slice(&self.pcm[self.pcm_pos..self.pcm_pos + take]);
+            out[w..w + take].copy_from_slice(&self.pcm.as_ref()[self.pcm_pos..self.pcm_pos + take]);
             self.pcm_pos += take;
             w += take;
         }

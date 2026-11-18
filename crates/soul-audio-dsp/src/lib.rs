@@ -13,6 +13,7 @@
 //! portable exchange format a baked profile is written to and the DAP reads back.
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
+#![deny(unconditional_recursion)]
 
 extern crate alloc;
 

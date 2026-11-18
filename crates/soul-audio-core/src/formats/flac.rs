@@ -18,6 +18,7 @@
 use crate::decoder::{DecodeError, Decoder, SeekableDecoder, secs_to_samples};
 use crate::demux::ogg::OggReader;
 use crate::demux::{Demuxer, FlacDemuxer};
+use crate::formats::scratch::ScratchCursor;
 use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
 
@@ -25,16 +26,27 @@ use crate::model::{SampleFormat, StreamInfo};
 /// 4608 covers every standard-block-size encoder (the subset limit at ≤48 kHz);
 /// larger blocks are declined with [`DecodeError::Unsupported`].
 const MAX_BLOCK: usize = 4608;
-/// Maximum channels the inline decode buffer supports (up to 7.1 surround).
-/// FLAC's inter-channel decorrelation is stereo-only, so >2 channels are always
-/// coded independently and decode with no cross-channel dependency.
+/// Maximum channels the decode buffer supports (up to 7.1 surround on
+/// the desktop profile). FLAC's inter-channel decorrelation is stereo-only,
+/// so anything past 2 channels is always coded independently and decodes
+/// with no cross-channel dependency.
 ///
-/// **RAM cost:** the `channels × MAX_BLOCK × 4`-byte plane buffer must persist
-/// between `decode_into` calls, and it sizes both `FlacDecoder` and — via the
-/// `Wav`/`Flac`/`Mp3` enum — [`AnyDecoder`](crate::dispatch::AnyDecoder). At the
-/// default it is `8 × 4608 × 4 ≈ 147 KiB`; lower this const to trade channel
-/// support for footprint on RAM-constrained targets.
+/// **RAM cost:** `channels × MAX_BLOCK` i32 slots are carved from the
+/// caller-provided scratch `P` (decoder-memory-externalization spec §7) rather
+/// than held inline, so this constant sizes the *scratch requirement*
+/// ([`crate::decoder_scratch_len`]'s budget), not `FlacDecoder`/[`AnyDecoder`](crate::dispatch::AnyDecoder)
+/// itself. At the desktop default that's `8 × 4608 ≈ 147 KiB` of scratch.
+///
+/// The **`embedded-profile`** feature (Lever A) tightens this to stereo
+/// (`2 × 4608 ≈ 36 KiB`): the DAP consumer this profile targets is
+/// stereo-only and downmixes surround to stereo at import, so a >2-channel
+/// plane would be pure waste on that target. [`FlacDecoder::new_in`]'s
+/// existing `channels > MAX_CHANNELS` check already turns a wider stream into
+/// a graceful [`DecodeError::Unsupported`] under either cap, never a panic.
+#[cfg(not(feature = "embedded-profile"))]
 const MAX_CHANNELS: usize = 8;
+#[cfg(feature = "embedded-profile")]
+const MAX_CHANNELS: usize = 2;
 /// Maximum predictor order (LPC tops out at 32).
 const MAX_ORDER: usize = 32;
 /// Raw-byte refill buffer size for the bit reader.
@@ -62,7 +74,17 @@ const MAX_SYNC_PROBES: u32 = 64;
 const HEADER_WINDOW: usize = 64;
 
 /// FLAC decoder over a byte [`Source`]. Decodes frames to interleaved `i32` PCM.
-pub struct FlacDecoder<S> {
+///
+/// The channel-planar decode buffer is **caller-provided, owned scratch** `P`
+/// (`AsRef<[i32]> + AsMut<[i32]>`) rather than an inline
+/// `[[i32; MAX_BLOCK]; MAX_CHANNELS]` array: the decoder owns a fat pointer
+/// into `P` plus a `usize` base offset (never a borrow), carved via a bump
+/// cursor in [`Self::new_in`]. This is the SAME shared scratch
+/// [`crate::formats::wavpack::WavpackDecoder`] owns outright — only one
+/// `AnyDecoder` variant is ever live, so one scratch backs whichever format is
+/// active (decoder-memory-externalization spec §3 self-reference rationale,
+/// §7 shared-scratch design).
+pub struct FlacDecoder<S, P> {
     demux: FlacDemuxer<S>,
     channels: u16,
     /// Stream bit depth (from STREAMINFO); the frame's declared depth normally
@@ -85,7 +107,13 @@ pub struct FlacDecoder<S> {
     acc_bits: u32,
 
     // --- current decoded block (channel-planar), streamed to the caller ---
-    planes: [[i32; MAX_BLOCK]; MAX_CHANNELS],
+    /// Caller-provided scratch the decode planes are carved from (see the
+    /// struct doc comment).
+    scratch: P,
+    /// Base i32-slot offset of channel `ci`'s plane within `scratch`:
+    /// `scratch[planes_off + ci * MAX_BLOCK .. + MAX_BLOCK]` (see
+    /// [`Self::plane_off`]).
+    planes_off: usize,
     /// Interleaved samples available in the current block (`block_len × channels`).
     block_total: usize,
     /// Interleaved emit cursor within the current block.
@@ -148,13 +176,20 @@ struct FrameHeader {
     coded_num: u64,
 }
 
-impl<S: Source> FlacDecoder<S> {
-    /// Parse the FLAC metadata and prepare to stream PCM.
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> FlacDecoder<S, P> {
+    /// Parse the FLAC metadata and prepare to stream PCM, carving the
+    /// channel-planar decode buffer (`MAX_CHANNELS × MAX_BLOCK` i32 slots) from
+    /// `scratch` — the same caller-provided storage
+    /// [`crate::formats::wavpack::WavpackDecoder`] owns outright (decoder-memory-
+    /// externalization spec §7). `scratch` must be at least
+    /// [`crate::decoder_scratch_len`] samples long.
     ///
     /// # Errors
-    /// Propagates [`FlacDemuxer::new`] errors; [`DecodeError::Unsupported`] for a
+    /// [`DecodeError::Unsupported`] if `scratch` is too small to hold the
+    /// planes (never a panic / out-of-bounds index on undersized storage);
+    /// propagates [`FlacDemuxer::new`] errors; [`DecodeError::Unsupported`] for a
     /// non-integer format, zero/oversize channel count, or a bit depth over 32.
-    pub fn new(src: S) -> Result<Self, DecodeError> {
+    pub fn new_in(src: S, scratch: P) -> Result<Self, DecodeError> {
         let demux = FlacDemuxer::new(src)?;
         let info = demux.stream_info();
         let bits = match info.format {
@@ -164,6 +199,8 @@ impl<S: Source> FlacDecoder<S> {
         if info.channels == 0 || info.channels as usize > MAX_CHANNELS || bits == 0 || bits > 32 {
             return Err(DecodeError::Unsupported);
         }
+        let mut cursor = ScratchCursor::new(scratch.as_ref().len());
+        let planes_off = cursor.alloc(MAX_CHANNELS * MAX_BLOCK)?;
         let total_samples = demux.total_samples();
         let stream_block = u64::from(demux.max_block());
         Ok(Self {
@@ -178,7 +215,8 @@ impl<S: Source> FlacDecoder<S> {
             byte_cur: 0,
             acc: 0,
             acc_bits: 0,
-            planes: [[0; MAX_BLOCK]; MAX_CHANNELS],
+            scratch,
+            planes_off,
             block_total: 0,
             emit_i: 0,
             validate_crc: false,
@@ -186,6 +224,24 @@ impl<S: Source> FlacDecoder<S> {
             crc16: 0,
             anchor_pending: false,
         })
+    }
+
+    /// The i32-slot offset of channel `ci`'s `MAX_BLOCK`-sample plane within
+    /// [`Self::scratch`].
+    fn plane_off(&self, ci: usize) -> usize {
+        self.planes_off + ci * MAX_BLOCK
+    }
+
+    /// Read-only view of channel `ci`'s plane.
+    fn plane_ref(&self, ci: usize) -> &[i32] {
+        let off = self.plane_off(ci);
+        &self.scratch.as_ref()[off..off + MAX_BLOCK]
+    }
+
+    /// Mutable view of channel `ci`'s plane.
+    fn plane_mut(&mut self, ci: usize) -> &mut [i32] {
+        let off = self.plane_off(ci);
+        &mut self.scratch.as_mut()[off..off + MAX_BLOCK]
     }
 
     /// Enable per-frame CRC verification. When on, a header CRC-8 or frame
@@ -309,7 +365,7 @@ impl<S: Source> FlacDecoder<S> {
 
     // -- frame / subframe decode ---------------------------------------------
 
-    /// Decode the next frame into `self.planes`, returning `Ok(false)` at a clean
+    /// Decode the next frame into the scratch planes, returning `Ok(false)` at a clean
     /// end of stream.
     fn decode_next_frame(&mut self) -> Result<bool, DecodeError> {
         if let Some(total) = self.total_samples {
@@ -458,7 +514,7 @@ impl<S: Source> FlacDecoder<S> {
     }
 
     /// Decode one subframe (channel `ci`, `bps` bits per sample) into
-    /// `self.planes[ci][..block]`.
+    /// `self.plane_mut(ci)[..block]`.
     fn decode_subframe(&mut self, ci: usize, bps: u32, block: usize) -> Result<(), DecodeError> {
         if self.read_bits(1)? != 0 {
             return Err(DecodeError::Malformed); // mandatory leading 0
@@ -484,7 +540,7 @@ impl<S: Source> FlacDecoder<S> {
                 }
                 self.read_warmup(ci, sbps, order)?;
                 self.decode_residual(ci, order, block)?;
-                Self::restore_fixed(&mut self.planes[ci], order, block);
+                Self::restore_fixed(self.plane_mut(ci), order, block);
             }
             t if t & 0b100_000 != 0 => {
                 let order = (t & 0b011_111) as usize + 1;
@@ -503,13 +559,13 @@ impl<S: Source> FlacDecoder<S> {
                     *slot = self.read_signed(precision)?;
                 }
                 self.decode_residual(ci, order, block)?;
-                Self::restore_lpc(&mut self.planes[ci], &coefs, order, block, shift as u32);
+                Self::restore_lpc(self.plane_mut(ci), &coefs, order, block, shift as u32);
             }
             _ => return Err(DecodeError::Unsupported), // reserved subframe type
         }
 
         if wasted > 0 {
-            for slot in self.planes[ci][..block].iter_mut() {
+            for slot in self.plane_mut(ci)[..block].iter_mut() {
                 *slot <<= wasted;
             }
         }
@@ -519,7 +575,7 @@ impl<S: Source> FlacDecoder<S> {
     /// CONSTANT subframe: one value repeated across the block.
     fn decode_constant(&mut self, ci: usize, bps: u32, block: usize) -> Result<(), DecodeError> {
         let v = self.read_signed(bps)?;
-        self.planes[ci][..block].fill(v);
+        self.plane_mut(ci)[..block].fill(v);
         Ok(())
     }
 
@@ -528,7 +584,7 @@ impl<S: Source> FlacDecoder<S> {
         let mut i = 0;
         while i < block {
             let v = self.read_signed(bps)?;
-            self.planes[ci][i] = v;
+            self.plane_mut(ci)[i] = v;
             i += 1;
         }
         Ok(())
@@ -539,13 +595,13 @@ impl<S: Source> FlacDecoder<S> {
         let mut i = 0;
         while i < order {
             let v = self.read_signed(bps)?;
-            self.planes[ci][i] = v;
+            self.plane_mut(ci)[i] = v;
             i += 1;
         }
         Ok(())
     }
 
-    /// Decode the Rice-coded residual into `self.planes[ci][order..block]`.
+    /// Decode the Rice-coded residual into `self.plane_mut(ci)[order..block]`.
     fn decode_residual(
         &mut self,
         ci: usize,
@@ -577,7 +633,7 @@ impl<S: Source> FlacDecoder<S> {
                 let n = self.read_bits(5)?;
                 for _ in 0..count {
                     let v = self.read_signed(n)?;
-                    self.planes[ci][idx] = v;
+                    self.plane_mut(ci)[idx] = v;
                     idx += 1;
                 }
             } else {
@@ -587,7 +643,7 @@ impl<S: Source> FlacDecoder<S> {
                     let r = self.read_bits(k)?;
                     let uval = (u64::from(q) << k) | u64::from(r);
                     let v = ((uval >> 1) as i64) ^ -((uval & 1) as i64);
-                    self.planes[ci][idx] = v as i32;
+                    self.plane_mut(ci)[idx] = v as i32;
                     idx += 1;
                 }
             }
@@ -596,8 +652,10 @@ impl<S: Source> FlacDecoder<S> {
     }
 
     /// Restore a FIXED subframe in place (residual → samples), using the standard
-    /// fixed polynomial predictor of the given order.
-    fn restore_fixed(plane: &mut [i32; MAX_BLOCK], order: usize, block: usize) {
+    /// fixed polynomial predictor of the given order. `plane` is a `MAX_BLOCK`-
+    /// long view carved from the caller's scratch (see [`Self::plane_mut`]), not
+    /// an inline array.
+    fn restore_fixed(plane: &mut [i32], order: usize, block: usize) {
         match order {
             0 => {}
             1 => {
@@ -630,8 +688,10 @@ impl<S: Source> FlacDecoder<S> {
     }
 
     /// Restore an LPC subframe in place: `s[i] = residual[i] + (Σ c[j]·s[i-1-j]) >> shift`.
+    /// `plane` is a `MAX_BLOCK`-long view carved from the caller's scratch (see
+    /// [`Self::plane_mut`]), not an inline array.
     fn restore_lpc(
-        plane: &mut [i32; MAX_BLOCK],
+        plane: &mut [i32],
         coefs: &[i32; MAX_ORDER],
         order: usize,
         block: usize,
@@ -647,32 +707,41 @@ impl<S: Source> FlacDecoder<S> {
     }
 
     /// Undo inter-channel decorrelation for the stereo assignment modes.
+    ///
+    /// Needs channels 0 and 1 simultaneously, so unlike the single-plane
+    /// methods above it computes both offsets first (an `&self` call that
+    /// completes before the `&mut` borrow below starts), then indexes one
+    /// `scratch.as_mut()` borrow at both offsets — never two overlapping
+    /// `&mut` borrows.
     fn apply_decorrelation(&mut self, ca: u32, block: usize) {
+        let off0 = self.plane_off(0);
+        let off1 = self.plane_off(1);
+        let scratch = self.scratch.as_mut();
         match ca {
             8 => {
                 // Left/side: ch0 = left, ch1 = side (= left − right) ⇒ right = left − side.
                 for i in 0..block {
-                    let l = i64::from(self.planes[0][i]);
-                    let s = i64::from(self.planes[1][i]);
-                    self.planes[1][i] = (l - s) as i32;
+                    let l = i64::from(scratch[off0 + i]);
+                    let s = i64::from(scratch[off1 + i]);
+                    scratch[off1 + i] = (l - s) as i32;
                 }
             }
             9 => {
                 // Right/side: ch0 = side (= left − right), ch1 = right ⇒ left = right + side.
                 for i in 0..block {
-                    let s = i64::from(self.planes[0][i]);
-                    let r = i64::from(self.planes[1][i]);
-                    self.planes[0][i] = (r + s) as i32;
+                    let s = i64::from(scratch[off0 + i]);
+                    let r = i64::from(scratch[off1 + i]);
+                    scratch[off0 + i] = (r + s) as i32;
                 }
             }
             10 => {
                 // Mid/side: ch0 = mid = (left+right)>>1, ch1 = side = left − right.
                 for i in 0..block {
-                    let side = i64::from(self.planes[1][i]);
+                    let side = i64::from(scratch[off1 + i]);
                     // Recover the LSB dropped by the mid's floor via the side's parity.
-                    let mid = (i64::from(self.planes[0][i]) << 1) | (side & 1);
-                    self.planes[0][i] = ((mid + side) >> 1) as i32;
-                    self.planes[1][i] = ((mid - side) >> 1) as i32;
+                    let mid = (i64::from(scratch[off0 + i]) << 1) | (side & 1);
+                    scratch[off0 + i] = ((mid + side) >> 1) as i32;
+                    scratch[off1 + i] = ((mid - side) >> 1) as i32;
                 }
             }
             _ => {} // independent channels: nothing to undo
@@ -680,7 +749,7 @@ impl<S: Source> FlacDecoder<S> {
     }
 }
 
-impl<S: Source> FlacDecoder<S> {
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> FlacDecoder<S, P> {
     /// Current playback position, in per-channel samples from the start (the
     /// index of the next sample `decode_into` will return).
     #[must_use]
@@ -697,7 +766,7 @@ impl<S: Source> FlacDecoder<S> {
     }
 }
 
-impl<S: Source> FlacDecoder<S> {
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> FlacDecoder<S, P> {
     /// Reset the bit reader + current-block cursors and set the decoded-sample
     /// baseline to `base`. Shared by every seek path so no stale byte/bit/plane
     /// from the pre-seek position can leak into the post-seek stream.
@@ -733,7 +802,7 @@ impl<S: Source> FlacDecoder<S> {
     }
 }
 
-impl<S: SeekSource> FlacDecoder<S> {
+impl<S: SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> FlacDecoder<S, P> {
     /// Seek to per-channel `sample` (sample-accurate). Returns the sample landed on
     /// (clamped to the stream length when known).
     ///
@@ -892,7 +961,9 @@ impl<S: SeekSource> FlacDecoder<S> {
     }
 }
 
-impl<S: SeekSource> SeekableDecoder for FlacDecoder<OggReader<S>> {
+impl<S: SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> SeekableDecoder
+    for FlacDecoder<OggReader<S>, P>
+{
     /// Seek **FLAC-in-Ogg** to per-channel `sample`, **sample-accurate** in
     /// **O(log n)**: the Ogg reader byte-bisects pages by granule
     /// ([`OggReader::seek_to_granule`]) to land just before the target, then the
@@ -918,8 +989,8 @@ impl<S: SeekSource> SeekableDecoder for FlacDecoder<OggReader<S>> {
     }
 }
 
-impl<S: SeekSource> SeekableDecoder
-    for FlacDecoder<crate::formats::matroska::MatroskaFlacReader<S>>
+impl<S: SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> SeekableDecoder
+    for FlacDecoder<crate::formats::matroska::MatroskaFlacReader<S>, P>
 {
     /// Seek **FLAC-in-Matroska** to per-channel `sample`: with a Cues index the
     /// Matroska reader jumps straight to the Cluster covering the target
@@ -952,7 +1023,7 @@ impl<S: SeekSource> SeekableDecoder
     }
 }
 
-impl<S: Source> Decoder for FlacDecoder<S> {
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for FlacDecoder<S, P> {
     fn stream_info(&self) -> StreamInfo {
         self.demux.stream_info()
     }
@@ -972,7 +1043,7 @@ impl<S: Source> Decoder for FlacDecoder<S> {
             }
             let frame = self.emit_i / ch;
             let c = self.emit_i % ch;
-            out[w] = self.planes[c][frame];
+            out[w] = self.plane_ref(c)[frame];
             self.emit_i += 1;
             w += 1;
         }
@@ -983,6 +1054,13 @@ impl<S: Source> Decoder for FlacDecoder<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scratch storage for `FlacDecoder::new_in` in this suite, sized via the
+    /// shared [`crate::dispatch::decoder_scratch_len`] helper — the same
+    /// storage `open()`'s callers provide.
+    fn scratch() -> Vec<i32> {
+        vec![0i32; crate::dispatch::decoder_scratch_len()]
+    }
     use crate::io::SliceSource;
 
     /// MSB-first bit writer for hand-building FLAC frames in tests.
@@ -1111,7 +1189,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(44_100, 1, 16, block as u64, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 16];
         let n = dec.decode_into(&mut out).unwrap();
         assert_eq!(n, block);
@@ -1135,7 +1213,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(44_100, 1, 16, samples.len() as u64, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 16];
         let n = dec.decode_into(&mut out).unwrap();
         assert_eq!(&out[..n], &samples);
@@ -1169,7 +1247,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(44_100, 1, 16, resid.len() as u64, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 8];
         let n = dec.decode_into(&mut out).unwrap();
         assert_eq!(&out[..n], &resid);
@@ -1187,7 +1265,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(44_100, 1, 16, expected.len() as u64, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 8];
         let n = dec.decode_into(&mut out).unwrap();
         assert_eq!(&out[..n], &expected);
@@ -1212,7 +1290,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(44_100, 1, 16, 6, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 8];
         let n = dec.decode_into(&mut out).unwrap();
         assert_eq!(&out[..n], &expected);
@@ -1237,7 +1315,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(44_100, 1, 16, resid.len() as u64, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 8];
         let n = dec.decode_into(&mut out).unwrap();
         assert_eq!(&out[..n], &resid);
@@ -1270,7 +1348,7 @@ mod tests {
             write_footer(&mut bw);
 
             let bytes = flac_file(44_100, 1, 16, block as u64, &bw.into_bytes());
-            let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+            let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
             let mut out = [0i32; 16];
             let n = dec.decode_into(&mut out).unwrap();
             assert_eq!(&out[..n], &expected[..]);
@@ -1304,7 +1382,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(44_100, 1, 16, 6, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 8];
         let n = dec.decode_into(&mut out).unwrap();
         assert_eq!(&out[..n], &expected);
@@ -1342,7 +1420,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(44_100, 1, 16, 8, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 8];
         let n = dec.decode_into(&mut out).unwrap();
         assert_eq!(&out[..n], &expected);
@@ -1374,7 +1452,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(44_100, 1, 16, expected.len() as u64, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 8];
         let n = dec.decode_into(&mut out).unwrap();
         assert_eq!(&out[..n], &expected);
@@ -1423,7 +1501,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(44_100, 1, 16, block as u64, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 8];
         let n = dec.decode_into(&mut out).unwrap();
         assert_eq!(n, block);
@@ -1447,7 +1525,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(44_100, 1, 16, block as u64, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 8];
         let n = dec.decode_into(&mut out).unwrap();
         assert!(out[..n].iter().all(|&s| s == base << 3));
@@ -1488,7 +1566,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(44_100, 2, 16, 4, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 8];
         let n = dec.decode_into(&mut out).unwrap();
         assert_eq!(n, 8);
@@ -1514,7 +1592,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(44_100, 2, 16, 3, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 8];
         let n = dec.decode_into(&mut out).unwrap();
         let expected = [left[0], right[0], left[1], right[1], left[2], right[2]];
@@ -1536,7 +1614,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(44_100, 2, 16, 3, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 8];
         let n = dec.decode_into(&mut out).unwrap();
         let expected = [left[0], right[0], left[1], right[1], left[2], right[2]];
@@ -1553,7 +1631,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(44_100, 2, 16, 3, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 8];
         let n = dec.decode_into(&mut out).unwrap();
         assert_eq!(&out[..n], &[1, -1, 2, -2, 3, -3]);
@@ -1574,7 +1652,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(44_100, 1, 16, block as u64, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 3];
         let mut total = 0;
         loop {
@@ -1606,7 +1684,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(44_100, 1, 16, 0, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 16];
         let n = dec.decode_into(&mut out).unwrap();
         assert_eq!(n, 8);
@@ -1631,7 +1709,7 @@ mod tests {
         write_footer(&mut bw);
 
         let bytes = flac_file(48_000, 1, 16, block as u64, &bw.into_bytes());
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         assert_eq!(dec.stream_info().sample_rate, 48_000);
         assert_eq!(dec.stream_info().channels, 1);
         assert_eq!(dec.stream_info().format, SampleFormat::Int { bits: 16 });
@@ -1729,14 +1807,14 @@ mod tests {
         (v, ramp)
     }
 
-    fn read_n(dec: &mut FlacDecoder<SliceSource<'_>>, n: usize) -> Vec<i32> {
+    fn read_n(dec: &mut FlacDecoder<SliceSource<'_>, Vec<i32>>, n: usize) -> Vec<i32> {
         let mut out = vec![0i32; n];
         let got = dec.decode_into(&mut out).unwrap();
         out.truncate(got);
         out
     }
 
-    fn drain(dec: &mut FlacDecoder<SliceSource<'_>>) -> Vec<i32> {
+    fn drain(dec: &mut FlacDecoder<SliceSource<'_>, Vec<i32>>) -> Vec<i32> {
         let mut all = Vec::new();
         let mut buf = [0i32; 16];
         loop {
@@ -1753,7 +1831,7 @@ mod tests {
     fn seek_round_trip_with_seektable() {
         let (bytes, ramp) = ramp_flac(40, 8, true); // 5 frames
         for &n in &[0u64, 1, 8, 15, 24, 39] {
-            let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+            let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
             assert_eq!(dec.seek_to(n).unwrap(), n);
             let got = read_n(&mut dec, 6);
             assert_eq!(
@@ -1769,7 +1847,7 @@ mod tests {
         // No SEEKTABLE → O(log n) frame bisection; must stay sample-accurate.
         let (bytes, ramp) = ramp_flac(40, 8, false);
         for &n in &[0u64, 3, 8, 20, 39] {
-            let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+            let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
             assert_eq!(dec.seek_to(n).unwrap(), n);
             let got = read_n(&mut dec, 5);
             assert_eq!(
@@ -1819,7 +1897,7 @@ mod tests {
                 inner: SliceSource::new(&bytes),
                 bytes: counter.clone(),
             };
-            let mut dec = FlacDecoder::new(src).unwrap();
+            let mut dec = FlacDecoder::new_in(src, scratch()).unwrap();
             assert_eq!(dec.seek_to(target).unwrap(), target, "seek({target})");
             let mut out = [0i32; 1];
             assert_eq!(dec.decode_into(&mut out).unwrap(), 1);
@@ -1856,7 +1934,7 @@ mod tests {
     fn seek_exhaustive_per_sample() {
         let (bytes, ramp) = ramp_flac(24, 4, true);
         for n in 0..24u64 {
-            let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+            let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
             assert_eq!(dec.seek_to(n).unwrap(), n);
             assert_eq!(read_n(&mut dec, 1), &ramp[n as usize..n as usize + 1]);
         }
@@ -1865,7 +1943,7 @@ mod tests {
     #[test]
     fn seek_to_zero_after_partial_matches_fresh() {
         let (bytes, ramp) = ramp_flac(40, 8, true);
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let _ = read_n(&mut dec, 13); // partial decode leaves internal state
         assert_eq!(dec.seek_to(0).unwrap(), 0);
         assert_eq!(drain(&mut dec), ramp); // no stale samples after seek(0)
@@ -1874,7 +1952,7 @@ mod tests {
     #[test]
     fn seek_backward_and_repeated() {
         let (bytes, ramp) = ramp_flac(48, 8, true);
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let _ = read_n(&mut dec, 30);
         assert_eq!(dec.seek_to(4).unwrap(), 4); // backward
         assert_eq!(read_n(&mut dec, 3), &ramp[4..7]);
@@ -1887,7 +1965,7 @@ mod tests {
     #[test]
     fn seek_beyond_end_reads_zero() {
         let (bytes, _) = ramp_flac(40, 8, true);
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         assert_eq!(dec.seek_to(40).unwrap(), 40); // exact end → clamp
         assert_eq!(dec.position(), 40);
         assert_eq!(dec.decode_into(&mut [0i32; 8]).unwrap(), 0);
@@ -1898,7 +1976,7 @@ mod tests {
     #[test]
     fn seek_to_time_converts_seconds() {
         let (bytes, ramp) = ramp_flac(40, 8, true); // 44_100 Hz
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         // 0.0004 s × 44_100 = 17.64 → sample 18.
         assert_eq!(dec.seek_to_time(0.0004).unwrap(), 18);
         assert_eq!(read_n(&mut dec, 1), &ramp[18..19]);
@@ -1907,7 +1985,7 @@ mod tests {
     #[test]
     fn position_tracks_seek_and_reads() {
         let (bytes, _) = ramp_flac(40, 8, true);
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         assert_eq!(dec.position(), 0);
         dec.seek_to(17).unwrap();
         assert_eq!(dec.position(), 17); // before any read
@@ -1954,7 +2032,7 @@ mod tests {
         let samples = [10i16, -20, 30, -40];
         let frame = frame_with_valid_crc(&samples);
         let bytes = flac_file(44_100, 1, 16, samples.len() as u64, &frame);
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         dec.set_validate_crc(true);
         let mut out = [0i32; 8];
         assert_eq!(dec.decode_into(&mut out).unwrap(), 4);
@@ -1967,7 +2045,7 @@ mod tests {
         let frame = frame_with_valid_crc(&samples);
         let mut bytes = flac_file(44_100, 1, 16, samples.len() as u64, &frame);
         bytes[FRAME_OFF + 7] ^= 0xFF; // corrupt the stored header CRC-8
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         dec.set_validate_crc(true);
         assert_eq!(dec.decode_into(&mut [0i32; 8]), Err(DecodeError::Malformed));
     }
@@ -1978,7 +2056,7 @@ mod tests {
         let frame = frame_with_valid_crc(&samples);
         let mut bytes = flac_file(44_100, 1, 16, samples.len() as u64, &frame);
         bytes[FRAME_OFF + 9] ^= 0xFF; // corrupt a subframe data byte (after header)
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         dec.set_validate_crc(true);
         assert_eq!(dec.decode_into(&mut [0i32; 8]), Err(DecodeError::Malformed));
     }
@@ -1990,13 +2068,18 @@ mod tests {
         let mut bytes = flac_file(44_100, 1, 16, samples.len() as u64, &frame);
         bytes[FRAME_OFF + 7] ^= 0xFF; // corrupt the stored CRC-8
         // Default (validation off): the corrupt CRC is ignored, decode proceeds.
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         let mut out = [0i32; 8];
         assert_eq!(dec.decode_into(&mut out).unwrap(), 4);
     }
 
     // -- multichannel ---------------------------------------------------------
 
+    /// Desktop profile only: `embedded-profile` tightens [`MAX_CHANNELS`] to
+    /// stereo (decoder-memory externalization spec, Lever A), so a 4-channel
+    /// FLAC stream is a graceful `Unsupported` there instead — skip rather
+    /// than assert a decode that profile intentionally refuses.
+    #[cfg(not(feature = "embedded-profile"))]
     #[test]
     fn decodes_4_independent_channels() {
         // FLAC >2 channels are always independent (decorrelation is stereo-only).
@@ -2016,7 +2099,7 @@ mod tests {
         write_footer(&mut bw);
         let bytes = flac_file(96_000, channels, 16, block as u64, &bw.into_bytes());
 
-        let mut dec = FlacDecoder::new(SliceSource::new(&bytes)).unwrap();
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         assert_eq!(dec.stream_info().channels, 4);
         let mut out = [0i32; 32];
         let n = dec.decode_into(&mut out).unwrap();
@@ -2027,6 +2110,20 @@ mod tests {
                 assert_eq!(out[i * 4 + c], (c as i32) * 100 + i as i32);
             }
         }
+    }
+
+    /// Embedded profile only: the inverse of `decodes_4_independent_channels`
+    /// above — under the stereo `MAX_CHANNELS` cap, the same 4-channel stream
+    /// must be a clean `Unsupported` at construction, never a panic
+    /// (decoder-memory externalization spec §5 acceptance gate).
+    #[cfg(feature = "embedded-profile")]
+    #[test]
+    fn embedded_profile_rejects_more_than_stereo() {
+        let bytes = flac_file(44_100, 4, 16, 0, &[]);
+        assert_eq!(
+            FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).err(),
+            Some(DecodeError::Unsupported)
+        );
     }
 }
 
@@ -2039,10 +2136,16 @@ mod ogg_seek_tests {
 
     const OGG: &[u8] = include_bytes!("../../testdata/flac-in-ogg.ogg");
 
-    type Dec = FlacDecoder<OggReader<SliceSource<'static>>>;
+    /// Scratch storage for `FlacDecoder::new_in` in this suite (see the
+    /// sibling helper in `mod tests`).
+    fn scratch() -> Vec<i32> {
+        vec![0i32; crate::dispatch::decoder_scratch_len()]
+    }
+
+    type Dec = FlacDecoder<OggReader<SliceSource<'static>>, Vec<i32>>;
 
     fn mk() -> Dec {
-        FlacDecoder::new(OggReader::new(SliceSource::new(OGG)).unwrap()).unwrap()
+        FlacDecoder::new_in(OggReader::new(SliceSource::new(OGG)).unwrap(), scratch()).unwrap()
     }
 
     fn drain(d: &mut Dec) -> Vec<i32> {
@@ -2116,8 +2219,8 @@ mod ogg_seek_tests {
     //          -c:a flac -f ogg flac-in-ogg-multipage.ogg
     const OGG_MP: &[u8] = include_bytes!("../../testdata/flac-in-ogg-multipage.ogg");
 
-    fn mk_mp() -> FlacDecoder<OggReader<SliceSource<'static>>> {
-        FlacDecoder::new(OggReader::new(SliceSource::new(OGG_MP)).unwrap()).unwrap()
+    fn mk_mp() -> FlacDecoder<OggReader<SliceSource<'static>>, Vec<i32>> {
+        FlacDecoder::new_in(OggReader::new(SliceSource::new(OGG_MP)).unwrap(), scratch()).unwrap()
     }
 
     /// Seeking into later pages must byte-bisect to a mid-stream page and still
