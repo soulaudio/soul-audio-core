@@ -262,6 +262,22 @@ fn device_by_name(name: &str) -> Option<wasapi::Device> {
     None
 }
 
+/// The exclusive buffer period (in 100 ns units, "hns") to request, given the device's
+/// `default_period`. Sized for RELIABLE playback, not minimum latency: the event-driven
+/// render thread is woken at the OS scheduler's granularity (~10 ms on Windows, up to
+/// ~15.6 ms with a coarse timer), so a buffer smaller than that chronically UNDERRUNS —
+/// the device drains its buffer, starves until the thread is next serviced, and the
+/// stream's effective sample rate collapses to `buffer_frames / servicing_interval`. A
+/// 4.33 ms period (the old `3·min_period/2`) serviced every ~10 ms clocked at ~0.43× =
+/// playback ~2.3× slow and distorted (the reported bug). A music player needs no low
+/// latency, so target a period comfortably above the servicing granularity, and never
+/// below the device's own default. Pure + device-free so the floor is unit-tested.
+fn playback_period_hns(default_period: i64) -> i64 {
+    /// 30 ms in hns — safely above the ~10–15.6 ms Windows thread-servicing quantum.
+    const PLAYBACK_PERIOD_HNS: i64 = 300_000;
+    default_period.max(PLAYBACK_PERIOD_HNS)
+}
+
 /// Open + configure the exclusive client (all COM, on the render thread). Returns the
 /// live client/render/event plus the negotiated format shape.
 #[allow(clippy::type_complexity)]
@@ -306,11 +322,11 @@ fn open_client(
     }
     let fmt = picked.ok_or(ExclusiveError::Unsupported)?;
 
-    let (_default_period, min_period) = client
+    let (default_period, _min_period) = client
         .get_device_period()
         .map_err(|e| ExclusiveError::Other(format!("device period: {e}")))?;
     let period = client
-        .calculate_aligned_period_near(3 * min_period / 2, Some(128), &fmt)
+        .calculate_aligned_period_near(playback_period_hns(default_period), Some(128), &fmt)
         .map_err(|e| ExclusiveError::Other(format!("align period: {e}")))?;
     client
         .initialize_client(
@@ -505,6 +521,34 @@ mod tests {
     //! Device-free checks of the bit-perfect sample packing — the exact bytes a DAC
     //! receives, verified without any WASAPI device.
     use super::*;
+
+    #[test]
+    fn playback_period_is_never_below_the_scheduler_safe_floor() {
+        // Regression guard for the "exclusive plays ~2.3× slow / distorted" underrun: the
+        // buffer period must stay comfortably above the OS thread-servicing granularity.
+        // A device default BELOW the 30 ms floor is raised to it; the old 4.33 ms /
+        // 10 ms-ish values would underrun.
+        assert_eq!(
+            playback_period_hns(100_000),
+            300_000,
+            "a 10 ms device default is raised to the 30 ms floor"
+        );
+        assert_eq!(
+            playback_period_hns(45_000),
+            300_000,
+            "the old ~4.5 ms target is raised to the 30 ms floor"
+        );
+        assert!(
+            playback_period_hns(30_000) >= 300_000,
+            "never below the scheduler-safe floor"
+        );
+        // A device that itself prefers a LARGER period is respected (don't shrink it).
+        assert_eq!(
+            playback_period_hns(500_000),
+            500_000,
+            "a larger device default period is kept"
+        );
+    }
 
     #[test]
     fn pack_sample_is_bit_perfect_per_format() {
