@@ -250,7 +250,7 @@ impl Sink for WasapiExclusiveSink {
 /// Find an output device by its friendly name, or `None` to fall through to the caller.
 fn device_by_name(name: &str) -> Option<wasapi::Device> {
     let enumerator = DeviceEnumerator::new().ok()?;
-    let collection = enumerator.get_device_collection(&Direction::Render).ok()?;
+    let collection = enumerator.get_device_collection(Direction::Render).ok()?;
     let count = collection.get_nbr_devices().ok()?;
     for i in 0..count {
         if let Ok(dev) = collection.get_device_at_index(i)
@@ -304,7 +304,7 @@ fn open_client(
     let device = match name {
         Some(n) => device_by_name(&n).ok_or(ExclusiveError::NoDevice)?,
         None => DeviceEnumerator::new()
-            .and_then(|e| e.get_default_device(&Direction::Render))
+            .and_then(|e| e.get_default_device(Direction::Render))
             .map_err(|_| ExclusiveError::NoDevice)?,
     };
     let mut client = device
@@ -314,7 +314,7 @@ fn open_client(
     // Pick the widest exclusive format the device accepts at the source rate.
     let mut picked: Option<WaveFormat> = None;
     for &(store, valid, st) in CANDIDATES {
-        let want = WaveFormat::new(store, valid, &st, rate as usize, channels as usize, None);
+        let want = WaveFormat::new(store, valid, st, rate as usize, channels as usize, None);
         if let Ok(ok) = client.is_supported_exclusive_with_quirks(&want) {
             picked = Some(ok);
             break;
@@ -331,8 +331,9 @@ fn open_client(
     client
         .initialize_client(
             &fmt,
-            &Direction::Render,
-            &StreamMode::EventsExclusive { period_hns: period },
+            Direction::Render,
+            StreamMode::EventsExclusive { period_hns: period },
+            None,
         )
         .map_err(|e| map_init_error(&e))?;
 
@@ -513,7 +514,7 @@ fn write_block(
         let off = i * bps;
         pack_sample(s, st, store_bits, &mut buf[off..off + bps]);
     }
-    let _ = render.write_to_device(frames as usize, &buf, None);
+    let _ = render.write_to_device(&buf, None);
 }
 
 #[cfg(test)]
