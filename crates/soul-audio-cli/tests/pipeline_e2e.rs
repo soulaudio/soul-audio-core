@@ -20,7 +20,7 @@
 //! `OwnedDecoder` is large by value, so the pipeline runs on a big-stack thread.
 
 use soul_audio_core::{
-    Deck, Equalizer, Progress, Quality, SampleFormat, Sink, SinkError, StreamInfo,
+    Deck, Decoder, Equalizer, Progress, Quality, SampleFormat, Sink, SinkError, StreamInfo,
 };
 use soul_audio_desktop::{OwnedDecoder, open_track};
 use soul_audio_eq::{Band, BandKind, MAX_BANDS, design};
@@ -548,4 +548,89 @@ fn pipeline_matches_ffmpeg_decode() {
         snr > 40.0,
         "pipeline output diverges from ffmpeg's decode: LEFT SNR {snr:.1} dB (<40 dB)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Every-format × {shared, exclusive} matrix
+// ---------------------------------------------------------------------------
+
+/// Every committed single-tone fixture, one per decoder + the key container / bit-depth
+/// / codec variants. All carry the same 440 Hz(L) / 659.25 Hz(R) tone. (Mono `tone-mono.wv`
+/// is excluded — it upmixes to a mono-on-both-channels signal, not the two-tone; MPEG
+/// Layer I `tone-layer1.mp1` is excluded — a known-garbled rarely-used format, as in the
+/// -ng signal gate.)
+const FORMATS: &[&str] = &[
+    // PCM: int, float, byte-swapped, companded, CAF
+    "tone.wav",
+    "tone-f32.wav",
+    "tone-aiff.aiff",
+    "tone-aifc-sowt.aifc",
+    "tone-aiff-fl32.aifc",
+    "tone-aiff-alaw.aifc",
+    "tone-aiff-ulaw.aifc",
+    "tone.caf",
+    "tone-caf-f32.caf",
+    // Lossless: FLAC (native + Matroska), WavPack (16/24), ALAC (MP4 + CAF)
+    "tone.flac",
+    "tone-flac.mka",
+    "tone.wv",
+    "tone-24.wv",
+    "tone.m4a",
+    "tone-alac.caf",
+    // Lossy: MP3, MP2, AAC-LC (ADTS/MP4/Matroska), HE-AAC SBR, Opus, Vorbis
+    "tone.mp3",
+    "tone.mp2",
+    "tone.aac",
+    "tone-aac.m4a",
+    "tone-aac.mka",
+    "tone-sbr.m4a",
+    "tone.opus",
+    "tone-opus.webm",
+    "tone.ogg",
+    "tone-vorbis.mka",
+    // DSD: DSF / DFF / DSD128 / 256 / 512
+    "tone.dsf",
+    "tone.dff",
+    "tone-dsd128.dsf",
+    "tone-dsd256.dsf",
+    "tone-dsd512.dsf",
+];
+
+/// The track's native decoded rate — decode one block first so HE-AAC SBR's post-first-
+/// frame rate flip (44.1 → 88.2 kHz) is reflected.
+fn native_rate(file: &str) -> u32 {
+    let file = file.to_string();
+    on_big_stack(move || {
+        let mut dec = open_track(&testdata(&file)).expect("open_track");
+        let mut buf = vec![0i32; 8192];
+        let _ = dec.decode_into(&mut buf);
+        dec.stream_info().sample_rate
+    })
+}
+
+/// THE exclusive-output coverage gate: EVERY format must produce the correct tone both
+/// SHARED (resampled to a 48 kHz device) AND EXCLUSIVE (the sink at the track's native
+/// rate → the deck's resampler is skipped entirely → bit-perfect). Proves exclusive /
+/// bit-perfect output works for the whole codec set, not just one fixture.
+#[test]
+fn every_format_plays_correctly_shared_and_exclusive() {
+    for &f in FORMATS {
+        // SHARED — 48 kHz device, the deck resamples the track rate up/down to it.
+        let shared = run_pipeline(f, CaptureSink::shared(48_000), |s| s.written.clone());
+        assert_two_tone(&format!("{f} shared@48k"), &shared, 48_000);
+
+        // EXCLUSIVE — the sink is the track's NATIVE rate, so src_rate == sink_rate and
+        // the deck bypasses the resampler (bit-perfect). Captured wholly at `native`.
+        let native = native_rate(f);
+        let fname = f.to_string();
+        let excl = on_big_stack(move || {
+            let dec = open_track(&testdata(&fname)).expect("open_track");
+            let mut deck: Deck<CaptureSink, OwnedDecoder, 0> =
+                Deck::new(CaptureSink::exclusive(native), Quality::Hq);
+            deck.load(dec).expect("load");
+            pump_to_end(&mut deck);
+            deck.sink().written.clone()
+        });
+        assert_two_tone(&format!("{f} exclusive@{native}"), &excl, native);
+    }
 }
