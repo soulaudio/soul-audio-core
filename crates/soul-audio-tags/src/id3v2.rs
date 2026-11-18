@@ -243,6 +243,7 @@ fn map_frame_id(id: &str) -> Option<Field> {
         "TSOP" | "TSP" => Some(Field::ArtistSort),
         "TSO2" => Some(Field::AlbumArtistSort),
         "TDRC" | "TYER" | "TYE" => Some(Field::Date),
+        "TDOR" | "TORY" => Some(Field::OriginalDate),
         "TCON" | "TCO" => Some(Field::Genre),
         "TCOM" | "TCM" => Some(Field::Composer),
         _ => None,
@@ -1061,6 +1062,33 @@ mod tests {
             c.fields
                 .iter()
                 .any(|(f, k, v)| f.is_none() && k == "some_other_desc" && v == "ignored")
+        );
+    }
+
+    #[test]
+    fn id3v2_emits_both_date_and_original_date() {
+        // TDRC (release date) and TDOR (original-release date) coexist on a
+        // reissue/remaster — both must surface as distinct fields.
+        let tag = id3v24(&[
+            text_frame_v24(b"TDRC", "2015"),
+            text_frame_v24(b"TDOR", "1973"),
+        ]);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        read_id3v2(&mut SliceSource::new(&tag), &mut scratch, &mut c).unwrap();
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::Date) && v == "2015"),
+            "TDRC -> Date: {:?}",
+            c.fields
+        );
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::OriginalDate) && v == "1973"),
+            "TDOR -> OriginalDate: {:?}",
+            c.fields
         );
     }
 

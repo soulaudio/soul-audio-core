@@ -154,6 +154,10 @@ fn map_key(key: &[u8]) -> Option<Field> {
         Some(Field::Album)
     } else if key.eq_ignore_ascii_case(b"year") || key.eq_ignore_ascii_case(b"date") {
         Some(Field::Date)
+    } else if key.eq_ignore_ascii_case(b"original date")
+        || key.eq_ignore_ascii_case(b"original year")
+    {
+        Some(Field::OriginalDate)
     } else if key.eq_ignore_ascii_case(b"genre") {
         Some(Field::Genre)
     } else {
