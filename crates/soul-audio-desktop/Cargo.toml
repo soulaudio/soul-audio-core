@@ -35,5 +35,5 @@ optional = true
 # WASAPI exclusive-mode backend (Windows only, MIT-licensed). Opens the DAC with
 # AUDCLNT_SHAREMODE_EXCLUSIVE for bit-perfect output, bypassing the OS mixer.
 [target.'cfg(windows)'.dependencies.wasapi]
-version = "0.22"
+version = "0.27"
 optional = true
