@@ -96,6 +96,7 @@ impl Default for FolderRec {
 /// date. Pure integer bit-ops only — `no_std`, no-alloc, no float (this type is
 /// read by the DAP's on-device index reader).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PackedDate(pub u32);
 
 impl PackedDate {
@@ -297,5 +298,24 @@ mod packed_date_tests {
         assert!(PackedDate::new(1973, 1, 1).sort_key() < PackedDate::new(1973, 12, 1).sort_key());
         // Any known date sorts before unknown.
         assert!(PackedDate::from_year(2200).sort_key() < PackedDate::UNKNOWN.sort_key());
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod packed_date_serde_tests {
+    use super::PackedDate;
+
+    /// `PackedDate` is a bare `u32` newtype — it must serialize transparently as
+    /// the plain integer (not a wrapped object) and round-trip exactly, since
+    /// `soul-audio-import`'s `RawTrack`/`ScanCache` embed it in the persisted
+    /// warm-scan cache.
+    #[test]
+    fn serializes_as_a_bare_u32_and_round_trips() {
+        let d = PackedDate::new(1973, 8, 7);
+        let json = serde_json::to_string(&d).expect("serialize");
+        assert_eq!(json, d.0.to_string());
+
+        let back: PackedDate = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, d);
     }
 }

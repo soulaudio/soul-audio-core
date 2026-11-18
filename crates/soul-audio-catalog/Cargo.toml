@@ -13,7 +13,23 @@ workspace = true
 default = []
 alloc = []
 std = ["alloc"]
+# Opt-in serde impls on PackedDate (the `-ng` head enables this transitively via
+# soul-audio-import's `serde` feature, to persist the warm scan cache). Off by
+# default so the no_std / no-alloc surface is unaffected — a bare `u32` newtype
+# needs no alloc even with serde on.
+serde = ["dep:serde"]
 
 [dependencies]
 soul-audio-core = { path = "../soul-audio-core" }
 embedded-io = { workspace = true }
+
+[dependencies.serde]
+version = "1"
+optional = true
+default-features = false
+features = ["derive"]
+
+[dev-dependencies]
+# Test-only: exercise PackedDate's serde impl through a concrete JSON
+# serializer (the desktop's choice). Not part of the crate's own dep surface.
+serde_json = "1"
