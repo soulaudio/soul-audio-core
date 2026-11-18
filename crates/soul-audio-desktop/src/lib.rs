@@ -5,6 +5,7 @@
 //! device-format conversion lives in `soul_audio_core::convert`; the sink calls
 //! it, so a future DMA sink shares the same math.
 #![forbid(unsafe_code)]
+#![deny(unconditional_recursion)]
 
 pub mod decoder;
 #[cfg(feature = "playback")]

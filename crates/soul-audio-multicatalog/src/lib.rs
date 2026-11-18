@@ -28,6 +28,7 @@
 //! baking the union. Ties break deterministically by `(source, local_track_id)`.
 //! Each axis is materialized lazily into a cached `Vec` of compound ids.
 #![forbid(unsafe_code)]
+#![deny(unconditional_recursion)]
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;

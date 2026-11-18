@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
+#![deny(unconditional_recursion)]
 
 //! `soul-audio-engine` — the portable playback queue on top of
 //! [`soul_audio_core::Deck`]. The [`Engine`] drives a [`Deck`] from a

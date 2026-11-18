@@ -11,6 +11,7 @@
 //! `docs/superpowers/specs/2026-11-08-shared-catalog-index-architecture.md`.
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
+#![deny(unconditional_recursion)]
 
 // (The `alloc`/`std` features are reserved for a future desktop in-RAM model +
 // grouping logic; the ports + record shapes here are no-alloc.)

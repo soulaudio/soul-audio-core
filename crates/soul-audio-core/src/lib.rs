@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
+#![deny(unconditional_recursion)]
 
 //! `soul-audio-core` — a strict `no_std`, no-alloc audio decode core.
 //!

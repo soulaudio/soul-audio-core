@@ -1,5 +1,6 @@
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![forbid(unsafe_code)]
+#![deny(unconditional_recursion)]
 
 //! `soul-audio-queue` — a portable `no_std` two-level Up-Next playback queue that
 //! implements [`soul_audio_engine::Sequencer`]. The source context is virtual
