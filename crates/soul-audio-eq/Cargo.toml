@@ -15,3 +15,9 @@ soul-audio-core = { path = "../soul-audio-core" }
 # Software transcendentals (sin/cos/pow/sqrt/log) so the RBJ design runs no_std on
 # the DAP exactly as on the desktop. Pure Rust, no_std, cross-builds to thumbv7em.
 libm = "0.2"
+
+[dev-dependencies]
+# FFT for the frequency-response fidelity tests (tests/response.rs): measure the
+# APPLIED biquad (via core's Equalizer) and cross-check it against the analytical
+# magnitude the crate reports for the UI plot. Host test only — never shipped.
+rustfft = "6"

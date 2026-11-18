@@ -1948,6 +1948,7 @@ dependencies = [
  "soul-audio-core",
  "soul-audio-desktop",
  "soul-audio-engine",
+ "soul-audio-eq",
 ]
 
 [[package]]
@@ -2002,6 +2003,7 @@ name = "soul-audio-eq"
 version = "0.1.0"
 dependencies = [
  "libm",
+ "rustfft",
  "soul-audio-core",
 ]
 
