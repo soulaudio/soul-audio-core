@@ -27,7 +27,9 @@
 use std::time::Instant;
 
 use soul_audio_core::Sink;
-use soul_audio_desktop::{WasapiExclusiveSink, default_output_config, default_output_device_name};
+use soul_audio_desktop::{
+    WasapiExclusiveSink, default_output_config, default_output_device_name, output_device_names,
+};
 
 /// Soft tone amplitude (~0.07 of 24-bit full scale) — audible but gentle.
 const AMP: f32 = 600_000.0;
@@ -92,42 +94,53 @@ fn check(sink: &mut WasapiExclusiveSink, stage: &str) {
 }
 
 #[test]
-#[ignore = "touches a real output device; run with --ignored"]
+#[ignore = "touches real output devices; run with --ignored"]
 fn wasapi_effective_clock_matches_reported_rate_across_reopens() {
-    let name = default_output_device_name();
-    let Some((def_rate, channels)) = default_output_config(name.as_deref()) else {
-        println!("no default output device — skipping");
-        return;
-    };
-    println!("\n=== clock probe on {name:?} (default {def_rate} Hz, {channels}ch) ===");
-
-    let mut sink = match WasapiExclusiveSink::open(name.clone(), def_rate, channels) {
-        Ok(s) => s,
-        Err(e) => {
-            println!("device has no exclusive mode ({e:?}) — skipping");
-            return;
-        }
-    };
-
-    // 1) Initial open at the device default rate.
-    check(&mut sink, &format!("open@{def_rate}"));
-
-    // 2) Native-rate reopen to each standard rate the app switches to per track.
-    for &rate in &[44_100u32, 96_000, def_rate] {
-        if rate == sink.stream_info().sample_rate {
+    // Measure the clock on EVERY exclusive-capable device, not just the default — the
+    // default may be a Bluetooth / shared-only device (no exclusive mode), and we
+    // specifically want to validate the bit-perfect path on a real exclusive DAC/speaker.
+    let mut names: Vec<Option<String>> = output_device_names().into_iter().map(Some).collect();
+    if names.is_empty() {
+        names.push(default_output_device_name());
+    }
+    let mut tested = 0usize;
+    for name in names {
+        let Some((def_rate, channels)) = default_output_config(name.as_deref()) else {
             continue;
-        }
-        match sink.reopen(rate) {
-            Ok(()) => {
-                let landed = sink.stream_info().sample_rate;
-                if landed != rate {
-                    println!("  reopen to {rate} landed on {landed} (device refused) — skipped");
-                    continue;
-                }
-                check(&mut sink, &format!("reopen@{rate}"));
+        };
+        let mut sink = match WasapiExclusiveSink::open(name.clone(), def_rate, channels) {
+            Ok(s) => s,
+            Err(_) => continue, // not exclusive-capable (e.g. Bluetooth) — skip
+        };
+        println!("\n=== clock probe on {name:?} ({def_rate} Hz, {channels}ch) ===");
+        tested += 1;
+
+        // 1) Initial open at the device default rate.
+        check(&mut sink, &format!("open@{def_rate}"));
+
+        // 2) Native-rate reopen to each standard rate the app switches to per track.
+        for &rate in &[44_100u32, 96_000, def_rate] {
+            if rate == sink.stream_info().sample_rate {
+                continue;
             }
-            Err(e) => println!("  reopen to {rate} failed ({e:?}) — skipped"),
+            match sink.reopen(rate) {
+                Ok(()) => {
+                    let landed = sink.stream_info().sample_rate;
+                    if landed != rate {
+                        println!(
+                            "  reopen to {rate} landed on {landed} (device refused) — skipped"
+                        );
+                        continue;
+                    }
+                    check(&mut sink, &format!("reopen@{rate}"));
+                }
+                Err(e) => println!("  reopen to {rate} failed ({e:?}) — skipped"),
+            }
         }
     }
-    println!("=== clock probe done: device clock matches reported rate at every stage ===");
+    if tested == 0 {
+        println!("no exclusive-capable output device present — nothing to validate");
+    } else {
+        println!("\n=== clock probe done: {tested} device(s) clock matches reported rate ===");
+    }
 }
