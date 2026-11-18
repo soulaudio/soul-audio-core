@@ -106,11 +106,15 @@ fn synth(n: u32) -> CatalogInput {
         })
         .collect();
     let album_metas = (0..albums)
-        .map(|a| AlbumMeta {
-            title: format!("Album {a:05}"),
-            album_artist: a % artists,
-            year: 1960 + (a % 60) as u16,
-            folder: a,
+        .map(|a| {
+            let year = 1960 + (a % 60) as u16;
+            AlbumMeta {
+                title: format!("Album {a:05}"),
+                album_artist: a % artists,
+                original_date: soul_audio_catalog::PackedDate::from_year(year),
+                release_date: soul_audio_catalog::PackedDate::from_year(year),
+                folder: a,
+            }
         })
         .collect();
     let tracks = (0..n)

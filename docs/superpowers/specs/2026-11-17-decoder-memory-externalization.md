@@ -1,0 +1,306 @@
+# Decoder memory externalization — shrinking `AnyDecoder` for bare metal
+
+> Spec. Target consumer: the SoulAudio DAP (STM32H7A3ZI — 1.18 MB DMA-capable
+> AXI SRAM, 128 KB DTCM, `forbid(unsafe_code)`, no-alloc). Goal: make the
+> decoder-open path fit on-target by shrinking `AnyDecoder` so moving it is
+> cheap. Branch: `feat/embedded-profile`.
+
+## 1. Problem — measured, not assumed
+
+The DAP consumer measured the **transient stack** of its open→decode→pump path
+(release build, host x86_64, player off-stack ≈ board `StaticCell`), bisected
+one child-process per candidate size:
+
+| Scenario | open→decode→pump peak stack |
+|---|---|
+| release, player on stack | ~2.1 MB |
+| **release, player off-stack (board-representative)** | **~1.44 MB** |
+
+Format-agnostic (WAV/FLAC/MP3 identical) → the cost is **decoder construction**,
+not decode scratch. **1.44 MB exceeds the H7A3's entire 1.18 MB AXI SRAM.**
+
+Root cause: `AnyDecoder` is **262 KB** and is moved **by value** ~5× through the
+open chain — `dispatch::open_seekable` (returns it) → `Engine::provide(decoder)`
+→ `Deck::load(decoder)` → `build_track(decoder)` → stored. Each hop is a real
+`memcpy` (the optimizer does not elide them). ~5 × 262 KB ≈ 1.44 MB.
+
+### Per-variant sizes (measured, `embedded-profile`)
+
+| Variant | Size | | Variant | Size |
+|---|---|---|---|---|
+| **AnyDecoder (enum total)** | **262,224 B** | | Alac | 124,144 B |
+| **WavPack** ← ceiling | 262,224 B | | Caf | 124,032 B |
+| Aac / Matroska | 241,504 B | | Opus | 87,160 B |
+| OggFlac / Flac | 160,240 B | | Mp3 | 44,240 B |
+| | | | Wav | 18,576 B · Aiff | 104 B |
+
+The enum is sized by its **largest** variant, so the ceiling only drops when the
+**top** variants all come down. Every large variant has the same shape: an
+**inline PCM block-staging buffer** sized for (max block × max channels):
+- WavPack: `pcm: [i32; 65536]` = **256 KB** (interleaved block staging)
+- FLAC: `planes: [[i32; 4608]; 8]` = **147 KB** (planar; `MAX_CHANNELS=8`, ungated)
+- AAC: `MAX_CHANNELS=8` filterbank/SBR/DecodedFrame buffers (ungated)
+- ALAC/Caf: `MAX_FRAME=4096` stereo frame buffers; Caf embeds ALAC
+
+## 2. Why the fix is "externalize buffers" (research + hard constraint)
+
+Web research on the canonical fixes for "moving a large enum = full `memcpy`"
+([rust#47490](https://github.com/rust-lang/rust/issues/47490)):
+
+1. **Box the large variant** — needs an allocator; and construction *still*
+   copies into the box unless placement-new'd. ✗ (no-alloc).
+2. **Placement-new via `MaybeUninit` / `pinned-init`** — guaranteed no stack
+   copy, no_std — but expands to **`unsafe`**. ✗ (`forbid(unsafe_code)`).
+3. **Pass large buffers by reference** (caller-provided / borrowed scratch). ✓
+
+`forbid(unsafe_code)` + no-alloc **rules out (1) and (2)** — safe Rust has no
+placement-new. The only constraint-compatible fix is **(3): externalize the
+decoder's large buffers** so `AnyDecoder` becomes small and cheap to move.
+
+This is already an **established pattern in this crate**: `formats/vorbis/arena.rs`
+(caller-provided bump arena; decoder stores **offsets**, not references, to avoid
+the self-reference trap under `forbid(unsafe_code)`), and Vorbis is deliberately
+kept **out of `AnyDecoder`** and dispatched per-platform because it needs that
+arena. The author already observed the stack blow-up ("8 channels overflowed
+even a single decoder") and built the **profile-knob** mitigation
+(`MAX_CHANNELS` gated by feature: desktop=8, embedded=2).
+
+## 3. The self-reference constraint (the crux)
+
+A `Deck` cannot own both a buffer *and* a decoder that borrows it — that's a
+self-referential struct, impossible in safe Rust. Two escape routes, both used
+here:
+- **Owned generic storage + offsets** (Vorbis model): the decoder owns storage
+  `P` generically; embedded supplies external storage (`&'static mut [i32]` from
+  a board `StaticCell`), desktop supplies `Vec`. The decoder owns a *fat pointer*
+  (16 B), not an inline array → small, cheap to move. Storage is owned by board
+  `main`'s static (outlives the `Deck`), so no self-reference.
+- **Pool-by-parameter**: the decoder stores no buffer; `decode(&mut self, pcm:
+  &mut [i32])` receives staging each call from a `Deck`-owned pool. No stored
+  borrow → no self-reference. More invasive to each decode loop.
+
+This spec uses **owned generic storage** (matches the existing Vorbis seam).
+
+## 4. Design — three combined levers
+
+The ceiling drops fastest by combining levers, not one mega-refactor:
+
+### Lever A — channel-profile gating (safe, high-leverage, mechanical)
+Gate every channel-scaled inline buffer to **stereo** under `embedded-profile`
+(FLAC `MAX_CHANNELS` 8→2, AAC 8→2, and audit the rest). Correct for the DAP:
+it is **stereo-only** (`Deck` rejects non-stereo; surround is downmixed to stereo
+at DAP import — see the dap-index doc), so >2-ch inline buffers are pure waste;
+a >2-ch file is already a graceful `DecodeError::Unsupported`. Desktop keeps 8.
+- FLAC 160 KB → ~50 KB; AAC 241 KB → TBD (measure); Matroska (embeds AAC/FLAC)
+  shrinks with them.
+
+### Lever B — externalize the block-staging buffers (the architectural core)
+Some ceilings are **block-size-driven**, not channel-driven, and cannot be
+profile-shrunk without rejecting valid files — **WavPack**'s `[i32; 65536]` can't
+go below ~44,100 (ffmpeg stereo blocks) → ~176 KB floor. These must be
+**externalized** via owned generic storage `P` (§3). Start with **WavPack** (the
+ceiling, a single `pcm` field — the simplest proof of the pattern + the open-path
+API change), measure, then extend to the other still-large variants (ALAC/Caf,
+FLAC planes, AAC) as needed to hit the target.
+
+### Lever C — reduce the move count (cheap multiplier win)
+Collapse/inline `open_seekable → provide → load → build_track` so the decoder is
+constructed closer to its final slot (fewer `memcpy` hops). Combined with A+B a
+smaller `AnyDecoder` × fewer hops compounds. Verify with the release stack probe.
+
+## 5. Acceptance gates (data-driven, each phase)
+- **Size probe**: a throwaway test prints per-variant `size_of` (the §1.3 table)
+  — each phase must show the targeted variants shrink; desktop sizes unchanged.
+- **Release stack probe**: the DAP's `examples/stackprobe.rs` (release, boxed) —
+  the open transient must fall from ~1.44 MB toward the target (**open transient
+  ≤ ~256 KB**, so it fits an AXI-SRAM stack region alongside the shrunk audio
+  path + framebuffers; ideally approach DTCM-fittable).
+- **Correctness**: `cargo test` (desktop) AND `cargo test --features
+  embedded-profile` both green; a >2-ch file is a clean `Unsupported`, never a
+  panic; multichannel tests cfg-gated off under `embedded-profile` (as surround
+  already is).
+- **Zero desktop regression**: desktop decoders keep full channel/block caps and
+  owned `Vec` storage; behavior identical.
+
+## 6. Rollout (incremental, tests green each step)
+- **Phase 1 — Lever A**: channel-gate FLAC + AAC (+ audit Matroska/others) to
+  stereo under `embedded-profile`. Measure. Low risk; mechanical.
+- **Phase 2 — Lever B on WavPack**: introduce the owned-generic-storage seam +
+  the open-path storage-provisioning API; externalize WavPack `pcm`. Measure the
+  ceiling drop + the stack-probe drop. Establishes the pattern + API.
+- **Phase 3 — Lever B on the rest**: ALAC/Caf, FLAC planes, AAC staging as
+  needed to reach the §5 target; Lever C move-count collapse.
+- **Phase 4 — DAP side**: wire the board's `StaticCell` storage pool into
+  `AudioPlayer`/`Deck` open; update `dap-arch-tests` budgets + the
+  `stack_highwater.rs` conclusion to the real release numbers; re-run the probe.
+
+Commits `sebastianstupak`, Conventional Commits, no AI trailers, hooks enforced.
+
+## 7. Research verdict + finalized design (supersedes §3–§6 where they differ)
+
+After Phase 1+2 landed, a deeper read raised a question: is `AnyDecoder` a tagged
+*union* (variants share space), so inline decoders are already memory-efficient
+and the real fix is just reducing the open-path **move count** (construct in
+place) rather than externalizing? Web research settled it:
+
+- **Move-count / NRVO reduction is NOT reliable.** Rust has **no guaranteed copy
+  elision in any circumstance**; NRVO is entirely optional and was *disabled* in
+  rustc ≤ 1.74 over an unsoundness bug ([rust#111005](https://github.com/rust-lang/rust/issues/111005)).
+  Betting a constrained embedded stack (overflow = hard crash) on an unguaranteed
+  optimization that has regressed before is unacceptable. REJECTED.
+- **Externalizing to caller-provided scratch is the embedded standard.** Every
+  comparable no_std codec does it ([audio-codec](https://lib.rs/crates/audio-codec)
+  — whose Opus "~250 KB working set is boxed", our exact case; [nanoaudio](https://github.com/AlixANNERAUD/nanoaudio);
+  [lc3-codec](https://lib.rs/crates/lc3-codec)), with a helper to size the buffer.
+  It is also this crate's own Vorbis pattern. CHOSEN.
+
+**On the union/at-rest concern:** *partial* externalization double-counts (the
+WavPack pool + still-inline AAC are both reserved → ~1.05 MB). The fix is to do it
+**fully**: one **shared scratch per Deck slot** that *all* externalized decoders
+carve from. Sized for the max decoder (~256 KB), × (1+PRELOAD) slots ≈ **512 KB
+at-rest — better than inline's 664 KB** — with a reliably tiny open transient. Not
+worse than inline; strictly better and robust.
+
+### Finalized design — one shared scratch store `A`
+- `AnyDecoder<S, A>` — a **single** extra type param `A` (the shared scratch
+  backing store), NOT one param per decoder (which would explode the signature).
+  `A: AsMut<[u8]> + AsRef<[u8]>` (byte store; desktop `Vec<u8>`/`Box<[u8]>`,
+  embedded `&'static mut [u8]` from a board `StaticCell`). Only one enum variant
+  is live at a time, so the active decoder owns `A`.
+- Each large decoder (`WavPack`, `Aac`, `Alac`/`Caf`, `Opus`, `Flac`) carves its
+  working buffers from `A` at construction using the **existing Vorbis
+  `arena::Arena`** (transient view → bump-allocate → record `usize` offsets → owned
+  `A` + offsets, never a stored borrow → no self-reference under `forbid(unsafe)`),
+  and does typed (i32/f32) access through `A` exactly as `formats/vorbis` already
+  does. `decode_into` signature is UNCHANGED.
+- A helper `pub fn decoder_scratch_len() -> usize` sizes `A` for the largest
+  decoder, so callers never hardcode. `MAX_BLOCK`/`MAX_FRAME` etc. gated to stereo
+  (Phase 1) keep the scratch small.
+- Small decoders (`Mp3` 44 KB, `Wav` 18 KB, `Aiff`) stay inline — the enum ceiling
+  settles at ~44 KB, so the moved `AnyDecoder` is small regardless of move count.
+
+### Reconcile Phase 2
+Phase 2's WavPack-specific `P: AsMut<[i32]>` becomes the shared `A` byte store
+(WavPack carves its `[i32; 65536]` from `A` via the arena). Keep Phase 2's caller
+plumbing; generalize the type.
+
+### Corrected rollout
+- **Phase 3 — shared `A` + AAC**: introduce `AnyDecoder<S, A>` with the shared
+  byte store; reconcile WavPack onto it; externalize AAC into it (ceiling 200→~124
+  KB, ALAC). Establishes the pattern.
+- **Phase 4 — ALAC/Caf + Opus + FLAC** into `A` (ceiling → ~44 KB, Mp3).
+- **Phase 5 — measure**: DAP release stack probe must show the open transient
+  ≤ ~256 KB (from 1.44 MB); update `dap-arch-tests` budgets + `stack_highwater.rs`.
+- **Phase 6 — DAP + soul-player-ng propagation**: board wires a `StaticCell`
+  scratch pool into the open path. Desktop (`soul-audio-desktop`) allocates `A`
+  internally (heap), so **`soul-player-ng` — which consumes the high-level
+  `soul-audio-control`/`soul-audio-desktop` API via `git = …/soul-audio-core,
+  branch = main`, with no raw `open()` in its source — needs no source change**,
+  only the updated core. Propagate by re-pinning soul-player-ng to this branch (or
+  a local path) for desktop testing, then merging to core `main` once validated.
+  Desktop test = the same core the DAP runs, exercised on the desktop player.
+
+## 8. AAC slice (Option A) — SBR gated off + PCM externalized
+
+Phase 3's AAC work landed as **Option A**: rather than externalize AAC's SBR
+state into the shared scratch (`sbr::SbrState`/`SbrOutput` are `f32` QMF
+state, not `i32` — externalizing them through `ScratchCursor`'s i32-slot
+cursor would need bytemuck-style reinterpretation, for a feature the DAP
+target doesn't use), **gate SBR off entirely under `embedded-profile`** and
+externalize only AAC's i32 PCM carry buffer:
+
+- `sbr`/`ps` (the whole submodule tree, QMF state + const tables) are
+  `#[cfg(not(feature = "embedded-profile"))]` — dropped from the embedded
+  build, not just unused. `syntax::decode_fil` skip-consumes any
+  `EXT_SBR_DATA`/`EXT_SBR_DATA_CRC` fill-element payload as a no-op there (same
+  bits read, no location recorded), so the AAC-LC core always decodes and the
+  bitstream never desyncs; `stream_info()` reports the **core** rate.
+- `AacDecoder<S, P>` carves its decoded-PCM carry buffer from the same shared
+  `P` scratch FLAC/ALAC/WavPack/Matroska use (`ScratchCursor`, one `usize`
+  offset — the established pattern from this doc's §3/§7).
+- MP4/Matroska `total_frames`/`encoder_delay`/`playable_frames`: an
+  explicit-ASC HE-AAC file's container-declared values are in the 2× SBR
+  output domain; `embedded-profile` halves them back to the core domain it
+  actually decodes at (otherwise a HE-AAC `.m4a` would report ~2× its real
+  duration under the profile that can't produce that duration).
+- An HE-AAC source should be **transcoded to AAC-LC or FLAC at desktop
+  import** for full quality under `embedded-profile` — mirroring the existing
+  surround→stereo downmix-at-import design (see the dap-index doc's "HE-AAC
+  fold-down" note).
+
+### Measured (this repo, `size_of::<T<SliceSource<'static>, &'static mut [i32]>>()`)
+
+| | Desktop (no feature) | `embedded-profile` |
+|---|---|---|
+| `AacDecoder` before (SBR inline, `pcm` inline) | 241,504 B | 200,536 B |
+| `AacDecoder` after (SBR gated off on embedded; `pcm` externalized both) | 208,760 B | **34,056 B** |
+| `AnyDecoder` ceiling | 322,552 B (`OpusMs`, unchanged) | 96,184 B |
+
+Desktop's drop (241,504 → 208,760) is PCM-externalization only (SBR/PS stay
+inline and fully intact — same codec, byte-identical decode). Embedded's drop
+(200,536 → 34,056, ~83%) is SBR gating (the bulk: `SbrState` 133,712 B +
+`SbrOutput` 16,400 B) plus PCM externalization plus the `embedded-profile`
+`PCM_CAP` formula no longer needing to size for SBR's 2×-rate stereo write.
+
+### Finding: the `embedded-profile` ceiling is NOT Mp3 — it's Matroska's inline Opus path
+
+The AAC work's own target (`AacDecoder` ≈ 34 KB) is hit, but **`AnyDecoder`'s
+embedded-profile ceiling does not drop to Mp3 (44,240 B)** as assumed when this
+slice was scoped. It drops to **96,184 B**, pinned by `MatroskaDecoder`'s
+`Opus` variant (`MatroskaOpus<S>`, `formats/matroska.rs`): an **inline**,
+never-externalized Opus-in-Matroska decoder — `OpusFrameDecoder` (24,288 B)
++ `MatroskaDemuxer` (17,576 B) + an 8,192 B packet buffer + an 11,520-sample
+(46,080 B) PCM buffer, none of which route through the shared `P` scratch the
+way the top-level dispatch `OpusDecoder<S, P>` variant does. This predates the
+AAC slice — it was already the #2-largest variant, just hidden behind AAC's
+larger 200,536 B. Mp3 (44,240 B) is the **actual** runner-up once both AAC and
+Matroska-Opus are accounted for. Externalizing `MatroskaOpus`'s packet/PCM
+buffers into the shared `P` scratch (the same treatment `OpusDecoder` already
+has) is the natural next slice to reach a true ~44 KB ceiling; out of scope
+here (AAC-only), flagged for Phase 4.
+
+## 9. Phase 4 — Matroska-Opus PCM externalized; the ceiling moves again (not to Mp3)
+
+`MatroskaOpus<S, P>` now carves its decoded-PCM buffer (the 11,520-sample /
+46,080 B `pcm` field §8 found) from the same shared `P` scratch the
+standalone `OpusDecoder<S, P>` (§7) and FLAC/AAC-in-Matroska already use —
+`new` → `new_in(demux, head, scratch)`, fallible via `ScratchCursor`. The
+8,192 B `packet` byte buffer and the 17,576 B `MatroskaDemuxer` container
+state stay inline per this doc's own scope rule (§4 Lever B is for `i32`
+working buffers; there is no byte-scratch arena here to carve a `u8` buffer
+from — that would be new machinery, not this lever). `OpusFrameDecoder` (the
+core both the standalone and Matroska Opus paths wrap) was checked for a
+carvable buffer of its own and has none: its CELT/SILK fields are `f32`
+cross-frame decode *state* (overlap-add history, LPC memory), not a
+per-call `i32` working buffer, so — like the Opus/FLAC/AAC decoder state
+already left in place — it isn't in scope for this lever either.
+
+### Measured (`size_of::<T<SliceSource<'static>, &'static mut [i32]>>()`, `embedded-profile`)
+
+| | Before | After |
+|---|---|---|
+| `MatroskaOpus<S, P>` | ~96,136 B (inline: `OpusFrameDecoder` 24,288 + `MatroskaDemuxer` 17,576 + packet 8,192 + pcm 46,080) | **50,128 B** |
+| `MatroskaDecoder<S, P>` / `AnyDecoder<S, P>` ceiling | 96,184 B | **80,240 B** |
+
+### Finding: the ceiling still isn't Mp3 — `A_FLAC`-in-Matroska takes over
+
+§8 predicted this slice would reach "a true ~44 KB ceiling." It doesn't:
+`AnyDecoder`'s `embedded-profile` ceiling drops from 96,184 B to **80,240 B**,
+but stays pinned to `MatroskaDecoder` — just via a different one of its own
+variants now. `FlacDecoder<MatroskaFlacReader<S>, P>` measures 80,240 B on
+the nose (`MatroskaOpus<S, P>`'s new 50,128 B is comfortably under it), driven
+by `MatroskaFlacReader`'s own inline `frame: [u8; 49_152]` (48 KiB) `SimpleBlock`
+staging buffer plus its embedded 17,576 B `MatroskaDemuxer` — 67,792 B just
+for the reader, predating this slice and untouched by it (it's `A_FLAC`'s
+native-FLAC-byte-adapter path, not `A_OPUS`'s). It was already the
+enum's #2-largest variant (visible once Opus's 96,136 B dropped below it),
+exactly the same "hidden behind the bigger sibling" pattern §8 found AAC
+hiding Matroska-Opus behind. Mp3 (44,240 B) is still the **actual** runner-up
+underneath both.
+
+Externalizing it would need a **byte** scratch arena (`MatroskaFlacReader`'s
+`frame` buffer is `u8`, like the Vorbis byte `Arena`, not `i32` like
+`ScratchCursor`) shared with — or separate from — the existing `i32` `P`,
+which is new machinery this doc's `ScratchCursor` lever doesn't cover; a
+candidate Phase 5 if the ~44 KB ceiling is still wanted, out of scope here
+(this slice is Opus-only, per its own task scope).

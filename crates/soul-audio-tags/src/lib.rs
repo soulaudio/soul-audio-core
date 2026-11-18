@@ -1,6 +1,7 @@
 //! no_std, no-alloc audio tag + cover-art reader. See the design spec.
 #![cfg_attr(not(test), no_std)] // matches soul-audio-core; std is available under `cargo test`
 #![forbid(unsafe_code)]
+#![deny(unconditional_recursion)]
 
 use soul_audio_core::SeekSource;
 
@@ -47,7 +48,12 @@ pub enum Field {
     TrackTotal,
     DiscNumber,
     DiscTotal,
+    /// The main release/recording date (ID3 `TDRC`/`TYER`, Vorbis `DATE`, MP4 `©day`).
     Date,
+    /// The ORIGINAL release date of a reissue/remaster (ID3 `TDOR`/`TORY`,
+    /// Vorbis `ORIGINALDATE`/`ORIGINALYEAR`, MP4 freeform `ORIGINALDATE`). The
+    /// audiophile-canonical "year" prefers this, falling back to `Date`.
+    OriginalDate,
     Genre,
     Composer,
     /// Artist sort-name ("Clapton, Eric"). Vorbis `ARTISTSORT`, ID3 `TSOP`, MP4 `soar`.

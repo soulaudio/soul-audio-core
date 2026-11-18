@@ -37,6 +37,9 @@ pub struct Tags {
     pub disc: Option<u32>,
     pub disc_total: Option<u32>,
     pub date: Option<String>,
+    /// The original-release date tag, if present (first value wins). Distinct
+    /// from `date` (the reissue/release date); the importer prefers it.
+    pub original_date: Option<String>,
     pub genre: Option<String>,
     pub composer: Option<String>,
     pub pictures: Vec<Picture>,
@@ -98,6 +101,9 @@ impl TagSink for OwnedTags {
             }
             Field::Date => {
                 self.tags.date.get_or_insert_with(|| value.into());
+            }
+            Field::OriginalDate => {
+                self.tags.original_date.get_or_insert_with(|| value.into());
             }
             Field::Genre => {
                 self.tags.genre.get_or_insert_with(|| value.into());
@@ -399,6 +405,19 @@ mod tests {
 
         assert_eq!(tags.track_gain_db, Some(-7.89));
         assert_eq!(tags.track_peak, Some(0.988));
+    }
+
+    #[test]
+    fn read_owned_collects_date_and_original_date_from_id3() {
+        // TDRC (release) and TDOR (original-release) on a reissue/remaster
+        // land in two distinct `Tags` fields.
+        use crate::testfix::{id3v23, text_frame};
+        let tag = id3v23(&[text_frame(b"TDRC", "2015"), text_frame(b"TDOR", "1973")]);
+        let mut src = SliceSource::new(&tag);
+        let (tags, _facts) = read_owned(&mut src).unwrap();
+
+        assert_eq!(tags.date.as_deref(), Some("2015"));
+        assert_eq!(tags.original_date.as_deref(), Some("1973"));
     }
 
     /// End-to-end acceptance for issue #26: a real `opusenc`-produced Opus file

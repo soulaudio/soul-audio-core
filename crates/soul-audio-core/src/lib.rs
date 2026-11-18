@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
+#![deny(unconditional_recursion)]
 
 //! `soul-audio-core` — a strict `no_std`, no-alloc audio decode core.
 //!
@@ -24,7 +25,7 @@ pub mod sink;
 pub use deck::{Deck, DeckError, DeckState, DecodeInfo, Progress};
 pub use decoder::{DecodeError, Decoder, DsdDecoder, DsdSeek, SeekableDecoder};
 pub use demux::{Demuxer, FlacDemuxer, Mp3Demuxer, Packet, WavDemuxer};
-pub use dispatch::{AnyDecoder, open, open_seekable};
+pub use dispatch::{AnyDecoder, decoder_scratch_len, open, open_seekable};
 pub use dsd::{DecimateAdapter, DopAdapter, PlaybackDecimateAdapter};
 pub use eq::{Biquad, Equalizer};
 pub use io::{BufReader, BufSource, SeekSource, SliceSource, Source};

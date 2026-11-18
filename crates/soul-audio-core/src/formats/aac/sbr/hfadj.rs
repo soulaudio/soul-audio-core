@@ -33,6 +33,11 @@ use super::header::SbrHeader;
 use super::qmf::{Cpx, MAX_SLOTS, MAX_Y_SLOTS, N_SYN, T_HFADJ};
 use super::tables::V_NOISE;
 use crate::decoder::DecodeError;
+// `sqrtf` now lives in the always-compiled `dsp` module (the AAC-LC core's
+// `fill_pns` needs it too; `dsp` is compiled under both profiles, unlike
+// `sbr`, which is desktop-only under `embedded-profile` — see the fn's doc
+// comment at its new home).
+use super::super::dsp::sqrtf;
 
 /// Max QMF high-band count (`M`, §3.4: `f_high[n_high] - f_high[0]` is
 /// capped `1..=49`) — local per-band scratch arrays are sized to this, one
@@ -51,47 +56,6 @@ const RING_LEN: usize = 42;
 /// the one-band overrun at `M==49` is bounded via `.get()`/slice truncation
 /// below rather than widening the brief-mandated struct shape.
 const RING_COLS: usize = 48;
-
-/// No-libm `f32` square root: extract the IEEE-754 exponent and build a
-/// coarse seed `2^floor(exp/2) · (√2 if exp is odd else 1)` — this ignores
-/// the mantissa entirely (one constant seed per whole octave of `x`), so
-/// it's accurate only to within the octave's spread: at the top of an
-/// even-exponent octave the seed undershoots by a factor of `1/√2`
-/// (`≈29.3%` relative error), which is the worst case across the whole
-/// domain. Three Newton-Raphson refinements (`y = 0.5·(y + x/y)`, which for
-/// this iteration roughly *squares* the relative error each step:
-/// `e_{n+1} ≈ e_n²/2`) take that `≈0.29` down through `≈0.042 → ≈0.00088 →
-/// ≈2e-7` — well past `f32` precision, hence "2–3" iterations sufficing per
-/// the brief. `x<0`/NaN (`x > 0.0` is false for both, since NaN comparisons
-/// are always false) and `x == 0.0` (`0.0 > 0.0` is false too) all return
-/// exactly `0.0` — the exponent-seed path would only asymptotically
-/// approach `0.0` through the iteration for a genuine `0.0` input, never
-/// hit it bit-exact, which the brief's test requires.
-// The negated `!(x > 0.0)` (rather than `x <= 0.0`) is deliberate: it also
-// catches NaN (every comparison against NaN, including `<=`, is false, so
-// `x <= 0.0` would NOT catch a NaN input, but `!(x > 0.0)` does since
-// `x > 0.0` is false for NaN too) -- exactly the guard this fn's doc comment
-// and the brief's test (`sqrtf(-1.0) == 0.0`, "guarded") require.
-#[allow(clippy::neg_cmp_op_on_partial_ord)]
-pub(crate) fn sqrtf(x: f32) -> f32 {
-    if !(x > 0.0) {
-        return 0.0;
-    }
-    let bits = x.to_bits();
-    let exp = ((bits >> 23) & 0xFF) as i32 - 127;
-    let half_exp = exp >> 1; // arithmetic (floor) shift -- correct for negative exp too
-    let remainder = exp - 2 * half_exp; // 0 or 1
-    let pow2_half = f32::from_bits(((half_exp + 127) as u32) << 23);
-    let mut y = if remainder != 0 {
-        pow2_half * core::f32::consts::SQRT_2
-    } else {
-        pow2_half
-    };
-    y = 0.5 * (y + x / y);
-    y = 0.5 * (y + x / y);
-    y = 0.5 * (y + x / y);
-    y
-}
 
 /// §9.3 per-band base gain (pre limiter/boost), FFmpeg `sbr_gain_calc`'s
 /// per-`m` gain formula transcribed exactly (both branches), including the
@@ -840,19 +804,6 @@ mod tests {
     use super::*;
 
     #[test]
-    // The brief's own literal pinned value (`1.4142135`, one digit short of
-    // `core::f32::consts::SQRT_2`'s full precision) -- clippy would rather
-    // this used the named constant, but the test is transcribed verbatim
-    // from the task brief's mandated Step-1 text.
-    #[allow(clippy::approx_constant)]
-    fn sqrtf_known_values() {
-        assert!((sqrtf(4.0) - 2.0).abs() < 1e-4);
-        assert!((sqrtf(2.0) - 1.4142135).abs() < 1e-4);
-        assert_eq!(sqrtf(0.0), 0.0);
-        assert_eq!(sqrtf(-1.0), 0.0); // guarded
-    }
-
-    #[test]
     fn base_gain_no_noise_no_sine() {
         // q_mapped=0, s_mapped=false, delta=true, e_curr=e_orig=3
         // -> sqrt(3 / ((1+3)(1+0))) = sqrt(0.75) ~= 0.8660254.
@@ -864,27 +815,6 @@ mod tests {
         // s_mapped=true: sqrt(e_orig*q_mapped / ((1+e_curr)(1+q_mapped)))
         // e_orig=4, e_curr=1, q_mapped=1 -> sqrt(4*1/((2)(2))) = sqrt(1) = 1.
         assert!((base_gain(4.0, 1.0, 1.0, true, false) - 1.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn sqrtf_matches_std_across_a_wide_range() {
-        // Broader regression beyond the brief's 2 pinned values: every
-        // power-of-two-ish magnitude across the practical f32 domain, to
-        // catch a seed/iteration-count regression the two pinned values
-        // alone might not exercise (both 2.0 and 4.0 happen to converge in
-        // zero extra NR steps -- see the fn doc's worked derivation).
-        let cases = [
-            0.001_f32, 0.1, 0.5, 1.0, 3.0, 10.0, 123.456, 1.0e6, 1.0e10, 1.0e20,
-        ];
-        for &x in &cases {
-            let got = sqrtf(x);
-            let want = (x as f64).sqrt() as f32;
-            let rel = ((got - want) / want).abs();
-            assert!(
-                rel < 1e-5,
-                "sqrtf({x}) = {got}, want ~{want} (rel err {rel})"
-            );
-        }
     }
 
     #[test]

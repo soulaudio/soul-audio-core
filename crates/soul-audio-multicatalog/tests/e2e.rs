@@ -148,8 +148,11 @@ fn scan_bake_aggregate_locate_decode_across_sources() {
         );
 
         let bytes = std::fs::read(&path).expect("read located file");
-        let mut dec =
-            open(SliceSource::new(&bytes)).unwrap_or_else(|e| panic!("open {path:?}: {e:?}"));
+        let mut dec = open(
+            SliceSource::new(&bytes),
+            vec![0i32; soul_audio_core::decoder_scratch_len()],
+        )
+        .unwrap_or_else(|e| panic!("open {path:?}: {e:?}"));
         let info = dec.stream_info();
         assert_ne!(
             rec.sample_rate, 0,

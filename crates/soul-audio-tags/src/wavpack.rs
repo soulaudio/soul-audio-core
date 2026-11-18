@@ -134,6 +134,10 @@ fn map_key(key: &[u8]) -> Option<Field> {
         Some(Field::TrackNumber)
     } else if key.eq_ignore_ascii_case(b"Year") || key.eq_ignore_ascii_case(b"Date") {
         Some(Field::Date)
+    } else if key.eq_ignore_ascii_case(b"Original Date")
+        || key.eq_ignore_ascii_case(b"Original Year")
+    {
+        Some(Field::OriginalDate)
     } else if key.eq_ignore_ascii_case(b"Genre") {
         Some(Field::Genre)
     } else {

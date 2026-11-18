@@ -34,6 +34,8 @@ pub fn map_vorbis_key(key: &str) -> Option<Field> {
         Some(Field::DiscNumber)
     } else if key.eq_ignore_ascii_case("DATE") || key.eq_ignore_ascii_case("YEAR") {
         Some(Field::Date)
+    } else if key.eq_ignore_ascii_case("ORIGINALDATE") || key.eq_ignore_ascii_case("ORIGINALYEAR") {
+        Some(Field::OriginalDate)
     } else if key.eq_ignore_ascii_case("GENRE") {
         Some(Field::Genre)
     } else if key.eq_ignore_ascii_case("COMPOSER") {
@@ -493,6 +495,31 @@ mod tests {
             v.extend_from_slice(c.as_bytes());
         }
         v
+    }
+
+    #[test]
+    fn vorbis_emits_both_date_and_original_date() {
+        // DATE (release) and ORIGINALDATE (original-release) coexist on a
+        // reissue/remaster — both must surface as distinct fields.
+        let body = comment_body(&["DATE=2015", "ORIGINALDATE=1973"]);
+        let mut src = SliceSource::new(&body);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        read_comment_vector(&mut src, body.len() as u32, &mut scratch, &mut c).unwrap();
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::Date) && v == "2015"),
+            "DATE -> Date: {:?}",
+            c.fields
+        );
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::OriginalDate) && v == "1973"),
+            "ORIGINALDATE -> OriginalDate: {:?}",
+            c.fields
+        );
     }
 
     #[test]
