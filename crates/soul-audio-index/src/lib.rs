@@ -516,6 +516,12 @@ pub mod build {
         pub title: String,
         pub album_artist: u32,
         pub year: u16,
+        /// Original-release date (e.g. the first pressing), if tagged.
+        /// Additive alongside `year`: not yet baked into the on-disk format.
+        pub original_date: soul_audio_catalog::PackedDate,
+        /// Release date (e.g. a reissue's date), if tagged. Additive alongside
+        /// `year`: not yet baked into the on-disk format.
+        pub release_date: soul_audio_catalog::PackedDate,
         pub folder: u32,
     }
 

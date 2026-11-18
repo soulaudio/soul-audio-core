@@ -9,7 +9,7 @@
 
 use image::{GrayImage, ImageEncoder, Luma};
 use soul_audio_artbake::ArtBlobReader;
-use soul_audio_catalog::{ArtStore, BrowseAxis, Catalog, NO_FOLDER};
+use soul_audio_catalog::{ArtStore, BrowseAxis, Catalog, NO_FOLDER, PackedDate};
 use soul_audio_core::SliceSource;
 use soul_audio_index::IndexReader;
 use soul_audio_index::build::{
@@ -58,6 +58,8 @@ fn fixture() -> CatalogInput {
             title: "Open Goldberg Variations".into(),
             album_artist: 0,
             year: 2012,
+            original_date: PackedDate::from_year(2012),
+            release_date: PackedDate::from_year(2012),
             folder: 1,
         }],
         // Folder 0 = root (empty path, no parent); folder 1 = the album dir.
@@ -206,6 +208,8 @@ fn baked_title_order_is_collation_sorted() {
             title: "A".to_string(),
             album_artist: 0,
             year: 0,
+            original_date: PackedDate::UNKNOWN,
+            release_date: PackedDate::UNKNOWN,
             folder: 0,
         }],
         folders: vec![FolderInput {
@@ -294,12 +298,16 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
                 title: "Covered Album".into(),
                 album_artist: 0,
                 year: 2020,
+                original_date: PackedDate::from_year(2020),
+                release_date: PackedDate::from_year(2020),
                 folder: 0,
             },
             AlbumMeta {
                 title: "Uncovered Album".into(),
                 album_artist: 0,
                 year: 2021,
+                original_date: PackedDate::from_year(2021),
+                release_date: PackedDate::from_year(2021),
                 folder: 0,
             },
         ],
@@ -395,12 +403,16 @@ fn artist_album_track_orders_by_sort_name() {
                 title: "Here Come the Warm Jets".into(),
                 album_artist: 0,
                 year: 1974,
+                original_date: PackedDate::from_year(1974),
+                release_date: PackedDate::from_year(1974),
                 folder: 0,
             },
             AlbumMeta {
                 title: "Slowhand".into(),
                 album_artist: 1,
                 year: 1977,
+                original_date: PackedDate::from_year(1977),
+                release_date: PackedDate::from_year(1977),
                 folder: 0,
             },
         ],
@@ -463,6 +475,8 @@ fn artist_sort_name_falls_back_to_display_when_untagged() {
             title: "Kind of Blue".into(),
             album_artist: 0,
             year: 1959,
+            original_date: PackedDate::from_year(1959),
+            release_date: PackedDate::from_year(1959),
             folder: 0,
         }],
         folders: vec![FolderInput {
@@ -518,6 +532,8 @@ fn baked_genre_order_groups_by_genre_collation() {
             title: "Album".into(),
             album_artist: 0,
             year: 2000,
+            original_date: PackedDate::from_year(2000),
+            release_date: PackedDate::from_year(2000),
             folder: 0,
         }],
         folders: vec![FolderInput {
