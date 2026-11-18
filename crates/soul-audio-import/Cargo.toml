@@ -21,7 +21,9 @@ serde = { version = "1", features = ["derive"], optional = true }
 
 [features]
 # Persistable ScanCache (the `-ng` head enables this to serialize the cache).
-serde = ["dep:serde"]
+# RawTrack embeds PackedDate, so this must also turn on the catalog crate's
+# serde impl for it.
+serde = ["dep:serde", "soul-audio-catalog/serde"]
 
 # Scan performance signal (incremental cache + parallel extraction). Hand-rolled
 # timer, no criterion — matches the repo's other benches' minimal-dep convention.

@@ -91,13 +91,71 @@ impl Default for FolderRec {
     }
 }
 
+/// A packed calendar date for album metadata: `(year << 9) | (month << 5) | day`.
+/// `day` occupies bits 0..4, `month` bits 5..8, `year` bits 9..31. A bare year
+/// keeps `month`/`day` = 0 ("precision unknown"); `0` overall is a fully-unknown
+/// date. Pure integer bit-ops only — `no_std`, no-alloc, no float (this type is
+/// read by the DAP's on-device index reader).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PackedDate(pub u32);
+
+impl PackedDate {
+    /// A fully-unknown date.
+    pub const UNKNOWN: PackedDate = PackedDate(0);
+
+    /// Pack components. `month` outside `1..=12` or `day` outside `1..=31`
+    /// collapses that component to `0` (unknown); the year is stored as given.
+    pub const fn new(year: u16, month: u8, day: u8) -> PackedDate {
+        let y = year as u32;
+        let m = if month >= 1 && month <= 12 {
+            month as u32
+        } else {
+            0
+        };
+        let d = if day >= 1 && day <= 31 { day as u32 } else { 0 };
+        PackedDate((y << 9) | (m << 5) | d)
+    }
+
+    /// A year-only date (month/day unknown).
+    pub const fn from_year(year: u16) -> PackedDate {
+        PackedDate::new(year, 0, 0)
+    }
+
+    pub const fn year(self) -> u16 {
+        (self.0 >> 9) as u16
+    }
+    pub const fn month(self) -> u8 {
+        ((self.0 >> 5) & 0xF) as u8
+    }
+    pub const fn day(self) -> u8 {
+        (self.0 & 0x1F) as u8
+    }
+
+    /// Whether any component is known (i.e. not the fully-unknown `0`).
+    pub const fn is_known(self) -> bool {
+        self.0 != 0
+    }
+
+    /// Ascending chronological sort key with unknown (`0`) forced LAST.
+    pub const fn sort_key(self) -> u32 {
+        if self.0 == 0 { u32::MAX } else { self.0 }
+    }
+}
+
 /// Tier-1 album record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct AlbumRec {
     pub id: AlbumId,
     pub title: StrRef,
     pub album_artist: ArtistId,
-    pub year: u16,
+    /// Original-release date (e.g. the first pressing) — the chronological sort
+    /// key within an artist (the audiophile default). `PackedDate::UNKNOWN` when
+    /// untagged. Baked at offset 14 of the album record (format v5).
+    pub original_date: PackedDate,
+    /// Release date of this particular edition (e.g. a reissue), if tagged, else
+    /// `PackedDate::UNKNOWN`. Baked at offset 18 of the album record (format v5).
+    pub release_date: PackedDate,
     pub folder: FolderId,
     pub art_id: u32,
 }
@@ -201,4 +259,70 @@ pub enum CatalogError {
     Corrupt,
     /// Underlying I/O failure (SD read, etc.).
     Io,
+}
+
+#[cfg(test)]
+mod packed_date_tests {
+    use super::PackedDate;
+
+    #[test]
+    fn packs_and_unpacks_components() {
+        let d = PackedDate::new(1973, 8, 7);
+        assert_eq!(d.year(), 1973);
+        assert_eq!(d.month(), 8);
+        assert_eq!(d.day(), 7);
+        assert!(d.is_known());
+    }
+
+    #[test]
+    fn year_only_has_zero_month_and_day() {
+        let d = PackedDate::from_year(2015);
+        assert_eq!(d.year(), 2015);
+        assert_eq!(d.month(), 0);
+        assert_eq!(d.day(), 0);
+        assert!(d.is_known());
+    }
+
+    #[test]
+    fn out_of_range_month_or_day_is_dropped_to_unknown_component() {
+        let d = PackedDate::new(2001, 13, 40);
+        assert_eq!(d.year(), 2001);
+        assert_eq!(d.month(), 0);
+        assert_eq!(d.day(), 0);
+    }
+
+    #[test]
+    fn zero_is_fully_unknown_and_sorts_last() {
+        assert_eq!(PackedDate::UNKNOWN, PackedDate::default());
+        assert!(!PackedDate::UNKNOWN.is_known());
+        assert_eq!(PackedDate::UNKNOWN.sort_key(), u32::MAX);
+    }
+
+    #[test]
+    fn sort_key_is_chronological() {
+        // Earlier date → smaller sort key; same year, later month → larger.
+        assert!(PackedDate::from_year(1973).sort_key() < PackedDate::from_year(2015).sort_key());
+        assert!(PackedDate::new(1973, 1, 1).sort_key() < PackedDate::new(1973, 12, 1).sort_key());
+        // Any known date sorts before unknown.
+        assert!(PackedDate::from_year(2200).sort_key() < PackedDate::UNKNOWN.sort_key());
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod packed_date_serde_tests {
+    use super::PackedDate;
+
+    /// `PackedDate` is a bare `u32` newtype — it must serialize transparently as
+    /// the plain integer (not a wrapped object) and round-trip exactly, since
+    /// `soul-audio-import`'s `RawTrack`/`ScanCache` embed it in the persisted
+    /// warm-scan cache.
+    #[test]
+    fn serializes_as_a_bare_u32_and_round_trips() {
+        let d = PackedDate::new(1973, 8, 7);
+        let json = serde_json::to_string(&d).expect("serialize");
+        assert_eq!(json, d.0.to_string());
+
+        let back: PackedDate = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, d);
+    }
 }

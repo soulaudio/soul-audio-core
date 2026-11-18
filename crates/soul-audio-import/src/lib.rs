@@ -177,12 +177,14 @@ impl Interner {
     /// sight, along with `dir` (the album's filesystem folder) and
     /// `track_path` (a representative track, for embedded cover-art
     /// discovery) — both recorded only on first sight, same as the metadata.
+    #[allow(clippy::too_many_arguments)] // album identity + both dates + cover-discovery inputs
     fn album(
         &mut self,
         title: &str,
         folder: u32,
         album_artist: u32,
-        year: u16,
+        original_date: soul_audio_catalog::PackedDate,
+        release_date: soul_audio_catalog::PackedDate,
         dir: &Path,
         track_path: &Path,
     ) -> u32 {
@@ -194,7 +196,8 @@ impl Interner {
         self.albums.push(AlbumMeta {
             title: title.to_owned(),
             album_artist,
-            year,
+            original_date,
+            release_date,
             folder,
         });
         self.album_dirs.push(dir.to_owned());
@@ -202,6 +205,24 @@ impl Interner {
         self.album_ids.insert(key, id);
         id
     }
+}
+
+/// Parse a tag date string (leading ISO `YYYY[-MM[-DD]]`) into a `PackedDate`.
+/// Year is accepted only in a fixed plausible range `1000..=2200` (no clock, so
+/// parsing is deterministic); an out-of-range year yields `UNKNOWN`. Month/day
+/// are optional and individually dropped to "unknown" when absent or malformed.
+fn parse_date(s: Option<&str>) -> soul_audio_catalog::PackedDate {
+    use soul_audio_catalog::PackedDate;
+    let Some(s) = s else {
+        return PackedDate::UNKNOWN;
+    };
+    let year = match s.get(0..4).and_then(|y| y.parse::<u16>().ok()) {
+        Some(y) if (1000..=2200).contains(&y) => y,
+        _ => return PackedDate::UNKNOWN,
+    };
+    let month = s.get(5..7).and_then(|m| m.parse::<u8>().ok()).unwrap_or(0);
+    let day = s.get(8..10).and_then(|d| d.parse::<u8>().ok()).unwrap_or(0);
+    PackedDate::new(year, month, day) // new() drops out-of-range month/day
 }
 
 fn duration_ms(f: &StreamFacts) -> u32 {
@@ -252,7 +273,8 @@ pub struct RawTrack {
     album_name: String,
     artist_sort: Option<String>,
     album_artist_sort: Option<String>,
-    year: u16,
+    original_date: soul_audio_catalog::PackedDate,
+    release_date: soul_audio_catalog::PackedDate,
     genre_name: String,
     track_no: u16,
     disc_no: u16,
@@ -284,13 +306,11 @@ fn extract_raw(path: &Path) -> RawTrack {
         .album
         .clone()
         .unwrap_or_else(|| "Unknown Album".to_owned());
-    // Year = leading 4 digits of the date tag (e.g. "2012-05-29" → 2012).
-    let year = tags
-        .date
-        .as_deref()
-        .and_then(|d| d.get(0..4))
-        .and_then(|y| y.parse::<u16>().ok())
-        .unwrap_or(0);
+    // Release vs. original-release date (reissue vs. the first pressing). Both
+    // `PackedDate`s carry optional month/day precision; the original date is the
+    // chronological sort key within an artist (see the index baker's `year_at`).
+    let release_date = parse_date(tags.date.as_deref());
+    let original_date = parse_date(tags.original_date.as_deref());
     // Genre from the tag, trimmed; blank/absent → the "Unknown Genre" bucket.
     let genre_name = tags
         .genre
@@ -307,7 +327,8 @@ fn extract_raw(path: &Path) -> RawTrack {
         album_name,
         artist_sort: tags.artist_sort.clone(),
         album_artist_sort: tags.album_artist_sort.clone(),
-        year,
+        original_date,
+        release_date,
         genre_name,
         track_no: tags.track.unwrap_or(0) as u16,
         disc_no: tags.disc.unwrap_or(1) as u16,
@@ -338,7 +359,8 @@ fn build_catalog(raw: &[RawTrack], root: &Path) -> CatalogInput {
             &r.album_name,
             folder,
             album_artist,
-            r.year,
+            r.original_date,
+            r.release_date,
             album_dir,
             &r.path,
         );
@@ -427,7 +449,7 @@ fn stamp_of(meta: &std::fs::Metadata) -> FileStamp {
 /// Bump when [`RawTrack`]/extraction changes so a persisted cache from an older
 /// build is discarded (re-extracted) instead of silently reused with stale fields.
 /// The desktop head stores this alongside the serialized cache and compares on load.
-pub const SCAN_CACHE_VERSION: u32 = 2;
+pub const SCAN_CACHE_VERSION: u32 = 3;
 
 #[derive(Default, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -761,6 +783,85 @@ pub fn export(root: &Path, out_dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join(INDEX_FILE), &bytes)?;
     std::fs::write(dir.join(ART_FILE), &art_blob)
+}
+
+#[cfg(test)]
+mod date_tests {
+    use super::{extract_raw, parse_date};
+
+    #[test]
+    fn parse_date_takes_leading_iso_components_with_guards() {
+        use soul_audio_catalog::PackedDate;
+        assert_eq!(parse_date(Some("2012-05-29")), PackedDate::new(2012, 5, 29));
+        assert_eq!(parse_date(Some("1973")), PackedDate::from_year(1973));
+        assert_eq!(parse_date(Some("1973-08")), PackedDate::new(1973, 8, 0));
+        assert_eq!(parse_date(Some("not a date")), PackedDate::UNKNOWN);
+        assert_eq!(parse_date(None), PackedDate::UNKNOWN);
+        assert_eq!(parse_date(Some("0000")), PackedDate::UNKNOWN); // year < 1000
+        assert_eq!(parse_date(Some("9999")), PackedDate::UNKNOWN); // year > 2200
+        assert_eq!(parse_date(Some("2001-13-40")), PackedDate::from_year(2001)); // bad m/d drop
+    }
+
+    /// Minimal FLAC bytes: STREAMINFO + a VORBIS_COMMENT (last block) carrying
+    /// the given `KEY=VALUE` comments — enough for `extract_raw`'s tag read, no
+    /// audio. Mirrors `tests/pipeline.rs`'s `flac_with_comments` helper (kept
+    /// local here since `extract_raw` is private to this crate's root module).
+    fn flac_with_comments(comments: &[&str]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"fLaC");
+        // STREAMINFO (type 0), 34-byte body, not last.
+        v.push(0x00);
+        v.extend_from_slice(&[0, 0, 34]);
+        let mut si = [0u8; 34];
+        let (sr, ch, bps, total): (u32, u32, u32, u64) = (44_100, 2, 16, 88_200);
+        si[10] = (sr >> 12) as u8;
+        si[11] = (sr >> 4) as u8;
+        si[12] =
+            (((sr & 0xF) as u8) << 4) | ((((ch - 1) & 0x7) as u8) << 1) | (((bps - 1) >> 4) as u8);
+        si[13] = ((((bps - 1) & 0xF) as u8) << 4) | (((total >> 32) & 0xF) as u8);
+        si[14] = (total >> 24) as u8;
+        si[15] = (total >> 16) as u8;
+        si[16] = (total >> 8) as u8;
+        si[17] = total as u8;
+        v.extend_from_slice(&si);
+        // VORBIS_COMMENT (type 4), LAST block (0x80 | 4 = 0x84).
+        let mut vc = Vec::new();
+        vc.extend_from_slice(&6u32.to_le_bytes());
+        vc.extend_from_slice(b"vendor");
+        vc.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+        for c in comments {
+            vc.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            vc.extend_from_slice(c.as_bytes());
+        }
+        v.push(0x84);
+        v.extend_from_slice(&(vc.len() as u32).to_be_bytes()[1..]);
+        v.extend_from_slice(&vc);
+        v
+    }
+
+    #[test]
+    fn extract_raw_captures_distinct_original_and_release_dates() {
+        use soul_audio_catalog::PackedDate;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("soul_import_dates_{}_{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("01.flac");
+        std::fs::write(
+            &path,
+            flac_with_comments(&["DATE=2015", "ORIGINALDATE=1973-08-07"]),
+        )
+        .unwrap();
+
+        let raw = extract_raw(&path);
+        assert_eq!(raw.release_date, PackedDate::from_year(2015));
+        assert_eq!(raw.original_date, PackedDate::new(1973, 8, 7));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

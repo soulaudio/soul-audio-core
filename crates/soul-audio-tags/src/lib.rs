@@ -48,7 +48,12 @@ pub enum Field {
     TrackTotal,
     DiscNumber,
     DiscTotal,
+    /// The main release/recording date (ID3 `TDRC`/`TYER`, Vorbis `DATE`, MP4 `©day`).
     Date,
+    /// The ORIGINAL release date of a reissue/remaster (ID3 `TDOR`/`TORY`,
+    /// Vorbis `ORIGINALDATE`/`ORIGINALYEAR`, MP4 freeform `ORIGINALDATE`). The
+    /// audiophile-canonical "year" prefers this, falling back to `Date`.
+    OriginalDate,
     Genre,
     Composer,
     /// Artist sort-name ("Clapton, Eric"). Vorbis `ARTISTSORT`, ID3 `TSOP`, MP4 `soar`.
