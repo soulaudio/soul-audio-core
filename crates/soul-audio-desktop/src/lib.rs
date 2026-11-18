@@ -5,6 +5,7 @@
 //! device-format conversion lives in `soul_audio_core::convert`; the sink calls
 //! it, so a future DMA sink shares the same math.
 #![forbid(unsafe_code)]
+#![deny(unconditional_recursion)]
 
 pub mod decoder;
 #[cfg(feature = "playback")]
@@ -14,7 +15,9 @@ pub mod sources;
 #[cfg(all(windows, feature = "wasapi-exclusive"))]
 pub mod wasapi_exclusive;
 
-pub use decoder::{OwnedDecoder, ReadSeek, Src, open_seekable_src, open_track, vorbis_arena};
+pub use decoder::{
+    OwnedDecoder, ReadSeek, Src, open_seekable_src, open_track, vorbis_arena, wavpack_pcm,
+};
 #[cfg(feature = "playback")]
 pub use sink::{CpalSink, default_output_config, default_output_device_name, output_device_names};
 pub use sources::{file_source, tcp_source};

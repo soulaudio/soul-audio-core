@@ -16,6 +16,7 @@
 //! real files and applying it (reading tags off disk, collision handling) is the
 //! IO layer added on top later.
 #![forbid(unsafe_code)]
+#![deny(unconditional_recursion)]
 
 mod apply;
 mod plan;

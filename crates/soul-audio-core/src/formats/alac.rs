@@ -98,6 +98,7 @@ impl<'a> BitReader<'a> {
 
 use crate::decoder::{DecodeError, Decoder, SeekableDecoder};
 use crate::demux::mp4::Mp4Reader;
+use crate::formats::scratch::ScratchCursor;
 use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
 
@@ -346,37 +347,107 @@ pub(crate) struct AlacCfg {
     pub(crate) frame_length: usize,
 }
 
-/// Fixed-size decode scratch (no allocation): the two predictor output buffers,
-/// the residual buffer, the wasted-bits ("shift") buffer, and the interleaved
-/// output buffer handed to the caller.
-pub(crate) struct Scratch {
-    mix_u: [i32; MAX_FRAME],
-    mix_v: [i32; MAX_FRAME],
-    resid: [i32; MAX_FRAME],
-    shift: [u16; MAX_FRAME * MAX_CHANNELS],
-    /// Interleaved decoded output; valid range `[0, samples × channels)`.
-    pub(crate) out: [i32; MAX_FRAME * MAX_CHANNELS],
+/// Decode scratch: the two predictor output buffers, the residual buffer, the
+/// wasted-bits ("shift") buffer, and the interleaved output buffer handed to
+/// the caller — all carved from **caller-provided scratch** `P`
+/// (`AsRef<[i32]> + AsMut<[i32]>`) rather than held inline, exactly like
+/// [`crate::formats::flac::FlacDecoder`]'s channel planes (decoder-memory-
+/// externalization spec §7 shared-scratch design, §3 self-reference rationale
+/// for why this is a bump cursor at construction time, not a stored borrow).
+/// `Scratch<P>` owns `P` plus five `usize` offsets into it; every accessor
+/// below re-derives a slice from `P::as_ref()`/`as_mut()` on demand.
+///
+/// The wasted-bits buffer is logically `u16`-valued but stored as `i32` slots
+/// (every value is <= 16 bits, so the round-trip is exact) — simpler than a
+/// mixed-width scratch store, and `ScratchCursor` only ever hands out i32 slots.
+pub(crate) struct Scratch<P> {
+    scratch: P,
+    mix_u_off: usize,
+    mix_v_off: usize,
+    resid_off: usize,
+    shift_off: usize,
+    out_off: usize,
 }
 
-impl Scratch {
-    /// A zeroed scratch (no allocation).
-    pub(crate) fn new() -> Self {
-        Self {
-            mix_u: [0; MAX_FRAME],
-            mix_v: [0; MAX_FRAME],
-            resid: [0; MAX_FRAME],
-            shift: [0; MAX_FRAME * MAX_CHANNELS],
-            out: [0; MAX_FRAME * MAX_CHANNELS],
-        }
+impl<P: AsRef<[i32]> + AsMut<[i32]>> Scratch<P> {
+    /// Carve the five working buffers out of `scratch` via a bump cursor.
+    ///
+    /// # Errors
+    /// [`DecodeError::Unsupported`] if `scratch` is too small to hold them all
+    /// (never a panic / out-of-bounds index on undersized storage).
+    pub(crate) fn new_in(scratch: P) -> Result<Self, DecodeError> {
+        let mut cursor = ScratchCursor::new(scratch.as_ref().len());
+        let mix_u_off = cursor.alloc(MAX_FRAME)?;
+        let mix_v_off = cursor.alloc(MAX_FRAME)?;
+        let resid_off = cursor.alloc(MAX_FRAME)?;
+        let shift_off = cursor.alloc(MAX_FRAME * MAX_CHANNELS)?;
+        let out_off = cursor.alloc(MAX_FRAME * MAX_CHANNELS)?;
+        Ok(Self {
+            scratch,
+            mix_u_off,
+            mix_v_off,
+            resid_off,
+            shift_off,
+            out_off,
+        })
+    }
+
+    fn mix_u_ref(&self) -> &[i32] {
+        &self.scratch.as_ref()[self.mix_u_off..self.mix_u_off + MAX_FRAME]
+    }
+    fn mix_u_mut(&mut self) -> &mut [i32] {
+        &mut self.scratch.as_mut()[self.mix_u_off..self.mix_u_off + MAX_FRAME]
+    }
+    fn mix_v_ref(&self) -> &[i32] {
+        &self.scratch.as_ref()[self.mix_v_off..self.mix_v_off + MAX_FRAME]
+    }
+    fn mix_v_mut(&mut self) -> &mut [i32] {
+        &mut self.scratch.as_mut()[self.mix_v_off..self.mix_v_off + MAX_FRAME]
+    }
+    fn resid_mut(&mut self) -> &mut [i32] {
+        &mut self.scratch.as_mut()[self.resid_off..self.resid_off + MAX_FRAME]
+    }
+    /// `resid` (read-only) and channel `e`'s mix buffer (`mix_u` for `e == 0`,
+    /// `mix_v` otherwise) mutable, simultaneously: [`unpc_block`] reads the
+    /// residual while writing the reconstructed samples into the OTHER buffer.
+    /// Both views are carved from the same backing `scratch` slice, so this
+    /// takes one `split_at_mut` at `resid_off` (`resid` sits after both mix
+    /// buffers in allocation order) rather than two independent borrows —
+    /// mirrors [`crate::formats::flac::FlacDecoder::apply_decorrelation`]'s
+    /// same-backing-slice pattern.
+    fn resid_ref_and_mix_mut(&mut self, e: usize) -> (&[i32], &mut [i32]) {
+        let (lo, hi) = self.scratch.as_mut().split_at_mut(self.resid_off);
+        let resid = &hi[..MAX_FRAME];
+        let mix_off = if e == 0 {
+            self.mix_u_off
+        } else {
+            self.mix_v_off
+        };
+        let mix = &mut lo[mix_off..mix_off + MAX_FRAME];
+        (resid, mix)
+    }
+    fn shift_ref(&self) -> &[i32] {
+        &self.scratch.as_ref()[self.shift_off..self.shift_off + MAX_FRAME * MAX_CHANNELS]
+    }
+    fn shift_mut(&mut self) -> &mut [i32] {
+        &mut self.scratch.as_mut()[self.shift_off..self.shift_off + MAX_FRAME * MAX_CHANNELS]
+    }
+    /// Read-only view of the interleaved decoded output (valid range
+    /// `[0, samples × channels)`).
+    pub(crate) fn out_ref(&self) -> &[i32] {
+        &self.scratch.as_ref()[self.out_off..self.out_off + MAX_FRAME * MAX_CHANNELS]
+    }
+    fn out_mut(&mut self) -> &mut [i32] {
+        &mut self.scratch.as_mut()[self.out_off..self.out_off + MAX_FRAME * MAX_CHANNELS]
     }
 }
 
 /// Decode one SCE/LFE (`elem_ch == 1`) or CPE (`elem_ch == 2`) element into the
 /// interleaved output buffer at `channel_index`.
 #[allow(clippy::needless_range_loop)]
-fn decode_channel_element(
+fn decode_channel_element<P: AsRef<[i32]> + AsMut<[i32]>>(
     r: &mut BitReader,
-    s: &mut Scratch,
+    s: &mut Scratch<P>,
     cfg: AlacCfg,
     channel_index: usize,
     num_samples: &mut usize,
@@ -461,38 +532,27 @@ fn decode_channel_element(
 
         for e in 0..elem_ch {
             let pb_eff = (cfg.pb * pbfactors[e]) / 4;
-            dyn_decomp(r, &mut s.resid, num, chan_bits, cfg.mb, pb_eff, cfg.kb);
+            dyn_decomp(r, s.resid_mut(), num, chan_bits, cfg.mb, pb_eff, cfg.kb);
             if modes[e] != 0 {
-                dc31_inplace(&mut s.resid, num, chan_bits);
+                dc31_inplace(s.resid_mut(), num, chan_bits);
             }
-            if e == 0 {
-                unpc_block(
-                    &s.resid,
-                    &mut s.mix_u,
-                    num,
-                    &mut coefs[0][..nums[0]],
-                    nums[0],
-                    chan_bits,
-                    denshifts[0],
-                );
-            } else {
-                unpc_block(
-                    &s.resid,
-                    &mut s.mix_v,
-                    num,
-                    &mut coefs[1][..nums[1]],
-                    nums[1],
-                    chan_bits,
-                    denshifts[1],
-                );
-            }
+            let (resid, mix) = s.resid_ref_and_mix_mut(e);
+            unpc_block(
+                resid,
+                mix,
+                num,
+                &mut coefs[e][..nums[e]],
+                nums[e],
+                chan_bits,
+                denshifts[e],
+            );
         }
 
         if bytes_shifted != 0 {
             let save = r.bit_pos();
             r.set_bit_pos(shift_pos);
-            for slot in s.shift[..num * elem_ch].iter_mut() {
-                *slot = r.read(shift) as u16;
+            for slot in s.shift_mut()[..num * elem_ch].iter_mut() {
+                *slot = r.read(shift) as i32;
             }
             r.set_bit_pos(save);
         }
@@ -503,19 +563,19 @@ fn decode_channel_element(
         let sh = 32 - chan_bits;
         if chan_bits <= 16 {
             for i in 0..num {
-                s.mix_u[i] = ((r.read(chan_bits) << sh) as i32) >> sh;
+                s.mix_u_mut()[i] = ((r.read(chan_bits) << sh) as i32) >> sh;
                 if elem_ch == 2 {
-                    s.mix_v[i] = ((r.read(chan_bits) << sh) as i32) >> sh;
+                    s.mix_v_mut()[i] = ((r.read(chan_bits) << sh) as i32) >> sh;
                 }
             }
         } else {
             let extra = chan_bits - 16;
             for i in 0..num {
                 let hi = ((r.read(16) << 16) as i32) >> sh;
-                s.mix_u[i] = hi | r.read(extra) as i32;
+                s.mix_u_mut()[i] = hi | r.read(extra) as i32;
                 if elem_ch == 2 {
                     let hi = ((r.read(16) << 16) as i32) >> sh;
-                    s.mix_v[i] = hi | r.read(extra) as i32;
+                    s.mix_v_mut()[i] = hi | r.read(extra) as i32;
                 }
             }
         }
@@ -529,16 +589,17 @@ fn decode_channel_element(
 
     if elem_ch == 1 {
         for i in 0..num {
-            let mut val = s.mix_u[i];
+            let mut val = s.mix_u_ref()[i];
             if apply_shift {
-                val = (val << shift) | i32::from(s.shift[i]);
+                val = (val << shift) | s.shift_ref()[i];
             }
-            s.out[i * stride + base] = if is16 { i32::from(val as i16) } else { val };
+            let v = if is16 { i32::from(val as i16) } else { val };
+            s.out_mut()[i * stride + base] = v;
         }
     } else {
         for i in 0..num {
-            let u = s.mix_u[i];
-            let v = s.mix_v[i];
+            let u = s.mix_u_ref()[i];
+            let v = s.mix_v_ref()[i];
             let (mut l, mut rr) = if mix_res != 0 {
                 let l = u
                     .wrapping_add(v)
@@ -548,15 +609,15 @@ fn decode_channel_element(
                 (u, v)
             };
             if apply_shift {
-                l = (l << shift) | i32::from(s.shift[2 * i]);
-                rr = (rr << shift) | i32::from(s.shift[2 * i + 1]);
+                l = (l << shift) | s.shift_ref()[2 * i];
+                rr = (rr << shift) | s.shift_ref()[2 * i + 1];
             }
             if is16 {
-                s.out[i * stride + base] = i32::from(l as i16);
-                s.out[i * stride + base + 1] = i32::from(rr as i16);
+                s.out_mut()[i * stride + base] = i32::from(l as i16);
+                s.out_mut()[i * stride + base + 1] = i32::from(rr as i16);
             } else {
-                s.out[i * stride + base] = l;
-                s.out[i * stride + base + 1] = rr;
+                s.out_mut()[i * stride + base] = l;
+                s.out_mut()[i * stride + base + 1] = rr;
             }
         }
     }
@@ -571,9 +632,9 @@ fn decode_channel_element(
 /// `(bytes_consumed, per_channel_samples)`; the interleaved output is
 /// `s.out[..samples × cfg.channels]`. Shared by the MP4 [`AlacDecoder`] and the
 /// CAF driver.
-pub(crate) fn decode_packet(
+pub(crate) fn decode_packet<P: AsRef<[i32]> + AsMut<[i32]>>(
     data: &[u8],
-    s: &mut Scratch,
+    s: &mut Scratch<P>,
     cfg: AlacCfg,
 ) -> Result<(usize, usize), DecodeError> {
     let mut r = BitReader::new(data);
@@ -642,11 +703,21 @@ pub(crate) fn decode_packet(
 /// Decodes the `mdat` ALAC packets produced by [`Mp4Reader`] to interleaved
 /// `i32` PCM. v1 supports mono and stereo at 16/20/24-bit; 16- and 24-bit are
 /// gated bit-exact by golden fixtures (20-bit shares the same width-generic
-/// path but has no fixture yet). No allocation: all buffers are fixed-size and
-/// owned by value.
-pub struct AlacDecoder<S> {
+/// path but has no fixture yet).
+///
+/// The decode scratch (predictor/residual/shift/output buffers) is
+/// **caller-provided scratch** `P` (`AsRef<[i32]> + AsMut<[i32]>`), carved by
+/// [`Scratch::new_in`] — the SAME shared scratch
+/// [`crate::formats::wavpack::WavpackDecoder`] and
+/// [`crate::formats::flac::FlacDecoder`] use (decoder-memory-externalization
+/// spec §7). [`CafAlac`](crate::formats::caf::CafAlac) carves its own
+/// `Scratch<P>` from the same shared storage, driving the same
+/// [`decode_packet`] core. The `inbuf` packet-staging buffer is raw encoded
+/// bytes (not PCM), so it stays an inline fixed-size array like every other
+/// decoder's byte-level input staging.
+pub struct AlacDecoder<S, P> {
     reader: Mp4Reader<S>,
-    scratch: Scratch,
+    scratch: Scratch<P>,
     inbuf: [u8; PACKET_CAP],
     filled: usize,
     used: usize,
@@ -659,25 +730,30 @@ pub struct AlacDecoder<S> {
     sample_rate: u32,
 }
 
-impl<S: Source> AlacDecoder<S> {
-    /// Parse the MP4 header and prepare to stream ALAC packets.
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> AlacDecoder<S, P> {
+    /// Parse the MP4 header and prepare to stream ALAC packets, carving the
+    /// decode scratch from `scratch` (must be at least
+    /// [`crate::dispatch::decoder_scratch_len`] samples long).
     ///
     /// # Errors
-    /// [`DecodeError::Unsupported`] for >2 channels or a frame length beyond the
-    /// fixed buffer; container errors propagate from [`Mp4Reader`].
-    pub fn new(src: S) -> Result<Self, DecodeError> {
-        Self::from_reader(Mp4Reader::new(src)?)
+    /// [`DecodeError::Unsupported`] for >2 channels, a frame length beyond the
+    /// fixed buffer, or a `scratch` too small to hold the decode buffers;
+    /// container errors propagate from [`Mp4Reader`].
+    pub fn new_in(src: S, scratch: P) -> Result<Self, DecodeError> {
+        Self::from_reader_in(Mp4Reader::new(src)?, scratch)
     }
 
     /// Construct from an already-parsed [`Mp4Reader`] (its header walked to
     /// `mdat`). Lets [`crate::dispatch::open`] build the reader once, inspect
     /// [`Mp4Reader::codec`], and route an `alac` sample entry here without
-    /// re-reading the container. `new` is this over a fresh `Mp4Reader`.
+    /// re-reading the container. `new_in` is this over a fresh [`Mp4Reader`].
+    /// `scratch` is as [`Self::new_in`].
     ///
     /// # Errors
-    /// As [`Self::new`]: [`DecodeError::Unsupported`] for >2 channels, an
-    /// out-of-range frame length, or a sample entry that wasn't ALAC.
-    pub fn from_reader(reader: Mp4Reader<S>) -> Result<Self, DecodeError> {
+    /// As [`Self::new_in`]: [`DecodeError::Unsupported`] for >2 channels, an
+    /// out-of-range frame length, a sample entry that wasn't ALAC, or an
+    /// undersized `scratch`.
+    pub fn from_reader_in(reader: Mp4Reader<S>, scratch: P) -> Result<Self, DecodeError> {
         let c = *reader.config();
         if c.channels == 0 || c.channels as usize > MAX_CHANNELS {
             return Err(DecodeError::Unsupported);
@@ -730,7 +806,7 @@ impl<S: Source> AlacDecoder<S> {
         };
         Ok(Self {
             reader,
-            scratch: Scratch::new(),
+            scratch: Scratch::new_in(scratch)?,
             inbuf: [0; PACKET_CAP],
             filled: 0,
             used: 0,
@@ -794,7 +870,7 @@ impl<S: Source> AlacDecoder<S> {
     }
 }
 
-impl<S: Source> Decoder for AlacDecoder<S> {
+impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for AlacDecoder<S, P> {
     fn stream_info(&self) -> StreamInfo {
         StreamInfo {
             sample_rate: self.sample_rate,
@@ -819,7 +895,7 @@ impl<S: Source> Decoder for AlacDecoder<S> {
             }
             let n = (out.len() - written).min(self.out_len - self.out_pos);
             out[written..written + n]
-                .copy_from_slice(&self.scratch.out[self.out_pos..self.out_pos + n]);
+                .copy_from_slice(&self.scratch.out_ref()[self.out_pos..self.out_pos + n]);
             self.out_pos += n;
             written += n;
         }
@@ -838,7 +914,7 @@ impl<S: Source> Decoder for AlacDecoder<S> {
     }
 }
 
-impl<S: SeekSource> AlacDecoder<S> {
+impl<S: SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> AlacDecoder<S, P> {
     /// Seek to per-channel `sample` (clamped to the stream length; returns the
     /// landed sample, always `== sample` when in range). **Sample-accurate**:
     /// ALAC packets are fully independent (each carries its own predictor
@@ -888,7 +964,7 @@ impl<S: SeekSource> AlacDecoder<S> {
     }
 }
 
-impl<S: SeekSource> SeekableDecoder for AlacDecoder<S> {
+impl<S: SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> SeekableDecoder for AlacDecoder<S, P> {
     fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
         AlacDecoder::seek_to(self, sample)
     }
@@ -944,9 +1020,16 @@ mod golden {
     const ALAC24: &[u8] = include_bytes!("../../testdata/alac24.m4a");
     const REF24: &[u8] = include_bytes!("../../testdata/alac24.ref.pcm"); // s24le interleaved
 
+    /// Scratch storage for `AlacDecoder::new_in` in this suite, sized via the
+    /// shared [`crate::dispatch::decoder_scratch_len`] helper — the same
+    /// storage `open()`'s callers provide.
+    fn scratch() -> Vec<i32> {
+        vec![0i32; crate::dispatch::decoder_scratch_len()]
+    }
+
     #[test]
     fn decodes_bit_exact_vs_reference() {
-        let mut dec = AlacDecoder::new(SliceSource::new(ALAC)).expect("open alac");
+        let mut dec = AlacDecoder::new_in(SliceSource::new(ALAC), scratch()).expect("open alac");
         let si = dec.stream_info();
         assert_eq!(si.sample_rate, 44_100);
         assert_eq!(si.channels, 2);
@@ -973,7 +1056,8 @@ mod golden {
 
     #[test]
     fn decodes_24bit_bit_exact_vs_reference() {
-        let mut dec = AlacDecoder::new(SliceSource::new(ALAC24)).expect("open alac24");
+        let mut dec =
+            AlacDecoder::new_in(SliceSource::new(ALAC24), scratch()).expect("open alac24");
         let si = dec.stream_info();
         assert_eq!(si.sample_rate, 44_100);
         assert_eq!(si.channels, 2);
@@ -1016,6 +1100,12 @@ mod malformed {
     use alloc::vec::Vec;
 
     const ALAC: &[u8] = include_bytes!("../../testdata/alac.m4a");
+
+    /// Scratch storage for `AlacDecoder::new_in` in this suite (see the
+    /// sibling helper in `mod golden`).
+    fn scratch() -> Vec<i32> {
+        vec![0i32; crate::dispatch::decoder_scratch_len()]
+    }
 
     /// MSB-first bit writer, mirroring [`BitReader`]'s bit order.
     struct BitWriter {
@@ -1111,7 +1201,7 @@ mod malformed {
         // Verbatim payload left unspecified (reads back as zero).
 
         let data = splice_first_packet(&w.bytes);
-        let mut dec = AlacDecoder::new(SliceSource::new(&data)).expect("open alac");
+        let mut dec = AlacDecoder::new_in(SliceSource::new(&data), scratch()).expect("open alac");
         let mut buf = [0i32; 8192];
         assert_eq!(dec.decode_into(&mut buf), Err(DecodeError::Malformed));
     }
@@ -1142,7 +1232,7 @@ mod malformed {
         // to a single all-zero sample per sub-frame, deterministically.
 
         let data = splice_first_packet(&w.bytes);
-        let mut dec = AlacDecoder::new(SliceSource::new(&data)).expect("open alac");
+        let mut dec = AlacDecoder::new_in(SliceSource::new(&data), scratch()).expect("open alac");
         let mut buf = [0i32; 8192];
         assert_eq!(dec.decode_into(&mut buf), Err(DecodeError::Malformed));
     }
@@ -1169,7 +1259,7 @@ mod malformed {
         // and residuals read back as zero.
 
         let data = splice_first_packet(&w.bytes);
-        let mut dec = AlacDecoder::new(SliceSource::new(&data)).expect("open alac");
+        let mut dec = AlacDecoder::new_in(SliceSource::new(&data), scratch()).expect("open alac");
         let mut buf = [0i32; 8192];
         assert_eq!(dec.decode_into(&mut buf), Err(DecodeError::Malformed));
     }
@@ -1225,7 +1315,7 @@ mod malformed {
         assert_eq!(data[cookie_off + 8], 14, "kb offset sanity check");
         data[cookie_off + 8] = 0; // kb = 0
         assert_eq!(
-            AlacDecoder::new(SliceSource::new(&data)).err(),
+            AlacDecoder::new_in(SliceSource::new(&data), scratch()).err(),
             Some(DecodeError::Unsupported)
         );
     }
@@ -1241,7 +1331,7 @@ mod malformed {
         assert_eq!(data[cookie_off + 5], 16, "bit_depth offset sanity check");
         data[cookie_off + 5] = 32; // bit_depth = 32
         assert_eq!(
-            AlacDecoder::new(SliceSource::new(&data)).err(),
+            AlacDecoder::new_in(SliceSource::new(&data), scratch()).err(),
             Some(DecodeError::Unsupported)
         );
     }
@@ -1256,7 +1346,13 @@ mod seek_tests {
     const CH: usize = 2;
     const TOTAL: u64 = 13_230;
 
-    fn decode_all<S: Source>(dec: &mut AlacDecoder<S>) -> Vec<i32> {
+    /// Scratch storage for `AlacDecoder::new_in` in this suite (see the
+    /// sibling helper in `mod golden`).
+    fn scratch() -> Vec<i32> {
+        vec![0i32; crate::dispatch::decoder_scratch_len()]
+    }
+
+    fn decode_all<S: Source>(dec: &mut AlacDecoder<S, Vec<i32>>) -> Vec<i32> {
         let mut out = Vec::new();
         let mut buf = [0i32; 4096];
         loop {
@@ -1270,7 +1366,7 @@ mod seek_tests {
     }
 
     fn full() -> Vec<i32> {
-        decode_all(&mut AlacDecoder::new(SliceSource::new(ALAC)).unwrap())
+        decode_all(&mut AlacDecoder::new_in(SliceSource::new(ALAC), scratch()).unwrap())
     }
 
     /// ALAC is lossless + frame-independent ⇒ seeking is exactly bit-identical
@@ -1281,7 +1377,7 @@ mod seek_tests {
         let reference = full();
         assert_eq!(reference.len(), TOTAL as usize * CH);
         for &target in &[0u64, 1, 100, 4095, 4096, 4097, 8192, 12_288, 12_289, 13_229] {
-            let mut d = AlacDecoder::new(SliceSource::new(ALAC)).unwrap();
+            let mut d = AlacDecoder::new_in(SliceSource::new(ALAC), scratch()).unwrap();
             let landed = d.seek_to(target).unwrap();
             assert_eq!(landed, target, "sample-accurate landing at {target}");
             let rest = decode_all(&mut d);
@@ -1302,7 +1398,7 @@ mod seek_tests {
     #[test]
     fn alac_seek_to_zero_matches_fresh() {
         let reference = full();
-        let mut d = AlacDecoder::new(SliceSource::new(ALAC)).unwrap();
+        let mut d = AlacDecoder::new_in(SliceSource::new(ALAC), scratch()).unwrap();
         let mut buf = [0i32; 1000];
         let _ = d.decode_into(&mut buf).unwrap(); // partial decode first
         assert_eq!(d.seek_to(0).unwrap(), 0);
@@ -1312,7 +1408,7 @@ mod seek_tests {
     #[test]
     fn alac_backward_seek_matches() {
         let reference = full();
-        let mut d = AlacDecoder::new(SliceSource::new(ALAC)).unwrap();
+        let mut d = AlacDecoder::new_in(SliceSource::new(ALAC), scratch()).unwrap();
         d.seek_to(10_000).unwrap();
         d.seek_to(2_000).unwrap(); // backward
         let rest = decode_all(&mut d);
@@ -1321,7 +1417,7 @@ mod seek_tests {
 
     #[test]
     fn alac_seek_beyond_end_clamps() {
-        let mut d = AlacDecoder::new(SliceSource::new(ALAC)).unwrap();
+        let mut d = AlacDecoder::new_in(SliceSource::new(ALAC), scratch()).unwrap();
         assert_eq!(d.seek_to(1_000_000).unwrap(), TOTAL, "clamps to length");
         let mut buf = [0i32; 16];
         assert_eq!(d.decode_into(&mut buf).unwrap(), 0, "at EOF after clamp");
@@ -1330,7 +1426,7 @@ mod seek_tests {
     #[test]
     fn alac_seek_to_time_matches_sample() {
         let reference = full();
-        let mut d = AlacDecoder::new(SliceSource::new(ALAC)).unwrap();
+        let mut d = AlacDecoder::new_in(SliceSource::new(ALAC), scratch()).unwrap();
         // 0.1 s @ 44100 = sample 4410.
         let landed = d.seek_to_time(0.1).unwrap();
         assert_eq!(landed, 4_410);

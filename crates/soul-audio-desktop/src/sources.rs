@@ -75,13 +75,16 @@ mod tests {
 
         let mut buf = [0u8; 64];
         let src = bytes_source(flac, &mut buf);
-        assert!(open(src).is_ok()); // fLaC → FLAC variant, real StreamInfo
+        assert!(open(src, vec![0i32; soul_audio_core::decoder_scratch_len()]).is_ok()); // fLaC → FLAC variant, real StreamInfo
     }
 
     #[test]
     fn open_over_in_memory_bytes_rejects_unknown() {
         let mut buf = [0u8; 64];
         let src = bytes_source(b"XXXXYYYY".to_vec(), &mut buf);
-        assert_eq!(open(src).err(), Some(DecodeError::Unsupported));
+        assert_eq!(
+            open(src, vec![0i32; soul_audio_core::decoder_scratch_len()]).err(),
+            Some(DecodeError::Unsupported)
+        );
     }
 }
