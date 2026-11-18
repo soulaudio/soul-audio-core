@@ -2001,6 +2001,7 @@ name = "soul-audio-eq"
 version = "0.1.0"
 dependencies = [
  "libm",
+ "rustfft",
  "soul-audio-core",
 ]
 
