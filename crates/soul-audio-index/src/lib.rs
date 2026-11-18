@@ -45,9 +45,10 @@
 //!   53 file_name.off u32 · 57 file_name.len u16 · 59 mbid.off u32 ·
 //!   63 mbid.len u16   (mbid new in format v4)
 //!
-//! ALBUM RECORD (24 B, fixed; indexed by dense album id):
+//! ALBUM RECORD (30 B, fixed; indexed by dense album id):
 //!    0 id u32 · 4 title.off u32 · 8 title.len u16 · 10 album_artist u32 ·
-//!   14 year u16 · 16 folder u32 · 20 art_id u32
+//!   14 original_date u32 · 18 release_date u32 · 22 folder u32 · 26 art_id u32
+//!   (original_date/release_date are PackedDate; year u16 replaced in format v5)
 //!
 //! ARTIST NAME TABLE: artist_count × StrRef (6 B: off u32, len u16), indexed by
 //!   artist id; each resolves to the artist's display name in the string heap.
@@ -96,18 +97,18 @@ use core::cell::RefCell;
 use embedded_io::SeekFrom;
 use soul_audio_catalog::{
     AlbumId, AlbumRec, ArtistId, BrowseAxis, Catalog, CatalogError, FolderId, FolderRec, GenreId,
-    PlaylistId, StrRef, TrackId, TrackRec,
+    PackedDate, PlaylistId, StrRef, TrackId, TrackRec,
 };
 use soul_audio_core::SeekSource;
 
 /// Magic at the head of `index.sidx` — `"SIDX"`.
 pub const MAGIC: [u8; 4] = *b"SIDX";
 /// Format version in the header.
-pub const FORMAT_VERSION: u16 = 4;
+pub const FORMAT_VERSION: u16 = 5;
 
 const HEADER_SIZE: usize = 72;
 const RECORD_SIZE: usize = 65;
-const ALBUM_RECORD_SIZE: usize = 24;
+const ALBUM_RECORD_SIZE: usize = 30;
 const ARTIST_REF_SIZE: usize = 6; // StrRef (off u32, len u16) per artist
 const GENRE_REF_SIZE: usize = 6; // StrRef (off u32, len u16) per genre
 const FOLDER_RECORD_SIZE: usize = 10; // path StrRef (6) + parent u32 (4)
@@ -352,9 +353,12 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
                 len: le_u16(&r, 8),
             },
             album_artist: le_u32(&r, 10),
-            year: le_u16(&r, 14),
-            folder: le_u32(&r, 16),
-            art_id: le_u32(&r, 20),
+            // Two PackedDate u32s replace the v4 `year u16`; `folder`/`art_id`
+            // shift by +6 bytes (14→original_date, 18→release_date, 22, 26).
+            original_date: PackedDate(le_u32(&r, 14)),
+            release_date: PackedDate(le_u32(&r, 18)),
+            folder: le_u32(&r, 22),
+            art_id: le_u32(&r, 26),
         })
     }
 
@@ -515,12 +519,12 @@ pub mod build {
     pub struct AlbumMeta {
         pub title: String,
         pub album_artist: u32,
-        pub year: u16,
-        /// Original-release date (e.g. the first pressing), if tagged.
-        /// Additive alongside `year`: not yet baked into the on-disk format.
+        /// Original-release date (e.g. the first pressing), if tagged, else
+        /// `PackedDate::UNKNOWN`. The chronological sort key within an artist
+        /// (the audiophile default); baked at offset 14 of the album record (v5).
         pub original_date: soul_audio_catalog::PackedDate,
-        /// Release date (e.g. a reissue's date), if tagged. Additive alongside
-        /// `year`: not yet baked into the on-disk format.
+        /// Release date of this particular edition (e.g. a reissue), if tagged,
+        /// else `PackedDate::UNKNOWN`; baked at offset 18 of the album record (v5).
         pub release_date: soul_audio_catalog::PackedDate,
         pub folder: u32,
     }
@@ -717,15 +721,15 @@ pub mod build {
         fn key_at(keys: &[Vec<u8>], i: u32) -> &[u8] {
             keys.get(i as usize).map_or(&[], |v| v.as_slice())
         }
-        // Album release year for chronological ordering within an artist (the
-        // collector default S+ players use). Unknown year (0 = untagged) sorts
-        // LAST (as `u16::MAX`) so the dated discography stays chronological and
-        // undated albums trail it. An out-of-range id also sorts last.
-        fn year_at(albums: &[AlbumMeta], i: u32) -> u16 {
-            match albums.get(i as usize).map(|a| a.year) {
-                Some(0) | None => u16::MAX,
-                Some(y) => y,
-            }
+        // Album ORIGINAL-release date for chronological ordering within an artist
+        // (the audiophile default). Unknown (0) sorts LAST (u32::MAX) so the dated
+        // discography stays chronological and undated albums trail it; an
+        // out-of-range id also sorts last. MUST match the multicatalog merge key
+        // (`Head.original_sort`) or the desktop merge diverges from the device order.
+        fn year_at(albums: &[AlbumMeta], i: u32) -> u32 {
+            albums
+                .get(i as usize)
+                .map_or(u32::MAX, |a| a.original_date.sort_key())
         }
 
         let title_order = sorted_ids(track_count, |a, b| {
@@ -756,8 +760,8 @@ pub mod build {
                 .then_with(|| (x.disc_no, x.track_no).cmp(&(y.disc_no, y.track_no)))
         });
         // Genre groups first by genre collation, then reuses the ArtistAlbumTrack
-        // tiebreak chain (album-artist sort → year → album → disc/track) within a
-        // genre. The `MultiCatalog` merge keys its heads on the genre key too; a
+        // tiebreak chain (album-artist sort → original date → album → disc/track)
+        // within a genre. The `MultiCatalog` merge keys its heads on the genre key too; a
         // union genre id belongs to exactly one source, so the within-genre chain
         // stays intra-source and the merge reproduces this frozen order.
         let genre_order = sorted_ids(track_count, |a, b| {
@@ -862,7 +866,10 @@ pub mod build {
             out.extend_from_slice(&toff.to_le_bytes());
             out.extend_from_slice(&tlen.to_le_bytes());
             out.extend_from_slice(&meta.album_artist.to_le_bytes());
-            out.extend_from_slice(&meta.year.to_le_bytes());
+            // Two PackedDate u32s (format v5) replacing the v4 `year u16`; folder
+            // and art_id writes keep their order, now at offsets 22 and 26.
+            out.extend_from_slice(&meta.original_date.0.to_le_bytes());
+            out.extend_from_slice(&meta.release_date.0.to_le_bytes());
             out.extend_from_slice(&meta.folder.to_le_bytes());
             let art_id = album_art_id.get(a).copied().unwrap_or(0);
             out.extend_from_slice(&art_id.to_le_bytes()); // art_id

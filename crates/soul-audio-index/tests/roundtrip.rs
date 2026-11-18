@@ -57,9 +57,8 @@ fn fixture() -> CatalogInput {
         albums: vec![AlbumMeta {
             title: "Open Goldberg Variations".into(),
             album_artist: 0,
-            year: 2012,
-            original_date: PackedDate::from_year(2012),
-            release_date: PackedDate::from_year(2012),
+            original_date: PackedDate::new(1973, 8, 7),
+            release_date: PackedDate::from_year(2015),
             folder: 1,
         }],
         // Folder 0 = root (empty path, no parent); folder 1 = the album dir.
@@ -159,7 +158,11 @@ fn soulidx_round_trips_tracks_order_and_playlists() {
         resolve(&rdr, album.title, &mut buf),
         "Open Goldberg Variations"
     );
-    assert_eq!(album.year, 2012);
+    // Dual packed dates survive the v5 round-trip: a full original-release date
+    // (1973-08-07) distinct from a year-only reissue date (2015). Distinct values
+    // also prove the reader reads offsets 14 and 18 independently, in order.
+    assert_eq!(album.original_date, PackedDate::new(1973, 8, 7));
+    assert_eq!(album.release_date, PackedDate::from_year(2015));
 
     // Desktop-baked browse order is readable.
     assert_eq!(rdr.order_len(BrowseAxis::Title), 2, "title axis len");
@@ -207,7 +210,6 @@ fn baked_title_order_is_collation_sorted() {
         albums: vec![AlbumMeta {
             title: "A".to_string(),
             album_artist: 0,
-            year: 0,
             original_date: PackedDate::UNKNOWN,
             release_date: PackedDate::UNKNOWN,
             folder: 0,
@@ -297,7 +299,6 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
             AlbumMeta {
                 title: "Covered Album".into(),
                 album_artist: 0,
-                year: 2020,
                 original_date: PackedDate::from_year(2020),
                 release_date: PackedDate::from_year(2020),
                 folder: 0,
@@ -305,7 +306,6 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
             AlbumMeta {
                 title: "Uncovered Album".into(),
                 album_artist: 0,
-                year: 2021,
                 original_date: PackedDate::from_year(2021),
                 release_date: PackedDate::from_year(2021),
                 folder: 0,
@@ -402,7 +402,6 @@ fn artist_album_track_orders_by_sort_name() {
             AlbumMeta {
                 title: "Here Come the Warm Jets".into(),
                 album_artist: 0,
-                year: 1974,
                 original_date: PackedDate::from_year(1974),
                 release_date: PackedDate::from_year(1974),
                 folder: 0,
@@ -410,7 +409,6 @@ fn artist_album_track_orders_by_sort_name() {
             AlbumMeta {
                 title: "Slowhand".into(),
                 album_artist: 1,
-                year: 1977,
                 original_date: PackedDate::from_year(1977),
                 release_date: PackedDate::from_year(1977),
                 folder: 0,
@@ -474,7 +472,6 @@ fn artist_sort_name_falls_back_to_display_when_untagged() {
         albums: vec![AlbumMeta {
             title: "Kind of Blue".into(),
             album_artist: 0,
-            year: 1959,
             original_date: PackedDate::from_year(1959),
             release_date: PackedDate::from_year(1959),
             folder: 0,
@@ -531,7 +528,6 @@ fn baked_genre_order_groups_by_genre_collation() {
         albums: vec![AlbumMeta {
             title: "Album".into(),
             album_artist: 0,
-            year: 2000,
             original_date: PackedDate::from_year(2000),
             release_date: PackedDate::from_year(2000),
             folder: 0,

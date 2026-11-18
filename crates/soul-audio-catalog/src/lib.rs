@@ -148,7 +148,13 @@ pub struct AlbumRec {
     pub id: AlbumId,
     pub title: StrRef,
     pub album_artist: ArtistId,
-    pub year: u16,
+    /// Original-release date (e.g. the first pressing) — the chronological sort
+    /// key within an artist (the audiophile default). `PackedDate::UNKNOWN` when
+    /// untagged. Baked at offset 14 of the album record (format v5).
+    pub original_date: PackedDate,
+    /// Release date of this particular edition (e.g. a reissue), if tagged, else
+    /// `PackedDate::UNKNOWN`. Baked at offset 18 of the album record (format v5).
+    pub release_date: PackedDate,
     pub folder: FolderId,
     pub art_id: u32,
 }

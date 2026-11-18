@@ -176,13 +176,12 @@ impl Interner {
     /// sight, along with `dir` (the album's filesystem folder) and
     /// `track_path` (a representative track, for embedded cover-art
     /// discovery) — both recorded only on first sight, same as the metadata.
-    #[allow(clippy::too_many_arguments)] // transitional: year + two PackedDates side by side
+    #[allow(clippy::too_many_arguments)] // album identity + both dates + cover-discovery inputs
     fn album(
         &mut self,
         title: &str,
         folder: u32,
         album_artist: u32,
-        year: u16,
         original_date: soul_audio_catalog::PackedDate,
         release_date: soul_audio_catalog::PackedDate,
         dir: &Path,
@@ -196,7 +195,6 @@ impl Interner {
         self.albums.push(AlbumMeta {
             title: title.to_owned(),
             album_artist,
-            year,
             original_date,
             release_date,
             folder,
@@ -274,7 +272,6 @@ pub struct RawTrack {
     album_name: String,
     artist_sort: Option<String>,
     album_artist_sort: Option<String>,
-    year: u16,
     original_date: soul_audio_catalog::PackedDate,
     release_date: soul_audio_catalog::PackedDate,
     genre_name: String,
@@ -308,16 +305,9 @@ fn extract_raw(path: &Path) -> RawTrack {
         .album
         .clone()
         .unwrap_or_else(|| "Unknown Album".to_owned());
-    // Year = leading 4 digits of the date tag (e.g. "2012-05-29" → 2012).
-    let year = tags
-        .date
-        .as_deref()
-        .and_then(|d| d.get(0..4))
-        .and_then(|y| y.parse::<u16>().ok())
-        .unwrap_or(0);
-    // Release vs. original-release date (reissue vs. the first pressing), kept
-    // alongside `year` for now — both `PackedDate`s carry optional month/day
-    // precision that the plain `year` doesn't.
+    // Release vs. original-release date (reissue vs. the first pressing). Both
+    // `PackedDate`s carry optional month/day precision; the original date is the
+    // chronological sort key within an artist (see the index baker's `year_at`).
     let release_date = parse_date(tags.date.as_deref());
     let original_date = parse_date(tags.original_date.as_deref());
     // Genre from the tag, trimmed; blank/absent → the "Unknown Genre" bucket.
@@ -336,7 +326,6 @@ fn extract_raw(path: &Path) -> RawTrack {
         album_name,
         artist_sort: tags.artist_sort.clone(),
         album_artist_sort: tags.album_artist_sort.clone(),
-        year,
         original_date,
         release_date,
         genre_name,
@@ -369,7 +358,6 @@ fn build_catalog(raw: &[RawTrack], root: &Path) -> CatalogInput {
             &r.album_name,
             folder,
             album_artist,
-            r.year,
             r.original_date,
             r.release_date,
             album_dir,

@@ -111,7 +111,6 @@ fn synth(n: u32) -> CatalogInput {
             AlbumMeta {
                 title: format!("Album {a:05}"),
                 album_artist: a % artists,
-                year,
                 original_date: soul_audio_catalog::PackedDate::from_year(year),
                 release_date: soul_audio_catalog::PackedDate::from_year(year),
                 folder: a,
