@@ -6,8 +6,8 @@
 //! checkable.
 
 use soul_audio_core::{
-    Deck, DecodeError, Decoder, Progress, Quality, SampleFormat, SeekableDecoder, Sink, SinkError,
-    StreamInfo, channels::speaker,
+    AnyDecoder, Deck, DecodeError, Decoder, Progress, Quality, SampleFormat, SeekableDecoder, Sink,
+    SinkError, SliceSource, StreamInfo, channels::speaker, decoder_scratch_len, open,
 };
 
 /// Emits one constant `vals` frame per output frame until `frames` is exhausted, reporting
@@ -233,4 +233,125 @@ fn downmix_clips_gracefully_on_hot_in_phase_surround() {
         lo > 7_000_000 && ro > 7_000_000,
         "clamped near full scale, not silent or wrapped: lo={lo} ro={ro}"
     );
+}
+
+// ===========================================================================
+// Real-decoder path: a multichannel WAV decoded through the PUBLIC `open()` API
+// (the exact probe + construct path the app runs), proving the channel mask
+// travels from the container `fmt ` chunk through the real decoder to the deck
+// fold. The tests above use a synthetic decoder; these exercise the whole chain.
+// ===========================================================================
+
+/// Build a 24-bit PCM WAV (24-bit ⇒ deck norm = 1, so the fold math stays exact). `mask`
+/// `Some` writes a WAVE_FORMAT_EXTENSIBLE header carrying that `dwChannelMask`; `None`
+/// writes a plain `fmt ` with no layout. Each of `frames` frames carries `vals` (one
+/// 24-bit value per channel).
+fn wav_24(ch: u16, mask: Option<u32>, vals: &[i32], frames: usize) -> Vec<u8> {
+    assert_eq!(vals.len(), ch as usize);
+    let block_align = ch * 3;
+    let byte_rate = 48_000 * u32::from(block_align);
+    let mut fmt = Vec::new();
+    let tag: u16 = if mask.is_some() { 0xFFFE } else { 0x0001 };
+    fmt.extend_from_slice(&tag.to_le_bytes());
+    fmt.extend_from_slice(&ch.to_le_bytes());
+    fmt.extend_from_slice(&48_000u32.to_le_bytes());
+    fmt.extend_from_slice(&byte_rate.to_le_bytes());
+    fmt.extend_from_slice(&block_align.to_le_bytes());
+    fmt.extend_from_slice(&24u16.to_le_bytes()); // bits/sample
+    if let Some(m) = mask {
+        fmt.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+        fmt.extend_from_slice(&24u16.to_le_bytes()); // valid bits
+        fmt.extend_from_slice(&m.to_le_bytes()); // dwChannelMask
+        fmt.extend_from_slice(&1u16.to_le_bytes()); // SubFormat GUID[0..2] = PCM
+        fmt.extend_from_slice(&[0u8; 14]); // rest of the GUID
+    }
+
+    let mut data = Vec::with_capacity(frames * ch as usize * 3);
+    for _ in 0..frames {
+        for &v in vals {
+            data.push((v & 0xFF) as u8);
+            data.push(((v >> 8) & 0xFF) as u8);
+            data.push(((v >> 16) & 0xFF) as u8);
+        }
+    }
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(4 + 8 + fmt.len() as u32 + 8 + data.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(b"WAVE");
+    bytes.extend_from_slice(b"fmt ");
+    bytes.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&fmt);
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&data);
+    bytes
+}
+
+/// Decode real WAV `bytes` through the public `open()` path into a stereo deck, returning a
+/// steady-state (Lo, Ro) sample well past the fade-in.
+fn play_real_wav(bytes: &[u8]) -> (i32, i32) {
+    let mut deck: Deck<StereoCapture, AnyDecoder<SliceSource, Vec<i32>>, 0> = Deck::new(
+        StereoCapture {
+            written: Vec::new(),
+        },
+        Quality::Hq,
+    );
+    let dec = open(SliceSource::new(bytes), vec![0i32; decoder_scratch_len()]).expect("open wav");
+    deck.load(dec).expect("load");
+    for _ in 0..100_000 {
+        match deck.pump().unwrap() {
+            Progress::Ended | Progress::Idle => break,
+            _ => {}
+        }
+    }
+    let out = &deck.sink().written;
+    let i = 3_000; // steady state, clear of the fade-in
+    assert!(out.len() > i * 2 + 1, "too little output: {}", out.len());
+    (out[i * 2], out[i * 2 + 1])
+}
+
+#[test]
+fn real_wav_5_1_folds_via_the_decoded_mask() {
+    // The dwChannelMask in the WAV fmt chunk must reach the deck fold. LFE huge ⇒ dropped.
+    let mask = speaker::FL | speaker::FR | speaker::FC | speaker::LFE | speaker::BL | speaker::BR;
+    let wav = wav_24(
+        6,
+        Some(mask),
+        &[1000, 2000, 3000, 4_000_000, 5000, 6000],
+        4_800,
+    );
+    let (lo, ro) = play_real_wav(&wav);
+    let exp_lo = (1000.0 + C * 3000.0 + C * 5000.0).round() as i32;
+    let exp_ro = (2000.0 + C * 3000.0 + C * 6000.0).round() as i32;
+    assert!((lo - exp_lo).abs() <= 2, "real 5.1 Lo {lo} != {exp_lo}");
+    assert!((ro - exp_ro).abs() <= 2, "real 5.1 Ro {ro} != {exp_ro}");
+}
+
+#[test]
+fn real_wav_quad_folds_via_the_decoded_mask() {
+    // 4ch quad folds ONLY because the WAV carries a mask — the headline new capability,
+    // proven through the real decoder rather than a synthetic one.
+    let mask = speaker::FL | speaker::FR | speaker::BL | speaker::BR;
+    let wav = wav_24(4, Some(mask), &[1000, 2000, 5000, 6000], 4_800);
+    let (lo, ro) = play_real_wav(&wav);
+    let exp_lo = (1000.0 + C * 5000.0).round() as i32;
+    let exp_ro = (2000.0 + C * 6000.0).round() as i32;
+    assert!((lo - exp_lo).abs() <= 2, "real quad Lo {lo} != {exp_lo}");
+    assert!((ro - exp_ro).abs() <= 2, "real quad Ro {ro} != {exp_ro}");
+}
+
+#[test]
+fn real_wav_plain_4ch_without_a_mask_stays_rejected() {
+    // A plain (non-extensible) 4ch WAV carries no layout → still rejected through the real
+    // decode path (the deck won't guess an ambiguous count).
+    let wav = wav_24(4, None, &[1000, 2000, 5000, 6000], 100);
+    let mut deck: Deck<StereoCapture, AnyDecoder<SliceSource, Vec<i32>>, 0> = Deck::new(
+        StereoCapture {
+            written: Vec::new(),
+        },
+        Quality::Hq,
+    );
+    let dec = open(SliceSource::new(&wav), vec![0i32; decoder_scratch_len()]).expect("open");
+    assert!(deck.load(dec).is_err(), "plain 4ch WAV must stay rejected");
 }

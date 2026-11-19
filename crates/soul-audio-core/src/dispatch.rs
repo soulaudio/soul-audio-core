@@ -228,6 +228,27 @@ impl<S: crate::io::Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for AnyDecode
         }
     }
 
+    /// Forward the source channel layout per variant, so a mask a decoder reports (e.g. the
+    /// WAV `dwChannelMask`) reaches the deck through this dispatch wrapper rather than being
+    /// masked by the trait's `None` default.
+    fn channel_mask(&self) -> Option<u32> {
+        match self {
+            AnyDecoder::Wav(d) => d.channel_mask(),
+            AnyDecoder::Aiff(d) => d.channel_mask(),
+            AnyDecoder::Flac(d) => d.channel_mask(),
+            AnyDecoder::Mp3(d) => d.channel_mask(),
+            AnyDecoder::OggFlac(d) => d.channel_mask(),
+            AnyDecoder::Alac(d) => d.channel_mask(),
+            AnyDecoder::Aac(d) => d.channel_mask(),
+            AnyDecoder::Opus(d) => d.channel_mask(),
+            #[cfg(not(feature = "embedded-profile"))]
+            AnyDecoder::OpusMs(d) => d.channel_mask(),
+            AnyDecoder::Matroska(d) => d.channel_mask(),
+            AnyDecoder::WavPack(d) => d.channel_mask(),
+            AnyDecoder::Caf(d) => d.channel_mask(),
+        }
+    }
+
     /// The source codec per variant. The MP4 ALAC/AAC split is already resolved
     /// into the `Alac`/`Aac` variants at `open` time (see `Mp4Codec` below), so a
     /// lossless and a lossy `.m4a` report distinct codecs. `OggFlac` is FLAC; both
