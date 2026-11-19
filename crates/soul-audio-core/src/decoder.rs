@@ -94,6 +94,16 @@ pub trait Decoder {
     fn codec(&self) -> crate::model::SourceCodec {
         crate::model::SourceCodec::Pcm
     }
+
+    /// The source channel **layout** as a WAVEFORMATEXTENSIBLE channel mask, when the
+    /// format carries one (WAV/CAF explicitly, or the per-count canonical layout the
+    /// spec-ordered formats imply). `None` (the default) means layout-unknown: the
+    /// [`Deck`](crate::deck::Deck) can still fold the unambiguous counts (3.0 / 5.1 / 7.1)
+    /// from the count alone, but folds the ambiguous counts (4/5/7) only when this reports
+    /// a mask. See [`crate::channels`].
+    fn channel_mask(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// A [`Decoder`] that can also seek and report its length — the capability the

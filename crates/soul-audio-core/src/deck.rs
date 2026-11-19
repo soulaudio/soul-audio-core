@@ -50,7 +50,7 @@ pub struct DecodeInfo {
 const CANONICAL_BITS: i32 = 24;
 const CANONICAL_MAX: f32 = 8_388_607.0; // 2^23 - 1
 const BLOCK: usize = 256; // resampler output frames per pump
-const MAX_CH: usize = 8;
+const MAX_CH: usize = crate::channels::MAX_CHANNELS;
 /// Seek de-click fade length, in milliseconds. On a seek the output is ramped up
 /// over this long with a raised-cosine (smoothstep) gain, so the splice from the
 /// just-cleared sink buffer to the first post-seek sample is a smooth rise from
@@ -127,39 +127,30 @@ impl core::error::Error for DeckError {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum Map {
     Passthrough,
     MonoToStereo,
-    /// Multichannel (3.0 / 5.1 / 7.1) folded down to a stereo sink with the ITU-R BS.775
-    /// coefficients (see [`downmix_sample`]). Only the unambiguous standard layouts are
-    /// mapped; [`Deck::channel_map`] rejects the layout-ambiguous channel counts.
-    DownmixToStereo,
+    /// Multichannel folded down to a stereo sink, carrying the per-channel `(Lo, Ro)` gains
+    /// [`Deck::channel_map`] resolved from the source layout (ITU-R BS.775; see
+    /// [`downmix_to_stereo_coeffs`](crate::channels::downmix_to_stereo_coeffs)). Indexed by
+    /// source channel; only the first `src_ch` entries are used.
+    DownmixToStereo([(f32, f32); MAX_CH]),
 }
 
 /// ITU-R BS.775 stereo downmix: the value for output `oc` (0 = Lo, 1 = Ro) from one source
-/// `frame` of `src_ch` channels in canonical WAVEFORMATEXTENSIBLE order
-/// (FL FR FC LFE BL BR SL SR). Center and surrounds fold in at −3 dB (`1/√2`); the LFE is
-/// dropped (standard for stereo downmix). No normalization — the shared output clamp
-/// handles the rare case where summed in-phase surround content exceeds full scale, the
-/// same way ReplayGain boosts hard-clip. Only 3 / 6 / 8 channels reach here
-/// ([`Deck::channel_map`] gates the rest), so the fallthrough is unreachable.
+/// `frame` of `src_ch` channels, summing each source channel through its resolved `coeffs`
+/// gain (see [`downmix_to_stereo_coeffs`](crate::channels::downmix_to_stereo_coeffs)). No
+/// normalization — the shared output clamp handles the rare case where summed in-phase
+/// surround content exceeds full scale, the same way ReplayGain boosts hard-clip.
 #[inline]
-fn downmix_sample(frame: &[i32], src_ch: usize, oc: usize) -> f32 {
-    const C: f32 = core::f32::consts::FRAC_1_SQRT_2; // -3 dB
-    let s = |i: usize| frame[i] as f32;
-    match (src_ch, oc) {
-        // 3.0 — FL FR FC
-        (3, 0) => s(0) + C * s(2),
-        (3, 1) => s(1) + C * s(2),
-        // 5.1 — FL FR FC LFE BL BR (LFE = 3 dropped)
-        (6, 0) => s(0) + C * s(2) + C * s(4),
-        (6, 1) => s(1) + C * s(2) + C * s(5),
-        // 7.1 — FL FR FC LFE BL BR SL SR (LFE = 3 dropped)
-        (8, 0) => s(0) + C * s(2) + C * s(6) + C * s(4),
-        (8, 1) => s(1) + C * s(2) + C * s(7) + C * s(5),
-        _ => s(oc.min(src_ch - 1)),
+fn downmix_sample(frame: &[i32], src_ch: usize, coeffs: &[(f32, f32); MAX_CH], oc: usize) -> f32 {
+    let mut acc = 0.0;
+    for c in 0..src_ch {
+        let g = if oc == 0 { coeffs[c].0 } else { coeffs[c].1 };
+        acc += frame[c] as f32 * g;
     }
+    acc
 }
 
 /// The currently-playing track and its per-track pipeline state.
@@ -167,6 +158,10 @@ struct Track<D> {
     decoder: D,
     resampler: Option<Resampler>,
     channels: usize,
+    /// The source channel layout as a WAVEFORMATEXTENSIBLE mask, when the decoder reports
+    /// one ([`Decoder::channel_mask`](crate::decoder::Decoder::channel_mask)). Retained so a
+    /// sink swap / reopen can re-resolve the downmix for the new sink without the decoder.
+    channel_mask: Option<u32>,
     map: Map,
     /// Source→canonical scale (`2^(24-bits)`).
     norm: f32,
@@ -253,27 +248,41 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         }
     }
 
-    /// Resolve a source→sink channel map (identity, or mono upmixed to stereo),
-    /// rejecting anything else as [`DeckError::ChannelMismatch`]. Scratch buffers are
-    /// sized for `MAX_CH`; the equal-rate path has no resampler to reject wider
-    /// streams, so both sides are bounds-checked here (else a >8-ch device + source
-    /// would overflow `in_buf`/`rs_buf`/`out_buf`).
-    fn channel_map(src_ch: usize, sink_ch: usize) -> Result<Map, DeckError> {
+    /// Resolve a source→sink channel map: identity, mono upmixed to stereo, or multichannel
+    /// folded to a stereo sink (using the `mask` layout when known), rejecting anything else
+    /// as [`DeckError::ChannelMismatch`]. Scratch buffers are sized for `MAX_CH`; the
+    /// equal-rate path has no resampler to reject wider streams, so both sides are
+    /// bounds-checked here (else a >8-ch device + source would overflow
+    /// `in_buf`/`rs_buf`/`out_buf`).
+    fn channel_map(src_ch: usize, mask: Option<u32>, sink_ch: usize) -> Result<Map, DeckError> {
         if src_ch > MAX_CH || sink_ch > MAX_CH {
             return Err(DeckError::ChannelMismatch);
         }
         if src_ch == sink_ch {
-            Ok(Map::Passthrough)
-        } else if src_ch == 1 && sink_ch == 2 {
-            Ok(Map::MonoToStereo)
-        } else if sink_ch == 2 && matches!(src_ch, 3 | 6 | 8) {
-            // Multichannel → stereo: the unambiguous standard layouts (3.0 / 5.1 / 7.1).
-            // Counts 4/5/7 are layout-ambiguous (quad vs 3.1, 5.0 vs 4.1, 6.1 variants)
-            // without a channel mask, so they stay rejected rather than risk mis-mixing.
-            Ok(Map::DownmixToStereo)
-        } else {
-            Err(DeckError::ChannelMismatch)
+            return Ok(Map::Passthrough);
         }
+        if src_ch == 1 && sink_ch == 2 {
+            return Ok(Map::MonoToStereo);
+        }
+        if sink_ch == 2 && (3..=MAX_CH).contains(&src_ch) {
+            // Fold multichannel → stereo when the layout is known. An explicit decoder mask
+            // resolves any count (including the layout-ambiguous 4/5/7: quad vs 3.1, 5.0 vs
+            // 4.1, the 6.1 variants); the unambiguous counts (3.0 / 5.1 / 7.1) fall back to
+            // their canonical layout from the count alone. A layout we can't name — an
+            // ambiguous count with no mask, or a mask we can't map — stays rejected rather
+            // than risk mis-mixing.
+            let coeffs = mask
+                .and_then(|m| crate::channels::downmix_to_stereo_coeffs(m, src_ch))
+                .or_else(|| match src_ch {
+                    3 | 6 | 8 => crate::channels::standard_layout_mask(src_ch as u16)
+                        .and_then(|m| crate::channels::downmix_to_stereo_coeffs(m, src_ch)),
+                    _ => None,
+                });
+            if let Some(coeffs) = coeffs {
+                return Ok(Map::DownmixToStereo(coeffs));
+            }
+        }
+        Err(DeckError::ChannelMismatch)
     }
 
     /// Build the resampler for `src_rate` → `sink_rate`, or `None` when they match
@@ -300,7 +309,8 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
     fn build_track(&self, decoder: D) -> Result<Track<D>, DeckError> {
         let si = decoder.stream_info();
         let ch = si.channels as usize;
-        let map = Self::channel_map(ch, self.sink_channels)?;
+        let channel_mask = decoder.channel_mask();
+        let map = Self::channel_map(ch, channel_mask, self.sink_channels)?;
         let resampler = Self::make_resampler(ch, si.sample_rate, self.sink_rate, self.quality)?;
         let bits = match si.format {
             SampleFormat::Int { bits } | SampleFormat::Float { bits } => bits,
@@ -323,6 +333,7 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             decoder,
             resampler,
             channels: ch,
+            channel_mask,
             map,
             norm: libm_exp2(f32::from(CANONICAL_BITS as i16 - i16::from(bits))),
             rate: si.sample_rate,
@@ -417,7 +428,7 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         // mutation (the deck stays on its old, working sink).
         let rebuilt = match self.current.as_ref() {
             Some(t) => Some((
-                Self::channel_map(t.channels, new_channels)?,
+                Self::channel_map(t.channels, t.channel_mask, new_channels)?,
                 Self::make_resampler(t.channels, t.rate, new_rate, self.quality)?,
             )),
             None => None,
@@ -474,7 +485,7 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             // SBR flips to 2× once decoding starts), and a stale rate here would build
             // the wrong resampler for the reopened device → wrong playback speed.
             track.rate = track.decoder.stream_info().sample_rate;
-            track.map = Self::channel_map(track.channels, channels)?;
+            track.map = Self::channel_map(track.channels, track.channel_mask, channels)?;
             track.resampler = Self::make_resampler(track.channels, track.rate, rate, quality)?;
         }
         self.clear_preloads();
@@ -744,10 +755,10 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             };
             let frame = &self.rs_buf[f * src_ch..f * src_ch + src_ch];
             for oc in 0..sink_ch {
-                let mixed = match map {
+                let mixed = match &map {
                     Map::Passthrough => frame[oc] as f32,
                     Map::MonoToStereo => frame[0] as f32,
-                    Map::DownmixToStereo => downmix_sample(frame, src_ch, oc),
+                    Map::DownmixToStereo(coeffs) => downmix_sample(frame, src_ch, coeffs, oc),
                 };
                 let s = mixed * g * fade;
                 // Round to nearest without `f32::round` (std-only in no_std).
