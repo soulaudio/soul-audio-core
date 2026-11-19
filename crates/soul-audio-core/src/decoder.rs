@@ -95,13 +95,14 @@ pub trait Decoder {
         crate::model::SourceCodec::Pcm
     }
 
-    /// The source channel **layout** as a WAVEFORMATEXTENSIBLE channel mask, when the
-    /// format carries one (WAV/CAF explicitly, or the per-count canonical layout the
-    /// spec-ordered formats imply). `None` (the default) means layout-unknown: the
-    /// [`Deck`](crate::deck::Deck) can still fold the unambiguous counts (3.0 / 5.1 / 7.1)
-    /// from the count alone, but folds the ambiguous counts (4/5/7) only when this reports
-    /// a mask. See [`crate::channels`].
-    fn channel_mask(&self) -> Option<u32> {
+    /// The source channel **layout** — which speaker each source channel drives, in stream
+    /// order — when the format carries or implies one (WAV/CAF explicitly; FLAC per count;
+    /// Vorbis/Opus per their own fixed order, which puts the centre channel second). `None`
+    /// (the default) means layout-unknown: the [`Deck`](crate::deck::Deck) can still fold the
+    /// unambiguous counts (3.0 / 5.1 / 7.1) from the count's canonical WAVEFORMATEXTENSIBLE
+    /// layout, but folds the ambiguous counts (4/5/7) only when this reports a layout. See
+    /// [`crate::channels::ChannelLayout`].
+    fn channel_layout(&self) -> Option<crate::channels::ChannelLayout> {
         None
     }
 }

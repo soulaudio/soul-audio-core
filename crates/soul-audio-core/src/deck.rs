@@ -158,10 +158,10 @@ struct Track<D> {
     decoder: D,
     resampler: Option<Resampler>,
     channels: usize,
-    /// The source channel layout as a WAVEFORMATEXTENSIBLE mask, when the decoder reports
-    /// one ([`Decoder::channel_mask`](crate::decoder::Decoder::channel_mask)). Retained so a
+    /// The source channel layout, when the decoder reports one
+    /// ([`Decoder::channel_layout`](crate::decoder::Decoder::channel_layout)). Retained so a
     /// sink swap / reopen can re-resolve the downmix for the new sink without the decoder.
-    channel_mask: Option<u32>,
+    channel_layout: Option<crate::channels::ChannelLayout>,
     map: Map,
     /// Source→canonical scale (`2^(24-bits)`).
     norm: f32,
@@ -249,12 +249,16 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
     }
 
     /// Resolve a source→sink channel map: identity, mono upmixed to stereo, or multichannel
-    /// folded to a stereo sink (using the `mask` layout when known), rejecting anything else
-    /// as [`DeckError::ChannelMismatch`]. Scratch buffers are sized for `MAX_CH`; the
+    /// folded to a stereo sink (using the source `layout` when known), rejecting anything
+    /// else as [`DeckError::ChannelMismatch`]. Scratch buffers are sized for `MAX_CH`; the
     /// equal-rate path has no resampler to reject wider streams, so both sides are
     /// bounds-checked here (else a >8-ch device + source would overflow
     /// `in_buf`/`rs_buf`/`out_buf`).
-    fn channel_map(src_ch: usize, mask: Option<u32>, sink_ch: usize) -> Result<Map, DeckError> {
+    fn channel_map(
+        src_ch: usize,
+        layout: Option<crate::channels::ChannelLayout>,
+        sink_ch: usize,
+    ) -> Result<Map, DeckError> {
         if src_ch > MAX_CH || sink_ch > MAX_CH {
             return Err(DeckError::ChannelMismatch);
         }
@@ -265,17 +269,19 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             return Ok(Map::MonoToStereo);
         }
         if sink_ch == 2 && (3..=MAX_CH).contains(&src_ch) {
-            // Fold multichannel → stereo when the layout is known. An explicit decoder mask
+            // Fold multichannel → stereo when the layout is known. An explicit decoder layout
             // resolves any count (including the layout-ambiguous 4/5/7: quad vs 3.1, 5.0 vs
-            // 4.1, the 6.1 variants); the unambiguous counts (3.0 / 5.1 / 7.1) fall back to
-            // their canonical layout from the count alone. A layout we can't name — an
-            // ambiguous count with no mask, or a mask we can't map — stays rejected rather
-            // than risk mis-mixing.
-            let coeffs = mask
-                .and_then(|m| crate::channels::downmix_to_stereo_coeffs(m, src_ch))
+            // 4.1, the 6.1 variants) and any channel order (Vorbis/Opus put the centre
+            // second); the unambiguous counts (3.0 / 5.1 / 7.1) fall back to the canonical
+            // WAVEFORMATEXTENSIBLE layout from the count alone. A layout we can't name — an
+            // ambiguous count with no layout, or one carrying a speaker we don't fold — stays
+            // rejected rather than risk mis-mixing.
+            let coeffs = layout
+                .filter(|l| l.channels() == src_ch)
+                .and_then(|l| crate::channels::downmix_to_stereo_coeffs(&l))
                 .or_else(|| match src_ch {
-                    3 | 6 | 8 => crate::channels::standard_layout_mask(src_ch as u16)
-                        .and_then(|m| crate::channels::downmix_to_stereo_coeffs(m, src_ch)),
+                    3 | 6 | 8 => crate::channels::ChannelLayout::standard(src_ch as u16)
+                        .and_then(|l| crate::channels::downmix_to_stereo_coeffs(&l)),
                     _ => None,
                 });
             if let Some(coeffs) = coeffs {
@@ -309,8 +315,8 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
     fn build_track(&self, decoder: D) -> Result<Track<D>, DeckError> {
         let si = decoder.stream_info();
         let ch = si.channels as usize;
-        let channel_mask = decoder.channel_mask();
-        let map = Self::channel_map(ch, channel_mask, self.sink_channels)?;
+        let channel_layout = decoder.channel_layout();
+        let map = Self::channel_map(ch, channel_layout, self.sink_channels)?;
         let resampler = Self::make_resampler(ch, si.sample_rate, self.sink_rate, self.quality)?;
         let bits = match si.format {
             SampleFormat::Int { bits } | SampleFormat::Float { bits } => bits,
@@ -333,7 +339,7 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             decoder,
             resampler,
             channels: ch,
-            channel_mask,
+            channel_layout,
             map,
             norm: libm_exp2(f32::from(CANONICAL_BITS as i16 - i16::from(bits))),
             rate: si.sample_rate,
@@ -428,7 +434,7 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         // mutation (the deck stays on its old, working sink).
         let rebuilt = match self.current.as_ref() {
             Some(t) => Some((
-                Self::channel_map(t.channels, t.channel_mask, new_channels)?,
+                Self::channel_map(t.channels, t.channel_layout, new_channels)?,
                 Self::make_resampler(t.channels, t.rate, new_rate, self.quality)?,
             )),
             None => None,
@@ -485,7 +491,7 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             // SBR flips to 2× once decoding starts), and a stale rate here would build
             // the wrong resampler for the reopened device → wrong playback speed.
             track.rate = track.decoder.stream_info().sample_rate;
-            track.map = Self::channel_map(track.channels, track.channel_mask, channels)?;
+            track.map = Self::channel_map(track.channels, track.channel_layout, channels)?;
             track.resampler = Self::make_resampler(track.channels, track.rate, rate, quality)?;
         }
         self.clear_preloads();

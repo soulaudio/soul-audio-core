@@ -289,10 +289,12 @@ impl<S: Source> Decoder for WavDecoder<S> {
     }
 
     /// The explicit WAVE_FORMAT_EXTENSIBLE speaker layout, when the header carried one — so
-    /// the deck can fold an ambiguous count (4/5/7) that the mask disambiguates. A plain WAV
-    /// with no mask reports `None`; the deck still folds the unambiguous counts by count.
-    fn channel_mask(&self) -> Option<u32> {
-        self.demux.channel_mask()
+    /// the deck can fold an ambiguous count (4/5/7) the mask disambiguates. A plain WAV with
+    /// no mask reports `None`; the deck still folds the unambiguous counts by count.
+    fn channel_layout(&self) -> Option<crate::channels::ChannelLayout> {
+        self.demux
+            .channel_mask()
+            .map(crate::channels::ChannelLayout::from_mask)
     }
 
     fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {

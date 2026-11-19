@@ -1029,10 +1029,11 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for FlacDecoder<S, P> {
     }
 
     /// FLAC fixes channel order by count (quad = FL FR BL BR, 5.0 = FL FR FC BL BR, 5.1,
-    /// 6.1, 7.1 …), so the count alone names the layout — report its canonical mask so the
-    /// deck can fold the ambiguous counts (4/5/7) to stereo, not just 3.0/5.1/7.1.
-    fn channel_mask(&self) -> Option<u32> {
-        crate::channels::standard_layout_mask(self.channels)
+    /// 6.1, 7.1 …) in WAVEFORMATEXTENSIBLE order, so the count alone names the layout — report
+    /// its canonical layout so the deck can fold the ambiguous counts (4/5/7), not just
+    /// 3.0/5.1/7.1.
+    fn channel_layout(&self) -> Option<crate::channels::ChannelLayout> {
+        crate::channels::ChannelLayout::standard(self.channels)
     }
 
     fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {
@@ -2109,7 +2110,10 @@ mod tests {
         let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).unwrap();
         assert_eq!(dec.stream_info().channels, 4);
         // FLAC fixes 4ch = quad by spec, so the decoder names that canonical layout.
-        assert_eq!(dec.channel_mask(), crate::channels::standard_layout_mask(4));
+        assert_eq!(
+            dec.channel_layout(),
+            crate::channels::ChannelLayout::standard(4)
+        );
         let mut out = [0i32; 32];
         let n = dec.decode_into(&mut out).unwrap();
         assert_eq!(n, block * channels as usize);

@@ -140,17 +140,17 @@ impl Decoder for OwnedDecoder {
             OwnedDecoder::Dsf(_) | OwnedDecoder::Dff(_) => SourceCodec::Dsd,
         }
     }
-    /// Forward the source channel layout so a decoder's mask (e.g. WAV `dwChannelMask`, FLAC
-    /// per-count canonical) reaches the deck through this wrapper instead of the `None`
-    /// default — the app's real playback path builds `OwnedDecoder`, so the multichannel
-    /// fold depends on this forward.
-    fn channel_mask(&self) -> Option<u32> {
+    /// Forward the source channel layout so a decoder's layout (e.g. WAV `dwChannelMask`,
+    /// FLAC per-count canonical, Vorbis/Opus per-count order) reaches the deck through this
+    /// wrapper instead of the `None` default — the app's real playback path builds
+    /// `OwnedDecoder`, so the multichannel fold depends on this forward.
+    fn channel_layout(&self) -> Option<soul_audio_core::channels::ChannelLayout> {
         match self {
-            OwnedDecoder::Pcm(d) => d.channel_mask(),
-            OwnedDecoder::Vorbis(d) => d.channel_mask(),
-            OwnedDecoder::MatroskaVorbis(d) => d.channel_mask(),
-            OwnedDecoder::Dsf(d) => d.channel_mask(),
-            OwnedDecoder::Dff(d) => d.channel_mask(),
+            OwnedDecoder::Pcm(d) => d.channel_layout(),
+            OwnedDecoder::Vorbis(d) => d.channel_layout(),
+            OwnedDecoder::MatroskaVorbis(d) => d.channel_layout(),
+            OwnedDecoder::Dsf(d) => d.channel_layout(),
+            OwnedDecoder::Dff(d) => d.channel_layout(),
         }
     }
 }

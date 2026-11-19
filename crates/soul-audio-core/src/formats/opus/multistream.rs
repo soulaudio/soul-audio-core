@@ -276,6 +276,13 @@ impl<S: Source> Decoder for MultistreamOpusDecoder<S> {
         self.stream_info
     }
 
+    /// Opus mapping-family-1 output is in the Vorbis channel order (RFC 7845 §5.1.1.2),
+    /// which this decoder already produces by gathering `output[c] = decoded[mapping[c]]`.
+    /// Report that order (centre second, LFE last) so the deck folds surround correctly.
+    fn channel_layout(&self) -> Option<crate::channels::ChannelLayout> {
+        crate::channels::vorbis_family1_layout(self.stream_info.channels)
+    }
+
     fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {
         let mut written = 0usize;
         while written < out.len() {

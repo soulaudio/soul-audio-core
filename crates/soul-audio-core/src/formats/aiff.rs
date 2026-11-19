@@ -125,6 +125,13 @@ impl<S: Source> Decoder for AiffDecoder<S> {
         }
     }
 
+    // Deliberately no `channel_layout`: AIFF carries no channel-layout chunk, and its
+    // multichannel order is undefined in the spec (6-channel only, "see ITU-R BS.2159") and
+    // tool-dependent in practice (e.g. Pro Tools vs others differ). Fabricating an order
+    // would mis-route surround channels, so AIFF reports no layout — the deck folds the
+    // unambiguous counts (3.0 / 5.1 / 7.1) via the count-based WAVEFORMATEXTENSIBLE fallback
+    // and leaves 4/5/7 rejected. Do NOT add a `standard_layout_mask`-style override here.
+
     fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {
         // Batch buffer: 768 is divisible by every supported sample width (1..4, 8).
         let mut buf = [0u8; 768];
