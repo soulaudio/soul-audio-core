@@ -7,7 +7,9 @@
 
 use soul_audio_core::{
     AnyDecoder, Deck, DecodeError, Decoder, Progress, Quality, SampleFormat, SeekableDecoder, Sink,
-    SinkError, SliceSource, StreamInfo, channels::speaker, decoder_scratch_len, open,
+    SinkError, SliceSource, StreamInfo,
+    channels::{ChannelLayout, speaker},
+    decoder_scratch_len, open,
 };
 
 /// Emits one constant `vals` frame per output frame until `frames` is exhausted, reporting
@@ -27,8 +29,9 @@ impl Decoder for ConstMulti {
             format: SampleFormat::Int { bits: 24 },
         }
     }
-    fn channel_mask(&self) -> Option<u32> {
-        self.mask
+    fn channel_layout(&self) -> Option<ChannelLayout> {
+        // A real WAV/FLAC source carries a WAVEFORMATEXTENSIBLE-ordered mask; expand it.
+        self.mask.map(ChannelLayout::from_mask)
     }
     fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {
         let want = ((out.len() / self.ch) as u64).min(self.frames - self.pos) as usize;

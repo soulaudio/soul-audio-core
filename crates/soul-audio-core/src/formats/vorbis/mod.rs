@@ -804,6 +804,14 @@ impl<S: Source, A: AsMut<[u8]> + AsRef<[u8]>> Decoder for VorbisDecoder<S, A> {
         self.stream_info
     }
 
+    /// Vorbis fixes channel order per count (spec §4.3.9) and outputs it in stream order,
+    /// unlike WAVEFORMATEXTENSIBLE: the centre channel is second (`FL C FR …`) and the LFE
+    /// last. Report that explicit order so the deck folds surround to the correct stereo
+    /// sides, rather than assuming the mask's ascending-bit order.
+    fn channel_layout(&self) -> Option<crate::channels::ChannelLayout> {
+        crate::channels::vorbis_family1_layout(self.stream_info.channels)
+    }
+
     fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {
         // Drain any PCM staged by a previous packet, refilling by decoding and
         // synthesizing the next packet(s) as the caller's buffer demands. A

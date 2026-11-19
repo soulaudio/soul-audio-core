@@ -1,18 +1,18 @@
 //! Channel layouts and stereo downmix coefficients.
 //!
 //! A multichannel source folded onto a stereo sink needs to know *which* speaker each
-//! source channel drives, not just how many there are. For the unambiguous counts (3.0 /
-//! 5.1 / 7.1) the count alone fixes the layout, but 4/5/7 channels are ambiguous (quad vs
-//! 3.1, 5.0 vs 4.1, the 6.1 variants) and need an explicit layout. This module models that
-//! layout as a WAVEFORMATEXTENSIBLE **channel mask** (the representation WAV/CAF carry
-//! directly, and the one FLAC/Vorbis/Opus/AIFF fix by spec per count), and turns a mask
-//! into per-channel stereo downmix gains.
+//! source channel drives, not just how many there are. [`ChannelLayout`] is that mapping:
+//! an ordered per-channel speaker list, in the stream's own channel order. Crucially the
+//! order is explicit, because formats disagree on it: WAV/FLAC use the WAVEFORMATEXTENSIBLE
+//! order (`FL FR FC LFE …`, which a channel mask's ascending bits already encode), but
+//! Vorbis and Opus-family-1 put the centre channel second (`FL C FR …`). A plain mask can't
+//! express that, so the layout carries the order directly and the downmix maps each channel
+//! to its speaker independently of position.
 
 /// The widest channel count the deck's scratch buffers are sized for.
 pub const MAX_CHANNELS: usize = 8;
 
-/// WAVEFORMATEXTENSIBLE speaker-position bits. A multichannel stream's channels are ordered
-/// by ascending bit value, so the mask both identifies and orders the channels.
+/// WAVEFORMATEXTENSIBLE speaker-position bits.
 pub mod speaker {
     pub const FL: u32 = 0x1; // front left
     pub const FR: u32 = 0x2; // front right
@@ -27,10 +27,73 @@ pub mod speaker {
     pub const SR: u32 = 0x400; // side right
 }
 
-/// The canonical WAVEFORMATEXTENSIBLE channel mask for a plain channel **count** — the
-/// layout the formats that fix channel order by spec (FLAC, Vorbis, Opus mapping-family 1,
-/// AIFF) imply from the count alone. `None` for 1/2 (handled by passthrough / mono-upmix,
-/// not a downmix) and counts past [`MAX_CHANNELS`].
+/// Which speaker each source channel drives, in the stream's channel order. Built from a
+/// WAVEFORMATEXTENSIBLE mask (ascending bits), the canonical layout for a count, or an
+/// explicit per-channel order a codec fixes differently (Vorbis/Opus).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ChannelLayout {
+    speakers: [u32; MAX_CHANNELS],
+    len: u8,
+}
+
+impl ChannelLayout {
+    /// From an explicit per-channel speaker order (stream order). `None` if empty or wider
+    /// than [`MAX_CHANNELS`].
+    #[must_use]
+    pub fn from_order(order: &[u32]) -> Option<Self> {
+        if order.is_empty() || order.len() > MAX_CHANNELS {
+            return None;
+        }
+        let mut speakers = [0u32; MAX_CHANNELS];
+        speakers[..order.len()].copy_from_slice(order);
+        Some(Self {
+            speakers,
+            len: order.len() as u8,
+        })
+    }
+
+    /// From a WAVEFORMATEXTENSIBLE channel mask: one channel per set bit, in ascending
+    /// speaker-bit order (the order such a stream interleaves its channels).
+    #[must_use]
+    pub fn from_mask(mask: u32) -> Self {
+        let mut speakers = [0u32; MAX_CHANNELS];
+        let mut bits = mask;
+        let mut len = 0;
+        while bits != 0 && len < MAX_CHANNELS {
+            let bit = bits & bits.wrapping_neg(); // lowest set bit
+            bits &= bits - 1;
+            speakers[len] = bit;
+            len += 1;
+        }
+        Self {
+            speakers,
+            len: len as u8,
+        }
+    }
+
+    /// The canonical WAVEFORMATEXTENSIBLE layout for a plain channel count — what WAV without
+    /// an explicit mask and FLAC (spec-ordered like WAVEFORMATEXTENSIBLE) use. `None` for
+    /// 1/2 (passthrough / mono-upmix, not a downmix) and counts past [`MAX_CHANNELS`].
+    #[must_use]
+    pub fn standard(channels: u16) -> Option<Self> {
+        standard_layout_mask(channels).map(Self::from_mask)
+    }
+
+    /// The speaker driven by each source channel, in stream order.
+    #[must_use]
+    pub fn speakers(&self) -> &[u32] {
+        &self.speakers[..self.len as usize]
+    }
+
+    /// Number of channels in the layout.
+    #[must_use]
+    pub fn channels(&self) -> usize {
+        self.len as usize
+    }
+}
+
+/// The canonical WAVEFORMATEXTENSIBLE channel mask for a plain channel **count**. `None` for
+/// 1/2 and counts past [`MAX_CHANNELS`].
 #[must_use]
 pub fn standard_layout_mask(channels: u16) -> Option<u32> {
     use speaker::*;
@@ -45,40 +108,52 @@ pub fn standard_layout_mask(channels: u16) -> Option<u32> {
     })
 }
 
-/// Per-channel `(Lo, Ro)` stereo downmix gains for a `mask`-described layout with
-/// `channels` channels, in the stream's canonical (ascending speaker-bit) order.
-///
-/// ITU-R BS.775: front-center and the surrounds fold in at −3 dB (`1/√2`); the LFE is
-/// dropped (standard for a stereo downmix). Back-center folds equally to both outputs at
-/// −3 dB. Returns `None` when the mask cannot drive a defined stereo fold — its set-bit
-/// count disagrees with `channels`, `channels` exceeds [`MAX_CHANNELS`], or it carries a
-/// speaker this fold does not place (don't guess a layout we can't name).
+/// The Vorbis / Opus-mapping-family-1 channel order for a count (Vorbis I spec §4.3.9 /
+/// RFC 7845 §5.1.1.2). It fixes the order per count but DIFFERS from WAVEFORMATEXTENSIBLE:
+/// the centre channel is second (`FL C FR`), and the LFE comes last. `None` for 1/2 (not a
+/// downmix) and counts past [`MAX_CHANNELS`].
 #[must_use]
-pub fn downmix_to_stereo_coeffs(mask: u32, channels: usize) -> Option<[(f32, f32); MAX_CHANNELS]> {
+pub fn vorbis_family1_layout(channels: u16) -> Option<ChannelLayout> {
+    use speaker::*;
+    let order: &[u32] = match channels {
+        3 => &[FL, FC, FR],
+        4 => &[FL, FR, BL, BR], // quad: no centre, same as WAVEFORMATEXTENSIBLE
+        5 => &[FL, FC, FR, BL, BR],
+        6 => &[FL, FC, FR, BL, BR, LFE],         // 5.1
+        7 => &[FL, FC, FR, SL, SR, BC, LFE],     // 6.1
+        8 => &[FL, FC, FR, SL, SR, BL, BR, LFE], // 7.1
+        _ => return None,
+    };
+    ChannelLayout::from_order(order)
+}
+
+/// The `(Lo, Ro)` stereo downmix gain for one speaker (ITU-R BS.775): front-centre and the
+/// surrounds fold in at −3 dB (`1/√2`), the LFE is dropped, back-centre folds equally to
+/// both. `None` for a speaker this fold does not place (don't guess).
+#[must_use]
+pub fn speaker_stereo_gains(speaker: u32) -> Option<(f32, f32)> {
     use speaker::*;
     const C: f32 = core::f32::consts::FRAC_1_SQRT_2; // −3 dB
+    Some(match speaker {
+        FL => (1.0, 0.0),
+        FR => (0.0, 1.0),
+        FC => (C, C),
+        LFE => (0.0, 0.0), // dropped
+        BL | SL | FLC => (C, 0.0),
+        BR | SR | FRC => (0.0, C),
+        BC => (C, C),
+        _ => return None,
+    })
+}
 
-    if channels == 0 || channels > MAX_CHANNELS || mask.count_ones() as usize != channels {
-        return None;
-    }
+/// Per-channel `(Lo, Ro)` stereo downmix gains for `layout`, in its channel order (indexed
+/// by source channel; only the first `layout.channels()` entries are meaningful). `None` if
+/// the layout carries a speaker [`speaker_stereo_gains`] can't place.
+#[must_use]
+pub fn downmix_to_stereo_coeffs(layout: &ChannelLayout) -> Option<[(f32, f32); MAX_CHANNELS]> {
     let mut coeffs = [(0.0_f32, 0.0_f32); MAX_CHANNELS];
-    let mut bits = mask;
-    let mut ch = 0;
-    // Walk the set bits low-to-high = the stream's channel order.
-    while bits != 0 {
-        let bit = bits & bits.wrapping_neg(); // lowest set bit
-        bits &= bits - 1;
-        coeffs[ch] = match bit {
-            FL => (1.0, 0.0),
-            FR => (0.0, 1.0),
-            FC => (C, C),
-            LFE => (0.0, 0.0), // dropped
-            BL | SL | FLC => (C, 0.0),
-            BR | SR | FRC => (0.0, C),
-            BC => (C, C),
-            _ => return None, // a speaker we don't fold → don't guess
-        };
-        ch += 1;
+    for (i, &sp) in layout.speakers().iter().enumerate() {
+        coeffs[i] = speaker_stereo_gains(sp)?;
     }
     Some(coeffs)
 }
@@ -100,10 +175,17 @@ mod tests {
     }
 
     #[test]
-    fn five_one_coeffs_match_itu() {
-        // FL FR FC LFE BL BR.
-        let m = standard_layout_mask(6).unwrap();
-        let c = downmix_to_stereo_coeffs(m, 6).unwrap();
+    fn from_mask_orders_by_ascending_bit() {
+        // 5.1 mask → FL FR FC LFE BL BR (ascending bit order).
+        let l = ChannelLayout::from_mask(standard_layout_mask(6).unwrap());
+        use speaker::*;
+        assert_eq!(l.speakers(), &[FL, FR, FC, LFE, BL, BR]);
+    }
+
+    #[test]
+    fn standard_five_one_coeffs_match_itu() {
+        let l = ChannelLayout::standard(6).unwrap();
+        let c = downmix_to_stereo_coeffs(&l).unwrap();
         assert_eq!(c[0], (1.0, 0.0)); // FL
         assert_eq!(c[1], (0.0, 1.0)); // FR
         assert_eq!(c[2], (C, C)); // FC
@@ -113,9 +195,25 @@ mod tests {
     }
 
     #[test]
-    fn quad_has_no_center_and_folds_the_back_pair() {
-        let m = speaker::FL | speaker::FR | speaker::BL | speaker::BR;
-        let c = downmix_to_stereo_coeffs(m, 4).unwrap();
+    fn vorbis_five_one_puts_centre_second_and_folds_correctly() {
+        use speaker::*;
+        let l = vorbis_family1_layout(6).unwrap();
+        // Vorbis order: FL C FR BL BR LFE (centre is channel 1, LFE last).
+        assert_eq!(l.speakers(), &[FL, FC, FR, BL, BR, LFE]);
+        let c = downmix_to_stereo_coeffs(&l).unwrap();
+        assert_eq!(c[0], (1.0, 0.0)); // FL
+        assert_eq!(c[1], (C, C)); // FC (second!)
+        assert_eq!(c[2], (0.0, 1.0)); // FR
+        assert_eq!(c[3], (C, 0.0)); // BL
+        assert_eq!(c[4], (0.0, C)); // BR
+        assert_eq!(c[5], (0.0, 0.0)); // LFE dropped
+    }
+
+    #[test]
+    fn quad_has_no_centre_and_folds_the_back_pair() {
+        let l = ChannelLayout::from_order(&[speaker::FL, speaker::FR, speaker::BL, speaker::BR])
+            .unwrap();
+        let c = downmix_to_stereo_coeffs(&l).unwrap();
         assert_eq!(c[0], (1.0, 0.0)); // FL
         assert_eq!(c[1], (0.0, 1.0)); // FR
         assert_eq!(c[2], (C, 0.0)); // BL
@@ -123,19 +221,17 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_mask_and_count_is_rejected() {
-        // A 6-bit mask with a 5-channel claim: the mask does not describe this stream.
-        let m = standard_layout_mask(6).unwrap();
-        assert_eq!(downmix_to_stereo_coeffs(m, 5), None);
-        // Too wide.
-        assert_eq!(downmix_to_stereo_coeffs(0x3FF | 0x800, 9), None);
+    fn unknown_speaker_bit_is_rejected_not_guessed() {
+        // FL FR + a high bit this fold does not place (top-front-left, 0x1000).
+        let l = ChannelLayout::from_order(&[speaker::FL, speaker::FR, 0x1000]).unwrap();
+        assert_eq!(downmix_to_stereo_coeffs(&l), None);
     }
 
     #[test]
-    fn unknown_speaker_bit_is_rejected_not_guessed() {
-        // FL FR + a high bit this fold does not place (top-front-left, 0x1000).
+    fn from_order_rejects_empty_and_too_wide() {
+        assert_eq!(ChannelLayout::from_order(&[]), None);
         assert_eq!(
-            downmix_to_stereo_coeffs(speaker::FL | speaker::FR | 0x1000, 3),
+            ChannelLayout::from_order(&[speaker::FL; MAX_CHANNELS + 1]),
             None
         );
     }
