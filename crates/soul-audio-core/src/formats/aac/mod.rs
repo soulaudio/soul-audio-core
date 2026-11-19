@@ -1127,6 +1127,15 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for AacDecoder<S, P> {
         }
     }
 
+    /// AAC emits its `channel_configuration` elements in bitstream order, which puts the
+    /// centre channel FIRST (the leading SCE) for the standard multichannel configs — unlike
+    /// WAVEFORMATEXTENSIBLE. Report that order so the deck folds surround correctly. (SBR can
+    /// promote 1->2 channels, which `channel_layout` ignores: 1/2 is passthrough / mono-upmix,
+    /// not a downmix.)
+    fn channel_layout(&self) -> Option<crate::channels::ChannelLayout> {
+        crate::channels::aac_layout(self.channels)
+    }
+
     fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {
         let mut written = 0;
         while written < out.len() {
