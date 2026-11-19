@@ -38,6 +38,8 @@ pub struct WavDemuxer<S> {
     big_endian: bool,
     /// `Some(samples_per_block)` for IMA-ADPCM (the `data` holds compressed blocks).
     adpcm: Option<u16>,
+    /// WAVE_FORMAT_EXTENSIBLE speaker layout (`dwChannelMask`), when present and non-zero.
+    channel_mask: Option<u32>,
 }
 
 /// Read a little- or big-endian `u32` from the first 4 bytes of `b`.
@@ -115,6 +117,7 @@ impl<S: Source> WavDemuxer<S> {
                         block_align,
                         companding,
                         adpcm,
+                        channel_mask,
                     } = fmt.ok_or(DecodeError::Malformed)?;
                     if block_align == 0 {
                         return Err(DecodeError::Malformed);
@@ -148,6 +151,7 @@ impl<S: Source> WavDemuxer<S> {
                         companding,
                         big_endian: be,
                         adpcm,
+                        channel_mask,
                     });
                 }
                 _ => {
@@ -173,6 +177,12 @@ impl<S: Source> WavDemuxer<S> {
     /// G.711 companding of the samples, if the codec is A-law/µ-law.
     pub(crate) fn companding(&self) -> Option<Companding> {
         self.companding
+    }
+
+    /// WAVE_FORMAT_EXTENSIBLE speaker layout (`dwChannelMask`), when the header declared a
+    /// non-zero one. `None` for a plain (non-extensible) or unspecified-mask WAV.
+    pub(crate) fn channel_mask(&self) -> Option<u32> {
+        self.channel_mask
     }
 
     /// Whether sample data is big-endian (RIFX).
@@ -272,6 +282,8 @@ struct FmtInfo {
     companding: Option<Companding>,
     /// `Some(samples_per_block)` for IMA-ADPCM.
     adpcm: Option<u16>,
+    /// WAVE_FORMAT_EXTENSIBLE speaker layout (`dwChannelMask`), when present and non-zero.
+    channel_mask: Option<u32>,
 }
 
 /// Parse a `fmt ` chunk body of `size` bytes (already consumed the 8-byte chunk
@@ -299,6 +311,15 @@ fn parse_fmt<S: Source>(src: &mut S, size: u32, be: bool) -> Result<FmtInfo, Dec
         read_u16(&fmt[24..26], be)
     } else {
         tag
+    };
+
+    // WAVE_FORMAT_EXTENSIBLE also carries an explicit speaker layout in `dwChannelMask`
+    // (bytes 20..24). Zero means "unspecified"; a non-extensible fmt has no mask field.
+    let channel_mask = if tag == 0xFFFE && take >= 24 {
+        let m = read_u32(&fmt[20..24], be);
+        (m != 0).then_some(m)
+    } else {
+        None
     };
 
     // A-law/µ-law (companded) and IMA-ADPCM all decode to 16-bit PCM.
@@ -338,6 +359,7 @@ fn parse_fmt<S: Source>(src: &mut S, size: u32, be: bool) -> Result<FmtInfo, Dec
         block_align,
         companding,
         adpcm,
+        channel_mask,
     })
 }
 
@@ -511,6 +533,58 @@ mod tests {
         let d = WavDemuxer::new(SliceSource::new(&bytes)).unwrap();
         assert_eq!(d.stream_info().format, SampleFormat::Int { bits: 24 });
         assert_eq!(d.stream_info().channels, 2);
+        assert_eq!(d.channel_mask(), Some(0x3)); // FL | FR
+    }
+
+    /// Build a WAVE_FORMAT_EXTENSIBLE PCM header with an explicit `mask`, `ch` channels, and
+    /// `frames` zero-filled 16-bit frames of `data`.
+    fn wav_extensible(ch: u16, mask: u32, frames: usize) -> Vec<u8> {
+        let block_align = ch * 2; // 16-bit
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&0xFFFEu16.to_le_bytes()); // tag
+        fmt.extend_from_slice(&ch.to_le_bytes());
+        fmt.extend_from_slice(&48_000u32.to_le_bytes());
+        fmt.extend_from_slice(&(48_000 * u32::from(block_align)).to_le_bytes());
+        fmt.extend_from_slice(&block_align.to_le_bytes());
+        fmt.extend_from_slice(&16u16.to_le_bytes()); // bits
+        fmt.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+        fmt.extend_from_slice(&16u16.to_le_bytes()); // valid bits
+        fmt.extend_from_slice(&mask.to_le_bytes()); // dwChannelMask
+        fmt.extend_from_slice(&1u16.to_le_bytes()); // GUID first u16 = PCM
+        fmt.extend_from_slice(&[0u8; 14]); // rest of GUID
+        let data_len = frames * usize::from(block_align);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&fmt);
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(data_len as u32).to_le_bytes());
+        bytes.extend(core::iter::repeat_n(0u8, data_len));
+        bytes
+    }
+
+    #[test]
+    fn extensible_reads_quad_channel_mask() {
+        // 4ch quad: FL | FR | BL | BR = 0x33 — the mask a plain count can't disambiguate.
+        let bytes = wav_extensible(4, 0x33, 4);
+        let d = WavDemuxer::new(SliceSource::new(&bytes)).unwrap();
+        assert_eq!(d.stream_info().channels, 4);
+        assert_eq!(d.channel_mask(), Some(0x33));
+    }
+
+    #[test]
+    fn extensible_zero_mask_and_plain_wav_report_no_layout() {
+        // A zero dwChannelMask is "unspecified" → no layout.
+        let ext = wav_extensible(6, 0, 4);
+        let d = WavDemuxer::new(SliceSource::new(&ext)).unwrap();
+        assert_eq!(d.channel_mask(), None);
+        // A plain (non-extensible) fmt has no mask field at all.
+        let plain = wav(1, 2, 48_000, 16, &[0; 8]);
+        let p = WavDemuxer::new(SliceSource::new(&plain)).unwrap();
+        assert_eq!(p.channel_mask(), None);
     }
 
     #[test]
