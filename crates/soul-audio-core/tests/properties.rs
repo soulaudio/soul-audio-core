@@ -109,7 +109,7 @@ type DecodeFn = fn(&'static [u8], usize) -> Decoded;
 /// approximate by design, not a bug. Lossless + container-granule formats
 /// (WAV/FLAC/ALAC/Opus/Vorbis) are exact.
 fn fixtures() -> Vec<(&'static str, &'static [u8], DecodeFn, bool)> {
-    vec![
+    let all: Vec<(&'static str, &'static [u8], DecodeFn, bool)> = vec![
         (
             "wav",
             include_bytes!("../../../testdata/tone.wav"),
@@ -170,7 +170,14 @@ fn fixtures() -> Vec<(&'static str, &'static [u8], DecodeFn, bool)> {
             decode_vorbis,
             true,
         ),
-    ]
+    ];
+    // AAC decode is patent-gated off by default (`aac` feature); drop its
+    // fixtures so the default test run doesn't try to decode them.
+    all.into_iter()
+        .filter(|(label, _, _, _)| {
+            cfg!(feature = "aac") || !(label.contains("aac") || label.contains("sbr"))
+        })
+        .collect()
 }
 
 /// Buffer size must not change the decoded output. One sample, an odd chunk, the

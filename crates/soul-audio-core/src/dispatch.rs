@@ -8,9 +8,12 @@
 //! [`DsdMode`](crate::model::DsdMode) (see [`crate::dsd`]).
 
 use crate::decoder::{DecodeError, Decoder, SeekableDecoder};
+#[cfg(feature = "aac")]
 use crate::demux::adts::AdtsReader;
 use crate::demux::mp4::{Mp4Codec, Mp4Reader};
 use crate::demux::ogg::OggReader;
+#[cfg(feature = "aac")]
+use crate::formats::aac::AacDecoder;
 use crate::formats::caf::CafDecoder;
 use crate::formats::matroska::MatroskaDecoder;
 #[cfg(not(feature = "embedded-profile"))]
@@ -18,8 +21,7 @@ use crate::formats::opus::multistream::MultistreamOpusDecoder;
 use crate::formats::opus::{OpusDecoder, open_opus_headers};
 use crate::formats::wavpack::WavpackDecoder;
 use crate::formats::{
-    aac::AacDecoder, aiff::AiffDecoder, alac::AlacDecoder, flac::FlacDecoder, mp3::Mp3Decoder,
-    wav::WavDecoder,
+    aiff::AiffDecoder, alac::AlacDecoder, flac::FlacDecoder, mp3::Mp3Decoder, wav::WavDecoder,
 };
 use crate::io::BufSource;
 use crate::model::{Format, StreamInfo};
@@ -57,7 +59,9 @@ pub enum AnyDecoder<S, P> {
     Alac(AlacDecoder<S, P>),
     /// AAC-LC in an MP4/M4A container or a raw ADTS (`.aac`) elementary stream.
     /// Carves its decoded-PCM carry buffer from the same shared `P` scratch
-    /// FLAC/ALAC/WavPack/Matroska use.
+    /// FLAC/ALAC/WavPack/Matroska use. Patent-gated behind the `aac` feature
+    /// (OFF by default) — absent in the shipped soul products.
+    #[cfg(feature = "aac")]
     Aac(AacDecoder<S, P>),
     /// Opus audio in an Ogg container (RFC 7845/6716). Unlike Vorbis, every
     /// Opus table is RFC-fixed (no per-file setup), so it needs no
@@ -110,6 +114,7 @@ impl<S: crate::io::SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> AnyDecoder<S, P> 
             AnyDecoder::Mp3(d) => d.total_frames(),
             AnyDecoder::OggFlac(d) => d.total_frames(),
             AnyDecoder::Alac(d) => d.total_frames(),
+            #[cfg(feature = "aac")]
             AnyDecoder::Aac(d) => d.total_frames(),
             AnyDecoder::Opus(d) => d.total_frames(),
             // Surround Opus is decode-only; no declared length.
@@ -133,6 +138,7 @@ impl<S: crate::io::SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> AnyDecoder<S, P> 
     pub fn resolve_lengths(&mut self) {
         match self {
             AnyDecoder::Mp3(d) => d.resolve_length(),
+            #[cfg(feature = "aac")]
             AnyDecoder::Aac(d) => d.resolve_length(),
             _ => {}
         }
@@ -156,6 +162,7 @@ impl<S: crate::io::SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> AnyDecoder<S, P> 
             // bare SeekSource, so the inherent FlacDecoder::seek_to doesn't apply).
             AnyDecoder::OggFlac(d) => SeekableDecoder::seek_to(d, sample),
             AnyDecoder::Alac(d) => d.seek_to(sample),
+            #[cfg(feature = "aac")]
             AnyDecoder::Aac(d) => d.seek_to(sample),
             AnyDecoder::Opus(d) => d.seek_to(sample),
             // Surround Opus seeking (per-stream pre-roll) is not implemented.
@@ -186,6 +193,7 @@ impl<S: crate::io::SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> AnyDecoder<S, P> 
                 SeekableDecoder::seek_to(d, crate::decoder::secs_to_samples(secs, rate))
             }
             AnyDecoder::Alac(d) => d.seek_to_time(secs),
+            #[cfg(feature = "aac")]
             AnyDecoder::Aac(d) => d.seek_to_time(secs),
             // Opus always decodes at 48 kHz; convert seconds at that rate.
             AnyDecoder::Opus(d) => d.seek_to(crate::decoder::secs_to_samples(secs, 48_000)),
@@ -218,6 +226,7 @@ impl<S: crate::io::Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for AnyDecode
             AnyDecoder::Mp3(d) => d.stream_info(),
             AnyDecoder::OggFlac(d) => d.stream_info(),
             AnyDecoder::Alac(d) => d.stream_info(),
+            #[cfg(feature = "aac")]
             AnyDecoder::Aac(d) => d.stream_info(),
             AnyDecoder::Opus(d) => d.stream_info(),
             #[cfg(not(feature = "embedded-profile"))]
@@ -239,6 +248,7 @@ impl<S: crate::io::Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for AnyDecode
             AnyDecoder::Mp3(d) => d.channel_layout(),
             AnyDecoder::OggFlac(d) => d.channel_layout(),
             AnyDecoder::Alac(d) => d.channel_layout(),
+            #[cfg(feature = "aac")]
             AnyDecoder::Aac(d) => d.channel_layout(),
             AnyDecoder::Opus(d) => d.channel_layout(),
             #[cfg(not(feature = "embedded-profile"))]
@@ -263,6 +273,7 @@ impl<S: crate::io::Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for AnyDecode
             AnyDecoder::Flac(_) | AnyDecoder::OggFlac(_) => SourceCodec::Flac,
             AnyDecoder::Mp3(_) => SourceCodec::Mp3,
             AnyDecoder::Alac(_) => SourceCodec::Alac,
+            #[cfg(feature = "aac")]
             AnyDecoder::Aac(_) => SourceCodec::Aac,
             #[cfg(not(feature = "embedded-profile"))]
             AnyDecoder::Opus(_) | AnyDecoder::OpusMs(_) => SourceCodec::Opus,
@@ -284,6 +295,7 @@ impl<S: crate::io::Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for AnyDecode
             AnyDecoder::Mp3(d) => d.decode_into(out),
             AnyDecoder::OggFlac(d) => d.decode_into(out),
             AnyDecoder::Alac(d) => d.decode_into(out),
+            #[cfg(feature = "aac")]
             AnyDecoder::Aac(d) => d.decode_into(out),
             AnyDecoder::Opus(d) => d.decode_into(out),
             #[cfg(not(feature = "embedded-profile"))]
@@ -302,6 +314,7 @@ impl<S: crate::io::Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for AnyDecode
     fn encoder_delay(&self) -> u64 {
         match self {
             AnyDecoder::Alac(d) => d.encoder_delay(),
+            #[cfg(feature = "aac")]
             AnyDecoder::Aac(d) => d.encoder_delay(),
             AnyDecoder::Mp3(d) => d.encoder_delay(),
             AnyDecoder::Wav(_)
@@ -325,6 +338,7 @@ impl<S: crate::io::Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for AnyDecode
         match self {
             AnyDecoder::Mp3(d) => d.playable_frames(),
             AnyDecoder::Alac(d) => d.playable_frames(),
+            #[cfg(feature = "aac")]
             AnyDecoder::Aac(d) => d.playable_frames(),
             AnyDecoder::Wav(_)
             | AnyDecoder::Aiff(_)
@@ -387,13 +401,22 @@ pub fn open<S: BufSource, P: AsRef<[i32]> + AsMut<[i32]>>(
                 Mp4Codec::Alac(_) => {
                     AlacDecoder::from_reader_in(reader, scratch).map(AnyDecoder::Alac)
                 }
+                #[cfg(feature = "aac")]
                 Mp4Codec::Aac(_) => AacDecoder::new_mp4_in(reader, scratch).map(AnyDecoder::Aac),
+                // AAC decode is patent-gated behind the `aac` feature; with it
+                // off, a `.m4a` AAC stream declines cleanly.
+                #[cfg(not(feature = "aac"))]
+                Mp4Codec::Aac(_) => Err(DecodeError::Unsupported),
             }
         }
-        // Raw ADTS (`.aac`) AAC-LC elementary stream.
+        // Raw ADTS (`.aac`) AAC-LC elementary stream. Patent-gated: with the
+        // `aac` feature off, an ADTS stream declines as `Unsupported`.
+        #[cfg(feature = "aac")]
         Format::Adts => AdtsReader::new(src)
             .and_then(|r| AacDecoder::new_adts_in(r, scratch))
             .map(AnyDecoder::Aac),
+        #[cfg(not(feature = "aac"))]
+        Format::Adts => Err(DecodeError::Unsupported),
         // DSD containers need an explicit DsdMode (native / DoP / decimate);
         // they are not routed through the PCM `open`.
         Format::Dsf | Format::Dff => Err(DecodeError::Unsupported),
@@ -474,7 +497,10 @@ pub fn open_seekable<S: BufSource + crate::io::SeekSource, P: AsRef<[i32]> + AsM
                 Mp4Codec::Alac(_) => {
                     AlacDecoder::from_reader_in(reader, scratch).map(AnyDecoder::Alac)
                 }
+                #[cfg(feature = "aac")]
                 Mp4Codec::Aac(_) => AacDecoder::new_mp4_in(reader, scratch).map(AnyDecoder::Aac),
+                #[cfg(not(feature = "aac"))]
+                Mp4Codec::Aac(_) => Err(DecodeError::Unsupported),
             }
         }
         // `probe` consumed nothing (it peeks via `fill_buf`), so `src` is still

@@ -4,13 +4,20 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Cross-platform no_std, no-alloc audio decode + resample + playback core (WAV/FLAC/MP3/DSD/ALAC/AAC/Vorbis/Opus)."
+description = "Cross-platform no_std, no-alloc audio decode + resample + playback core (WAV/FLAC/MP3/DSD/ALAC/Vorbis/Opus; AAC decode behind the patent-gated `aac` feature, OFF by default)."
 
 [lints]
 workspace = true
 
 [features]
 default = []
+# AAC-LC/HE-AAC decode (the `formats::aac` module + its MP4/ADTS/Matroska wiring).
+# OFF by default and kept opt-in because AAC is a Via LA patent ($15,000 one-time
+# + $0.98/unit) — a clean-room implementation does not clear the patent. The
+# shipped soul products (DAP firmware, desktop player) MUST NOT enable this; it is
+# enforced downstream by arch tests asserting `AAC_ENABLED == false`. See
+# soul-listener/docs/research/2026-11-18-licensing-ip-and-workarounds.md.
+aac = []
 # Embedded Vorbis profile (design spec `2026-09-05-vorbis-decoder-design.md`
 # "Profiles"; firmware wiring is issue #32): stereo channel cap + a 4096
 # maximum transform length, roughly halving the per-decode DSP scratch

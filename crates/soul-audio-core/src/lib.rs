@@ -34,3 +34,10 @@ pub use model::{DsdMode, DsdRate, Format, SampleFormat, SourceCodec, StreamInfo}
 pub use probe::probe;
 pub use resample::{Quality, ResampleError, Resampler};
 pub use sink::{Sink, SinkError};
+
+/// Whether the patented AAC decoder is compiled in. MUST stay `false` in all
+/// shipped soul products (DAP firmware + desktop player) — AAC is a Via LA
+/// patent ($15k one-time + $0.98/unit), and a clean-room decoder does not clear
+/// it. Enforced by arch tests downstream. See
+/// soul-listener/docs/research/2026-11-18-licensing-ip-and-workarounds.md.
+pub const AAC_ENABLED: bool = cfg!(feature = "aac");

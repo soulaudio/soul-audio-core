@@ -685,6 +685,7 @@ fn alac_24bit_bit_exact() {
 /// AAC-LC at **48 kHz** vs ffmpeg — a different `swb_offset_1024` scalefactor-band
 /// table than the 44.1 kHz fixtures, driven by the (short-block) chirp so it stays
 /// PNS-free and SNR-matchable.
+#[cfg(feature = "aac")]
 #[test]
 fn aac_48k_matches_ffmpeg() {
     let ours = decode_all(include_bytes!("../../../testdata/chirp-aac-48k.m4a"));
@@ -723,6 +724,7 @@ fn aac_48k_matches_ffmpeg() {
 /// content can only be checked structurally, not by SNR — the chirp is the
 /// demanding-but-deterministic case. (MP3/Vorbis/Opus have no un-matchable noise
 /// fill, so they stress against `complex.wav` directly.)
+#[cfg(feature = "aac")]
 #[test]
 fn stress_aac_short_blocks_match_ffmpeg() {
     let ours = decode_all(include_bytes!("../../../testdata/chirp-aac.m4a"));
@@ -1076,6 +1078,7 @@ fn best_align_segsnr(ours: &[i32], refr: &[i32], channels: usize) -> (usize, f64
 /// it with its own PRNG), so those silenced bands account for essentially all of
 /// the gap below the ~75 dB a PNS-free encode scores; whole-signal SNR still
 /// clears the bar comfortably.
+#[cfg(feature = "aac")]
 #[test]
 fn open_decodes_aac_mp4_matching_ffmpeg_within_tolerance() {
     let m4a = include_bytes!("../testdata/aac.m4a");
@@ -1106,6 +1109,7 @@ fn open_decodes_aac_mp4_matching_ffmpeg_within_tolerance() {
 /// decodes the audio. `aac-nonfaststart.m4a` is a stream-copy remux of
 /// `aac.m4a` (same `mdat`/`esds`, `moov` moved to the end), so its decode
 /// matches the same ffmpeg reference within the AAC-LC lossy tolerance.
+#[cfg(feature = "aac")]
 #[test]
 fn open_seekable_decodes_non_faststart_aac() {
     let m4a = include_bytes!("../testdata/aac-nonfaststart.m4a");
@@ -1160,6 +1164,7 @@ fn open_seekable_decodes_non_faststart_alac_bit_exact() {
 /// (the desktop now routes every MP4 — incl. fragmented — through it, so this
 /// guards the new constructor's faststart and `moof` branches against a
 /// regression, not just the non-faststart case it adds).
+#[cfg(feature = "aac")]
 #[test]
 fn open_seekable_still_decodes_faststart_mp4() {
     let aac = include_bytes!("../testdata/aac.m4a");
@@ -1186,6 +1191,7 @@ fn open_seekable_still_decodes_faststart_mp4() {
 /// list, so our decode and ffmpeg's align at offset 0 and the measured SNR is
 /// 73.7 dB; the bar is 63 dB (~10 dB margin), far above a conformant decode's
 /// need and decisive against a per-fragment desync.
+#[cfg(feature = "aac")]
 #[test]
 fn open_decodes_fragmented_aac_mp4() {
     let m4a = include_bytes!("../testdata/frag-aac.m4a");
@@ -1233,7 +1239,7 @@ fn open_decodes_fragmented_aac_mp4() {
 /// graceful `Unsupported` there instead — skip rather than assert a decode
 /// that profile intentionally refuses. See
 /// `open_rejects_aac_5p1_under_embedded_profile` for the inverse check.
-#[cfg(not(feature = "embedded-profile"))]
+#[cfg(all(feature = "aac", not(feature = "embedded-profile")))]
 #[test]
 fn open_decodes_aac_5p1_matching_ffmpeg() {
     const CH: usize = 6;
@@ -1323,7 +1329,7 @@ fn open_decodes_aac_5p1_matching_ffmpeg() {
 /// above — under the stereo `MAX_CHANNELS` cap (decoder-memory externalization
 /// spec, Lever A), the same 5.1 AAC-LC file is a clean `Unsupported` at
 /// `open()`, never a panic.
-#[cfg(feature = "embedded-profile")]
+#[cfg(all(feature = "aac", feature = "embedded-profile"))]
 #[test]
 fn open_rejects_aac_5p1_under_embedded_profile() {
     let m4a = include_bytes!("../testdata/aac-5p1.m4a");
@@ -1463,6 +1469,7 @@ fn open_decodes_opus_5p1_matching_ffmpeg() {
 /// `open()` built an MP3 decoder that reported bogus stream info (48000 Hz /
 /// mono) and emitted garbage. The fixture is a 42-byte ID3v2.3 tag prepended to
 /// `aac.aac`, so its audio is byte-identical to the untagged fixture.
+#[cfg(feature = "aac")]
 #[test]
 fn id3_prefixed_adts_routes_to_aac_not_mp3() {
     let id3 = include_bytes!("../testdata/aac-id3.aac");
@@ -1501,7 +1508,7 @@ fn id3_prefixed_adts_routes_to_aac_not_mp3() {
 /// at the core rate instead of the 2× SBR rate — see
 /// `formats::aac::tests::he_aac_decodes_lc_core_only_under_embedded_profile`
 /// for that profile's equivalent gate.
-#[cfg(not(feature = "embedded-profile"))]
+#[cfg(all(feature = "aac", not(feature = "embedded-profile")))]
 #[test]
 fn open_decodes_he_aac_sbr_matching_ffmpeg() {
     for (label, data, refpcm) in [
@@ -1539,7 +1546,7 @@ fn open_decodes_he_aac_sbr_matching_ffmpeg() {
 ///
 /// Desktop only: see `open_decodes_he_aac_sbr_matching_ffmpeg`'s note on the
 /// `embedded-profile` counterpart (no 2× SBR rate there).
-#[cfg(not(feature = "embedded-profile"))]
+#[cfg(all(feature = "aac", not(feature = "embedded-profile")))]
 #[test]
 fn sbr_output_is_2x_and_non_silent() {
     let aac = include_bytes!("../testdata/sbr.aac");
@@ -1883,7 +1890,7 @@ fn ps_local_matches_ffmpeg_per_channel() {
 /// `ps-local`'s ~34 dB), comfortably over `PS_SNR_BAR`.
 ///
 /// Desktop only — see `ps_local_fixture`'s note.
-#[cfg(not(feature = "embedded-profile"))]
+#[cfg(all(feature = "aac", not(feature = "embedded-profile")))]
 #[test]
 fn open_decodes_ps_synth_matching_ffmpeg_per_channel() {
     let aac = include_bytes!("../testdata/ps-synth.aac");
@@ -3332,7 +3339,9 @@ fn opus_celt_decode_throughput() {
 /// O(target) full AAC-frame decodes (≈10 s for a 5-minute file). Resolving a CBR
 /// byte-size estimate both supplies a duration and lets the seek jump by a byte
 /// estimate + syncword resync, touching the source O(1) times.
-#[cfg(test)]
+// ADTS is a raw AAC elementary stream; this whole seek suite is AAC-only and
+// patent-gated behind the `aac` feature (OFF by default).
+#[cfg(all(test, feature = "aac"))]
 mod adts_cbr_seek {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3636,6 +3645,7 @@ mod matroska_cue_seek {
     const OPUS_WEBM: &[u8] = include_bytes!("../../../testdata/tone-opus-cues.webm");
     const OPUS_MKA: &[u8] = include_bytes!("../../../testdata/tone-opus-cues.mka");
     const FLAC_MKA: &[u8] = include_bytes!("../../../testdata/tone-flac-cues.mka");
+    #[cfg(feature = "aac")]
     const AAC_MKA: &[u8] = include_bytes!("../../../testdata/tone-aac-cues.mka");
 
     /// A seekable `BufSource` over a `'static` slice that counts `read` calls —
@@ -3852,6 +3862,7 @@ mod matroska_cue_seek {
     /// the filterbank reset warms up over the landed cluster's run-in — so the
     /// landing is **frame-granular**, correct at high SNR within the index's ms
     /// resolution, and sublinear in source touches.
+    #[cfg(feature = "aac")]
     #[test]
     fn late_aac_cue_seek_is_sublinear_and_correct() {
         let (full, ch) = super::decode_all_with_channels(AAC_MKA);
