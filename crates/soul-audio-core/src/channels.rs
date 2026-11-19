@@ -127,6 +127,28 @@ pub fn vorbis_family1_layout(channels: u16) -> Option<ChannelLayout> {
     ChannelLayout::from_order(order)
 }
 
+/// The AAC default `channel_configuration` channel order for a count (ISO/IEC 14496-3): the
+/// decoder emits elements in bitstream order, which for the standard configs puts the centre
+/// FIRST (the leading SCE), then the front L/R pair, the surround pair(s), and the LFE last.
+/// Differs from WAVEFORMATEXTENSIBLE and from the Vorbis order. The standard configs are
+/// count-distinct (config 3..6 → 3..6 channels, config 7 → 8), so the count names the order;
+/// `None` for 1/2 (not a downmix), 7 (no standard AAC config), and counts past
+/// [`MAX_CHANNELS`]. The exact side-vs-back label of a surround channel does not affect the
+/// stereo fold (both fold to their side at −3 dB), only its L/R sidedness does.
+#[must_use]
+pub fn aac_layout(channels: u16) -> Option<ChannelLayout> {
+    use speaker::*;
+    let order: &[u32] = match channels {
+        3 => &[FC, FL, FR],                      // config 3
+        4 => &[FC, FL, FR, BC],                  // config 4: centre, front L/R, rear centre
+        5 => &[FC, FL, FR, BL, BR],              // config 5: 5.0
+        6 => &[FC, FL, FR, BL, BR, LFE],         // config 6: 5.1
+        8 => &[FC, FL, FR, SL, SR, BL, BR, LFE], // config 7: 7.1
+        _ => return None,
+    };
+    ChannelLayout::from_order(order)
+}
+
 /// The `(Lo, Ro)` stereo downmix gain for one speaker (ITU-R BS.775): front-centre and the
 /// surrounds fold in at −3 dB (`1/√2`), the LFE is dropped, back-centre folds equally to
 /// both. `None` for a speaker this fold does not place (don't guess).
@@ -207,6 +229,23 @@ mod tests {
         assert_eq!(c[3], (C, 0.0)); // BL
         assert_eq!(c[4], (0.0, C)); // BR
         assert_eq!(c[5], (0.0, 0.0)); // LFE dropped
+    }
+
+    #[test]
+    fn aac_five_one_puts_centre_first_and_folds_correctly() {
+        use speaker::*;
+        let l = aac_layout(6).unwrap();
+        // AAC 5.1 decode order: C L R Ls Rs LFE (centre FIRST).
+        assert_eq!(l.speakers(), &[FC, FL, FR, BL, BR, LFE]);
+        let c = downmix_to_stereo_coeffs(&l).unwrap();
+        assert_eq!(c[0], (C, C)); // FC (first!)
+        assert_eq!(c[1], (1.0, 0.0)); // FL
+        assert_eq!(c[2], (0.0, 1.0)); // FR
+        assert_eq!(c[3], (C, 0.0)); // BL
+        assert_eq!(c[4], (0.0, C)); // BR
+        assert_eq!(c[5], (0.0, 0.0)); // LFE dropped
+        // No standard AAC config is 7-channel.
+        assert_eq!(aac_layout(7), None);
     }
 
     #[test]

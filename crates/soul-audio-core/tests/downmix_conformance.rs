@@ -329,3 +329,53 @@ fn opus_surround_folds_centre_by_family1_order() {
         "a centre-only fold must make L == R (SNR {snr:.1} dB); channel order wrong?"
     );
 }
+
+/// AAC's `channel_configuration` decode order puts the centre channel FIRST (the leading
+/// SCE), not in WAVEFORMATEXTENSIBLE order. A 5.1 source with audio ONLY in the front-centre,
+/// encoded to AAC and decoded through our deck, must fold the centre EQUALLY to L and R. If
+/// we mis-read the order (centre taken as front-left/right), the centre would skew to one
+/// side. End to end through the real `open()` -> AAC -> deck path.
+#[test]
+#[ignore = "requires ffmpeg (FFMPEG_BIN or on PATH)"]
+fn aac_surround_folds_centre_by_config_order() {
+    let Some(bin) = ffmpeg_bin() else {
+        eprintln!("skip: no ffmpeg");
+        return;
+    };
+    let mask = speaker::FL | speaker::FR | speaker::FC | speaker::LFE | speaker::BL | speaker::BR;
+    let planes = vec![
+        vec![0; FRAMES],          // FL
+        vec![0; FRAMES],          // FR
+        tone(440.0, 1_500_000.0), // FC — the only audio
+        vec![0; FRAMES],          // LFE
+        vec![0; FRAMES],          // BL
+        vec![0; FRAMES],          // BR
+    ];
+    let src = wav_ext_24(mask, &planes);
+    // ADTS AAC-LC 5.1 (channel_configuration 6); ffmpeg maps WAVEFORMATEXTENSIBLE FC into the
+    // AAC centre element.
+    let aac = ffmpeg_encode(
+        &bin,
+        &src,
+        &["-c:a", "aac", "-b:a", "256k", "-f", "adts"],
+        "soul_dm.aac",
+    );
+
+    let ours = our_downmix(&aac);
+    let end = (SKIP * 2 + WIN * 2).min(ours.len());
+    assert!(end > SKIP * 2, "no steady AAC output decoded");
+    let o = &ours[SKIP * 2..end];
+    let l: Vec<i32> = o.iter().step_by(2).copied().collect();
+    let r: Vec<i32> = o.iter().skip(1).step_by(2).copied().collect();
+    let (rl, rr) = (rms(&l), rms(&r));
+    println!("AAC 5.1 centre fold: L rms={rl:.0} R rms={rr:.0}");
+    assert!(
+        rl > 1_000.0 && rr > 1_000.0,
+        "centre must fold to BOTH L and R (L rms={rl:.0} R rms={rr:.0}); channel order wrong?"
+    );
+    let snr = scale_invariant_snr(&l, &r);
+    assert!(
+        snr > 40.0,
+        "a centre-only fold must make L == R (SNR {snr:.1} dB); channel order wrong?"
+    );
+}
