@@ -2078,6 +2078,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "soul-audio-playlist"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "soul-audio-queue"
 version = "0.1.0"
 dependencies = [

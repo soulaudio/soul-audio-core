@@ -80,7 +80,7 @@ build.
 | Tier | Constraint | Members |
 | --- | --- | --- |
 | **T0 — kernel** | `no_std`, no-alloc, `forbid(unsafe)`; normal deps ⊆ {`embedded-io`} ∪ T0 | `soul-audio-core`, `soul-audio-tags`, `soul-audio-catalog`, `soul-audio-index` (reader surface), `soul-audio-loudness` |
-| **T1 — no_std + alloc** | `no_std`; may use `alloc`; no `std`-only dep; deps ⊆ {`embedded-io`, `libm`} ∪ T0 ∪ T1 (+ `serde` behind an **optional** feature, off by default — keeps the no-default surface within the set) | `soul-audio-queue`, `soul-audio-engine`, `soul-audio-control`, `soul-audio-eq` (RBJ EQ design; no-alloc + `libm`), `soul-audio-dsp` (DSP-chain + audio-profile model; optional serde exchange format) |
+| **T1 — no_std + alloc** | `no_std`; may use `alloc`; no `std`-only dep; deps ⊆ {`embedded-io`, `libm`} ∪ T0 ∪ T1 (+ `serde` behind an **optional** feature, off by default — keeps the no-default surface within the set) | `soul-audio-queue`, `soul-audio-engine`, `soul-audio-control`, `soul-audio-eq` (RBJ EQ design; no-alloc + `libm`), `soul-audio-dsp` (DSP-chain + audio-profile model; optional serde exchange format), `soul-audio-playlist` (editable playlist model + durable track locators + cover selection; DAP-reusable) |
 | **Firmware** | `no_std` binary; may depend on T0/T1 + embedded HAL; **never** a std-adapter | `soul-audio-firmware` |
 | **Std adapter** | `std`; may depend on T0/T1 + std-adapters | `soul-audio-desktop`, `soul-audio-service`, `soul-audio-cli`, `soul-audio-import`, `soul-audio-organize`; *planned:* `soul-audio-artbake`, `soul-audio-remote`, `soul-audio-server`, `soul-audio-multicatalog`, `soul-audio-mutable` |
 | **Tests** | may depend on anything; nothing depends on it | `architecture-tests` |

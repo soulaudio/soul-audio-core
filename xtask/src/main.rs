@@ -238,6 +238,28 @@ fn verify() -> Result<(), String> {
         "--features",
         "serde",
     ])?;
+    // The playlist model (durable locators + editable playlist + cover
+    // selection) the DAP reuses for its own playlist UI. Same split as
+    // `soul-audio-dsp` above: the pure no_std model, then with the optional
+    // serde (de)serialization surface.
+    run(&[
+        "build",
+        "-p",
+        "soul-audio-playlist",
+        "--target",
+        "thumbv7em-none-eabihf",
+        "--no-default-features",
+    ])?;
+    run(&[
+        "build",
+        "-p",
+        "soul-audio-playlist",
+        "--target",
+        "thumbv7em-none-eabihf",
+        "--no-default-features",
+        "--features",
+        "serde",
+    ])?;
     run(&[
         "build",
         "-p",
