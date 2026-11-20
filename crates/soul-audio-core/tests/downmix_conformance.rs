@@ -22,8 +22,8 @@ use std::io::Write;
 use std::process::Command;
 
 use soul_audio_core::{
-    AnyDecoder, Deck, Progress, Quality, SampleFormat, Sink, SinkError, SliceSource, StreamInfo,
-    channels::speaker, decoder_scratch_len, open,
+    AnyDecoder, Deck, Decoder, Progress, Quality, SampleFormat, Sink, SinkError, SliceSource,
+    StreamInfo, channels::speaker, decoder_scratch_len, open,
 };
 
 const RATE: u32 = 48_000;
@@ -254,7 +254,9 @@ fn downmix_5_1_matches_ffmpeg_ac2() {
 /// into the codec's own native order), returning the encoded file bytes.
 fn ffmpeg_encode(bin: &str, wav: &[u8], codec_args: &[&str], out_name: &str) -> Vec<u8> {
     let dir = std::env::temp_dir();
-    let src = dir.join("soul_dm_enc_src.wav");
+    // Unique per fixture: tests run in parallel, and a shared source path would let one
+    // test's WAV clobber another's mid-encode.
+    let src = dir.join(format!("{out_name}.src.wav"));
     let out = dir.join(out_name);
     std::fs::File::create(&src).unwrap().write_all(wav).unwrap();
     let status = Command::new(bin)
@@ -377,5 +379,143 @@ fn aac_surround_folds_centre_by_config_order() {
     assert!(
         snr > 40.0,
         "a centre-only fold must make L == R (SNR {snr:.1} dB); channel order wrong?"
+    );
+}
+
+/// Goertzel single-bin power at `hz` (sample rate [`RATE`]). Only relative powers compared.
+fn goertzel(samples: &[i32], hz: f64) -> f64 {
+    let n = samples.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let w = 2.0 * std::f64::consts::PI * hz / RATE as f64;
+    let coeff = 2.0 * w.cos();
+    let (mut s1, mut s2) = (0.0f64, 0.0f64);
+    for &x in samples {
+        let s0 = x as f64 + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    (s1 * s1 + s2 * s2 - coeff * s1 * s2) / n as f64
+}
+
+/// Decode `bytes` through the public `open()` path into `ch` per-channel planes (a steady
+/// window past any decoder priming).
+fn decode_planes(bytes: &[u8], ch: usize) -> Vec<Vec<i32>> {
+    let mut dec = open(SliceSource::new(bytes), vec![0i32; decoder_scratch_len()]).expect("open");
+    let mut pcm: Vec<i32> = Vec::new();
+    let mut buf = vec![0i32; 4096 * ch];
+    for _ in 0..10_000 {
+        let n = dec.decode_into(&mut buf).expect("decode");
+        if n == 0 {
+            break;
+        }
+        pcm.extend_from_slice(&buf[..n]);
+        if pcm.len() >= ch * (SKIP + WIN) {
+            break;
+        }
+    }
+    let start = (SKIP * ch).min(pcm.len());
+    let frames = &pcm[start..];
+    (0..ch)
+        .map(|c| frames.chunks_exact(ch).map(|f| f[c]).collect())
+        .collect()
+}
+
+/// ALAC multichannel: every channel must decode correctly AND land in the right position.
+/// Encode a 5.1 source with a DISTINCT tone per speaker, decode through the real `open()`
+/// path, and check each decoded channel carries the tone its speaker should - which proves
+/// both that the multichannel decode works and that the reported channel order (`alac_layout`,
+/// centre first) matches what the decoder emits.
+#[test]
+#[ignore = "requires ffmpeg (FFMPEG_BIN or on PATH)"]
+fn alac_5_1_decodes_each_channel_in_order() {
+    let Some(bin) = ffmpeg_bin() else {
+        eprintln!("skip: no ffmpeg");
+        return;
+    };
+    // WAVEFORMATEXTENSIBLE order FL FR FC LFE BL BR, one distinct tone each.
+    let mask = speaker::FL | speaker::FR | speaker::FC | speaker::LFE | speaker::BL | speaker::BR;
+    let f = [300.0, 400.0, 500.0, 600.0, 700.0, 800.0];
+    let src_planes: Vec<Vec<i32>> = f.iter().map(|&hz| tone(hz, 1_500_000.0)).collect();
+    let wav = wav_ext_24(mask, &src_planes);
+    // ffmpeg maps by speaker into ALAC's centre-first order (C L R Ls Rs LFE).
+    let alac = ffmpeg_encode(
+        &bin,
+        &wav,
+        &[
+            "-c:a",
+            "alac",
+            "-sample_fmt",
+            "s16p",
+            "-movflags",
+            "+faststart",
+        ],
+        "soul_dm_alac.m4a",
+    );
+
+    let planes = decode_planes(&alac, 6);
+    assert_eq!(planes.len(), 6, "ALAC did not decode 6 channels");
+    assert!(planes[0].len() > WIN / 2, "too little ALAC audio decoded");
+    // alac_layout(6) = [FC, FL, FR, BL, BR, LFE] → the tone expected in each decoded channel.
+    let expect = [500.0, 300.0, 400.0, 700.0, 800.0, 600.0];
+    for (i, &want) in expect.iter().enumerate() {
+        let p_want = goertzel(&planes[i], want);
+        let p_other = f
+            .iter()
+            .filter(|&&hz| hz != want)
+            .map(|&hz| goertzel(&planes[i], hz))
+            .fold(0.0, f64::max);
+        println!("ALAC plane {i}: {want} Hz power {p_want:.2e} vs best other {p_other:.2e}");
+        assert!(
+            p_want > p_other * 10.0,
+            "ALAC channel {i} must carry {want} Hz (multichannel decode or channel order wrong)"
+        );
+    }
+}
+
+/// ALAC 5.1 end to end through the deck: a centre-only source folds EQUALLY to L and R,
+/// confirming the ordered layout reaches the deck via `open()` -> ALAC -> fold.
+#[test]
+#[ignore = "requires ffmpeg (FFMPEG_BIN or on PATH)"]
+fn alac_surround_folds_centre() {
+    let Some(bin) = ffmpeg_bin() else {
+        eprintln!("skip: no ffmpeg");
+        return;
+    };
+    let mask = speaker::FL | speaker::FR | speaker::FC | speaker::LFE | speaker::BL | speaker::BR;
+    let planes = vec![
+        vec![0; FRAMES],
+        vec![0; FRAMES],
+        tone(440.0, 1_500_000.0),
+        vec![0; FRAMES],
+        vec![0; FRAMES],
+        vec![0; FRAMES],
+    ];
+    let wav = wav_ext_24(mask, &planes);
+    let alac = ffmpeg_encode(
+        &bin,
+        &wav,
+        &[
+            "-c:a",
+            "alac",
+            "-sample_fmt",
+            "s16p",
+            "-movflags",
+            "+faststart",
+        ],
+        "soul_dm_alac_c.m4a",
+    );
+    let ours = our_downmix(&alac);
+    let end = (SKIP * 2 + WIN * 2).min(ours.len());
+    assert!(end > SKIP * 2, "no steady ALAC output decoded");
+    let o = &ours[SKIP * 2..end];
+    let l: Vec<i32> = o.iter().step_by(2).copied().collect();
+    let r: Vec<i32> = o.iter().skip(1).step_by(2).copied().collect();
+    let (rl, rr) = (rms(&l), rms(&r));
+    println!("ALAC 5.1 centre fold: L rms={rl:.0} R rms={rr:.0}");
+    assert!(
+        rl > 1_000.0 && rr > 1_000.0 && scale_invariant_snr(&l, &r) > 40.0,
+        "centre must fold equally to L and R (L rms={rl:.0} R rms={rr:.0}); channel order wrong?"
     );
 }

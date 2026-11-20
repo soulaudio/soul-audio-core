@@ -346,7 +346,11 @@ impl<S: crate::io::Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for AnyDecode
 /// `vec![0i32; decoder_scratch_len()]`.
 #[must_use]
 pub const fn decoder_scratch_len() -> usize {
-    crate::formats::wavpack::MAX_BLOCK_PCM
+    // The two decoders that carve from this shared buffer: WavPack's block-staging PCM and
+    // the ALAC decode planes (which, at 8 channels, exceed it). Size to the larger.
+    let wavpack = crate::formats::wavpack::MAX_BLOCK_PCM;
+    let alac = crate::formats::alac::SCRATCH_LEN;
+    if wavpack > alac { wavpack } else { alac }
 }
 
 /// Probe `src`, then construct the matching PCM decoder.
