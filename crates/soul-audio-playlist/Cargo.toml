@@ -1,0 +1,29 @@
+[package]
+name = "soul-audio-playlist"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Portable no_std playlist model: durable track locators + snapshots, editable ordered playlists, and cover-art selection, shared by the desktop host (soul-player-ng) and the DAP firmware (soul-listener)."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Opt-in (de)serialization of the locator/snapshot/playlist types. Off by default
+# so the no_std / `--no-default-features` surface stays within the T1 external
+# set {embedded-io, libm}. serde is pulled with `alloc` + `derive`, no std.
+serde = ["dep:serde"]
+
+[dependencies.serde]
+version = "1"
+optional = true
+default-features = false
+features = ["derive", "alloc"]
+
+[dev-dependencies]
+# Test-only: exercise the serde round-trips through a concrete JSON serializer
+# (the desktop's choice). `toml` is not no_std so it stays out of the crate's
+# own dependency surface.
+serde_json = "1"
