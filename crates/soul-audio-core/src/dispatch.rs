@@ -341,14 +341,15 @@ impl<S: crate::io::Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for AnyDecode
 }
 
 /// The required length of [`open`]/[`open_seekable`]'s `scratch` storage
-/// parameter (equivalently [`crate::formats::wavpack::MAX_BLOCK_PCM`]) — call
+/// parameter (equivalently [`crate::formats::wavpack::SCRATCH_LEN`]) — call
 /// this instead of hardcoding the constant when sizing the buffer, e.g.
 /// `vec![0i32; decoder_scratch_len()]`.
 #[must_use]
 pub const fn decoder_scratch_len() -> usize {
-    // The two decoders that carve from this shared buffer: WavPack's block-staging PCM and
-    // the ALAC decode planes (which, at 8 channels, exceed it). Size to the larger.
-    let wavpack = crate::formats::wavpack::MAX_BLOCK_PCM;
+    // The two decoders that carve from this shared buffer: WavPack's block-staging PCM plus
+    // its interleaved multichannel output region, and the ALAC decode planes. Size to the
+    // larger.
+    let wavpack = crate::formats::wavpack::SCRATCH_LEN;
     let alac = crate::formats::alac::SCRATCH_LEN;
     if wavpack > alac { wavpack } else { alac }
 }
