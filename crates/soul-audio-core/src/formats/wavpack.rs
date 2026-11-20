@@ -35,6 +35,11 @@ const FLAG_SRATE_MASK: u32 = 0x0780_0000;
 const FLAG_SRATE_LSB: u32 = 23;
 const FLAG_FALSE_STEREO: u32 = 0x4000_0000;
 const FLAG_DSD: u32 = 0x8000_0000;
+/// Last block of a frame. For >2 channels WavPack emits a run of ≤2-channel
+/// sub-blocks sharing one `block_index`, the first flagged INITIAL (0x800) and
+/// the last FINAL; a mono/stereo frame is a single block with both set. We bracket
+/// multichannel frames by FINAL alone, so INITIAL needs no constant.
+const FLAG_FINAL_BLOCK: u32 = 0x0000_1000;
 
 /// "treat the block as a single channel of samples".
 const FLAG_MONO_DATA: u32 = FLAG_MONO | FLAG_FALSE_STEREO;
@@ -49,6 +54,9 @@ const ID_DECORR_SAMPLES: u8 = 0x04;
 const ID_ENTROPY_VARS: u8 = 0x05;
 const ID_INT32_INFO: u8 = 0x09;
 const ID_WV_BITSTREAM: u8 = 0x0a;
+/// Channel-count + WAVEFORMATEXTENSIBLE mask, in the `INITIAL` block of a
+/// multichannel frame: byte 0 = channel count, following bytes = mask (LE).
+const ID_CHANNEL_INFO: u8 = 0x0d;
 
 const MAX_TERMS: usize = 16;
 /// Largest decoded block we buffer: `block_samples × channels` interleaved i32.
@@ -58,6 +66,25 @@ const MAX_TERMS: usize = 16;
 /// [`WavpackDecoder::new_in`]) must meet — [`crate::dispatch::decoder_scratch_len`]
 /// exposes it without hardcoding.
 pub const MAX_BLOCK_PCM: usize = 65536;
+
+/// Largest channel count the decoder assembles. Desktop supports multichannel
+/// (5.1 / 7.1); the embedded profile stays mono/stereo, since its SRAM budget
+/// can't hold the interleaved multichannel output frame below.
+#[cfg(not(feature = "embedded-profile"))]
+pub const MAX_WV_CHANNELS: usize = 8;
+#[cfg(feature = "embedded-profile")]
+pub const MAX_WV_CHANNELS: usize = 2;
+
+/// Minimum caller-provided staging length. The first [`MAX_BLOCK_PCM`] i32 stage
+/// one ≤2-channel sub-block (as for mono/stereo); the remainder holds the
+/// interleaved N-channel frame. A sub-block's `block_samples·2 ≤ MAX_BLOCK_PCM`,
+/// so an N-channel frame needs at most `(MAX_WV_CHANNELS / 2) · MAX_BLOCK_PCM`
+/// more. The embedded profile is mono/stereo only, so it needs no output region.
+/// [`crate::dispatch::decoder_scratch_len`] exposes this.
+#[cfg(not(feature = "embedded-profile"))]
+pub const SCRATCH_LEN: usize = MAX_BLOCK_PCM + (MAX_WV_CHANNELS / 2) * MAX_BLOCK_PCM;
+#[cfg(feature = "embedded-profile")]
+pub const SCRATCH_LEN: usize = MAX_BLOCK_PCM;
 
 const SAMPLE_RATES: [u32; 15] = [
     6000, 8000, 9600, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000,
@@ -660,10 +687,38 @@ pub struct WavpackDecoder<S, P> {
     total_frames: Option<u64>,
     channels: usize,
     shift: u32,
+    /// WAVEFORMATEXTENSIBLE channel mask for a multichannel (>2ch) stream, 0 otherwise.
+    chan_mask: u32,
     pcm: P,
     pcm_len: usize,
     pcm_pos: usize,
+    /// Base index in `pcm` of the current frame: 0 for a mono/stereo frame staged
+    /// in place, [`MAX_BLOCK_PCM`] for a multichannel frame assembled in the output
+    /// region. `pcm_pos`/`pcm_len` are absolute, so [`Self::decode_into`] is agnostic;
+    /// only [`Self::seek_to`] re-derives a within-frame offset and must add this.
+    frame_off: usize,
     eof: bool,
+}
+
+/// One decoded ≤2-channel sub-block, handed from [`WavpackDecoder::decode_subblock`]
+/// up to the frame-level [`WavpackDecoder::decode_block`]. Its PCM lives in the
+/// staging region `pcm[0..block_samples·out_channels]`.
+struct SubBlock {
+    /// Samples per channel in this block.
+    block_samples: usize,
+    /// Channels this block contributes (1 = mono, 2 = stereo / false-stereo).
+    out_channels: usize,
+    /// `FLAG_FINAL_BLOCK` — last block of the frame (always set for a mono/stereo frame).
+    final_block: bool,
+    /// Total channels from `ID_CHANNEL_INFO` (present in a multichannel INITIAL block), else 0.
+    chan_count: usize,
+    /// WAVEFORMATEXTENSIBLE channel mask from `ID_CHANNEL_INFO`, else 0.
+    chan_mask: u32,
+    /// Per-stream parameters, taken from the frame's first sub-block.
+    sample_rate: u32,
+    bits: u8,
+    total_frames: Option<u64>,
+    shift: u32,
 }
 
 impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> WavpackDecoder<S, P> {
@@ -689,9 +744,11 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> WavpackDecoder<S, P> {
             total_frames: None,
             channels: 0,
             shift: 0,
+            chan_mask: 0,
             pcm,
             pcm_len: 0,
             pcm_pos: 0,
+            frame_off: 0,
             eof: false,
         };
         // Decode the first audio block to establish stream parameters.
@@ -706,13 +763,15 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> WavpackDecoder<S, P> {
         self.total_frames
     }
 
-    /// Decode one block into [`Self::pcm`]. Returns `false` at a clean EOF.
-    fn decode_block(&mut self) -> Result<bool, DecodeError> {
+    /// Decode one ≤2-channel sub-block into `pcm[0..n_samples]` and return its
+    /// descriptor, or `None` at a clean EOF. The frame-level [`Self::decode_block`]
+    /// calls this once for mono/stereo and once per channel group for multichannel.
+    fn decode_subblock(&mut self) -> Result<Option<SubBlock>, DecodeError> {
         loop {
             let mut hdr = [0u8; 32];
             if !read_full_or_eof(&mut self.src, &mut hdr)? {
                 self.eof = true;
-                return Ok(false);
+                return Ok(None);
             }
             if &hdr[0..4] != b"wvpk" {
                 // Trailing non-audio data (e.g. an APEv2 / ID3 tag ffmpeg appends)
@@ -720,7 +779,7 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> WavpackDecoder<S, P> {
                 // but junk before the very first block is malformed.
                 if self.channels != 0 {
                     self.eof = true;
-                    return Ok(false);
+                    return Ok(None);
                 }
                 return Err(DecodeError::Malformed);
             }
@@ -779,6 +838,9 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> WavpackDecoder<S, P> {
             let mut int32_info = [0u8; 4];
             let mut have_int32 = false;
             let mut decoded = false;
+            // Channel count + mask from the INITIAL block's `ID_CHANNEL_INFO` (0 if absent).
+            let mut chan_count = 0usize;
+            let mut chan_mask = 0u32;
 
             while body_remaining >= 2 && !decoded {
                 let mut idb = [0u8; 2];
@@ -858,6 +920,21 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> WavpackDecoder<S, P> {
                         read_exact(&mut self.src, &mut int32_info[..cnt])?;
                         skip(&mut self.src, payload - cnt as u64 + pad)?;
                         have_int32 = true;
+                    }
+                    ID_CHANNEL_INFO => {
+                        // byte 0 = channel count, following bytes = mask (LE, ≤4).
+                        let mut raw = [0u8; 8];
+                        let cnt = (payload as usize).min(raw.len());
+                        read_exact(&mut self.src, &mut raw[..cnt])?;
+                        skip(&mut self.src, payload - cnt as u64 + pad)?;
+                        if cnt >= 1 {
+                            chan_count = raw[0] as usize;
+                            let mut mask = 0u32;
+                            for (k, &b) in raw[1..cnt.min(5)].iter().enumerate() {
+                                mask |= u32::from(b) << (8 * k);
+                            }
+                            chan_mask = mask;
+                        }
                     }
                     ID_WV_BITSTREAM => {
                         // Decode residuals straight from the stream.
@@ -965,30 +1042,112 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> WavpackDecoder<S, P> {
                 }
             }
 
-            // First block: lock stream parameters.
-            if self.channels == 0 {
-                self.channels = out_channels;
-                self.shift = shift;
-                let bits = ((bytes_per_sample * 8) as u8).saturating_sub(shift as u8);
-                self.info = StreamInfo {
-                    sample_rate: SAMPLE_RATES.get(srate_idx).copied().unwrap_or(44_100),
-                    channels: out_channels as u16,
-                    format: SampleFormat::Int {
-                        bits: if int32 { 32 } else { bits },
-                    },
-                };
-                let ts = if total_samples == 0xFFFF_FFFF {
-                    None
-                } else {
-                    Some(u64::from(total_samples) + (u64::from(total_samples_u8) << 32))
-                };
-                self.total_frames = ts;
-            }
+            // Hand the decoded sub-block up to the frame assembler.
+            let bits = ((bytes_per_sample * 8) as u8).saturating_sub(shift as u8);
+            let total_frames = if total_samples == 0xFFFF_FFFF {
+                None
+            } else {
+                Some(u64::from(total_samples) + (u64::from(total_samples_u8) << 32))
+            };
+            return Ok(Some(SubBlock {
+                block_samples: block_samples as usize,
+                out_channels,
+                final_block: flags & FLAG_FINAL_BLOCK != 0,
+                chan_count,
+                chan_mask,
+                sample_rate: SAMPLE_RATES.get(srate_idx).copied().unwrap_or(44_100),
+                bits: if int32 { 32 } else { bits },
+                total_frames,
+                shift,
+            }));
+        }
+    }
 
-            self.pcm_len = block_samples as usize * self.channels;
+    /// Decode one whole frame: mono/stereo = one sub-block; multichannel = a run
+    /// of ≤2-channel sub-blocks (`INITIAL`…`FINAL`, sharing a `block_index`)
+    /// interleaved into the output region. Returns `false` at a clean EOF.
+    fn decode_block(&mut self) -> Result<bool, DecodeError> {
+        let first = match self.decode_subblock()? {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+
+        // A mono/stereo frame is a single block (FINAL set on the first); a
+        // multichannel frame's first block is not FINAL and carries the channel
+        // count in its `ID_CHANNEL_INFO`.
+        if first.final_block {
+            if self.channels == 0 {
+                self.lock_params(&first, first.out_channels, 0);
+            }
+            self.frame_off = 0;
             self.pcm_pos = 0;
+            self.pcm_len = first.block_samples * self.channels;
             return Ok(true);
         }
+
+        // Multichannel: assemble into the output region at pcm[MAX_BLOCK_PCM..].
+        let total = first.chan_count;
+        if total <= 2 || total > MAX_WV_CHANNELS {
+            // A multi-block frame without a usable channel count is out of scope.
+            return Err(DecodeError::Unsupported);
+        }
+        let bsamp = first.block_samples;
+        let out_len = bsamp * total;
+        if MAX_BLOCK_PCM + out_len > self.pcm.as_ref().len() {
+            return Err(DecodeError::Unsupported);
+        }
+
+        self.interleave_subblock(0, total, bsamp, first.out_channels);
+        let mut off = first.out_channels;
+        let mut fin = first.final_block;
+        while off < total && !fin {
+            let sb = match self.decode_subblock()? {
+                Some(s) => s,
+                None => return Err(DecodeError::Malformed), // truncated frame
+            };
+            if sb.block_samples != bsamp || off + sb.out_channels > total {
+                return Err(DecodeError::Malformed);
+            }
+            self.interleave_subblock(off, total, bsamp, sb.out_channels);
+            off += sb.out_channels;
+            fin = sb.final_block;
+        }
+        if off != total {
+            return Err(DecodeError::Malformed);
+        }
+
+        if self.channels == 0 {
+            self.lock_params(&first, total, first.chan_mask);
+        }
+        self.frame_off = MAX_BLOCK_PCM;
+        self.pcm_pos = MAX_BLOCK_PCM;
+        self.pcm_len = MAX_BLOCK_PCM + out_len;
+        Ok(true)
+    }
+
+    /// Copy a just-decoded ≤2-channel sub-block from the staging region
+    /// `pcm[0..]` into the interleaved output region `pcm[MAX_BLOCK_PCM..]` at
+    /// channel offset `off`, with frame stride `total`.
+    fn interleave_subblock(&mut self, off: usize, total: usize, bsamp: usize, sub_ch: usize) {
+        let (scratch, output) = self.pcm.as_mut().split_at_mut(MAX_BLOCK_PCM);
+        for i in 0..bsamp {
+            for c in 0..sub_ch {
+                output[i * total + off + c] = scratch[i * sub_ch + c];
+            }
+        }
+    }
+
+    /// Lock per-stream parameters from the frame's first sub-block.
+    fn lock_params(&mut self, first: &SubBlock, channels: usize, mask: u32) {
+        self.channels = channels;
+        self.shift = first.shift;
+        self.chan_mask = mask;
+        self.info = StreamInfo {
+            sample_rate: first.sample_rate,
+            channels: channels as u16,
+            format: SampleFormat::Int { bits: first.bits },
+        };
+        self.total_frames = first.total_frames;
     }
 }
 
@@ -1050,7 +1209,9 @@ impl<S: SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> WavpackDecoder<S, P> {
                 let within = sample
                     .saturating_sub(block_index)
                     .min(u64::from(block_samples));
-                self.pcm_pos = within as usize * ch;
+                // `decode_block` set `frame_off` (0 mono/stereo, MAX_BLOCK_PCM
+                // multichannel); `pcm_pos` is an absolute index into `pcm`.
+                self.pcm_pos = self.frame_off + within as usize * ch;
                 return Ok(block_index + within);
             }
             last_end = block_end;
@@ -1078,6 +1239,23 @@ impl<S: SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> WavpackDecoder<S, P> {
 impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for WavpackDecoder<S, P> {
     fn stream_info(&self) -> StreamInfo {
         self.info
+    }
+
+    /// The WAVEFORMATEXTENSIBLE speaker layout for a multichannel (>2ch) stream,
+    /// from its `ID_CHANNEL_INFO` mask — so the deck folds 5.1/7.1 correctly on a
+    /// stereo device. Mono/stereo report `None` (the deck needs no layout).
+    fn channel_layout(&self) -> Option<crate::channels::ChannelLayout> {
+        if self.channels <= 2 {
+            return None;
+        }
+        let layout = crate::channels::ChannelLayout::from_mask(self.chan_mask);
+        if layout.channels() == self.channels {
+            Some(layout)
+        } else {
+            // Mask absent or inconsistent with the count: fall back to the
+            // canonical layout for this channel count.
+            crate::channels::ChannelLayout::standard(self.channels as u16)
+        }
     }
 
     fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {
