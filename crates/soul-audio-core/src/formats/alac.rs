@@ -102,7 +102,16 @@ use crate::formats::scratch::ScratchCursor;
 use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
 
-pub(crate) const MAX_CHANNELS: usize = 2; // v1: mono + stereo
+/// Maximum channels this decoder reconstructs. The element/packet loop
+/// ([`decode_packet`]) is already AAC-style (a sequence of SCE/CPE/LFE elements
+/// placed at a running `channel_index`), so multichannel is just a wider cap
+/// plus the scratch it sizes. The desktop profile covers up to 7.1; the
+/// embedded profile stays mono/stereo (its SRAM budget can't hold the
+/// `MAX_FRAME * MAX_CHANNELS` decode buffers for 8 channels).
+#[cfg(not(feature = "embedded-profile"))]
+pub(crate) const MAX_CHANNELS: usize = 8;
+#[cfg(feature = "embedded-profile")]
+pub(crate) const MAX_CHANNELS: usize = 2;
 pub(crate) const MAX_FRAME: usize = 4096; // frameLength cap
 const QBSHIFT: u32 = 9;
 const QB: i32 = 1 << QBSHIFT; // 512
@@ -120,6 +129,12 @@ const N_MAX_MEAN_CLAMP: u32 = 0xFFFF;
 /// element-header overhead. Sizing for 3 bytes/sample keeps 20/24-bit verbatim
 /// frames from overflowing the buffer (a 2-byte cap silently desynced them).
 pub(crate) const PACKET_CAP: usize = MAX_FRAME * MAX_CHANNELS * 3 + 1024;
+
+/// i32 scratch the decoder carves from the shared `open()` buffer: `mix_u`, `mix_v`, `resid`
+/// (one [`MAX_FRAME`] each) plus the `shift` and `out` planes (`MAX_FRAME * MAX_CHANNELS`
+/// each). At 8 channels this exceeds WavPack's block, so [`crate::dispatch::decoder_scratch_len`]
+/// sizes the shared buffer to the max of the two.
+pub(crate) const SCRATCH_LEN: usize = 3 * MAX_FRAME + 2 * MAX_FRAME * MAX_CHANNELS;
 
 /// `lead(x)` == number of leading zero bits (`lead(0) == 32`, matching the
 /// reference's `lead()`).
@@ -701,9 +716,11 @@ pub(crate) fn decode_packet<P: AsRef<[i32]> + AsMut<[i32]>>(
 /// A streaming ALAC (Apple Lossless) decoder over an MP4/M4A [`Source`].
 ///
 /// Decodes the `mdat` ALAC packets produced by [`Mp4Reader`] to interleaved
-/// `i32` PCM. v1 supports mono and stereo at 16/20/24-bit; 16- and 24-bit are
-/// gated bit-exact by golden fixtures (20-bit shares the same width-generic
-/// path but has no fixture yet).
+/// `i32` PCM. Supports mono through 7.1 (up to [`MAX_CHANNELS`]) at 16/20/24-bit
+/// — the element/packet loop ([`decode_packet`]) already places a sequence of
+/// SCE/CPE/LFE elements, so multichannel is the same path with a wider cap.
+/// 16- and 24-bit are gated bit-exact by golden fixtures (20-bit shares the
+/// same width-generic path but has no fixture yet).
 ///
 /// The decode scratch (predictor/residual/shift/output buffers) is
 /// **caller-provided scratch** `P` (`AsRef<[i32]> + AsMut<[i32]>`), carved by
@@ -736,7 +753,7 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> AlacDecoder<S, P> {
     /// [`crate::dispatch::decoder_scratch_len`] samples long).
     ///
     /// # Errors
-    /// [`DecodeError::Unsupported`] for >2 channels, a frame length beyond the
+    /// [`DecodeError::Unsupported`] for more than [`MAX_CHANNELS`] channels, a frame length beyond the
     /// fixed buffer, or a `scratch` too small to hold the decode buffers;
     /// container errors propagate from [`Mp4Reader`].
     pub fn new_in(src: S, scratch: P) -> Result<Self, DecodeError> {
@@ -750,7 +767,7 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> AlacDecoder<S, P> {
     /// `scratch` is as [`Self::new_in`].
     ///
     /// # Errors
-    /// As [`Self::new_in`]: [`DecodeError::Unsupported`] for >2 channels, an
+    /// As [`Self::new_in`]: [`DecodeError::Unsupported`] for more than [`MAX_CHANNELS`] channels, an
     /// out-of-range frame length, a sample entry that wasn't ALAC, or an
     /// undersized `scratch`.
     pub fn from_reader_in(reader: Mp4Reader<S>, scratch: P) -> Result<Self, DecodeError> {
@@ -879,6 +896,13 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for AlacDecoder<S, P> {
                 bits: self.cfg.bit_depth as u8,
             },
         }
+    }
+
+    /// ALAC decodes its channel elements in bitstream order, which for the standard
+    /// multichannel layouts is centre first (`C L R …`) like AAC — report that order so the
+    /// deck folds surround correctly.
+    fn channel_layout(&self) -> Option<crate::channels::ChannelLayout> {
+        crate::channels::alac_layout(self.cfg.channels as u16)
     }
 
     fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {

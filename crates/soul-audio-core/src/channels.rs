@@ -149,6 +149,25 @@ pub fn aac_layout(channels: u16) -> Option<ChannelLayout> {
     ChannelLayout::from_order(order)
 }
 
+/// The ALAC (Apple Lossless) default channel order for a count, from the ALAC per-count
+/// channel-layout tags. Centre first (like AAC) for 3..6 channels; 6.1 adds a rear centre,
+/// and 7.1 adds the front left/right-of-centre pair. `None` for 1/2 (not a downmix) and
+/// counts past [`MAX_CHANNELS`].
+#[must_use]
+pub fn alac_layout(channels: u16) -> Option<ChannelLayout> {
+    use speaker::*;
+    let order: &[u32] = match channels {
+        3 => &[FC, FL, FR],                        // C L R
+        4 => &[FC, FL, FR, BC],                    // C L R Cs
+        5 => &[FC, FL, FR, BL, BR],                // C L R Ls Rs
+        6 => &[FC, FL, FR, BL, BR, LFE],           // C L R Ls Rs LFE (5.1)
+        7 => &[FC, FL, FR, BL, BR, BC, LFE],       // C L R Ls Rs Cs LFE (6.1)
+        8 => &[FC, FLC, FRC, FL, FR, BL, BR, LFE], // C Lc Rc L R Ls Rs LFE (7.1)
+        _ => return None,
+    };
+    ChannelLayout::from_order(order)
+}
+
 /// The `(Lo, Ro)` stereo downmix gain for one speaker (ITU-R BS.775): front-centre and the
 /// surrounds fold in at −3 dB (`1/√2`), the LFE is dropped, back-centre folds equally to
 /// both. `None` for a speaker this fold does not place (don't guess).
@@ -246,6 +265,28 @@ mod tests {
         assert_eq!(c[5], (0.0, 0.0)); // LFE dropped
         // No standard AAC config is 7-channel.
         assert_eq!(aac_layout(7), None);
+    }
+
+    #[test]
+    fn alac_layouts_are_centre_first_and_map_7_1_centre_channels() {
+        use speaker::*;
+        // 5.1 shares AAC's centre-first order.
+        assert_eq!(
+            alac_layout(6).unwrap().speakers(),
+            aac_layout(6).unwrap().speakers()
+        );
+        // 7.1 differs: C Lc Rc L R Ls Rs LFE (front left/right-of-centre present).
+        assert_eq!(
+            alac_layout(8).unwrap().speakers(),
+            &[FC, FLC, FRC, FL, FR, BL, BR, LFE]
+        );
+        // Every ALAC layout folds (FLC/FRC are placed).
+        for ch in 3..=8u16 {
+            assert!(
+                downmix_to_stereo_coeffs(&alac_layout(ch).unwrap()).is_some(),
+                "{ch}ch"
+            );
+        }
     }
 
     #[test]
