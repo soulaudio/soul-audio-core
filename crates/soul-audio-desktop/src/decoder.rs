@@ -380,6 +380,11 @@ mod tests {
             .spawn(move || {
                 let mut failures = Vec::new();
                 for (file, want) in cases {
+                    // AAC decode is patent-gated off by default (Via LA); `open_track`
+                    // declines AAC as Unsupported, so skip those cases unless `aac` is on.
+                    if !cfg!(feature = "aac") && *want == SourceCodec::Aac {
+                        continue;
+                    }
                     let path = td.join(file);
                     match open_track(&path) {
                         Ok(d) => {
