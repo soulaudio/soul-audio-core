@@ -1,0 +1,68 @@
+{
+  "id": "intel-builtin-output",
+  "source": "synthesized",
+  "notes": "Intel Macs: Int16/Int24 44.1\u201396k reported; unverified \u2014 replace with a capture.",
+  "name": "Built-in Output",
+  "transport": "built-in",
+  "nominal_rate": 44100,
+  "hog": "supported",
+  "fixed_rate": false,
+  "formats": [
+    {
+      "rate_min": 44100,
+      "rate_max": 44100,
+      "float": false,
+      "bits": 24,
+      "channels": 2
+    },
+    {
+      "rate_min": 48000,
+      "rate_max": 48000,
+      "float": false,
+      "bits": 24,
+      "channels": 2
+    },
+    {
+      "rate_min": 88200,
+      "rate_max": 88200,
+      "float": false,
+      "bits": 24,
+      "channels": 2
+    },
+    {
+      "rate_min": 96000,
+      "rate_max": 96000,
+      "float": false,
+      "bits": 24,
+      "channels": 2
+    },
+    {
+      "rate_min": 44100,
+      "rate_max": 44100,
+      "float": false,
+      "bits": 16,
+      "channels": 2
+    },
+    {
+      "rate_min": 48000,
+      "rate_max": 48000,
+      "float": false,
+      "bits": 16,
+      "channels": 2
+    },
+    {
+      "rate_min": 88200,
+      "rate_max": 88200,
+      "float": false,
+      "bits": 16,
+      "channels": 2
+    },
+    {
+      "rate_min": 96000,
+      "rate_max": 96000,
+      "float": false,
+      "bits": 16,
+      "channels": 2
+    }
+  ]
+}

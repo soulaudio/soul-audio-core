@@ -1,0 +1,40 @@
+{
+  "id": "hdmi-avr-apple-silicon",
+  "source": "synthesized",
+  "notes": "M-series HDMI to an AVR: 2ch and 8ch LPCM at 48k only (Apple Discussions 254618629); compressed AC-3 formats are non-LPCM and skipped.",
+  "name": "DENON-AVR",
+  "transport": "hdmi",
+  "nominal_rate": 48000,
+  "hog": "supported",
+  "fixed_rate": false,
+  "formats": [
+    {
+      "rate_min": 48000,
+      "rate_max": 48000,
+      "float": false,
+      "bits": 24,
+      "channels": 8
+    },
+    {
+      "rate_min": 48000,
+      "rate_max": 48000,
+      "float": false,
+      "bits": 16,
+      "channels": 8
+    },
+    {
+      "rate_min": 48000,
+      "rate_max": 48000,
+      "float": false,
+      "bits": 24,
+      "channels": 2
+    },
+    {
+      "rate_min": 48000,
+      "rate_max": 48000,
+      "float": false,
+      "bits": 16,
+      "channels": 2
+    }
+  ]
+}

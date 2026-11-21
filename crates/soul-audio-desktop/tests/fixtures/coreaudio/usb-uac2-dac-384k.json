@@ -1,0 +1,180 @@
+{
+  "id": "usb-uac2-dac-384k",
+  "source": "synthesized",
+  "notes": "Typical USB Audio Class 2 DAC: discrete Int16/24/32 ladder to 384k.",
+  "name": "USB Audio DAC",
+  "transport": "usb",
+  "nominal_rate": 44100,
+  "hog": "supported",
+  "fixed_rate": false,
+  "formats": [
+    {
+      "rate_min": 44100,
+      "rate_max": 44100,
+      "float": false,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 48000,
+      "rate_max": 48000,
+      "float": false,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 88200,
+      "rate_max": 88200,
+      "float": false,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 96000,
+      "rate_max": 96000,
+      "float": false,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 176400,
+      "rate_max": 176400,
+      "float": false,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 192000,
+      "rate_max": 192000,
+      "float": false,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 352800,
+      "rate_max": 352800,
+      "float": false,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 384000,
+      "rate_max": 384000,
+      "float": false,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 44100,
+      "rate_max": 44100,
+      "float": false,
+      "bits": 24,
+      "channels": 2
+    },
+    {
+      "rate_min": 48000,
+      "rate_max": 48000,
+      "float": false,
+      "bits": 24,
+      "channels": 2
+    },
+    {
+      "rate_min": 88200,
+      "rate_max": 88200,
+      "float": false,
+      "bits": 24,
+      "channels": 2
+    },
+    {
+      "rate_min": 96000,
+      "rate_max": 96000,
+      "float": false,
+      "bits": 24,
+      "channels": 2
+    },
+    {
+      "rate_min": 176400,
+      "rate_max": 176400,
+      "float": false,
+      "bits": 24,
+      "channels": 2
+    },
+    {
+      "rate_min": 192000,
+      "rate_max": 192000,
+      "float": false,
+      "bits": 24,
+      "channels": 2
+    },
+    {
+      "rate_min": 352800,
+      "rate_max": 352800,
+      "float": false,
+      "bits": 24,
+      "channels": 2
+    },
+    {
+      "rate_min": 384000,
+      "rate_max": 384000,
+      "float": false,
+      "bits": 24,
+      "channels": 2
+    },
+    {
+      "rate_min": 44100,
+      "rate_max": 44100,
+      "float": false,
+      "bits": 16,
+      "channels": 2
+    },
+    {
+      "rate_min": 48000,
+      "rate_max": 48000,
+      "float": false,
+      "bits": 16,
+      "channels": 2
+    },
+    {
+      "rate_min": 88200,
+      "rate_max": 88200,
+      "float": false,
+      "bits": 16,
+      "channels": 2
+    },
+    {
+      "rate_min": 96000,
+      "rate_max": 96000,
+      "float": false,
+      "bits": 16,
+      "channels": 2
+    },
+    {
+      "rate_min": 176400,
+      "rate_max": 176400,
+      "float": false,
+      "bits": 16,
+      "channels": 2
+    },
+    {
+      "rate_min": 192000,
+      "rate_max": 192000,
+      "float": false,
+      "bits": 16,
+      "channels": 2
+    },
+    {
+      "rate_min": 352800,
+      "rate_max": 352800,
+      "float": false,
+      "bits": 16,
+      "channels": 2
+    },
+    {
+      "rate_min": 384000,
+      "rate_max": 384000,
+      "float": false,
+      "bits": 16,
+      "channels": 2
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "studio-display",
+  "source": "synthesized",
+  "notes": "Apple Studio Display speakers (USB): believed 48k only; unverified \u2014 replace with a capture.",
+  "name": "Studio Display Speakers",
+  "transport": "usb",
+  "nominal_rate": 48000,
+  "hog": "supported",
+  "fixed_rate": false,
+  "formats": [
+    {
+      "rate_min": 48000,
+      "rate_max": 48000,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    }
+  ]
+}

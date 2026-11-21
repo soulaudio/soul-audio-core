@@ -128,6 +128,31 @@ impl Fill {
     }
 }
 
+/// Push **all** of `frames` into the ring, sleeping while it is full (the backpressure
+/// that paces the pump to the device clock) — but return [`SinkError::Closed`] as soon
+/// as `gone()` reports the device has disappeared (an unplugged DAC / headphones), since
+/// then nothing will ever drain the ring and a plain loop would block forever.
+pub(crate) fn push_blocking(
+    prod: &mut impl Producer<Item = i32>,
+    frames: &[i32],
+    gone: impl Fn() -> bool,
+) -> Result<(), SinkError> {
+    if gone() {
+        return Err(SinkError::Closed);
+    }
+    let mut off = 0;
+    while off < frames.len() {
+        off += prod.push_slice(&frames[off..]);
+        if off < frames.len() {
+            if gone() {
+                return Err(SinkError::Closed);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    Ok(())
+}
+
 /// A cpal output stream presented as a [`Sink`] consuming canonical 24-bit PCM.
 pub struct CpalSink {
     prod: <HeapRb<i32> as Split>::Prod,
@@ -149,6 +174,69 @@ pub struct CpalSink {
     /// reported via [`Sink::stream_info`] so the signal path shows the true output
     /// depth, not the canonical-24 the deck feeds in.
     format: CoreFmt,
+    /// Liveness of the device this stream opened on (see [`DeviceAlive`]).
+    alive: DeviceAlive,
+}
+
+/// Whether the output device this sink opened on still exists.
+///
+/// macOS (with `coreaudio-exclusive`, which brings `coreaudio-rs`): a
+/// `kAudioDevicePropertyDeviceIsAlive` listener on that device. On Apple silicon the
+/// headphone jack, AirPods / Bluetooth and USB DACs are separate CoreAudio devices that
+/// **disappear** on unplug — so a write fails with [`SinkError::Closed`] and the player
+/// pauses (Apple Music behaviour) instead of the default-output stream silently moving
+/// to the laptop speakers. Elsewhere: always alive (cpal's error callback is the only
+/// signal there).
+struct DeviceAlive {
+    #[cfg(all(target_os = "macos", feature = "coreaudio-exclusive"))]
+    listener: Option<Box<coreaudio::audio_unit::macos_helpers::AliveListener>>,
+}
+
+impl DeviceAlive {
+    /// No watch (always alive) — the state before a constructor knows the device.
+    fn unwatched() -> Self {
+        Self {
+            #[cfg(all(target_os = "macos", feature = "coreaudio-exclusive"))]
+            listener: None,
+        }
+    }
+
+    /// Watch the device cpal names `name` (the system default when `None`).
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "coreaudio-exclusive")),
+        allow(unused_variables)
+    )]
+    fn watch(name: Option<&str>) -> Self {
+        #[cfg(all(target_os = "macos", feature = "coreaudio-exclusive"))]
+        {
+            use coreaudio::audio_unit::macos_helpers as hal;
+            let id = match name {
+                Some(n) => hal::get_device_id_from_name(n),
+                None => hal::get_default_device_id(false),
+            };
+            let listener = id.and_then(|id| {
+                // Boxed: CoreAudio keeps a pointer to the listener.
+                let mut l = Box::new(hal::AliveListener::new(id));
+                l.register().ok().map(|_| l)
+            });
+            Self { listener }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "coreaudio-exclusive")))]
+        {
+            Self {}
+        }
+    }
+
+    fn gone(&self) -> bool {
+        #[cfg(all(target_os = "macos", feature = "coreaudio-exclusive"))]
+        {
+            self.listener.as_ref().is_some_and(|l| !l.is_alive())
+        }
+        #[cfg(not(all(target_os = "macos", feature = "coreaudio-exclusive")))]
+        {
+            false
+        }
+    }
 }
 
 impl CpalSink {
@@ -158,7 +246,9 @@ impl CpalSink {
         let device = cpal::default_host()
             .default_output_device()
             .context("no default output device")?;
-        Self::build(device)
+        let mut sink = Self::build(device)?;
+        sink.alive = DeviceAlive::watch(None);
+        Ok(sink)
     }
 
     /// Open a specific output device by name (one of [`output_device_names`]).
@@ -170,7 +260,9 @@ impl CpalSink {
             .context("enumerating output devices")?
             .find(|d| d.name().map(|n| n == name).unwrap_or(false))
             .with_context(|| format!("no output device named {name:?}"))?;
-        Self::build(device)
+        let mut sink = Self::build(device)?;
+        sink.alive = DeviceAlive::watch(Some(name));
+        Ok(sink)
     }
 
     /// Build a sink on an already-selected device. Input is always canonical
@@ -281,6 +373,7 @@ impl CpalSink {
             rate,
             channels,
             format,
+            alive: DeviceAlive::unwatched(), // the constructors install the real watch
         })
     }
 }
@@ -334,20 +427,17 @@ impl Sink for CpalSink {
     }
 
     fn write(&mut self, frames: &[i32]) -> Result<(), SinkError> {
-        let mut off = 0;
-        while off < frames.len() {
-            off += self.prod.push_slice(&frames[off..]);
-            if off < frames.len() {
-                // Ring full — wait for the callback to drain some.
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-        }
-        Ok(())
+        // Ring full → wait for the callback to drain some; device gone → Closed.
+        let alive = &self.alive;
+        push_blocking(&mut self.prod, frames, || alive.gone())
     }
 
     fn flush(&mut self) -> Result<(), SinkError> {
         // Wait for the callback to play out what's buffered.
         while self.prod.occupied_len() > 0 {
+            if self.alive.gone() {
+                return Err(SinkError::Closed);
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         Ok(())
@@ -554,6 +644,66 @@ mod tests {
             "discard ack released after the clear"
         );
         assert_eq!(fade[n + 4], 0, "stays silent past the fade (no re-trigger)");
+    }
+
+    #[test]
+    fn push_blocking_writes_everything_when_there_is_room() {
+        let (mut prod, mut cons) = HeapRb::<i32>::new(16).split();
+        push_blocking(&mut prod, &[1, 2, 3, 4], || false).unwrap();
+        assert_eq!(cons.try_pop(), Some(1));
+        assert_eq!(cons.occupied_len(), 3);
+    }
+
+    #[test]
+    fn push_blocking_on_a_gone_device_fails_immediately() {
+        let (mut prod, _cons) = HeapRb::<i32>::new(16).split();
+        assert_eq!(
+            push_blocking(&mut prod, &[1], || true),
+            Err(SinkError::Closed)
+        );
+        assert_eq!(prod.occupied_len(), 0, "nothing written to a dead device");
+    }
+
+    #[test]
+    fn push_blocking_returns_closed_instead_of_hanging_on_a_full_ring() {
+        // The device dies mid-write with the ring full: nobody will drain it. Before the
+        // fix this looped forever; now it returns promptly with Closed.
+        use std::sync::atomic::AtomicBool;
+        let (mut prod, _cons) = HeapRb::<i32>::new(4).split();
+        let dead = std::sync::Arc::new(AtomicBool::new(false));
+        let d = std::sync::Arc::clone(&dead);
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            d.store(true, Ordering::Relaxed);
+        });
+        let t = std::time::Instant::now();
+        let r = push_blocking(&mut prod, &[0; 64], || dead.load(Ordering::Relaxed));
+        killer.join().unwrap();
+        assert_eq!(r, Err(SinkError::Closed));
+        assert!(t.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    #[test]
+    fn push_blocking_waits_for_the_consumer_while_the_device_lives() {
+        let (mut prod, mut cons) = HeapRb::<i32>::new(4).split();
+        let drainer = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            while got.len() < 32 {
+                if let Some(v) = cons.try_pop() {
+                    got.push(v);
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            got
+        });
+        let frames: Vec<i32> = (0..32).collect();
+        push_blocking(&mut prod, &frames, || false).unwrap();
+        assert_eq!(
+            drainer.join().unwrap(),
+            frames,
+            "backpressure, in order, nothing lost"
+        );
     }
 
     #[test]

@@ -1,0 +1,103 @@
+{
+  "id": "blackhole-2ch",
+  "source": "synthesized",
+  "notes": "BlackHole 0.7: Float32, 8k\u2013768k discrete list. Replace with the CI capture.",
+  "name": "BlackHole 2ch",
+  "transport": "virtual",
+  "nominal_rate": 48000,
+  "hog": "supported",
+  "fixed_rate": false,
+  "formats": [
+    {
+      "rate_min": 8000,
+      "rate_max": 8000,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 16000,
+      "rate_max": 16000,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 24000,
+      "rate_max": 24000,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 44100,
+      "rate_max": 44100,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 48000,
+      "rate_max": 48000,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 88200,
+      "rate_max": 88200,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 96000,
+      "rate_max": 96000,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 176400,
+      "rate_max": 176400,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 192000,
+      "rate_max": 192000,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 352800,
+      "rate_max": 352800,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 384000,
+      "rate_max": 384000,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 705600,
+      "rate_max": 705600,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 768000,
+      "rate_max": 768000,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    }
+  ]
+}
