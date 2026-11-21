@@ -615,6 +615,16 @@ fn native_rate(file: &str) -> u32 {
 #[test]
 fn every_format_plays_correctly_shared_and_exclusive() {
     for &f in FORMATS {
+        // AAC decode is patent-gated off by default (Via LA); its fixtures decline as
+        // Unsupported, so skip them unless the `aac` feature is enabled.
+        if !cfg!(feature = "aac")
+            && matches!(
+                f,
+                "tone.aac" | "tone-aac.m4a" | "tone-aac.mka" | "tone-sbr.m4a"
+            )
+        {
+            continue;
+        }
         // SHARED — 48 kHz device, the deck resamples the track rate up/down to it.
         let shared = run_pipeline(f, CaptureSink::shared(48_000), |s| s.written.clone());
         assert_two_tone(&format!("{f} shared@48k"), &shared, 48_000);

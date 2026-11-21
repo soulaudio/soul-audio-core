@@ -565,6 +565,11 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
         // path without carrying the full 360 KiB fixture into the corpus.
         ("dsf-head", dsf_full[..dsf_full.len().min(8192)].to_vec()),
     ]
+    .into_iter()
+    // AAC decode is patent-gated off by default (`aac` feature); drop its seeds
+    // so the default fuzz run doesn't target the absent decoder.
+    .filter(|(label, _)| cfg!(feature = "aac") || !(label.contains("aac") || label.contains("sbr")))
+    .collect()
 }
 
 /// Container magics — random/structured bodies behind these drive the parsers

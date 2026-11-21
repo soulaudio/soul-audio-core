@@ -449,6 +449,10 @@ fn committed_fixtures_conform_to_reference() {
     let testdata = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata");
     let mut checked = 0;
     for f in FORMATS {
+        // AAC decode is patent-gated off by default (`aac` feature); skip it.
+        if !cfg!(feature = "aac") && f.name == "AAC" {
+            continue;
+        }
         let Some(bin) = resolve_bin(f) else {
             eprintln!("SKIP {}: no reference ({} or PATH)", f.name, f.bin_env);
             continue;
@@ -485,6 +489,10 @@ fn corpus_conforms_to_reference() {
     let dir = PathBuf::from(dir);
     let mut checked = 0;
     for f in FORMATS {
+        // AAC decode is patent-gated off by default (`aac` feature); skip it.
+        if !cfg!(feature = "aac") && f.name == "AAC" {
+            continue;
+        }
         let Some(bin) = resolve_bin(f) else {
             eprintln!("SKIP {}: no reference", f.name);
             continue;

@@ -785,6 +785,8 @@ fn real_mp1_renders_nonsilent() {
     assert!(pcm.iter().any(|&s| s.abs() > 1000), "MP1 render silent");
 }
 
+// AAC is patent-gated off by default (Via LA); this render golden runs only with `--features aac`.
+#[cfg(feature = "aac")]
 #[test]
 fn real_he_aac_sbr_renders_stereo_tones() {
     // HE-AAC (explicit SBR in MP4): decode → SBR (2× rate) → resample → file.
@@ -874,6 +876,8 @@ fn real_alac_renders_stereo_tones() {
     );
 }
 
+// AAC is patent-gated off by default (Via LA); this render golden runs only with `--features aac`.
+#[cfg(feature = "aac")]
 #[test]
 fn real_aac_m4a_renders_stereo_tones() {
     // AAC-LC is lossy, so — unlike the ALAC/FLAC goldens above — this is a
@@ -909,6 +913,8 @@ fn real_aac_m4a_renders_stereo_tones() {
     );
 }
 
+// AAC is patent-gated off by default (Via LA); this render golden runs only with `--features aac`.
+#[cfg(feature = "aac")]
 #[test]
 fn real_aac_adts_renders_stereo_tones() {
     // Same signal and same pitch-only rationale as
