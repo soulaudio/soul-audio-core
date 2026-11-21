@@ -37,13 +37,15 @@
 //!   64  string_heap_off         u32   (abs)
 //!   68  string_heap_len         u32
 //!
-//! TRACK RECORD (65 B, fixed; `record[i]` at records_off + i*65):
+//! TRACK RECORD (85 B, fixed; `record[i]` at records_off + i*85):
 //!    0 id u32 · 4 title.off u32 · 8 title.len u16 · 10 artist u32 ·
 //!   14 album u32 · 18 album_artist u32 · 22 genre u32 · 26 folder u32 ·
 //!   30 track_no u16 · 32 disc_no u16 · 34 duration_ms u32 · 38 sample_rate u32 ·
 //!   42 channels u8 · 43 art_id u32 · 47 flags u16 · 49 extended_off u32 ·
 //!   53 file_name.off u32 · 57 file_name.len u16 · 59 mbid.off u32 ·
-//!   63 mbid.len u16   (mbid new in format v4)
+//!   63 mbid.len u16 · 65 loudness: integrated_lufs f32 · 69 lra f32 ·
+//!   73 true_peak_dbtp f32 · 77 plr f32 · 81 dr f32
+//!   (mbid new in v4; loudness new in v6, valid iff flags & FLAG_HAS_LOUDNESS)
 //!
 //! ALBUM RECORD (30 B, fixed; indexed by dense album id):
 //!    0 id u32 · 4 title.off u32 · 8 title.len u16 · 10 album_artist u32 ·
@@ -97,18 +99,18 @@ use core::cell::RefCell;
 
 use embedded_io::SeekFrom;
 use soul_audio_catalog::{
-    AlbumId, AlbumRec, ArtistId, BrowseAxis, Catalog, CatalogError, FolderId, FolderRec, GenreId,
-    PackedDate, PlaylistId, StrRef, TrackId, TrackRec,
+    AlbumId, AlbumRec, ArtistId, BrowseAxis, Catalog, CatalogError, FLAG_HAS_LOUDNESS, FolderId,
+    FolderRec, GenreId, LoudnessRec, PackedDate, PlaylistId, StrRef, TrackId, TrackRec,
 };
 use soul_audio_core::SeekSource;
 
 /// Magic at the head of `index.sidx` — `"SIDX"`.
 pub const MAGIC: [u8; 4] = *b"SIDX";
 /// Format version in the header.
-pub const FORMAT_VERSION: u16 = 5;
+pub const FORMAT_VERSION: u16 = 6;
 
 const HEADER_SIZE: usize = 72;
-const RECORD_SIZE: usize = 65;
+const RECORD_SIZE: usize = 85; // 65 (v5) + 5×f32 loudness (v6)
 const ALBUM_RECORD_SIZE: usize = 30;
 const ARTIST_REF_SIZE: usize = 6; // StrRef (off u32, len u16) per artist
 const GENRE_REF_SIZE: usize = 6; // StrRef (off u32, len u16) per genre
@@ -137,6 +139,10 @@ fn le_u16(b: &[u8], o: usize) -> u16 {
 #[inline]
 fn le_u32(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+
+fn le_f32(b: &[u8], o: usize) -> f32 {
+    f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 
 /// Cached header — parsed once in [`IndexReader::new`]; all fields are `Copy`.
@@ -337,6 +343,13 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
                 off: le_u32(&r, 59),
                 len: le_u16(&r, 63),
             },
+            loudness: (le_u16(&r, 47) & FLAG_HAS_LOUDNESS != 0).then(|| LoudnessRec {
+                integrated_lufs: le_f32(&r, 65),
+                lra: le_f32(&r, 69),
+                true_peak_dbtp: le_f32(&r, 73),
+                plr: le_f32(&r, 77),
+                dr: le_f32(&r, 81),
+            }),
         })
     }
 
@@ -504,6 +517,8 @@ pub mod build {
         pub file_name: String,
         /// MusicBrainz recording MBID, or empty when the file carried none. (v4)
         pub mbid: String,
+        /// Baked R128 loudness, `Some` iff this track has been analyzed. (v6)
+        pub loudness: Option<soul_audio_catalog::LoudnessRec>,
     }
 
     /// One folder to bake into the folder table. `path` is relative to the card
@@ -850,13 +865,25 @@ pub mod build {
             out.push(t.channels);
             let art_id = album_art_id.get(t.album as usize).copied().unwrap_or(0);
             out.extend_from_slice(&art_id.to_le_bytes()); // art_id (the track's album's)
-            out.extend_from_slice(&0u16.to_le_bytes()); // flags
-            out.extend_from_slice(&0u32.to_le_bytes()); // extended_off
+            let flags = if t.loudness.is_some() {
+                soul_audio_catalog::FLAG_HAS_LOUDNESS
+            } else {
+                0
+            };
+            out.extend_from_slice(&flags.to_le_bytes()); // flags (HAS_LOUDNESS in v6)
+            out.extend_from_slice(&0u32.to_le_bytes()); // extended_off (reserved)
             out.extend_from_slice(&foff.to_le_bytes()); // file_name.off
             out.extend_from_slice(&flen.to_le_bytes()); // file_name.len
             let (moff, mlen) = track_mbids[i];
             out.extend_from_slice(&moff.to_le_bytes()); // mbid.off (v4)
             out.extend_from_slice(&mlen.to_le_bytes()); // mbid.len (v4)
+            // Loudness (v6): 5×f32 at offsets 65..85, zeroed when not analyzed.
+            let l = t.loudness.unwrap_or_default();
+            out.extend_from_slice(&l.integrated_lufs.to_le_bytes());
+            out.extend_from_slice(&l.lra.to_le_bytes());
+            out.extend_from_slice(&l.true_peak_dbtp.to_le_bytes());
+            out.extend_from_slice(&l.plr.to_le_bytes());
+            out.extend_from_slice(&l.dr.to_le_bytes());
         }
         debug_assert_eq!(out.len(), albums_off);
 

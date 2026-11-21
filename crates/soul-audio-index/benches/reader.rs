@@ -134,6 +134,7 @@ fn synth(n: u32) -> CatalogInput {
                 channels: 2,
                 file_name: format!("{:02} - Track {i:06}.flac", i % 12 + 1),
                 mbid: String::new(),
+                loudness: None,
             }
         })
         .collect();

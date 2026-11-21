@@ -34,6 +34,7 @@ fn fixture() -> CatalogInput {
                 channels: 2,
                 file_name: "01 - Aria.flac".into(),
                 mbid: String::new(),
+                loudness: None,
             },
             TrackInput {
                 title: "Variatio 1".into(),
@@ -49,6 +50,7 @@ fn fixture() -> CatalogInput {
                 channels: 2,
                 file_name: "02 - Variatio 1.flac".into(),
                 mbid: String::new(),
+                loudness: None,
             },
         ],
         artists: vec!["Kimiko Ishizaka".into()],
@@ -200,6 +202,7 @@ fn baked_title_order_is_collation_sorted() {
             channels: 2,
             file_name: format!("{t}.flac"),
             mbid: String::new(),
+            loudness: None,
         })
         .collect();
     let input = CatalogInput {
@@ -275,6 +278,7 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
                 channels: 2,
                 file_name: "a.flac".into(),
                 mbid: String::new(),
+                loudness: None,
             },
             TrackInput {
                 title: "Uncovered Track".into(),
@@ -290,6 +294,7 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
                 channels: 2,
                 file_name: "b.flac".into(),
                 mbid: String::new(),
+                loudness: None,
             },
         ],
         artists: vec!["Artist".into()],
@@ -378,6 +383,7 @@ fn artist_album_track_orders_by_sort_name() {
                 channels: 2,
                 file_name: "eno.flac".into(),
                 mbid: String::new(),
+                loudness: None,
             },
             TrackInput {
                 title: "clapton_track".into(),
@@ -393,6 +399,7 @@ fn artist_album_track_orders_by_sort_name() {
                 channels: 2,
                 file_name: "clapton.flac".into(),
                 mbid: String::new(),
+                loudness: None,
             },
         ],
         artists: vec!["Brian Eno".into(), "Eric Clapton".into()],
@@ -465,6 +472,7 @@ fn artist_sort_name_falls_back_to_display_when_untagged() {
             channels: 2,
             file_name: "t.flac".into(),
             mbid: String::new(),
+            loudness: None,
         }],
         artists: vec!["Miles Davis".into()],
         artist_sorts: Vec::new(),
@@ -514,6 +522,7 @@ fn baked_genre_order_groups_by_genre_collation() {
             channels: 2,
             file_name: format!("{title}.flac"),
             mbid: String::new(),
+            loudness: None,
         }
     }
     let input = CatalogInput {
@@ -567,4 +576,39 @@ fn baked_genre_order_groups_by_genre_collation() {
         })
         .collect();
     assert_eq!(order, vec!["a_track", "r_track_a", "r_track_b"]);
+}
+
+/// Per-track R128 loudness round-trips through the widened v6 record: an analyzed
+/// track carries its metrics (+ the HAS_LOUDNESS flag); an un-analyzed track reads `None`.
+/// This is the on-disk half of the loudness library column (the DAP reads the same bytes).
+#[test]
+fn loudness_fields_round_trip() {
+    let loud = soul_audio_catalog::LoudnessRec {
+        integrated_lufs: -14.25,
+        lra: 7.5,
+        true_peak_dbtp: -1.0,
+        plr: 13.25,
+        dr: 12.0,
+    };
+    let mut input = fixture();
+    input.tracks[0].loudness = Some(loud);
+    input.tracks[1].loudness = None;
+    let bytes = write_index(&input);
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+
+    assert_eq!(
+        soul_audio_index::FORMAT_VERSION,
+        6,
+        "record widened for loudness"
+    );
+    assert_eq!(
+        rdr.track(0).unwrap().loudness,
+        Some(loud),
+        "analyzed loudness round-trips bit-exact"
+    );
+    assert_eq!(
+        rdr.track(1).unwrap().loudness,
+        None,
+        "un-analyzed track reads None"
+    );
 }
