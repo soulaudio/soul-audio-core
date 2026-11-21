@@ -379,6 +379,8 @@ fn build_catalog(raw: &[RawTrack], root: &Path) -> CatalogInput {
             channels: r.channels,
             file_name: r.file_name.clone(),
             mbid: r.mbid.clone(),
+            // Loudness is a deferred Tier-2 analysis pass (full decode), not the metadata scan.
+            loudness: None,
         });
     }
     let covers: Vec<Option<Vec<u8>>> = interner

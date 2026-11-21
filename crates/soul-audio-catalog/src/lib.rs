@@ -38,9 +38,30 @@ pub struct StrRef {
     pub len: u16,
 }
 
+/// `TrackRec.flags` bit: this track carries baked [`LoudnessRec`] metrics (it has been
+/// analyzed). When clear, [`TrackRec::loudness`] reads back `None`.
+pub const FLAG_HAS_LOUDNESS: u16 = 0x0001;
+
+/// Per-track R128 loudness, baked into the index as Tier-2 analysis data (the on-disk form of
+/// the loudness/DR library column; the DAP reads the same bytes). Present on a [`TrackRec`] iff
+/// the track has been analyzed ([`FLAG_HAS_LOUDNESS`]); `f32`, so not `Eq`.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct LoudnessRec {
+    /// Gated BS.1770-4 integrated loudness (LUFS); a large negative sentinel if below the gate.
+    pub integrated_lufs: f32,
+    /// Loudness Range (LU).
+    pub lra: f32,
+    /// Max true-peak (dBTP).
+    pub true_peak_dbtp: f32,
+    /// Peak-to-Loudness Ratio (LU) = true_peak_dbtp - integrated_lufs.
+    pub plr: f32,
+    /// TT/Pleasurize "DR" (crest-factor dynamic range; the dr.loudness-war convention).
+    pub dr: f32,
+}
+
 /// Tier-1 track record (the browse set). `Copy`; string fields are heap refs
-/// resolved via [`Catalog::resolve_str`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// resolved via [`Catalog::resolve_str`]. Not `Eq` since [`Self::loudness`] holds `f32`.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct TrackRec {
     pub id: TrackId,
     pub title: StrRef,
@@ -68,6 +89,9 @@ pub struct TrackRec {
     /// carried none). The stable identity key an enrichment pass joins on. (New in
     /// format v4.)
     pub mbid: StrRef,
+    /// Baked R128 loudness, `Some` iff the track was analyzed ([`FLAG_HAS_LOUDNESS`] in
+    /// [`Self::flags`]); `None` otherwise. (New in format v6.)
+    pub loudness: Option<LoudnessRec>,
 }
 
 /// Tier-1 folder record. `path` is the folder's location **relative to the card
