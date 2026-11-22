@@ -15,6 +15,7 @@ on:
       - "crates/soul-audio-desktop/**"
       - "crates/soul-audio-core/src/sink.rs"
       - "crates/soul-audio-core/src/convert.rs"
+      - "ci/hal-profile-device/**"
       - ".github/workflows/ci-macos-audio.yml"
       - "Cargo.lock"
   pull_request:
@@ -22,6 +23,7 @@ on:
       - "crates/soul-audio-desktop/**"
       - "crates/soul-audio-core/src/sink.rs"
       - "crates/soul-audio-core/src/convert.rs"
+      - "ci/hal-profile-device/**"
       - ".github/workflows/ci-macos-audio.yml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -97,7 +99,7 @@ jobs:
           cargo test -p soul-audio-desktop --features coreaudio-exclusive
           --test coreaudio_exclusive_suite --
           --ignored --nocapture --test-threads=1
-          --skip bit_perfect_loopback_through_blackhole
+          --skip bit_perfect_loopback
 
       # Captures BlackHole's input side (hosted runners grant the microphone TCC
       # permission). Green on macos-15, macos-26 and macos-15-intel, so it gates.
@@ -107,7 +109,7 @@ jobs:
         run: >
           cargo test -p soul-audio-desktop --features coreaudio-exclusive
           --test coreaudio_exclusive_suite --
-          --ignored --nocapture --exact bit_perfect_loopback_through_blackhole
+          --ignored --nocapture --exact bit_perfect_loopback
 
   # A *custom-built* BlackHole that only offers 44.1k and 96k, so the real AUHAL path — not
   # just the fake HAL — exercises the closest-same-family fallback (22.05/176.4/352.8k → 44.1k;
@@ -182,6 +184,84 @@ jobs:
           path: device-profiles/
 
       - name: Hardware suite on the restricted ladder (incl. closest-same-family fallback)
+        run: >
+          cargo test -p soul-audio-desktop --features coreaudio-exclusive
+          --test coreaudio_exclusive_suite --
+          --ignored --nocapture --test-threads=1
+
+  # SoulProfile: our own libASPL HAL plug-in (ci/hal-profile-device) impersonating device
+  # classes BlackHole can't — INTEGER physical formats (BlackHole is Float32-only, so the
+  # HAL's float → int conversion on the exclusive path is otherwise never exercised) and a
+  # fixed-rate sink. Each device loops its output back to an input stream, so the
+  # bit-perfect loopback runs through Int24 / Int32 physical words too.
+  #   "SoulProfile UAC2 DAC"  44.1k–384k ladder, Int16/24/32 (cf. usb-uac2-dac-384k.json)
+  #   "SoulProfile HDMI 48k"  48k only, Int16/24            (cf. hdmi-avr-apple-silicon.json)
+  hal-profile-device:
+    name: SoulProfile plug-in (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Build SoulProfile.driver (libASPL, ad-hoc signed)
+        run: ci/hal-profile-device/build.sh "$RUNNER_TEMP/profile"
+
+      - name: Install it and restart coreaudiod
+        run: |
+          sudo cp -R "$RUNNER_TEMP/profile/SoulProfile.driver" /Library/Audio/Plug-Ins/HAL/
+          sudo killall -9 coreaudiod || true
+          for i in $(seq 1 30); do
+            [ "$(system_profiler SPAudioDataType | grep -c 'SoulProfile')" -ge 2 ] && break
+            sleep 1
+          done
+          system_profiler SPAudioDataType | grep -E "^\s{8}[A-Za-z].*:$" || true
+          [ "$(system_profiler SPAudioDataType | grep -c 'SoulProfile')" -ge 2 ] \
+            || { echo "::error::SoulProfile devices did not load"; log show --last 2m --predicate 'process == "coreaudiod"' | grep -i -E "soulprofile|plug-?in" | tail -40; exit 1; }
+
+      - name: Capture their device profiles (artifact) and check the ladders
+        run: |
+          cargo run -p soul-audio-desktop --features coreaudio-exclusive \
+            --example coreaudio_device_report -- --probe-hog --out device-profiles
+          python3 - <<'PY'
+          import glob, json
+          want = {
+              "SoulProfile UAC2 DAC": ([44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000], [16, 24, 32]),
+              "SoulProfile HDMI 48k": ([48000], [16, 24]),
+          }
+          seen = {}
+          for f in glob.glob("device-profiles/*.json"):
+              d = json.load(open(f))
+              if d["name"] in want:
+                  rates = sorted({fm["rate_min"] for fm in d["formats"]})
+                  bits = sorted({fm["bits"] for fm in d["formats"] if not fm["float"]})
+                  print(d["name"], "rates", rates, "int bits", bits, "hog", d["hog"])
+                  seen[d["name"]] = (rates, bits)
+          assert seen == want, seen
+          PY
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: device-profiles-soulprofile-${{ matrix.os }}
+          path: device-profiles/
+
+      - name: Hardware suite on "SoulProfile UAC2 DAC" (Int32 physical, 8-rate ladder)
+        env:
+          SOUL_CA_DEVICE: SoulProfile UAC2 DAC
+        run: >
+          cargo test -p soul-audio-desktop --features coreaudio-exclusive
+          --test coreaudio_exclusive_suite --
+          --ignored --nocapture --test-threads=1
+
+      - name: Hardware suite on "SoulProfile HDMI 48k" (Int24 physical, fixed rate)
+        if: success() || failure()
+        env:
+          SOUL_CA_DEVICE: SoulProfile HDMI 48k
         run: >
           cargo test -p soul-audio-desktop --features coreaudio-exclusive
           --test coreaudio_exclusive_suite --
