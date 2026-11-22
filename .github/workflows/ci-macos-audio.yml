@@ -136,7 +136,8 @@ jobs:
           git -C "$RUNNER_TEMP/BlackHole" checkout --quiet e2b22aaaba4e507a097131704bf96dabc004d9cf # v0.7.1
           cd "$RUNNER_TEMP/BlackHole"
           defs='$GCC_PREPROCESSOR_DEFINITIONS kDriver_Name=\"BlackHoleLadder\" kPlugIn_BundleID=\"audio.soulaudio.ladder\" kSampleRates=44100,96000'
-          xcodebuild -project BlackHole.xcodeproj -configuration Release -derivedDataPath build \
+          set -o pipefail
+          xcodebuild -project BlackHole.xcodeproj -configuration Release SYMROOT="$PWD/build" \
             PRODUCT_BUNDLE_IDENTIFIER=audio.soulaudio.ladder \
             CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= \
             GCC_PREPROCESSOR_DEFINITIONS="$defs" | tail -5
