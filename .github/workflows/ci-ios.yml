@@ -1,0 +1,59 @@
+name: CI (iOS build)
+
+# First step toward an iOS Soul Player: prove the audio stack cross-compiles for iPhone
+# (aarch64-apple-ios) and the Apple-silicon simulator (aarch64-apple-ios-sim). The no_std
+# decode core is target-agnostic; soul-audio-desktop's `playback` (cpal → CoreAudio RemoteIO)
+# is the part with real iOS surface. Needs Xcode's iOS SDK, which hosted macOS runners have
+# (local machines with only the Command Line Tools don't). macOS-only bits (hog mode,
+# device-alive listeners) are `cfg(target_os = "macos")` and must stay out of iOS builds.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/soul-audio-core/**"
+      - "crates/soul-audio-desktop/**"
+      - ".github/workflows/ci-ios.yml"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - "crates/soul-audio-core/**"
+      - "crates/soul-audio-desktop/**"
+      - ".github/workflows/ci-ios.yml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ios:
+    name: iOS build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-ios, aarch64-apple-ios-sim]
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Add the iOS target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Decode core (no_std, default features — no AAC)
+        run: cargo build -p soul-audio-core --target ${{ matrix.target }}
+
+      - name: Desktop/mobile playback (cpal → CoreAudio RemoteIO) + decoders
+        run: cargo build -p soul-audio-desktop --features playback --target ${{ matrix.target }}
