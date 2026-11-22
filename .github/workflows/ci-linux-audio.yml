@@ -1,0 +1,74 @@
+name: CI (Linux audio)
+
+# The ALSA exclusive / bit-perfect sink (`soul-audio-desktop`, feature
+# `alsa-exclusive`) only compiles on Linux AND only under that feature, so the main
+# gate — which runs with default features — never sees it. This job builds + lints it
+# and runs its device-free unit tests.
+#
+# There is deliberately no real-device leg, unlike the macOS job's BlackHole run.
+# A hosted Linux runner has no sound card, and the usual virtual ones are out of
+# reach: `snd-dummy` and `snd-aloop` are kernel modules the runner image does not
+# ship, and a PulseAudio null sink is not an ALSA `hw:` card, which is the only thing
+# this sink will open. The real-hardware suite therefore stays `#[ignore]`d and is run
+# by hand (`--ignored`), the same way the WASAPI device probes are.
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "crates/soul-audio-desktop/**"
+      - "crates/soul-audio-core/src/sink.rs"
+      - "crates/soul-audio-core/src/convert.rs"
+      - ".github/workflows/ci-linux-audio.yml"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - "crates/soul-audio-desktop/**"
+      - "crates/soul-audio-core/src/sink.rs"
+      - "crates/soul-audio-core/src/convert.rs"
+      - ".github/workflows/ci-linux-audio.yml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-linux-audio-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  alsa-exclusive:
+    name: alsa-exclusive (build, lint, unit tests)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install the pinned toolchain
+        run: rustup component add rustfmt clippy
+
+      # libasound2-dev for the `alsa` crate's libasound linkage. `zbus` is pure Rust
+      # and needs nothing from apt.
+      - name: ALSA build dependency
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if sudo apt-get update && sudo apt-get install -y -o Acquire::Retries=3 libasound2-dev; then
+              exit 0
+            fi
+            echo "::warning::apt attempt $attempt failed, retrying in $((attempt * 5))s"
+            sleep $((attempt * 5))
+          done
+          echo "::error::apt-get failed after 5 attempts"; exit 1
+
+      - uses: Swatinem/rust-cache@v2.9.3
+
+      - name: Clippy (alsa-exclusive)
+        run: cargo clippy -p soul-audio-desktop --features alsa-exclusive --all-targets -- -D warnings
+
+      # The device-free tests: name/format parsing, the canonical-24 conversion
+      # arithmetic, and the reservation's bus-name convention. The device-touching
+      # tests are `#[ignore]`d and skipped here.
+      - name: Test (alsa-exclusive, device-free)
+        run: cargo test -p soul-audio-desktop --features alsa-exclusive

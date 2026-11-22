@@ -11,6 +11,9 @@ workflows:
     '.github/workflows/ci-ios.yml':
         - 'actions/checkout@v7.0.1'
         - 'swatinem/rust-cache@v2.9.3'
+    '.github/workflows/ci-linux-audio.yml':
+        - 'actions/checkout@v7.0.1'
+        - 'swatinem/rust-cache@v2.9.3'
     '.github/workflows/ci-macos-audio.yml':
         - 'actions/checkout@v7.0.1'
         - 'actions/upload-artifact@v7.0.2'
