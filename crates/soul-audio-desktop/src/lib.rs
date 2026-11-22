@@ -13,14 +13,16 @@ pub mod coreaudio_exclusive;
 pub mod decoder;
 /// The platform-neutral exclusive-output engine (hog / native rate / restore), driven by a
 /// `Hal` — CoreAudio on macOS, the fake device world in tests.
-#[cfg(feature = "playback")]
+#[cfg(any(feature = "playback", feature = "test-util"))]
 pub mod exclusive_engine;
 /// Device-free exclusive-output policy (rate choice + physical-format ranking), unit-tested
 /// on every OS and used by the CoreAudio exclusive sink.
 pub mod exclusive_policy;
 /// Scriptable fake HAL + device profiles for testing the exclusive engine.
-#[cfg(all(feature = "playback", any(test, feature = "test-util")))]
+#[cfg(feature = "test-util")]
 pub mod fake_hal;
+#[cfg(any(feature = "playback", feature = "test-util"))]
+mod ring;
 #[cfg(feature = "playback")]
 pub mod sink;
 pub mod sources;

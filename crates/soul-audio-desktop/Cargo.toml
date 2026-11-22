@@ -27,8 +27,9 @@ wasapi-exclusive = ["playback", "dep:wasapi"]
 # already links on macOS, so no second copy) for its safe AUHAL + device helpers.
 coreaudio-exclusive = ["playback", "dep:coreaudio-rs"]
 # Exposes `fake_hal` (the scriptable fake CoreAudio-style device world) to downstream
-# test suites. Never enabled in shipped builds.
-test-util = ["playback"]
+# test suites. Never enabled in shipped builds. Needs only the ring (no cpal), so the
+# contract suite also runs on Linux CI without ALSA.
+test-util = ["dep:ringbuf"]
 
 [dev-dependencies]
 # Device-profile fixtures (tests/fixtures/coreaudio/*.json) for the fake-HAL contract suite.

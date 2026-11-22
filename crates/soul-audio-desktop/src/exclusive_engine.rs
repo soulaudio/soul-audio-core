@@ -33,7 +33,7 @@ use soul_audio_core::model::SampleFormat as CoreFmt;
 use soul_audio_core::{Sink, SinkError, StreamInfo};
 
 use crate::exclusive_policy::{PhysFormat, choose_rate, pick_physical_format, supported_rates};
-use crate::sink::{CpalRing, DISCARD_FADE_MS, Fill, push_blocking};
+use crate::ring::{CpalRing, DISCARD_FADE_MS, Fill, push_blocking};
 
 /// ~200 ms of buffering, like [`CpalSink`](crate::CpalSink).
 pub const BUFFER_MS: usize = 200;
