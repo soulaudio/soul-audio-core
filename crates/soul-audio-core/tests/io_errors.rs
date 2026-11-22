@@ -153,6 +153,11 @@ const OPEN_FIXTURES: &[(&str, &[u8])] = &[
 #[test]
 fn open_routed_decoders_handle_io_errors_gracefully() {
     for &(label, data) in OPEN_FIXTURES {
+        // AAC decode is patent-gated off by default (`aac` feature); its fixtures
+        // decline as `Unsupported`, so skip them when the feature is off.
+        if !cfg!(feature = "aac") && (label.contains("aac") || label.contains("sbr")) {
+            continue;
+        }
         assert_graceful_at_all_faults(label, data, open_drive);
 
         // Crisp probe-path invariant: a reader that fails on the very first
@@ -195,6 +200,7 @@ fn dsd_handles_io_errors_gracefully() {
 /// would be must surface that fault as `Err(Io)` from `decode_into` — not a
 /// silent clean stop (which would mean a real read fault is indistinguishable
 /// from a complete stream).
+#[cfg(feature = "aac")]
 #[test]
 fn decode_loop_surfaces_io_error_not_just_clean_eof() {
     let data: &[u8] = include_bytes!("../testdata/aac.aac");
