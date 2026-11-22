@@ -99,10 +99,9 @@ jobs:
           --ignored --nocapture --test-threads=1
           --skip bit_perfect_loopback_through_blackhole
 
-      # Captures BlackHole's input side, which needs the runner's microphone (TCC)
-      # grant. Non-blocking until it has been seen green on hosted runners.
+      # Captures BlackHole's input side (hosted runners grant the microphone TCC
+      # permission). Green on macos-15, macos-26 and macos-15-intel, so it gates.
       - name: Bit-perfect loopback through BlackHole
-        continue-on-error: true
         env:
           SOUL_CA_DEVICE: BlackHole 2ch
         run: >

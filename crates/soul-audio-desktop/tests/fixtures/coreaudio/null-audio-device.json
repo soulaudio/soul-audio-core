@@ -1,0 +1,15 @@
+{
+  "id": "null-audio-device",
+  "source": "captured",
+  "captured_on": "Null Audio Device on VirtualMac2,1 (arm64), macOS 15.8.2",
+  "name": "Null Audio Device",
+  "transport": "virtual",
+  "nominal_rate": 44100,
+  "hog": "supported",
+  "hog_probed": true,
+  "fixed_rate": false,
+  "formats": [
+    { "rate_min": 48000, "rate_max": 48000, "float": true, "bits": 32, "channels": 2 },
+    { "rate_min": 44100, "rate_max": 44100, "float": true, "bits": 32, "channels": 2 }
+  ]
+}
