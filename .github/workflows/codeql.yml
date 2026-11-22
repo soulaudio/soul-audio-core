@@ -27,7 +27,7 @@ jobs:
       contents: read
       actions: read          # required on private repos; inert on public
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@52cf1852265d99e9bea071b03366fc777a602909 # v3 (codeql-bundle-v2.27.4)

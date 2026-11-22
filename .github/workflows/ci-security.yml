@@ -21,10 +21,10 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v7.0.1
       # Prebuilt binary — avoids compiling cargo-audit (whose latest deps need a
       # newer rustc than this repo's pinned toolchain).
-      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2
+      - uses: taiki-e/install-action@v2.90.4
         with:
           tool: cargo-audit
       - name: Vulnerability scan
@@ -34,8 +34,8 @@ jobs:
     name: cargo-deny (licenses, bans, sources)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+      - uses: actions/checkout@v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
         with:
           command: check bans licenses sources
 
@@ -43,9 +43,9 @@ jobs:
     name: SBOM (CycloneDX)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v7.0.1
       - name: Generate SBOM from Cargo.lock
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        uses: anchore/sbom-action@v0.24.3
         with:
           format: cyclonedx-json
           output-file: sbom.cdx.json

@@ -51,12 +51,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Set up Rust
         run: rustup component add clippy
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: Swatinem/rust-cache@v2.9.3
 
       - name: Clippy (coreaudio-exclusive)
         run: cargo clippy -p soul-audio-desktop --features coreaudio-exclusive --all-targets -- -D warnings
@@ -87,7 +87,7 @@ jobs:
           cargo run -p soul-audio-desktop --features coreaudio-exclusive
           --example coreaudio_device_report -- --probe-hog --out device-profiles
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: device-profiles-${{ matrix.os }}
           path: device-profiles/
@@ -127,9 +127,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v7.0.1
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: Swatinem/rust-cache@v2.9.3
 
       - name: Build BlackHole with a 44.1k / 96k ladder
         run: |
@@ -178,7 +178,7 @@ jobs:
               raise SystemExit(f"no profile for {name}")
           PY
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: device-profiles-ladder-${{ matrix.os }}
           path: device-profiles/
@@ -205,9 +205,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v7.0.1
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: Swatinem/rust-cache@v2.9.3
 
       - name: Build SoulProfile.driver (libASPL, ad-hoc signed)
         run: ci/hal-profile-device/build.sh "$RUNNER_TEMP/profile"
@@ -245,7 +245,7 @@ jobs:
           assert seen == want, seen
           PY
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: device-profiles-soulprofile-${{ matrix.os }}
           path: device-profiles/
