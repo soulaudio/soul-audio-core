@@ -9,7 +9,7 @@
 #![deny(unconditional_recursion)]
 
 use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -20,18 +20,111 @@ use soul_audio_tags::{StreamFacts, Tags, read_owned};
 mod cover;
 
 /// Extensions the decoders support (lower-cased comparison).
+///
+/// Every entry here is also gated on its decoder actually being compiled in —
+/// see [`is_supported`], which is what `"aac"` depends on.
 const SUPPORTED: &[&str] = &[
     "wav", "flac", "mp3", "mp2", "mp1", "m4a", "aac", "ogg", "oga", "opus", "aiff", "aif", "dsf",
     "dff", "mka", "webm", "wv", "caf",
 ];
+/// Audio formats this library does not decode, but which a music collection
+/// plausibly contains. Listed so a scan can SAY it skipped them instead of
+/// silently dropping files — a user whose `.wma` rips vanish has no way to tell
+/// a deliberate limitation from a broken scan.
+///
+/// Best-effort and deliberately short: the point is to name the common cases,
+/// not to enumerate every container in existence. Anything not here (artwork,
+/// cue sheets, text) is simply not audio and is never mentioned.
+const KNOWN_AUDIO_WE_DO_NOT_DECODE: &[&str] = &[
+    "wma", "ape", "mpc", "tta", "shn", "ra", "m4b", "m4p", "aifc", "au", "ac3", "dts", "amr",
+];
+
+/// Why a file the scan walked past was not imported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SkipReason {
+    /// The format is one this library knows, but its decoder was not compiled
+    /// into this build — AAC is gated behind an opt-in feature (patent). A
+    /// different build of the same app WOULD play these files.
+    DecoderDisabled,
+    /// A recognised audio format this library does not decode at all.
+    UnsupportedFormat,
+}
+
+/// Files the scan passed over, grouped by extension: "12 .aac files, because the
+/// decoder is disabled". Grouped rather than listed because a real library
+/// yields thousands of paths and a user only needs the shape of the problem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SkippedGroup {
+    /// Lower-cased, without the dot.
+    pub extension: String,
+    pub reason: SkipReason,
+    pub count: usize,
+}
+
+/// Accumulates skips during a walk. Counts only — see [`SkippedGroup`].
+#[derive(Debug, Default)]
+pub(crate) struct Skips {
+    by_ext: BTreeMap<String, (SkipReason, usize)>,
+}
+
+impl Skips {
+    /// Note that `path` was not imported, if it is audio worth mentioning.
+    pub(crate) fn record(&mut self, path: &Path) {
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            return;
+        };
+        let ext = ext.to_ascii_lowercase();
+        let reason = if SUPPORTED.contains(&ext.as_str()) {
+            // In the supported set yet skipped: the decoder is not built in.
+            SkipReason::DecoderDisabled
+        } else if KNOWN_AUDIO_WE_DO_NOT_DECODE.contains(&ext.as_str()) {
+            SkipReason::UnsupportedFormat
+        } else {
+            return; // not audio — nothing to tell the user
+        };
+        let entry = self.by_ext.entry(ext).or_insert((reason, 0));
+        entry.1 += 1;
+    }
+
+    pub(crate) fn into_groups(self) -> Vec<SkippedGroup> {
+        self.by_ext
+            .into_iter()
+            .map(|(extension, (reason, count))| SkippedGroup {
+                extension,
+                reason,
+                count,
+            })
+            .collect()
+    }
+}
+
 /// Last-resort recursion guard against a pathological tree.
 const MAX_DEPTH: usize = 64;
 
+/// Whether a scan should import `path`.
+///
+/// The extension must be one the decoders handle AND its decoder must be built
+/// into this binary. The second half matters because AAC is gated behind an
+/// opt-in feature (patent): without the check, a product that does not take the
+/// licence still imports the user's `.aac` files, shows them in the library, and
+/// only fails when they press play. Not listing them is the honest behaviour.
+///
+/// `.m4a` cannot be filtered this way — the container carries ALAC as well as
+/// AAC, and only a decode can tell them apart — so an AAC-in-MP4 file stays
+/// listed and unplayable in an AAC-less build.
 fn is_supported(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| SUPPORTED.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let ext = ext.to_ascii_lowercase();
+    if !SUPPORTED.contains(&ext.as_str()) {
+        return false;
+    }
+    // `AAC_ENABLED` reflects the feature as resolved across the whole dependency
+    // graph, so this agrees with whatever decoder was actually compiled.
+    ext != "aac" || soul_audio_core::AAC_ENABLED
 }
 
 /// Skip dotfiles / dot-dirs (macOS `._*` AppleDouble sidecars, `.DS_Store`, …).
@@ -49,6 +142,7 @@ fn walk(
     dir: &Path,
     out: &mut Vec<PathBuf>,
     visited: &mut HashSet<PathBuf>,
+    skips: &mut Skips,
     depth: usize,
 ) -> std::io::Result<()> {
     if depth >= MAX_DEPTH {
@@ -68,11 +162,15 @@ fn walk(
             continue;
         }
         if path.is_dir() {
-            if let Err(e) = walk(&path, out, visited, depth + 1) {
+            if let Err(e) = walk(&path, out, visited, skips, depth + 1) {
                 eprintln!("import: skipping unreadable dir {path:?}: {e}");
             }
         } else if is_supported(&path) {
             out.push(path);
+        } else {
+            // Not imported — tell the caller why, so the app can say so rather
+            // than leaving the user to wonder where their files went.
+            skips.record(&path);
         }
     }
     Ok(())
@@ -409,7 +507,9 @@ fn build_catalog(raw: &[RawTrack], root: &Path) -> CatalogInput {
 pub fn scan(root: &Path) -> std::io::Result<CatalogInput> {
     let mut paths = Vec::new();
     let mut visited = HashSet::new();
-    walk(root, &mut paths, &mut visited, 0)?;
+    // `bake` has nowhere to put a report; the incremental scan carries one.
+    let mut skips = Skips::default();
+    walk(root, &mut paths, &mut visited, &mut skips, 0)?;
     let raw: Vec<RawTrack> = paths.iter().map(|p| extract_raw(p)).collect();
     Ok(build_catalog(&raw, root))
 }
@@ -502,6 +602,13 @@ pub struct ScanOutcome {
     pub changed: Vec<PathBuf>,
     /// Files present in the prior cache but gone from disk (deletions).
     pub removed: Vec<PathBuf>,
+    /// Audio files the scan walked past without importing, grouped by extension
+    /// with the reason. Empty for a library this build can fully decode.
+    ///
+    /// Reported rather than dropped because a silent skip is indistinguishable
+    /// from a broken scan: a user whose AAC rips simply do not appear has no way
+    /// to learn that the decoder is disabled in this build.
+    pub skipped: Vec<SkippedGroup>,
 }
 
 /// How often (ms) an over-target worker re-checks whether a concurrency permit has
@@ -665,7 +772,8 @@ fn scan_incremental_inner(
     // 1. Discovery: walk (sorted, deterministic) + stat each file.
     let mut paths = Vec::new();
     let mut visited = HashSet::new();
-    walk(root, &mut paths, &mut visited, 0)?;
+    let mut skips = Skips::default();
+    walk(root, &mut paths, &mut visited, &mut skips, 0)?;
     let total = paths.len();
     let mut current: Vec<(PathBuf, FileStamp)> = Vec::with_capacity(total);
     for (i, p) in paths.iter().enumerate() {
@@ -739,6 +847,7 @@ fn scan_incremental_inner(
         added,
         changed,
         removed,
+        skipped: skips.into_groups(),
     })
 }
 
@@ -988,5 +1097,141 @@ mod pool_tests {
         let target = AtomicUsize::new(4);
         let out = run_adaptive_pool(0, 8, &target, |i| i, &mut |_, _| {});
         assert!(out.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod supported_tests {
+    use super::*;
+
+    /// A skipped file must be reported with a reason a user can act on, grouped
+    /// by extension so a library of thousands yields a sentence, not a list.
+    #[test]
+    fn skips_are_grouped_by_extension_with_a_reason() {
+        let mut skips = Skips::default();
+        skips.record(Path::new("a/one.aac"));
+        skips.record(Path::new("b/two.AAC"));
+        skips.record(Path::new("c/three.wma"));
+        // Not audio at all: nothing a music player should mention.
+        skips.record(Path::new("cover.jpg"));
+        skips.record(Path::new("notes.txt"));
+
+        let mut groups = skips.into_groups();
+        groups.sort_by(|a, b| a.extension.cmp(&b.extension));
+        assert_eq!(
+            groups.len(),
+            2,
+            "only audio formats are reported: {groups:?}"
+        );
+
+        assert_eq!(groups[0].extension, "aac");
+        assert_eq!(groups[0].count, 2, "case-insensitive grouping");
+        assert_eq!(
+            groups[0].reason,
+            SkipReason::DecoderDisabled,
+            "AAC is skipped because its decoder is gated off, not because the \
+             format is unknown — the user can act on that distinction"
+        );
+
+        assert_eq!(groups[1].extension, "wma");
+        assert_eq!(groups[1].count, 1);
+        assert_eq!(groups[1].reason, SkipReason::UnsupportedFormat);
+    }
+
+    /// A REAL scan of a directory reports what it passed over, so the app can
+    /// show "N files skipped" with a reason instead of silently importing
+    /// nothing. The unit tests above pin the grouping; this pins that the
+    /// grouping actually reaches the scan's result.
+    #[test]
+    fn a_real_scan_reports_the_files_it_skipped() {
+        let dir = std::env::temp_dir().join(format!("import_skips_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scan dir");
+        // Two formats this build cannot play, plus a non-audio file that must
+        // never be mentioned.
+        std::fs::write(dir.join("a.aac"), b"not really aac").expect("write");
+        std::fs::write(dir.join("b.wma"), b"not really wma").expect("write");
+        std::fs::write(dir.join("cover.jpg"), b"not audio").expect("write");
+
+        let outcome = scan_incremental(&dir, &ScanCache::default(), 1, &mut |_| {})
+            .expect("scan the directory");
+
+        let exts: Vec<&str> = outcome
+            .skipped
+            .iter()
+            .map(|g| g.extension.as_str())
+            .collect();
+        assert!(
+            !exts.contains(&"jpg"),
+            "artwork is not audio and must never be reported: {exts:?}"
+        );
+        assert!(
+            exts.contains(&"wma"),
+            "a recognised audio format we cannot decode must be reported: {exts:?}"
+        );
+        assert_eq!(
+            exts.contains(&"aac"),
+            !soul_audio_core::AAC_ENABLED,
+            "an .aac file is reported exactly when AAC is gated off: {exts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When AAC IS compiled in, `.aac` is imported and so never skipped. Guards
+    /// against a report that keeps accusing a working build of skipping files.
+    #[test]
+    fn aac_is_only_reported_as_skipped_when_its_decoder_is_off() {
+        let mut skips = Skips::default();
+        skips.record(Path::new("one.aac"));
+        let reported = !skips.into_groups().is_empty();
+        assert_eq!(
+            reported,
+            !soul_audio_core::AAC_ENABLED,
+            "an .aac file is reported as skipped exactly when AAC is gated off"
+        );
+    }
+
+    /// A scan must only list files this BUILD can actually decode.
+    ///
+    /// AAC is gated behind an opt-in feature (patent), and the extension set is
+    /// otherwise keyed purely on the file name — so without this an `.aac` file
+    /// is imported into a library, shown to the user, and then fails the moment
+    /// they press play. Asserted against `AAC_ENABLED` rather than a fixed
+    /// expectation so the test states the invariant in both configurations.
+    #[test]
+    fn aac_is_listed_only_when_its_decoder_is_compiled_in() {
+        assert_eq!(
+            is_supported(Path::new("track.aac")),
+            soul_audio_core::AAC_ENABLED,
+            "an .aac file must be listed exactly when the AAC decoder is built in"
+        );
+        assert_eq!(
+            is_supported(Path::new("TRACK.AAC")),
+            soul_audio_core::AAC_ENABLED,
+            "the extension check is case-insensitive, so the gate must be too"
+        );
+    }
+
+    /// `.m4a` stays supported either way: the container carries ALAC as well as
+    /// AAC, and ALAC is always available. (An AAC-in-MP4 file therefore remains
+    /// listed-but-unplayable — the extension cannot tell them apart.)
+    #[test]
+    fn m4a_stays_supported_because_it_may_carry_alac() {
+        assert!(is_supported(Path::new("track.m4a")));
+    }
+
+    /// The rest of the set is unconditional; a gate that swallowed more than AAC
+    /// would silently shrink a user's library.
+    #[test]
+    fn every_other_extension_is_unconditionally_supported() {
+        for ext in [
+            "wav", "flac", "mp3", "mp2", "mp1", "ogg", "oga", "opus", "aiff", "aif", "dsf", "dff",
+            "mka", "webm", "wv", "caf",
+        ] {
+            assert!(
+                is_supported(&Path::new("track").with_extension(ext)),
+                "{ext} must stay supported"
+            );
+        }
     }
 }
