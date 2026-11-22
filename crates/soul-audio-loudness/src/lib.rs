@@ -16,4 +16,6 @@
 mod analyzer;
 mod math;
 
-pub use analyzer::{LoudnessMetrics, NO_LOUDNESS, R128Analyzer, REPLAYGAIN2_TARGET_LUFS};
+pub use analyzer::{
+    LiveLoudnessMeter, LoudnessMetrics, NO_LOUDNESS, R128Analyzer, REPLAYGAIN2_TARGET_LUFS,
+};
