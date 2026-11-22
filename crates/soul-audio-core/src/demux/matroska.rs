@@ -62,7 +62,48 @@ const TRACK_TYPE_AUDIO: u64 = 2;
 
 /// Largest `CodecPrivate` we retain (Vorbis packs its 3 setup headers here —
 /// a few KiB; Opus/FLAC/AAC are tens of bytes).
+#[cfg(not(feature = "embedded-profile"))]
 const MAX_CODEC_PRIVATE: usize = 16 * 1024;
+
+/// Largest `CodecPrivate` we retain under `embedded-profile`: **8 KiB**.
+///
+/// The 16 KiB above is sized for **Vorbis**, which packs three setup headers
+/// (identification, comment, and the codebook-heavy setup header) into
+/// `CodecPrivate`. Everything else needs orders of magnitude less: `OpusHead` is
+/// 19 bytes, AAC's `AudioSpecificConfig` a handful, and FLAC's is independently
+/// capped at 1 KiB by
+/// [`MatroskaFlacReader`](crate::formats::matroska::MatroskaFlacReader).
+///
+/// 8 KiB is **derived from measurement, not guessed**: `testdata/tone-vorbis.mka`
+/// carries a 4,286 B `CodecPrivate`, so a 2 KiB cap regresses
+/// `decode::open_decodes_matroska_vorbis_matches_ogg` (verified — it was tried
+/// first and failed). 8 KiB clears that with ~1.9x headroom for
+/// larger-codebook encodes, and anything beyond it declines as
+/// [`DecodeError::Unsupported`](crate::DecodeError::Unsupported) rather than
+/// misbehaving — the same graceful-decline tradeoff this profile already makes
+/// for `MAX_FLAC_FRAME` (48 KiB → 28 KiB).
+///
+/// # Why it is worth two lines
+/// This buffer is inline in `MatroskaDemuxer`, which nests inside
+/// `MatroskaFlacReader` → `FlacDemuxer` → `FlacDecoder` → `MatroskaDecoder` —
+/// and `MatroskaDecoder` is the variant that sets `size_of::<AnyDecoder>()`.
+/// Every frame on the decode-open path holds `AnyDecoder`-sized slots, so the
+/// saving multiplies: measured on `thumbv7em-none-eabihf` via
+/// soul-listener's QEMU stack probe, the firmware's worst-case open transient
+/// and whole-tick stack both fall by several times this constant's reduction.
+/// See soul-listener `docs/plans/2026-11-21-memory-architecture-and-placement.md`.
+///
+/// # The other 8 KiB
+/// A DAP cannot actually decode Vorbis-in-Matroska: [`AnyDecoder`](crate::AnyDecoder)
+/// has no Vorbis variant, so `open`/`open_seekable` never produce one — the path
+/// is consumer-dispatched via
+/// [`MatroskaVorbisOgg`](crate::formats::matroska::MatroskaVorbisOgg) with a
+/// caller-provided arena. Giving that path its own feature, so an embedded
+/// consumer could drop it and reclaim the remaining 8 KiB (and with it several
+/// times that in stack), is a deliberate feature-surface decision and is
+/// **not** taken here.
+#[cfg(feature = "embedded-profile")]
+const MAX_CODEC_PRIVATE: usize = 8 * 1024;
 /// Largest `CodecID` string we retain (e.g. `A_PCM/INT/LIT`).
 const MAX_CODEC_ID: usize = 24;
 /// Maximum frames in one laced block (the lace count is a `u8`, so ≤ 256).
