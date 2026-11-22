@@ -654,6 +654,150 @@ impl R128Analyzer {
     }
 }
 
+/// Momentary gating-block length: 400 ms = 4 × 100 ms sub-blocks (BS.1770 "M").
+const MOMENTARY_BLOCKS: usize = 4;
+
+/// A lightweight streaming loudness meter for a LIVE display (a LUFS/peak meter shown while a
+/// track plays), as distinct from [`R128Analyzer`]'s whole-track integrated analysis. It
+/// K-weights the signal with the same BS.1770 pre-filter into 100 ms sub-blocks and keeps a
+/// 3 s sliding ring, exposing the current MOMENTARY (400 ms) and SHORT-TERM (3 s) loudness
+/// plus a decaying sample peak.
+///
+/// It deliberately OMITS the histogram gating, true-peak FIR, and DR of the full analyzer, so
+/// it is cheap enough to run per audio block on the playback pump thread without risking
+/// dropouts. Fixed-size state, no-alloc, `no_std`, DAP-reusable.
+pub struct LiveLoudnessMeter {
+    channels: usize,
+    c1: Coeffs,
+    c2: Coeffs,
+    s1: [State; MAX_CHANNELS],
+    s2: [State; MAX_CHANNELS],
+    samples_per_subblock: u32,
+    subblock_filled: u32,
+    sub_sumsq: [f64; MAX_CHANNELS],
+    /// The last `ST_BLOCKS` (30 = 3 s) sub-block per-channel mean-squares. The momentary
+    /// window is the most recent [`MOMENTARY_BLOCKS`] (400 ms); short-term is all 30.
+    ring: [[f64; MAX_CHANNELS]; ST_BLOCKS],
+    /// Next slot to write (so the most recent is `pos - 1`).
+    pos: usize,
+    count: usize,
+    /// Per-sub-block max sample magnitude (normalized to full scale), parallel to `ring`; the
+    /// peak meter reads the max over the recent momentary window so it rises on a transient and
+    /// falls as it ages out, with no decay-timing artefact.
+    peak_ring: [f64; ST_BLOCKS],
+    /// Max sample magnitude seen in the in-progress sub-block.
+    cur_peak: f64,
+}
+
+impl LiveLoudnessMeter {
+    /// Build a meter for `sample_rate` Hz and `channels` (mono or stereo).
+    #[must_use]
+    pub fn new(sample_rate: u32, channels: u8) -> Self {
+        let fs = f64::from(sample_rate);
+        let ch = (channels as usize).clamp(1, MAX_CHANNELS);
+        Self {
+            channels: ch,
+            c1: stage1(fs),
+            c2: stage2(fs),
+            s1: [State::default(); MAX_CHANNELS],
+            s2: [State::default(); MAX_CHANNELS],
+            samples_per_subblock: (sample_rate / 10).max(1), // 100 ms
+            subblock_filled: 0,
+            sub_sumsq: [0.0; MAX_CHANNELS],
+            ring: [[0.0; MAX_CHANNELS]; ST_BLOCKS],
+            pos: 0,
+            count: 0,
+            peak_ring: [0.0; ST_BLOCKS],
+            cur_peak: 0.0,
+        }
+    }
+
+    /// Feed interleaved canonical-24-bit `i32` PCM (`len` a multiple of `channels`).
+    pub fn feed(&mut self, interleaved: &[i32]) {
+        for frame in interleaved.chunks_exact(self.channels) {
+            for (ch, &s) in frame.iter().enumerate() {
+                let x = f64::from(s) / FULL_SCALE;
+                let a = if x < 0.0 { -x } else { x };
+                if a > self.cur_peak {
+                    self.cur_peak = a;
+                }
+                let k1 = self.s1[ch].process(&self.c1, x);
+                let y = self.s2[ch].process(&self.c2, k1);
+                self.sub_sumsq[ch] += y * y;
+            }
+            self.subblock_filled += 1;
+            if self.subblock_filled >= self.samples_per_subblock {
+                self.finish_subblock();
+            }
+        }
+    }
+
+    fn finish_subblock(&mut self) {
+        let n = f64::from(self.samples_per_subblock);
+        for ch in 0..self.channels {
+            self.ring[self.pos][ch] = self.sub_sumsq[ch] / n; // mean square
+            self.sub_sumsq[ch] = 0.0;
+        }
+        self.peak_ring[self.pos] = self.cur_peak;
+        self.cur_peak = 0.0;
+        self.pos = (self.pos + 1) % ST_BLOCKS;
+        self.count = (self.count + 1).min(ST_BLOCKS);
+        self.subblock_filled = 0;
+    }
+
+    /// Mean loudness (LUFS) over the most recent `blocks` sub-blocks, or [`NO_LOUDNESS`] when
+    /// nothing has accumulated yet (or the window is silent).
+    fn windowed_lufs(&self, blocks: usize) -> f32 {
+        let w = blocks.min(self.count);
+        if w == 0 {
+            return NO_LOUDNESS;
+        }
+        let mut z = 0.0f64;
+        for ch in 0..self.channels {
+            let mut sum = 0.0;
+            for k in 0..w {
+                let idx = (self.pos + ST_BLOCKS - 1 - k) % ST_BLOCKS;
+                sum += self.ring[idx][ch];
+            }
+            z += channel_weight(ch) * (sum / w as f64);
+        }
+        if z <= 0.0 {
+            return NO_LOUDNESS;
+        }
+        (LUFS_OFFSET + 10.0 * log10(z)) as f32
+    }
+
+    /// The current MOMENTARY (400 ms) loudness in LUFS — the fast meter reading.
+    #[must_use]
+    pub fn momentary_lufs(&self) -> f32 {
+        self.windowed_lufs(MOMENTARY_BLOCKS)
+    }
+
+    /// The current SHORT-TERM (3 s) loudness in LUFS — the slower meter reading.
+    #[must_use]
+    pub fn short_term_lufs(&self) -> f32 {
+        self.windowed_lufs(ST_BLOCKS)
+    }
+
+    /// The recent sample peak in dBFS — the max sample magnitude over the momentary (400 ms)
+    /// window and the in-progress sub-block — or [`NO_LOUDNESS`] at silence.
+    #[must_use]
+    pub fn peak_dbfs(&self) -> f32 {
+        let mut p = self.cur_peak;
+        let w = MOMENTARY_BLOCKS.min(self.count);
+        for k in 0..w {
+            let idx = (self.pos + ST_BLOCKS - 1 - k) % ST_BLOCKS;
+            if self.peak_ring[idx] > p {
+                p = self.peak_ring[idx];
+            }
+        }
+        if p <= 0.0 {
+            return NO_LOUDNESS;
+        }
+        (20.0 * log10(p)) as f32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
