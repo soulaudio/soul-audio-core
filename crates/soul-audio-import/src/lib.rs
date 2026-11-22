@@ -20,6 +20,9 @@ use soul_audio_tags::{StreamFacts, Tags, read_owned};
 mod cover;
 
 /// Extensions the decoders support (lower-cased comparison).
+///
+/// Every entry here is also gated on its decoder actually being compiled in —
+/// see [`is_supported`], which is what `"aac"` depends on.
 const SUPPORTED: &[&str] = &[
     "wav", "flac", "mp3", "mp2", "mp1", "m4a", "aac", "ogg", "oga", "opus", "aiff", "aif", "dsf",
     "dff", "mka", "webm", "wv", "caf",
@@ -27,11 +30,28 @@ const SUPPORTED: &[&str] = &[
 /// Last-resort recursion guard against a pathological tree.
 const MAX_DEPTH: usize = 64;
 
+/// Whether a scan should import `path`.
+///
+/// The extension must be one the decoders handle AND its decoder must be built
+/// into this binary. The second half matters because AAC is gated behind an
+/// opt-in feature (patent): without the check, a product that does not take the
+/// licence still imports the user's `.aac` files, shows them in the library, and
+/// only fails when they press play. Not listing them is the honest behaviour.
+///
+/// `.m4a` cannot be filtered this way — the container carries ALAC as well as
+/// AAC, and only a decode can tell them apart — so an AAC-in-MP4 file stays
+/// listed and unplayable in an AAC-less build.
 fn is_supported(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| SUPPORTED.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let ext = ext.to_ascii_lowercase();
+    if !SUPPORTED.contains(&ext.as_str()) {
+        return false;
+    }
+    // `AAC_ENABLED` reflects the feature as resolved across the whole dependency
+    // graph, so this agrees with whatever decoder was actually compiled.
+    ext != "aac" || soul_audio_core::AAC_ENABLED
 }
 
 /// Skip dotfiles / dot-dirs (macOS `._*` AppleDouble sidecars, `.DS_Store`, …).
@@ -988,5 +1008,54 @@ mod pool_tests {
         let target = AtomicUsize::new(4);
         let out = run_adaptive_pool(0, 8, &target, |i| i, &mut |_, _| {});
         assert!(out.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod supported_tests {
+    use super::*;
+
+    /// A scan must only list files this BUILD can actually decode.
+    ///
+    /// AAC is gated behind an opt-in feature (patent), and the extension set is
+    /// otherwise keyed purely on the file name — so without this an `.aac` file
+    /// is imported into a library, shown to the user, and then fails the moment
+    /// they press play. Asserted against `AAC_ENABLED` rather than a fixed
+    /// expectation so the test states the invariant in both configurations.
+    #[test]
+    fn aac_is_listed_only_when_its_decoder_is_compiled_in() {
+        assert_eq!(
+            is_supported(Path::new("track.aac")),
+            soul_audio_core::AAC_ENABLED,
+            "an .aac file must be listed exactly when the AAC decoder is built in"
+        );
+        assert_eq!(
+            is_supported(Path::new("TRACK.AAC")),
+            soul_audio_core::AAC_ENABLED,
+            "the extension check is case-insensitive, so the gate must be too"
+        );
+    }
+
+    /// `.m4a` stays supported either way: the container carries ALAC as well as
+    /// AAC, and ALAC is always available. (An AAC-in-MP4 file therefore remains
+    /// listed-but-unplayable — the extension cannot tell them apart.)
+    #[test]
+    fn m4a_stays_supported_because_it_may_carry_alac() {
+        assert!(is_supported(Path::new("track.m4a")));
+    }
+
+    /// The rest of the set is unconditional; a gate that swallowed more than AAC
+    /// would silently shrink a user's library.
+    #[test]
+    fn every_other_extension_is_unconditionally_supported() {
+        for ext in [
+            "wav", "flac", "mp3", "mp2", "mp1", "ogg", "oga", "opus", "aiff", "aif", "dsf", "dff",
+            "mka", "webm", "wv", "caf",
+        ] {
+            assert!(
+                is_supported(&Path::new("track").with_extension(ext)),
+                "{ext} must stay supported"
+            );
+        }
     }
 }
