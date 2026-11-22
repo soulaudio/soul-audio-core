@@ -108,3 +108,81 @@ jobs:
           cargo test -p soul-audio-desktop --features coreaudio-exclusive
           --test coreaudio_exclusive_suite --
           --ignored --nocapture --exact bit_perfect_loopback_through_blackhole
+
+  # Spike (non-blocking until proven): a *custom-built* BlackHole that only offers 44.1k and
+  # 96k, so the real AUHAL path — not just the fake HAL — exercises the closest-same-family
+  # fallback (22.05/176.4/352.8k → 44.1k; 32/192/384k → 96k) on a device with a restricted
+  # rate ladder, like many real DACs and HDMI sinks. Single-Mac project: this is how device
+  # classes we don't own get real-device coverage. Built from BlackHole v0.7.1 (GPL-3.0; a CI
+  # test fixture only, never linked or shipped), ad-hoc signed — whether hosted runners load
+  # an ad-hoc-signed HAL plug-in is exactly what this job finds out.
+  restricted-ladder:
+    name: restricted-rate BlackHole (${{ matrix.os }})
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Build BlackHole with a 44.1k / 96k ladder
+        run: |
+          git clone --quiet https://github.com/ExistentialAudio/BlackHole.git "$RUNNER_TEMP/BlackHole"
+          git -C "$RUNNER_TEMP/BlackHole" checkout --quiet e2b22aaaba4e507a097131704bf96dabc004d9cf # v0.7.1
+          cd "$RUNNER_TEMP/BlackHole"
+          defs='$GCC_PREPROCESSOR_DEFINITIONS kDriver_Name=\"BlackHoleLadder\" kPlugIn_BundleID=\"audio.soulaudio.ladder\" kSampleRates=44100,96000'
+          xcodebuild -project BlackHole.xcodeproj -configuration Release -derivedDataPath build \
+            PRODUCT_BUNDLE_IDENTIFIER=audio.soulaudio.ladder \
+            CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= \
+            GCC_PREPROCESSOR_DEFINITIONS="$defs" | tail -5
+          drv="$(find build -name '*.driver' -maxdepth 6 | head -1)"
+          echo "built: $drv"
+          codesign -dv "$drv" 2>&1 | head -5 || true
+          sudo cp -R "$drv" /Library/Audio/Plug-Ins/HAL/BlackHoleLadder.driver
+
+      - name: Load it (restart coreaudiod) and find the device
+        run: |
+          sudo killall -9 coreaudiod || true
+          for i in $(seq 1 30); do
+            system_profiler SPAudioDataType | grep -q "BlackHoleLadder" && break
+            sleep 1
+          done
+          system_profiler SPAudioDataType | grep -E "^\s{8}[A-Za-z].*:$" || true
+          name="$(system_profiler SPAudioDataType | sed -n 's/^ *\(BlackHoleLadder[^:]*\):$/\1/p' | head -1)"
+          [ -n "$name" ] || { echo "::error::the ad-hoc-signed BlackHoleLadder driver did not load"; exit 1; }
+          echo "SOUL_CA_DEVICE=$name" >> "$GITHUB_ENV"
+          echo "device: $name"
+
+      - name: Capture its device profile (artifact) and check the ladder
+        run: |
+          cargo run -p soul-audio-desktop --features coreaudio-exclusive \
+            --example coreaudio_device_report -- --probe-hog --out device-profiles
+          python3 - <<'PY'
+          import glob, json, os
+          name = os.environ["SOUL_CA_DEVICE"]
+          for f in glob.glob("device-profiles/*.json"):
+              d = json.load(open(f))
+              if d["name"] == name:
+                  rates = sorted({fm["rate_min"] for fm in d["formats"]})
+                  print(name, "rates", rates, "hog", d["hog"])
+                  assert rates == [44100, 96000], rates
+                  break
+          else:
+              raise SystemExit(f"no profile for {name}")
+          PY
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: device-profiles-ladder-${{ matrix.os }}
+          path: device-profiles/
+
+      - name: Hardware suite on the restricted ladder (incl. closest-same-family fallback)
+        run: >
+          cargo test -p soul-audio-desktop --features coreaudio-exclusive
+          --test coreaudio_exclusive_suite --
+          --ignored --nocapture --test-threads=1
