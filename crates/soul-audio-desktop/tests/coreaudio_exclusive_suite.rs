@@ -8,7 +8,7 @@
 //!
 //! Device under test: `SOUL_CA_DEVICE=<name>` (e.g. `"BlackHole 2ch"` in CI), else the
 //! system default output (resolved by name once, up front — see [`device`]). Writes SILENCE only to real devices; the loopback test writes a
-//! signal but only to a BlackHole virtual device (inaudible).
+//! signal but only to a virtual loopback device (BlackHole / SoulProfile, inaudible).
 //!
 //! Hog mode is per-device and per-process, so every test takes `SERIAL` (and the CLI
 //! should still pass `--test-threads=1`). One test spawns a second copy of this binary to
@@ -114,10 +114,15 @@ fn open_takes_hog_mode_and_drop_releases_it() {
 fn drop_restores_the_original_nominal_rate() {
     let _g = lock();
     let original = nominal_rate(device().as_deref()).expect("device has a nominal rate");
-    let other = rates()
-        .into_iter()
-        .find(|&r| r != original)
-        .expect("device supports more than one rate");
+    let Some(other) = rates().into_iter().find(|&r| r != original) else {
+        // A fixed-rate device (e.g. a 48k-only HDMI sink): any request maps onto the one
+        // rate, so there is nothing to switch — and nothing to restore.
+        let Some(sink) = open(44_100) else { return };
+        assert_eq!(sink.stream_info().sample_rate, original);
+        drop(sink);
+        assert_eq!(nominal_rate(device().as_deref()), Some(original));
+        return;
+    };
     let Some(sink) = open(other) else { return };
     assert_eq!(sink.stream_info().sample_rate, other);
     assert_eq!(
@@ -347,9 +352,11 @@ fn unknown_device_name_is_no_device() {
 }
 
 /// Bit-perfect proof by loopback: play a known 24-bit pattern through the exclusive sink
-/// into BlackHole and capture BlackHole's input with cpal — every captured sample must
-/// equal the canonical value we wrote (Float32 carries 24-bit exactly). Only runs when the
-/// device under test is a BlackHole virtual device (inaudible); capture needs the
+/// into a loopback device and capture its input side with cpal — every captured sample
+/// must equal the canonical value we wrote (Float32 carries 24-bit exactly). Only runs on
+/// a virtual loopback device ([`is_loopback_device`], inaudible): BlackHole covers a
+/// Float32 physical format, the CI `SoulProfile` plug-in covers Int24 / Int32 ones (so
+/// the HAL's float → integer conversion is part of what is proven). Capture needs the
 /// microphone (TCC) permission for the running terminal/CI agent.
 ///
 /// Each rate gets up to [`LOOPBACK_ATTEMPTS`] tries and passes only on a capture that is
@@ -359,14 +366,25 @@ fn unknown_device_name_is_no_device() {
 /// is sample-time indexed, so a late cycle leaves a whole-buffer hole, not a value
 /// change). Failed attempts print the mismatch shape so a real defect stays visible.
 #[test]
-#[ignore = "needs a BlackHole loopback device; run with --ignored"]
-fn bit_perfect_loopback_through_blackhole() {
+#[ignore = "needs a loopback device; run with --ignored"]
+fn bit_perfect_loopback() {
     let _g = lock();
-    let Some(name) = device().filter(|d| d.starts_with("BlackHole")) else {
-        eprintln!("SKIP: set SOUL_CA_DEVICE to a BlackHole device for the loopback test");
+    let Some(name) = device().filter(|d| is_loopback_device(d)) else {
+        eprintln!(
+            "SKIP: set SOUL_CA_DEVICE to a loopback device (BlackHole*, SoulProfile*) for the loopback test"
+        );
         return;
     };
-    for rate in [44_100u32, 96_000] {
+    // Both families where the device has them; a fixed-rate device gets its one rate.
+    let ladder = rates();
+    let mut loop_rates: Vec<u32> = [44_100u32, 96_000]
+        .into_iter()
+        .filter(|r| ladder.contains(r))
+        .collect();
+    if loop_rates.is_empty() {
+        loop_rates.push(ladder[0]);
+    }
+    for rate in loop_rates {
         let mut failures = Vec::new();
         let n = (1..=LOOPBACK_ATTEMPTS).find_map(|attempt| match loopback_once(&name, rate) {
             Ok(n) => Some(n),
@@ -388,7 +406,14 @@ fn bit_perfect_loopback_through_blackhole() {
     }
 }
 
-/// Tries per rate for [`bit_perfect_loopback_through_blackhole`].
+/// Virtual devices whose input side plays back what was written to the output: BlackHole
+/// (Float32 physical) and the CI-only `SoulProfile` HAL plug-in (`ci/hal-profile-device`,
+/// integer physical formats).
+fn is_loopback_device(name: &str) -> bool {
+    name.starts_with("BlackHole") || name.starts_with("SoulProfile")
+}
+
+/// Tries per rate for [`bit_perfect_loopback`].
 const LOOPBACK_ATTEMPTS: usize = 3;
 
 /// One loopback round at `rate`: `Ok(samples compared)` when the whole captured pattern
@@ -402,7 +427,7 @@ fn loopback_once(name: &str, rate: u32) -> Result<usize, String> {
         .input_devices()
         .unwrap()
         .find(|d| d.name().is_ok_and(|n| n == name))
-        .expect("BlackHole input side");
+        .expect("loopback input side");
     let cfg = cpal::StreamConfig {
         channels: 2,
         sample_rate: cpal::SampleRate(rate),
