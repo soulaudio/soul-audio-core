@@ -141,8 +141,20 @@ mod tests {
     fn unique_dir(tag: &str) -> PathBuf {
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("organize-test-{}-{tag}-{n}", std::process::id()));
+        // `module_path!()` is part of the name on purpose. `plan::tests` and
+        // `apply::tests` each have their OWN `static N`, but they live in the
+        // same test binary (same pid) and both use the tags `src-move` and
+        // `dest-move` — so without a per-module discriminator their independent
+        // counters can mint the IDENTICAL path. Run in parallel, one test then
+        // populates the other's destination directory, and the planner correctly
+        // reports `SkipDuplicate` where the test expects `Move` (or an apply
+        // test finds its originals already moved). Intermittent, because it
+        // depends on the order the two counters happen to be advanced in.
+        let dir = std::env::temp_dir().join(format!(
+            "organize-test-{}-{}-{tag}-{n}",
+            std::process::id(),
+            module_path!().replace("::", "-")
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
