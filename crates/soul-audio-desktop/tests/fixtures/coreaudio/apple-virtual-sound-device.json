@@ -1,0 +1,15 @@
+{
+  "id": "apple-virtual-sound-device",
+  "source": "captured",
+  "captured_on": "Apple Virtual Sound Device on VirtualMac2,1 (arm64), macOS 15.8.2",
+  "name": "Apple Virtual Sound Device",
+  "transport": "builtin",
+  "nominal_rate": 48000,
+  "hog": "supported",
+  "hog_probed": true,
+  "fixed_rate": false,
+  "formats": [
+    { "rate_min": 96000, "rate_max": 96000, "float": true, "bits": 32, "channels": 2 },
+    { "rate_min": 48000, "rate_max": 48000, "float": true, "bits": 32, "channels": 2 }
+  ]
+}

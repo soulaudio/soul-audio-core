@@ -16,117 +16,13 @@ use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
 use ringbuf::HeapRb;
-use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use ringbuf::traits::{Observer, Split};
 use soul_audio_core::model::SampleFormat as CoreFmt;
 use soul_audio_core::{Sink, SinkError, StreamInfo};
 
 use soul_audio_core::convert::{self, CANONICAL_BITS};
 
-/// Falling-smoothstep fade-out length for a seek-discard, in milliseconds. On a
-/// seek the buffered pre-seek audio still sitting in the ring is ramped down to
-/// zero over this window *before* the ring is cleared, so the output descends
-/// smoothly to silence instead of stepping from the last buffered sample straight
-/// to 0 — that step is a format-agnostic click. It pairs with the deck's rising
-/// fade-IN on the post-seek side (`deck.rs`): old→0 here, brief silence, then new
-/// 0→full there = a click-free splice. 8 ms ≈ a few hundred samples at 48 kHz, so
-/// the ack is still released far inside `discard`'s ~200 ms bound.
-pub(crate) const DISCARD_FADE_MS: u32 = 8;
-
-/// The slice of the SPSC ring consumer the real-time fill needs. Abstracting it
-/// lets the flush/fade logic in [`Fill`] be unit-tested against an in-memory fake
-/// — the cpal callback is otherwise only reachable with a live output device.
-pub(crate) trait Ring {
-    /// Pop the next buffered sample, or `None` on underrun.
-    fn pop(&mut self) -> Option<i32>;
-    /// Drop all buffered samples.
-    fn clear(&mut self);
-}
-
-/// Newtype over the cpal SPSC ring consumer. A concrete named type (rather than
-/// the `<HeapRb<i32> as Split>::Cons` projection) so [`Ring`] can also be
-/// implemented for the test fake without a coherence conflict.
-pub(crate) struct CpalRing(pub(crate) <HeapRb<i32> as Split>::Cons);
-
-impl Ring for CpalRing {
-    fn pop(&mut self) -> Option<i32> {
-        self.0.try_pop()
-    }
-    fn clear(&mut self) {
-        self.0.clear();
-    }
-}
-
-/// Real-time fill state shared by the f32 and i16 callbacks: the smoothed volume
-/// gain plus the seek-discard fade-out. Allocation-free; every method runs on the
-/// audio thread.
-pub(crate) struct Fill {
-    /// Smoothed output gain, ramped toward the target volume per sample so a
-    /// volume change is heard on already-buffered audio without a click.
-    cur_gain: f32,
-    /// Interleaved samples of seek fade-out still owed. `0` = idle. Armed to
-    /// `fade_len` when a discard request is first seen, counted down one per faded
-    /// sample; on reaching `0` the ring is cleared and the discard ack released.
-    fade_remaining: u32,
-    /// Fade-out length in interleaved samples (`DISCARD_FADE_MS` at the device
-    /// rate × channels). `0` disables the fade (an instant clear + ack).
-    fade_len: u32,
-}
-
-impl Fill {
-    pub(crate) fn new(fade_len: u32) -> Self {
-        Self {
-            cur_gain: 1.0,
-            fade_remaining: 0,
-            fade_len,
-        }
-    }
-
-    /// Called once at the top of each callback. If a seek-discard is pending and
-    /// no fade is already in flight, arm the fade-out so the buffered head ramps
-    /// down in [`next`](Fill::next) rather than being hard-cleared here. A zero
-    /// `fade_len` keeps the original instant clear + ack (and the Release store
-    /// publishes the clear to the producer's Acquire-load in [`Sink::discard`], so
-    /// it only resumes writing post-seek audio once the clear has happened). While
-    /// a fade is in flight (`fade_remaining > 0`) the flag is left set until
-    /// `next` finishes the ramp, so this never re-arms mid-fade.
-    pub(crate) fn begin(&mut self, flush: &AtomicBool, ring: &mut impl Ring) {
-        if self.fade_remaining == 0 && flush.load(Ordering::Acquire) {
-            if self.fade_len == 0 {
-                ring.clear();
-                flush.store(false, Ordering::Release);
-            } else {
-                self.fade_remaining = self.fade_len;
-            }
-        }
-    }
-
-    /// Produce the next source sample for the output buffer. Applies the smoothed
-    /// volume gain and, while a seek fade-out is in flight, a falling smoothstep
-    /// gain (`g = t·t·(3−2t)`, `t = fade_remaining / fade_len`, so `g` runs 1→0 —
-    /// the mirror of the deck's rising fade, no trig for a shared curve). When the
-    /// fade completes it clears the ring's remaining pre-seek audio and releases
-    /// the discard ack. `None` = ring underran (downstream fills silence).
-    pub(crate) fn next(
-        &mut self,
-        ring: &mut impl Ring,
-        flush: &AtomicBool,
-        target: f32,
-    ) -> Option<i32> {
-        self.cur_gain += (target - self.cur_gain) * 0.01;
-        if self.fade_remaining == 0 {
-            return ring.pop().map(|s| (s as f32 * self.cur_gain) as i32);
-        }
-        let t = self.fade_remaining as f32 / self.fade_len as f32;
-        let g = t * t * (3.0 - 2.0 * t);
-        let out = ring.pop().map(|s| (s as f32 * self.cur_gain * g) as i32);
-        self.fade_remaining -= 1;
-        if self.fade_remaining == 0 {
-            ring.clear();
-            flush.store(false, Ordering::Release);
-        }
-        out
-    }
-}
+pub(crate) use crate::ring::{CpalRing, DISCARD_FADE_MS, Fill, push_blocking};
 
 /// A cpal output stream presented as a [`Sink`] consuming canonical 24-bit PCM.
 pub struct CpalSink {
@@ -149,6 +45,69 @@ pub struct CpalSink {
     /// reported via [`Sink::stream_info`] so the signal path shows the true output
     /// depth, not the canonical-24 the deck feeds in.
     format: CoreFmt,
+    /// Liveness of the device this stream opened on (see [`DeviceAlive`]).
+    alive: DeviceAlive,
+}
+
+/// Whether the output device this sink opened on still exists.
+///
+/// macOS (with `coreaudio-exclusive`, which brings `coreaudio-rs`): a
+/// `kAudioDevicePropertyDeviceIsAlive` listener on that device. On Apple silicon the
+/// headphone jack, AirPods / Bluetooth and USB DACs are separate CoreAudio devices that
+/// **disappear** on unplug — so a write fails with [`SinkError::Closed`] and the player
+/// pauses (Apple Music behaviour) instead of the default-output stream silently moving
+/// to the laptop speakers. Elsewhere: always alive (cpal's error callback is the only
+/// signal there).
+struct DeviceAlive {
+    #[cfg(all(target_os = "macos", feature = "coreaudio-exclusive"))]
+    listener: Option<Box<coreaudio::audio_unit::macos_helpers::AliveListener>>,
+}
+
+impl DeviceAlive {
+    /// No watch (always alive) — the state before a constructor knows the device.
+    fn unwatched() -> Self {
+        Self {
+            #[cfg(all(target_os = "macos", feature = "coreaudio-exclusive"))]
+            listener: None,
+        }
+    }
+
+    /// Watch the device cpal names `name` (the system default when `None`).
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "coreaudio-exclusive")),
+        allow(unused_variables)
+    )]
+    fn watch(name: Option<&str>) -> Self {
+        #[cfg(all(target_os = "macos", feature = "coreaudio-exclusive"))]
+        {
+            use coreaudio::audio_unit::macos_helpers as hal;
+            let id = match name {
+                Some(n) => hal::get_device_id_from_name(n),
+                None => hal::get_default_device_id(false),
+            };
+            let listener = id.and_then(|id| {
+                // Boxed: CoreAudio keeps a pointer to the listener.
+                let mut l = Box::new(hal::AliveListener::new(id));
+                l.register().ok().map(|_| l)
+            });
+            Self { listener }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "coreaudio-exclusive")))]
+        {
+            Self {}
+        }
+    }
+
+    fn gone(&self) -> bool {
+        #[cfg(all(target_os = "macos", feature = "coreaudio-exclusive"))]
+        {
+            self.listener.as_ref().is_some_and(|l| !l.is_alive())
+        }
+        #[cfg(not(all(target_os = "macos", feature = "coreaudio-exclusive")))]
+        {
+            false
+        }
+    }
 }
 
 impl CpalSink {
@@ -158,7 +117,9 @@ impl CpalSink {
         let device = cpal::default_host()
             .default_output_device()
             .context("no default output device")?;
-        Self::build(device)
+        let mut sink = Self::build(device)?;
+        sink.alive = DeviceAlive::watch(None);
+        Ok(sink)
     }
 
     /// Open a specific output device by name (one of [`output_device_names`]).
@@ -170,7 +131,9 @@ impl CpalSink {
             .context("enumerating output devices")?
             .find(|d| d.name().map(|n| n == name).unwrap_or(false))
             .with_context(|| format!("no output device named {name:?}"))?;
-        Self::build(device)
+        let mut sink = Self::build(device)?;
+        sink.alive = DeviceAlive::watch(Some(name));
+        Ok(sink)
     }
 
     /// Build a sink on an already-selected device. Input is always canonical
@@ -281,6 +244,7 @@ impl CpalSink {
             rate,
             channels,
             format,
+            alive: DeviceAlive::unwatched(), // the constructors install the real watch
         })
     }
 }
@@ -334,20 +298,17 @@ impl Sink for CpalSink {
     }
 
     fn write(&mut self, frames: &[i32]) -> Result<(), SinkError> {
-        let mut off = 0;
-        while off < frames.len() {
-            off += self.prod.push_slice(&frames[off..]);
-            if off < frames.len() {
-                // Ring full — wait for the callback to drain some.
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-        }
-        Ok(())
+        // Ring full → wait for the callback to drain some; device gone → Closed.
+        let alive = &self.alive;
+        push_blocking(&mut self.prod, frames, || alive.gone())
     }
 
     fn flush(&mut self) -> Result<(), SinkError> {
         // Wait for the callback to play out what's buffered.
         while self.prod.occupied_len() > 0 {
+            if self.alive.gone() {
+                return Err(SinkError::Closed);
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         Ok(())
@@ -371,204 +332,5 @@ impl Sink for CpalSink {
     fn set_volume(&mut self, volume: f32) {
         self.volume
             .store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    //! Device-free tests for the seek-discard splice. They drive the real
-    //! real-time fill ([`Fill`]) against an in-memory ring, so the sample-to-sample
-    //! discontinuity a listener hears on seek is measured with no cpal device.
-    use super::*;
-    use std::collections::VecDeque;
-
-    /// 16-bit source value 100 at canonical 24-bit scale (`100 << 8`) — full-scale
-    /// steady pre-seek audio. Matches the deck fade-in test so the two curves line
-    /// up by inspection.
-    const FULL: i32 = 25_600;
-    /// Fade length (interleaved samples) used in the tests: equals the deck's
-    /// `fade_len` at 48 kHz mono, and a multiple of 4 so the smoothstep waypoints
-    /// land on exact dyadic fractions of `FULL`.
-    const FADE_LEN: u32 = 384;
-
-    /// In-memory stand-in for the ring consumer: pops buffered samples FIFO and
-    /// records whether it was cleared.
-    struct FakeRing {
-        buf: VecDeque<i32>,
-        cleared: bool,
-    }
-    impl FakeRing {
-        /// A ring holding `n` samples of steady full-scale pre-seek audio.
-        fn steady(n: usize) -> Self {
-            Self {
-                buf: std::iter::repeat_n(FULL, n).collect(),
-                cleared: false,
-            }
-        }
-    }
-    impl Ring for FakeRing {
-        fn pop(&mut self) -> Option<i32> {
-            self.buf.pop_front()
-        }
-        fn clear(&mut self) {
-            self.buf.clear();
-            self.cleared = true;
-        }
-    }
-
-    fn max_abs_delta(xs: &[i32]) -> i64 {
-        xs.windows(2)
-            .map(|w| i64::from(w[1]).abs_diff(i64::from(w[0])) as i64)
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// `max |x[i] − 2·x[i−1] + x[i−2]|` — the discrete second difference's peak.
-    /// A smoothstep ramp (C¹ at both ends, bounded curvature) keeps this tiny
-    /// (≈ FULL·6/FADE_LEN²); a slope break — a hard clear, or a *linear* ramp's
-    /// corners — spikes it (a step ≈ 2·FULL, a linear corner ≈ FULL/FADE_LEN).
-    fn second_difference_peak(xs: &[i32]) -> i64 {
-        xs.windows(3)
-            .map(|w| (i64::from(w[2]) - 2 * i64::from(w[1]) + i64::from(w[0])).abs())
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// Emit `steady` samples of pre-seek audio, then raise the discard flag and
-    /// service it (one callback: `begin` once, then `after` `next` calls). Returns
-    /// the full output stream (canonical i32, underrun → 0).
-    fn run_seek_discard(fade_len: u32, steady: usize, after: usize) -> (Vec<i32>, FakeRing, bool) {
-        let mut fill = Fill::new(fade_len);
-        let mut ring = FakeRing::steady(steady + after + 8);
-        let flush = AtomicBool::new(false);
-        let mut out = Vec::new();
-        for _ in 0..steady {
-            out.push(fill.next(&mut ring, &flush, 1.0).unwrap_or(0));
-        }
-        // Seek: the producer requests the discard, then blocks for the ack.
-        flush.store(true, Ordering::Release);
-        fill.begin(&flush, &mut ring);
-        for _ in 0..after {
-            out.push(fill.next(&mut ring, &flush, 1.0).unwrap_or(0));
-        }
-        let acked = !flush.load(Ordering::Acquire);
-        (out, ring, acked)
-    }
-
-    #[test]
-    fn seek_discard_without_fade_steps_to_silence() {
-        // Characterizes the click with the fade disabled (`fade_len == 0`, the
-        // instant-clear fallback): the output steps from the last buffered sample
-        // (FULL) straight to 0 the moment the flush is serviced. That full-scale
-        // step IS the click — the RED number we measure.
-        let (out, ring, acked) = run_seek_discard(0, 64, 64);
-        assert_eq!(out[63], FULL, "last pre-seek sample is full scale");
-        assert_eq!(out[64], 0, "instant clear drops straight to silence");
-        assert_eq!(
-            max_abs_delta(&out[63..]),
-            i64::from(FULL),
-            "hard step FULL→0 = the click"
-        );
-        assert!(ring.cleared && acked, "cleared + acked immediately");
-    }
-
-    #[test]
-    fn seek_discard_fade_declicks_the_splice() {
-        // With the fade armed the splice must be smooth: the buffered head ramps
-        // from full down to zero, so the largest adjacent step is a tiny fraction
-        // of a hard FULL→0 jump.
-        let (out, _ring, _acked) = run_seek_discard(FADE_LEN, 64, FADE_LEN as usize + 64);
-        let delta = max_abs_delta(&out[63..]);
-        assert!(
-            delta < i64::from(FULL) / 50,
-            "splice delta {delta} must be «FULL/50 ({}); a hard clear would be {FULL}",
-            FULL / 50
-        );
-    }
-
-    #[test]
-    fn seek_discard_fade_is_monotonic_to_zero_with_exact_waypoints() {
-        // Service the discard with no steady prefix, so index 0 is the first faded
-        // sample.
-        let mut fill = Fill::new(FADE_LEN);
-        let mut ring = FakeRing::steady(FADE_LEN as usize + 64);
-        let flush = AtomicBool::new(false);
-        flush.store(true, Ordering::Release);
-        fill.begin(&flush, &mut ring);
-        let fade: Vec<i32> = (0..FADE_LEN as usize + 8)
-            .map(|_| fill.next(&mut ring, &flush, 1.0).unwrap_or(0))
-            .collect();
-
-        // Starts at full — continuous with the last pre-seek sample (t=1 ⇒ g=1).
-        assert_eq!(fade[0], FULL, "first faded sample is full level");
-        // Monotonically non-increasing across the whole fade (a clean descent).
-        for i in 1..FADE_LEN as usize {
-            assert!(
-                fade[i] <= fade[i - 1],
-                "fade must fall at {i}: {} > {}",
-                fade[i],
-                fade[i - 1]
-            );
-        }
-        // Falling-smoothstep waypoints are exact (FULL × dyadic fractions):
-        //   t=0.75 → 0.84375 → 21600 ; t=0.5 → 0.5 → 12800 ; t=0.25 → 0.15625 → 4000.
-        let n = FADE_LEN as usize;
-        assert_eq!(fade[n / 4], 21_600, "quarter in ⇒ smoothstep(0.75)");
-        assert_eq!(fade[n / 2], 12_800, "half in ⇒ smoothstep(0.5)");
-        assert_eq!(
-            fade[3 * n / 4],
-            4_000,
-            "three-quarters in ⇒ smoothstep(0.25)"
-        );
-        // No slope break anywhere across the fade-out (the real de-click gate,
-        // complementing the monotonic check above). The audible shape is a steady
-        // full level continuing INTO the fade and out to silence, so prepend two
-        // steady-FULL samples to include the steady→fade junction: a smoothstep is
-        // C¹ at t=1 (zero slope) so that junction is smooth, as is the fade→silence
-        // junction at t=0. The peak second difference therefore stays ≈ FULL·6/n²
-        // (a couple of LSB), orders of magnitude below a hard clear's 0→FULL step
-        // (≈ 2·FULL) or even a linear ramp's corner (≈ FULL/n ≈ 66). Bound K is set
-        // well under that corner so the test proves *smoothstep*, not merely
-        // *some* ramp.
-        let shaped: Vec<i32> = [FULL, FULL]
-            .into_iter()
-            .chain(fade.iter().copied())
-            .collect();
-        let d2 = second_difference_peak(&shaped);
-        let k = i64::from(FULL) / 1000; // 25 — below a linear corner (~66), far below a step
-        assert!(
-            d2 <= k,
-            "fade-out second-difference peak {d2} exceeds {k} — the ramp has a slope \
-             break (not a bounded-curvature smoothstep); a hard clear would be ~{}",
-            2 * i64::from(FULL)
-        );
-
-        // Lands at silence; the remainder is cleared and the ack released.
-        assert_eq!(fade[n - 1], 0, "fade ends at zero");
-        assert!(
-            ring.cleared,
-            "remaining pre-seek audio cleared after the fade"
-        );
-        assert!(
-            !flush.load(Ordering::Acquire),
-            "discard ack released after the clear"
-        );
-        assert_eq!(fade[n + 4], 0, "stays silent past the fade (no re-trigger)");
-    }
-
-    #[test]
-    fn fade_out_respects_volume_gain() {
-        // The fade multiplies on top of the smoothed volume gain, so a half-volume
-        // stream fades out from half scale, not full.
-        let mut fill = Fill::new(FADE_LEN);
-        let mut ring = FakeRing::steady(FADE_LEN as usize + 8);
-        let flush = AtomicBool::new(false);
-        // Pre-ramp the volume gain to a steady 0.5 so the first faded sample is
-        // half scale (not mid-ramp).
-        fill.cur_gain = 0.5;
-        flush.store(true, Ordering::Release);
-        fill.begin(&flush, &mut ring);
-        let first = fill.next(&mut ring, &flush, 0.5).unwrap_or(0);
-        assert_eq!(first, FULL / 2, "fade starts from the volume-scaled level");
     }
 }

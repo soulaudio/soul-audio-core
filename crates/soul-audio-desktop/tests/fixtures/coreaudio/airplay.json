@@ -1,0 +1,19 @@
+{
+  "id": "airplay",
+  "source": "synthesized",
+  "notes": "AirPlay endpoint: fixed rate, Float32; hog not granted (unverified).",
+  "name": "Living Room",
+  "transport": "airplay",
+  "nominal_rate": 44100,
+  "hog": "refused",
+  "fixed_rate": true,
+  "formats": [
+    {
+      "rate_min": 44100,
+      "rate_max": 44100,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    }
+  ]
+}

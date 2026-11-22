@@ -1,0 +1,19 @@
+{
+  "id": "airpods",
+  "source": "synthesized",
+  "notes": "Bluetooth A2DP: single 48k Float32; hog not granted (unverified); mic use drops to SCO 16k (developer forum 770232).",
+  "name": "AirPods Pro",
+  "transport": "bluetooth",
+  "nominal_rate": 48000,
+  "hog": "refused",
+  "fixed_rate": true,
+  "formats": [
+    {
+      "rate_min": 48000,
+      "rate_max": 48000,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    }
+  ]
+}

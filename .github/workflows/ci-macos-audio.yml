@@ -1,0 +1,110 @@
+name: CI (macOS audio)
+
+# The CoreAudio exclusive / bit-perfect sink (`soul-audio-desktop`, feature
+# `coreaudio-exclusive`) only compiles on macOS, so the Linux gate never sees it.
+# This job builds + lints it, runs its device-free unit tests, then runs the
+# real-device suite against a BlackHole virtual output (hosted runners have no audio
+# hardware): hog mode, per-track native-rate switching across BlackHole's full rate
+# ladder, restore-on-drop, cross-process "device in use", release-on-process-death,
+# and a bit-exact loopback capture.
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "crates/soul-audio-desktop/**"
+      - "crates/soul-audio-core/src/sink.rs"
+      - "crates/soul-audio-core/src/convert.rs"
+      - ".github/workflows/ci-macos-audio.yml"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - "crates/soul-audio-desktop/**"
+      - "crates/soul-audio-core/src/sink.rs"
+      - "crates/soul-audio-core/src/convert.rs"
+      - ".github/workflows/ci-macos-audio.yml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-macos-audio-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coreaudio:
+    name: coreaudio exclusive (${{ matrix.os }})
+    # Every Apple desktop architecture GitHub hosts: Apple silicon on the current and
+    # next macOS, plus Intel. The fake-HAL contract suite (every recorded device profile
+    # × every fault) needs no device; the BlackHole steps exercise the real AUHAL path.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Rust
+        run: rustup component add clippy
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Clippy (coreaudio-exclusive)
+        run: cargo clippy -p soul-audio-desktop --features coreaudio-exclusive --all-targets -- -D warnings
+
+      - name: Unit + fake-HAL contract suite (device-free)
+        run: cargo test -p soul-audio-desktop --features coreaudio-exclusive
+
+      # BlackHole is a GPL-3.0 virtual audio driver installed only on the CI runner as
+      # a test fixture — never linked into or shipped with the crate. coreaudiod must
+      # be restarted to load the new HAL plug-in.
+      # Same recipe as mozilla/cubeb-coreaudio-rs CI. Hosted runners only have a flaky
+      # "Null Audio Device" (missing on some runs), so always install a real one and
+      # make it the default output.
+      - name: Install BlackHole virtual audio device
+        run: |
+          brew install --cask blackhole-2ch
+          brew install switchaudio-osx
+          sudo killall -9 coreaudiod || true
+          for i in $(seq 1 30); do
+            if system_profiler SPAudioDataType | grep -q "BlackHole 2ch"; then break; fi
+            sleep 1
+          done
+          system_profiler SPAudioDataType | grep -q "BlackHole 2ch" || { echo "::error::BlackHole did not load"; exit 1; }
+          SwitchAudioSource -s "BlackHole 2ch" -t output
+
+      - name: Capture BlackHole device profile (artifact)
+        run: >
+          cargo run -p soul-audio-desktop --features coreaudio-exclusive
+          --example coreaudio_device_report -- --probe-hog --out device-profiles
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: device-profiles-${{ matrix.os }}
+          path: device-profiles/
+
+      - name: Hardware suite on BlackHole (hog / native rate / restore / in-use / crash)
+        env:
+          SOUL_CA_DEVICE: BlackHole 2ch
+        run: >
+          cargo test -p soul-audio-desktop --features coreaudio-exclusive
+          --test coreaudio_exclusive_suite --
+          --ignored --nocapture --test-threads=1
+          --skip bit_perfect_loopback_through_blackhole
+
+      # Captures BlackHole's input side (hosted runners grant the microphone TCC
+      # permission). Green on macos-15, macos-26 and macos-15-intel, so it gates.
+      - name: Bit-perfect loopback through BlackHole
+        env:
+          SOUL_CA_DEVICE: BlackHole 2ch
+        run: >
+          cargo test -p soul-audio-desktop --features coreaudio-exclusive
+          --test coreaudio_exclusive_suite --
+          --ignored --nocapture --exact bit_perfect_loopback_through_blackhole

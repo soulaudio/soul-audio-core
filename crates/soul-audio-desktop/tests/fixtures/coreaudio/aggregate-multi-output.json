@@ -1,0 +1,26 @@
+{
+  "id": "aggregate-multi-output",
+  "source": "synthesized",
+  "notes": "Aggregate / Multi-Output devices have NO hog-mode property (WebRTC source comment).",
+  "name": "Multi-Output Device",
+  "transport": "aggregate",
+  "nominal_rate": 48000,
+  "hog": "absent",
+  "fixed_rate": false,
+  "formats": [
+    {
+      "rate_min": 44100,
+      "rate_max": 44100,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 48000,
+      "rate_max": 48000,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "id": "apple-silicon-headphone-jack",
+  "source": "synthesized",
+  "notes": "Apple: built-in DAC up to 96 kHz (support.apple.com/108351). Exact format list unverified \u2014 replace with a capture.",
+  "name": "External Headphones",
+  "transport": "built-in",
+  "nominal_rate": 48000,
+  "hog": "supported",
+  "fixed_rate": false,
+  "formats": [
+    {
+      "rate_min": 44100,
+      "rate_max": 44100,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 48000,
+      "rate_max": 48000,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 88200,
+      "rate_max": 88200,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    },
+    {
+      "rate_min": 96000,
+      "rate_max": 96000,
+      "float": true,
+      "bits": 32,
+      "channels": 2
+    }
+  ]
+}

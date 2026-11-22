@@ -1974,11 +1974,14 @@ name = "soul-audio-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "coreaudio-rs",
  "cpal",
  "embedded-io 0.6.1",
  "embedded-io-adapters",
  "ringbuf",
+ "serde_json",
  "soul-audio-core",
+ "soul-audio-desktop",
  "wasapi",
 ]
 
