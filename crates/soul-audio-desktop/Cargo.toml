@@ -29,6 +29,13 @@ wasapi-exclusive = ["playback", "dep:wasapi"]
 # real-time fill from `playback`; adds a direct `coreaudio-rs` dep (the same 0.11 cpal
 # already links on macOS, so no second copy) for its safe AUHAL + device helpers.
 coreaudio-exclusive = ["playback", "dep:coreaudio-rs"]
+# ALSA exclusive / bit-perfect output (Linux only): the card opened directly as
+# `hw:CARD,DEV` so the stream reaches the DAC without PipeWire/PulseAudio's mixer or
+# resampler, with the device claimed first through the D-Bus device-reservation
+# protocol every Linux audio server honours. Reuses the shared ring + the real-time
+# fill from `playback`; adds `alsa` (the same crate cpal already links on Linux, so
+# no second copy) and `zbus` for the reservation.
+alsa-exclusive = ["playback", "dep:alsa", "dep:zbus"]
 # Exposes `fake_hal` (the scriptable fake CoreAudio-style device world) to downstream
 # test suites. Never enabled in shipped builds. Needs only the ring (no cpal), so the
 # contract suite also runs on Linux CI without ALSA.
@@ -56,6 +63,22 @@ optional = true
 [target.'cfg(windows)'.dependencies.wasapi]
 version = "0.27"
 optional = true
+
+# ALSA PCM access (Linux only, MIT/Apache-2.0). Pinned to the same 0.9 line cpal 0.15
+# links on Linux so the graph keeps one copy. Its wrappers are SAFE, so this crate stays
+# `forbid(unsafe_code)`; libasound is already a build dependency of the cpal backend.
+[target.'cfg(target_os = "linux")'.dependencies.alsa]
+version = "0.9"
+optional = true
+
+# The D-Bus device-reservation client (Linux only, MIT). `zbus` is pure Rust — no
+# libdbus system dependency — and only compiled when `alsa-exclusive` is on.
+[target.'cfg(target_os = "linux")'.dependencies.zbus]
+version = "5"
+optional = true
+# Default features on purpose: the blocking API is a wrapper over zbus's async core, so
+# `default-features = false` drops the executor it needs and the crate does not build.
+features = ["blocking-api"]
 
 # CoreAudio AUHAL + HAL device helpers (macOS only, MIT/Apache-2.0). Pinned to the same
 # 0.11 line cpal 0.15 uses, with the same minimal feature set, so the graph keeps one

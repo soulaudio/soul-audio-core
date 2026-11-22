@@ -7,6 +7,10 @@
 #![forbid(unsafe_code)]
 #![deny(unconditional_recursion)]
 
+#[cfg(all(target_os = "linux", feature = "alsa-exclusive"))]
+pub mod alsa_exclusive;
+#[cfg(all(target_os = "linux", feature = "alsa-exclusive"))]
+pub mod alsa_reserve;
 /// CoreAudio exclusive / bit-perfect output (macOS only, behind `coreaudio-exclusive`).
 #[cfg(all(target_os = "macos", feature = "coreaudio-exclusive"))]
 pub mod coreaudio_exclusive;
@@ -30,6 +34,8 @@ pub mod sources;
 #[cfg(all(windows, feature = "wasapi-exclusive"))]
 pub mod wasapi_exclusive;
 
+#[cfg(all(target_os = "linux", feature = "alsa-exclusive"))]
+pub use alsa_exclusive::{AlsaDevice, AlsaExclusiveSink};
 #[cfg(all(target_os = "macos", feature = "coreaudio-exclusive"))]
 pub use coreaudio_exclusive::{
     CoreAudioExclusiveSink, CoreAudioHal, ExclusiveError, coreaudio_output_device_names, hog_owner,
