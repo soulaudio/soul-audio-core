@@ -10,10 +10,28 @@ use crate::decoder::DecodeError;
 use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
 
-/// Maximum SEEKTABLE points retained (no-alloc). A typical encoder writes one
-/// point per ~1–10 s; beyond this cap the extra points are ignored (seeking
-/// stays correct, just coarser). Placeholders are never stored.
-const MAX_SEEK_POINTS: usize = 512;
+/// Maximum SEEKTABLE points retained (no-alloc).
+///
+/// The reference encoder's default is `-S 10s` — one point per ten seconds — so
+/// 128 points keeps **every** point of any stream up to ~21 minutes, which is
+/// every ordinary music track (a 3–8 minute track carries 18–48 points). Longer
+/// streams are **subsampled** across their whole length rather than truncated
+/// (see [`FlacDemuxer::new`]), so the retained index always spans the stream and
+/// the comment this replaces — "the extra points are ignored (seeking stays
+/// correct, just coarser)" — is now actually true.
+///
+/// Was 512 with truncation, which was the worse failure mode: a stream with more
+/// than 512 points (over ~85 minutes — a live set, a mix, an audiobook chapter)
+/// had everything past the cap **unindexed**, so a seek into the tail
+/// decode-discarded forward from the 85-minute mark. Subsampling trades uniform
+/// granularity for guaranteed whole-stream coverage, which is the right way
+/// round. Placeholders are never stored.
+///
+/// For scale, Rockbox caps at 5000 points (a 2 GB stream carries ~4869) — a
+/// reasonable figure with megabytes of RAM to spend; this decoder's whole
+/// `FlacDemuxer` has to fit an MCU's budget, where this array was 8,192 B of a
+/// 51,488 B `AnyDecoder`.
+const MAX_SEEK_POINTS: usize = 128;
 
 /// FLAC container parser over a byte [`Source`].
 pub struct FlacDemuxer<S> {
@@ -85,11 +103,27 @@ impl<S: Source> FlacDemuxer<S> {
                     stream_info = Some(parse_streaminfo(&si)?);
                 }
                 3 => {
-                    // SEEKTABLE: length/18 points of 18 bytes each.
+                    // SEEKTABLE: length/18 points of 18 bytes each. The count is
+                    // known up front from the block length, which is what lets us
+                    // SUBSAMPLE evenly instead of truncating: every point is still
+                    // read off the wire (they are fixed-width and we must consume
+                    // them), but only an evenly-spaced subset is retained, so the
+                    // index spans the whole stream however many points it carries.
                     let points = length as usize / 18;
                     let mut pt = [0u8; 18];
-                    for _ in 0..points {
+                    for i in 0..points {
                         read_exact(&mut src, &mut pt)?;
+                        // Keep index `i` iff it is one of the first
+                        // MAX_SEEK_POINTS evenly-spaced indices of `points`
+                        // (i == 0, then whenever the scaled index advances).
+                        // Retains exactly min(points, MAX_SEEK_POINTS) points.
+                        let keep = points <= MAX_SEEK_POINTS
+                            || i == 0
+                            || (i * MAX_SEEK_POINTS) / points
+                                != ((i - 1) * MAX_SEEK_POINTS) / points;
+                        if !keep {
+                            continue;
+                        }
                         let sample = u64::from_be_bytes([
                             pt[0], pt[1], pt[2], pt[3], pt[4], pt[5], pt[6], pt[7],
                         ]);
@@ -357,6 +391,87 @@ mod tests {
         v.extend_from_slice(si);
         v.extend_from_slice(audio);
         v
+    }
+
+    /// `fLaC` + STREAMINFO + a SEEKTABLE carrying `points` evenly-spaced points
+    /// (10 s apart at 44.1 kHz, matching the reference encoder's `-S 10s`
+    /// default), then audio. The last point's sample number is returned so a
+    /// test can assert the retained index actually reaches the end of the table.
+    fn flac_with_seektable(points: usize) -> (Vec<u8>, u64) {
+        const SPACING: u64 = 441_000; // 10 s @ 44.1 kHz
+        let si = streaminfo(44_100, 2, 16, SPACING * points as u64);
+        let mut v = Vec::new();
+        v.extend_from_slice(b"fLaC");
+        v.push(0x00); // not last, type 0 (STREAMINFO)
+        v.extend_from_slice(&[0, 0, 34]);
+        v.extend_from_slice(&si);
+        let len = (points * 18) as u32;
+        v.push(0x83); // last block + type 3 (SEEKTABLE)
+        v.extend_from_slice(&len.to_be_bytes()[1..4]);
+        for i in 0..points {
+            let sample = SPACING * i as u64;
+            v.extend_from_slice(&sample.to_be_bytes()); // sample number
+            v.extend_from_slice(&(i as u64 * 1024).to_be_bytes()); // byte offset
+            v.extend_from_slice(&4096u16.to_be_bytes()); // frame samples
+        }
+        v.extend_from_slice(&[0u8; 8]); // a little audio
+        (v, SPACING * (points.saturating_sub(1)) as u64)
+    }
+
+    /// A table that fits the cap is retained in full — the common case. At the
+    /// encoder's default 10 s spacing, 128 points is ~21 minutes, so every
+    /// ordinary music track lands here untouched.
+    #[test]
+    fn seektable_within_the_cap_is_retained_in_full() {
+        for points in [1usize, 30, MAX_SEEK_POINTS] {
+            let (bytes, last) = flac_with_seektable(points);
+            let d = FlacDemuxer::new(SliceSource::new(&bytes)).unwrap();
+            assert_eq!(
+                d.seek_count, points,
+                "{points} points should all be retained"
+            );
+            assert_eq!(
+                d.seek_points[d.seek_count - 1].0,
+                last,
+                "{points} points: the last retained point must be the table's last"
+            );
+        }
+    }
+
+    /// **The regression this cap's subsampling exists for.** An oversized table
+    /// must be thinned across its WHOLE span, not truncated at the cap: the
+    /// retained index has to still reach the end of the stream, or a seek into
+    /// the tail has nothing to aim at and decode-discards forward from the
+    /// truncation point.
+    #[test]
+    fn oversized_seektable_is_subsampled_across_the_whole_span() {
+        // 720 points at 10 s = a 2-hour stream; 5.6x the cap.
+        let (bytes, last) = flac_with_seektable(720);
+        let d = FlacDemuxer::new(SliceSource::new(&bytes)).unwrap();
+
+        assert_eq!(d.seek_count, MAX_SEEK_POINTS, "should fill the cap exactly");
+
+        let kept = &d.seek_points[..d.seek_count];
+        // Spans the whole table: the last retained point is in the final stride,
+        // not at the 128th of 720 points (which truncation would have given).
+        let stride = 720u64.div_ceil(MAX_SEEK_POINTS as u64) * 441_000;
+        assert!(
+            kept[kept.len() - 1].0 + stride >= last,
+            "last retained point {} is not within one stride of the table's last {last} \
+             — the index does not span the stream",
+            kept[kept.len() - 1].0
+        );
+        // Strictly increasing, and monotone byte offsets (a seek binary-searches these).
+        for w in kept.windows(2) {
+            assert!(w[1].0 > w[0].0, "sample numbers must strictly increase");
+            assert!(w[1].1 > w[0].1, "byte offsets must strictly increase");
+        }
+        // Truncation would have stopped here; assert we went past it.
+        assert!(
+            kept[kept.len() - 1].0 > 441_000 * (MAX_SEEK_POINTS as u64 - 1),
+            "retained index stops inside the first {MAX_SEEK_POINTS} points — that is \
+             truncation, not subsampling"
+        );
     }
 
     #[test]
