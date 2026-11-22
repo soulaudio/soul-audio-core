@@ -176,9 +176,12 @@ fn main() {
     bench("flac-in-ogg", || {
         open_decode(include_bytes!("../testdata/flac-in-ogg-multipage.ogg"))
     });
+    // AAC decode is patent-gated off by default (`aac` feature).
+    #[cfg(feature = "aac")]
     bench("aac-lc", || {
         open_decode(include_bytes!("../testdata/aac.m4a"))
     });
+    #[cfg(feature = "aac")]
     bench("he-aac (sbr)", || {
         open_decode(include_bytes!("../testdata/sbr.m4a"))
     });
@@ -200,6 +203,7 @@ fn main() {
     bench("mka-flac", || {
         open_decode(include_bytes!("../../../testdata/tone-flac.mka"))
     });
+    #[cfg(feature = "aac")]
     bench("mka-aac", || {
         open_decode(include_bytes!("../../../testdata/tone-aac.mka"))
     });

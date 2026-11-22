@@ -815,6 +815,11 @@ const MATRIX: &[Fmt] = &[
 fn decode_vs_reference() {
     let mut failures = Vec::new();
     for f in MATRIX {
+        // AAC decode is patent-gated off by default (`aac` feature); skip its
+        // cases (aac-m4a / aac-adts / mka-aac) when the feature is off.
+        if !cfg!(feature = "aac") && (f.name.contains("aac") || f.name.contains("sbr")) {
+            continue;
+        }
         let Some(case) = f.decode else { continue };
 
         // Stream info + (streaming) no-declared-length, mirroring the bespoke
@@ -903,6 +908,11 @@ fn pcm_seek_tail(bytes: &'static [u8], target: u64) -> (u16, u64, Vec<i32>) {
 fn seek_round_trip() {
     let mut failures = Vec::new();
     for f in MATRIX {
+        // AAC decode is patent-gated off by default (`aac` feature); skip its
+        // cases (aac-m4a / aac-adts / mka-aac) when the feature is off.
+        if !cfg!(feature = "aac") && (f.name.contains("aac") || f.name.contains("sbr")) {
+            continue;
+        }
         let Some(case) = f.seek else { continue };
         let full = decode_pcm_all(case.fixture);
 
@@ -1145,6 +1155,11 @@ fn seek_cost_bounded() {
 
     let mut failures = Vec::new();
     for f in MATRIX {
+        // AAC decode is patent-gated off by default (`aac` feature); skip its
+        // cases (aac-m4a / aac-adts / mka-aac) when the feature is off.
+        if !cfg!(feature = "aac") && (f.name.contains("aac") || f.name.contains("sbr")) {
+            continue;
+        }
         let Some(case) = f.cost else { continue };
         let total = cost_total(f, case.fixture);
         assert!(
@@ -1301,6 +1316,11 @@ fn seek_playthrough(bytes: &'static [u8], rate: u32, ch: u16, p: u64, blocks: us
 #[test]
 fn declick() {
     for f in MATRIX {
+        // AAC decode is patent-gated off by default (`aac` feature); skip its
+        // cases (aac-m4a / aac-adts / mka-aac) when the feature is off.
+        if !cfg!(feature = "aac") && (f.name.contains("aac") || f.name.contains("sbr")) {
+            continue;
+        }
         let Some(case) = f.declick else { continue };
         let fixture = case.fixture;
         big_stack(move || {
@@ -1393,6 +1413,11 @@ fn declick() {
 fn duration() {
     let mut failures = Vec::new();
     for f in MATRIX {
+        // AAC decode is patent-gated off by default (`aac` feature); skip its
+        // cases (aac-m4a / aac-adts / mka-aac) when the feature is off.
+        if !cfg!(feature = "aac") && (f.name.contains("aac") || f.name.contains("sbr")) {
+            continue;
+        }
         let Some(case) = f.duration else { continue };
 
         let (pcm, chn) = big_stack(move || {

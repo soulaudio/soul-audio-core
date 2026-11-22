@@ -17,6 +17,9 @@ anyhow = "1"
 
 [features]
 default = []
+# AAC decode is patent-gated OFF by default in soul-audio-core (Via LA). Forward the opt-in
+# so the desktop harness's AAC codec-detection coverage can be enabled; products never set it.
+aac = ["soul-audio-core/aac"]
 playback = ["dep:cpal", "dep:ringbuf"]
 # WASAPI exclusive / bit-perfect output (Windows only). Reuses the shared ring + the
 # real-time fill from `playback`; adds the `wasapi` backend for exclusive-mode streams.

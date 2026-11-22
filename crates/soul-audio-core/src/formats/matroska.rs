@@ -20,8 +20,10 @@
 use embedded_io::{ErrorType, Read};
 
 use crate::decoder::{DecodeError, Decoder, SeekableDecoder};
+#[cfg(feature = "aac")]
 use crate::demux::mp4::parse_audio_specific_config;
 use crate::demux::{Demuxer, MatroskaDemuxer};
+#[cfg(feature = "aac")]
 use crate::formats::aac::AacDecoder;
 use crate::formats::flac::FlacDecoder;
 use crate::formats::opus::conformance::OpusFrameDecoder;
@@ -112,7 +114,9 @@ pub enum MatroskaDecoder<S, P> {
     Flac(FlacDecoder<MatroskaFlacReader<S>, P>),
     /// `A_AAC` — [`AacDecoder`] fed one `SimpleBlock` (= raw access unit) at a
     /// time; config from the `CodecPrivate` `AudioSpecificConfig`. Carves its
-    /// decoded-PCM carry buffer from the same shared `P` scratch.
+    /// decoded-PCM carry buffer from the same shared `P` scratch. Patent-gated
+    /// behind the `aac` feature (OFF by default).
+    #[cfg(feature = "aac")]
     Aac(AacDecoder<S, P>),
 }
 
@@ -155,6 +159,9 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> MatroskaDecoder<S, P> {
                 let reader = MatroskaFlacReader::new(demux)?;
                 Ok(MatroskaDecoder::Flac(FlacDecoder::new_in(reader, scratch)?))
             }
+            // AAC is patent-gated behind the `aac` feature; with it off, an
+            // `A_AAC` track falls through to `Unsupported` below.
+            #[cfg(feature = "aac")]
             b"A_AAC" => {
                 let config = parse_audio_specific_config(demux.codec_private())?;
                 Ok(MatroskaDecoder::Aac(AacDecoder::new_matroska_in(
@@ -183,6 +190,7 @@ impl<S: SeekSource, P: AsRef<[i32]> + AsMut<[i32]>> MatroskaDecoder<S, P> {
         match self {
             MatroskaDecoder::Opus(d) => d.seek_to(sample),
             MatroskaDecoder::Flac(d) => SeekableDecoder::seek_to(d, sample),
+            #[cfg(feature = "aac")]
             MatroskaDecoder::Aac(d) => d.seek_to(sample),
         }
     }
@@ -202,6 +210,7 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for MatroskaDecoder<S, P
         match self {
             MatroskaDecoder::Opus(d) => d.stream_info(),
             MatroskaDecoder::Flac(d) => d.stream_info(),
+            #[cfg(feature = "aac")]
             MatroskaDecoder::Aac(d) => d.stream_info(),
         }
     }
@@ -210,6 +219,7 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for MatroskaDecoder<S, P
         match self {
             MatroskaDecoder::Opus(d) => d.decode_into(out),
             MatroskaDecoder::Flac(d) => d.decode_into(out),
+            #[cfg(feature = "aac")]
             MatroskaDecoder::Aac(d) => d.decode_into(out),
         }
     }
@@ -220,6 +230,7 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for MatroskaDecoder<S, P
         match self {
             MatroskaDecoder::Opus(_) => crate::model::SourceCodec::Opus,
             MatroskaDecoder::Flac(_) => crate::model::SourceCodec::Flac,
+            #[cfg(feature = "aac")]
             MatroskaDecoder::Aac(_) => crate::model::SourceCodec::Aac,
         }
     }

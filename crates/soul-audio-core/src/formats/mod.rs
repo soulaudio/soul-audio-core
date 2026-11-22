@@ -11,6 +11,11 @@
 //! - DSD containers ([`dsf`], [`dff`]) implement [`crate::DsdDecoder`]; [`dst`]
 //!   is the lossless DSD-stream decompressor they feed through.
 
+/// AAC-LC / HE-AAC decoder. Patent-gated: compiled only with the `aac` cargo
+/// feature (OFF by default) — AAC is a Via LA patent and must not ship in soul
+/// products. The MP4/ADTS/Matroska *container* parsers stay compiled; only this
+/// decoder is gated. See the crate's `aac` feature in Cargo.toml.
+#[cfg(feature = "aac")]
 pub mod aac;
 pub mod aiff;
 pub mod alac;

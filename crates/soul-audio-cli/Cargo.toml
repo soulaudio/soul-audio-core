@@ -19,6 +19,9 @@ anyhow = "1"
 [features]
 default = []
 playback = ["soul-audio-desktop/playback"]
+# AAC decode is patent-gated OFF by default in soul-audio-core (Via LA: $15k + $0.98/unit).
+# Enabling this opts the CLI's AAC render/e2e coverage back in; shipped products never set it.
+aac = ["soul-audio-core/aac", "soul-audio-desktop/aac"]
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -528,6 +528,15 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
         v.push(("ps-local", b));
     }
 
+    // AAC decode is patent-gated off by default (`aac` feature); drop its seeds
+    // (aac / sbr / ps-local) so the default fuzz run doesn't target the absent
+    // decoder.
+    if !cfg!(feature = "aac") {
+        v.retain(|(label, _)| {
+            !(label.contains("aac") || label.contains("sbr") || label.contains("ps-local"))
+        });
+    }
+
     v
 }
 
