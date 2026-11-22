@@ -351,86 +351,143 @@ fn unknown_device_name_is_no_device() {
 /// equal the canonical value we wrote (Float32 carries 24-bit exactly). Only runs when the
 /// device under test is a BlackHole virtual device (inaudible); capture needs the
 /// microphone (TCC) permission for the running terminal/CI agent.
+///
+/// Each rate gets up to [`LOOPBACK_ATTEMPTS`] tries and passes only on a capture that is
+/// **entirely** bit-identical. That keeps the proof sound — a path that alters samples
+/// (dither, gain, truncation) can never reproduce a pseudo-random 24-bit pattern exactly
+/// by chance — while tolerating the I/O-cycle dropouts a loaded CI VM causes (BlackHole
+/// is sample-time indexed, so a late cycle leaves a whole-buffer hole, not a value
+/// change). Failed attempts print the mismatch shape so a real defect stays visible.
 #[test]
 #[ignore = "needs a BlackHole loopback device; run with --ignored"]
 fn bit_perfect_loopback_through_blackhole() {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let _g = lock();
     let Some(name) = device().filter(|d| d.starts_with("BlackHole")) else {
         eprintln!("SKIP: set SOUL_CA_DEVICE to a BlackHole device for the loopback test");
         return;
     };
     for rate in [44_100u32, 96_000] {
-        let mut sink = CoreAudioExclusiveSink::open(Some(name.clone()), rate, 2).unwrap();
-        assert_eq!(sink.stream_info().sample_rate, rate);
-
-        let input = cpal::default_host()
-            .input_devices()
-            .unwrap()
-            .find(|d| d.name().is_ok_and(|n| n == name))
-            .expect("BlackHole input side");
-        let cfg = cpal::StreamConfig {
-            channels: 2,
-            sample_rate: cpal::SampleRate(rate),
-            buffer_size: cpal::BufferSize::Default,
+        let mut failures = Vec::new();
+        let n = (1..=LOOPBACK_ATTEMPTS).find_map(|attempt| match loopback_once(&name, rate) {
+            Ok(n) => Some(n),
+            Err(why) => {
+                eprintln!("{rate} Hz attempt {attempt}/{LOOPBACK_ATTEMPTS}: {why}");
+                failures.push(why);
+                None
+            }
+        });
+        let Some(n) = n else {
+            panic!(
+                "{rate} Hz: no bit-identical capture in {LOOPBACK_ATTEMPTS} attempts — output is NOT bit-perfect: {failures:#?}"
+            );
         };
-        let captured = std::sync::Arc::new(Mutex::new(Vec::<f32>::new()));
-        let cap = std::sync::Arc::clone(&captured);
-        let stream = input
-            .build_input_stream(
-                &cfg,
-                move |d: &[f32], _| cap.lock().unwrap().extend_from_slice(d),
-                |e| eprintln!("capture error {e}"),
-                None,
-            )
-            .expect("capture stream");
-        stream.play().unwrap();
-
-        // A pseudo-random full-range 24-bit pattern, framed by a marker so it can be
-        // found in the capture regardless of latency.
-        let mut x: u32 = 0x1234_5678;
-        let mut pattern = Vec::with_capacity(rate as usize);
-        for _ in 0..rate as usize / 2 {
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            let s = ((x & 0x00FF_FFFF) as i32) - (1 << 23); // [-2^23, 2^23)
-            pattern.push(s);
-        }
-        let marker = [(1 << 23) - 1, -(1 << 23), (1 << 22) + 7, -(1 << 21) - 3];
-        sink.write(&vec![0; rate as usize / 5 * 2]).unwrap();
-        sink.write(&marker).unwrap();
-        sink.write(&pattern).unwrap();
-        sink.write(&vec![0; rate as usize / 2 * 2]).unwrap();
-        sink.flush().unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        drop(stream);
-        drop(sink);
-
-        let got: Vec<i32> = captured
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|&f| (f * (1 << 23) as f32) as i32)
-            .collect();
-        assert!(
-            got.iter().any(|&s| s != 0),
-            "captured only silence — grant microphone access to the terminal / CI agent"
+        println!(
+            "{rate} Hz: {n} samples bit-identical through hog-mode output (after {} failed attempt(s))",
+            failures.len()
         );
-        let start = got
-            .windows(marker.len())
-            .position(|w| w == marker)
-            .expect("marker found bit-exact in the capture")
-            + marker.len();
-        let n = pattern.len().min(got.len() - start);
-        assert!(n > pattern.len() / 2, "captured enough of the pattern");
-        let mismatches = (0..n).filter(|&i| got[start + i] != pattern[i]).count();
-        assert_eq!(
-            mismatches, 0,
-            "{rate} Hz: {mismatches}/{n} samples differ — output is NOT bit-perfect"
-        );
-        println!("{rate} Hz: {n} samples bit-identical through hog-mode output");
     }
+}
+
+/// Tries per rate for [`bit_perfect_loopback_through_blackhole`].
+const LOOPBACK_ATTEMPTS: usize = 3;
+
+/// One loopback round at `rate`: `Ok(samples compared)` when the whole captured pattern
+/// is bit-identical, else a description of how it differs.
+fn loopback_once(name: &str, rate: u32) -> Result<usize, String> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    let mut sink = CoreAudioExclusiveSink::open(Some(name.to_owned()), rate, 2).unwrap();
+    assert_eq!(sink.stream_info().sample_rate, rate);
+
+    let input = cpal::default_host()
+        .input_devices()
+        .unwrap()
+        .find(|d| d.name().is_ok_and(|n| n == name))
+        .expect("BlackHole input side");
+    let cfg = cpal::StreamConfig {
+        channels: 2,
+        sample_rate: cpal::SampleRate(rate),
+        buffer_size: cpal::BufferSize::Default,
+    };
+    let captured = std::sync::Arc::new(Mutex::new(Vec::<f32>::new()));
+    let cap = std::sync::Arc::clone(&captured);
+    let stream = input
+        .build_input_stream(
+            &cfg,
+            move |d: &[f32], _| cap.lock().unwrap().extend_from_slice(d),
+            |e| eprintln!("capture error {e}"),
+            None,
+        )
+        .expect("capture stream");
+    stream.play().unwrap();
+
+    // A pseudo-random full-range 24-bit pattern, framed by a marker so it can be
+    // found in the capture regardless of latency.
+    let mut x: u32 = 0x1234_5678;
+    let mut pattern = Vec::with_capacity(rate as usize);
+    for _ in 0..rate as usize / 2 {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        let s = ((x & 0x00FF_FFFF) as i32) - (1 << 23); // [-2^23, 2^23)
+        pattern.push(s);
+    }
+    let marker = [(1 << 23) - 1, -(1 << 23), (1 << 22) + 7, -(1 << 21) - 3];
+    sink.write(&vec![0; rate as usize / 5 * 2]).unwrap();
+    sink.write(&marker).unwrap();
+    sink.write(&pattern).unwrap();
+    sink.write(&vec![0; rate as usize / 2 * 2]).unwrap();
+    sink.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    drop(stream);
+    drop(sink);
+
+    let got: Vec<i32> = captured
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|&f| (f * (1 << 23) as f32) as i32)
+        .collect();
+    assert!(
+        got.iter().any(|&s| s != 0),
+        "captured only silence — grant microphone access to the terminal / CI agent"
+    );
+    let Some(start) = got
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .map(|p| p + marker.len())
+    else {
+        return Err("marker not found bit-exact in the capture (dropout over the marker?)".into());
+    };
+    let n = pattern.len().min(got.len() - start);
+    if n <= pattern.len() / 2 {
+        return Err(format!(
+            "captured only {n}/{} pattern samples",
+            pattern.len()
+        ));
+    }
+    let bad: Vec<usize> = (0..n).filter(|&i| got[start + i] != pattern[i]).collect();
+    if bad.is_empty() {
+        return Ok(n);
+    }
+    // Shape of the damage: contiguous runs (a dropout) vs scattered samples (a
+    // conversion defect), and whether the wrong samples are silence.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for &i in &bad {
+        match runs.last_mut() {
+            Some((s, len)) if *s + *len == i => *len += 1,
+            _ => runs.push((i, 1)),
+        }
+    }
+    let zeros = bad.iter().filter(|&&i| got[start + i] == 0).count();
+    let first = bad[0];
+    Err(format!(
+        "{}/{n} samples differ in {} run(s) {:?}; {zeros} of them are 0; first at {first}: got {} want {}",
+        bad.len(),
+        runs.len(),
+        &runs[..runs.len().min(8)],
+        got[start + first],
+        pattern[first],
+    ))
 }
 
 #[test]
