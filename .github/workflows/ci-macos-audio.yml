@@ -109,16 +109,15 @@ jobs:
           --test coreaudio_exclusive_suite --
           --ignored --nocapture --exact bit_perfect_loopback_through_blackhole
 
-  # Spike (non-blocking until proven): a *custom-built* BlackHole that only offers 44.1k and
-  # 96k, so the real AUHAL path — not just the fake HAL — exercises the closest-same-family
-  # fallback (22.05/176.4/352.8k → 44.1k; 32/192/384k → 96k) on a device with a restricted
-  # rate ladder, like many real DACs and HDMI sinks. Single-Mac project: this is how device
-  # classes we don't own get real-device coverage. Built from BlackHole v0.7.1 (GPL-3.0; a CI
-  # test fixture only, never linked or shipped), ad-hoc signed — whether hosted runners load
-  # an ad-hoc-signed HAL plug-in is exactly what this job finds out.
+  # A *custom-built* BlackHole that only offers 44.1k and 96k, so the real AUHAL path — not
+  # just the fake HAL — exercises the closest-same-family fallback (22.05/176.4/352.8k → 44.1k;
+  # 32/192/384k → 96k) on a device with a restricted rate ladder, like many real DACs and HDMI
+  # sinks. Single-Mac project: this is how device classes we don't own get real-device
+  # coverage. Built from BlackHole v0.7.1 (GPL-3.0; a CI test fixture only, never linked or
+  # shipped). Hosted runners load the ad-hoc-signed HAL plug-in (proven on macos-15 and
+  # macos-26: 12/12 incl. bit-identical loopback at both rates), so this gates.
   restricted-ladder:
     name: restricted-rate BlackHole (${{ matrix.os }})
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
