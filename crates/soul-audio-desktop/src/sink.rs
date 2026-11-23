@@ -126,10 +126,22 @@ impl CpalSink {
     /// Errors if no device matches — the caller can fall back to
     /// [`new`](Self::new) for the system default.
     pub fn new_on_device(name: &str) -> Result<Self> {
-        let device = cpal::default_host()
-            .output_devices()
-            .context("enumerating output devices")?
-            .find(|d| d.name().map(|n| n == name).unwrap_or(false))
+        // Resolve from the warm device cache first (skips cpal's slow re-enumeration on a
+        // device switch). If the cached handle won't open — the device was unplugged since it
+        // was listed — fall back to a fresh enumeration so a genuinely-gone device still errors
+        // cleanly (and the caller can fall back to the system default).
+        if let Some((_, device)) = cached_output_devices(false)
+            .into_iter()
+            .find(|(n, _)| n == name)
+            && let Ok(mut sink) = Self::build(device)
+        {
+            sink.alive = DeviceAlive::watch(Some(name));
+            return Ok(sink);
+        }
+        let device = cached_output_devices(true)
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, d)| d)
             .with_context(|| format!("no output device named {name:?}"))?;
         let mut sink = Self::build(device)?;
         sink.alive = DeviceAlive::watch(Some(name));
@@ -249,13 +261,58 @@ impl CpalSink {
     }
 }
 
-/// Names of the available output devices on the default host, for a device
-/// picker. Empty if the host exposes none (e.g. a headless CI machine).
-pub fn output_device_names() -> Vec<String> {
-    cpal::default_host()
+/// How long an enumerated output-device list is reused before re-enumerating. cpal's
+/// WASAPI enumeration activates every endpoint (hundreds of ms to seconds, worst on a
+/// Bluetooth endpoint), so re-running it on every device open/switch made the first play and
+/// a live device switch wait out the whole enumeration. A desktop re-lists devices every few
+/// seconds for its picker, which keeps this cache warm, so opening a device then resolves it
+/// from the cache instead of re-enumerating. Short enough that a plugged/unplugged device is
+/// reflected within a few seconds.
+const DEVICE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct DeviceCache {
+    at: std::time::Instant,
+    devices: Vec<(String, cpal::Device)>,
+}
+
+/// A process-wide cache of the last output-device enumeration (name + handle). cpal's
+/// `Device` is a cheap, `Send + Sync + Clone` handle, so caching it is safe; a stale handle
+/// (the device was unplugged) simply fails to open, and the caller re-enumerates. `None`
+/// until the first enumeration.
+static DEVICE_CACHE: std::sync::Mutex<Option<DeviceCache>> = std::sync::Mutex::new(None);
+
+/// The output devices (name + handle) on the default host. Reuses a recent enumeration while
+/// it is still fresh (within [`DEVICE_CACHE_TTL`]); otherwise re-enumerates and refreshes the
+/// cache. `force` bypasses a fresh cache to re-enumerate now (used as the fallback when a
+/// cached handle failed to open, e.g. the device was unplugged since it was listed).
+fn cached_output_devices(force: bool) -> Vec<(String, cpal::Device)> {
+    let mut guard = DEVICE_CACHE.lock().expect("device cache mutex");
+    if !force
+        && let Some(c) = guard.as_ref()
+        && c.at.elapsed() < DEVICE_CACHE_TTL
+    {
+        return c.devices.clone();
+    }
+    let devices: Vec<(String, cpal::Device)> = cpal::default_host()
         .output_devices()
-        .map(|devs| devs.filter_map(|d| d.name().ok()).collect())
-        .unwrap_or_default()
+        .map(|devs| devs.filter_map(|d| d.name().ok().map(|n| (n, d))).collect())
+        .unwrap_or_default();
+    *guard = Some(DeviceCache {
+        at: std::time::Instant::now(),
+        devices: devices.clone(),
+    });
+    devices
+}
+
+/// Names of the available output devices on the default host, for a device
+/// picker. Empty if the host exposes none (e.g. a headless CI machine). Served from the
+/// short-lived device cache (see [`cached_output_devices`]) so a picker that polls this does
+/// not re-run cpal's slow enumeration every time.
+pub fn output_device_names() -> Vec<String> {
+    cached_output_devices(false)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// Name of the current system-default output device, if any — for preselecting
@@ -276,13 +333,13 @@ pub fn default_output_device_name() -> Option<String> {
 /// rate-matched track then plays untouched; a mismatched one is reported as
 /// resampling until per-track rate switching lands).
 pub fn default_output_config(name: Option<&str>) -> Option<(u32, u16)> {
-    let host = cpal::default_host();
     let device = match name {
-        Some(name) => host
-            .output_devices()
-            .ok()?
-            .find(|d| d.name().map(|n| n == name).unwrap_or(false))?,
-        None => host.default_output_device()?,
+        // Resolve a named device from the warm cache (skips cpal's slow re-enumeration).
+        Some(name) => cached_output_devices(false)
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, d)| d)?,
+        None => cpal::default_host().default_output_device()?,
     };
     let cfg = device.default_output_config().ok()?;
     Some((cfg.sample_rate().0, cfg.channels()))
