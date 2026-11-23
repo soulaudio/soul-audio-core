@@ -31,6 +31,15 @@ const SHARED_CRATES: &[&str] = &[
     "soul-audio-control",
     "soul-audio-loudness",
     "soul-audio-dsp",
+    // soul-audio-eq is strictly no_std / no-alloc (its own module doc) and feeds
+    // soul-audio-dsp, soul-audio-core's `Equalizer` and the DAP firmware. It was
+    // missing here, which meant a change to it took the SCOPED gate: a host-only
+    // `cargo test -p soul-audio-eq` that cannot prove the thumbv7em cross-build
+    // still links. It also happens to own every value
+    // `architecture-tests/tests/signal_integrity.rs` pins — `Band::affects`'
+    // 1e-3 tolerance, `coeffs`, `format_autoeq`'s precision — so its absence let
+    // the crate under test skip the tests that guard it.
+    "soul-audio-eq",
     "soul-audio-playlist",
     "soul-audio-tags",
     "soul-audio-firmware",
@@ -116,6 +125,20 @@ fn classify(files: &[String]) -> Scope {
     Scope::Packages(pkgs.into_iter().collect())
 }
 
+/// Cross-crate fitness functions, run by the scoped gate NO MATTER what changed.
+///
+/// Scoping tests by "which crate changed" is the right call for a crate's own
+/// unit tests and a category error for these. `architecture-tests` asserts
+/// properties of the COMPOSITION — layering, the no-alloc surface, the tier
+/// split, and (since `signal_integrity.rs`) that a bypassed stage is bit-exact
+/// and that the desktop -> DAP profile transport is lossless. Any crate change
+/// can break a property like that, including a change in a crate the test file
+/// never names, so there is no file-path rule that would select them correctly.
+///
+/// Cheap enough to be unconditional: the suite is pure computation over small
+/// buffers, no fixtures and no I/O.
+const ALWAYS_TESTED: &[&str] = &["architecture-tests"];
+
 fn scoped_clippy_and_test(pkgs: &[String]) -> Result<(), String> {
     let mut clippy = vec!["clippy"];
     for p in pkgs {
@@ -129,6 +152,14 @@ fn scoped_clippy_and_test(pkgs: &[String]) -> Result<(), String> {
     for p in pkgs {
         test.push("-p");
         test.push(p);
+    }
+    // The cross-crate gates, always — see ALWAYS_TESTED. Skipped only if the
+    // scope already names them, so the flag is not passed twice.
+    for p in ALWAYS_TESTED {
+        if !pkgs.iter().any(|x| x == p) {
+            test.push("-p");
+            test.push(p);
+        }
     }
     run(&test)
 }
@@ -227,6 +258,44 @@ mod tests {
                 "soul-audio-cli".to_string(),
                 "soul-audio-import".to_string()
             ]
+        );
+    }
+
+    /// soul-audio-eq must force the full gate like every other shared no_std
+    /// crate. It did not, and the consequence was two-fold: a host-only scoped
+    /// run could not prove the thumbv7em cross-build still linked, and the crate
+    /// owning `Band::affects`' tolerance, `coeffs` and `format_autoeq`'s
+    /// precision could change without running the signal-integrity gates that
+    /// pin exactly those values.
+    #[test]
+    fn the_eq_crate_forces_full_because_it_is_shared_and_no_std() {
+        assert!(
+            scope(&["crates/soul-audio-eq/src/lib.rs"]).is_err(),
+            "a change to soul-audio-eq must force the FULL gate: it is strictly no_std, it feeds \
+             the DAP cross-build, and it owns the values signal_integrity.rs pins"
+        );
+    }
+
+    /// The cross-crate fitness functions must run whatever the scope is.
+    ///
+    /// `classify` is about which crate changed; `architecture-tests` is about the
+    /// composition, so no file-path rule selects it correctly. Without this, a
+    /// change to a leaf crate would run that crate's tests and silently skip
+    /// every architectural invariant.
+    #[test]
+    fn the_cross_crate_gates_are_never_scoped_out() {
+        assert!(
+            super::ALWAYS_TESTED.contains(&"architecture-tests"),
+            "architecture-tests must be in ALWAYS_TESTED — its assertions are about the \
+             composition, not about any one crate, so scoping them by changed path is a category \
+             error"
+        );
+        // And a leaf-crate change must still be a SCOPED run (not full), so the
+        // always-tested list is doing real work rather than being masked by
+        // everything forcing full anyway.
+        assert!(
+            scope(&["crates/soul-audio-multicatalog/src/lib.rs"]).is_ok(),
+            "a leaf crate should still scope, otherwise ALWAYS_TESTED is untested in practice"
         );
     }
 
