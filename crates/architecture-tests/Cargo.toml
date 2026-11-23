@@ -13,5 +13,10 @@ soul-audio-core = { path = "../soul-audio-core" }
 soul-audio-catalog = { path = "../soul-audio-catalog" }
 # Default features = the no-alloc reader (no `build` baker).
 soul-audio-index = { path = "../soul-audio-index" }
+# signal_integrity.rs: the audiophile fitness functions need the DSP chain model
+# (shared with soul-player-ng and the DAP) and the equalizer it applies through.
+soul-audio-dsp = { path = "../soul-audio-dsp", features = ["serde"] }
+serde_json = "1"
+soul-audio-eq = { path = "../soul-audio-eq" }
 embedded-io = { workspace = true }
 cargo_metadata = "0.18"
