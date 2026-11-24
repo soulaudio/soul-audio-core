@@ -11,13 +11,16 @@
 //! only the playlist's own locator keys. Memory is O(playlist), never O(catalog),
 //! and nothing from the stream is retained past the single pass, so the same
 //! `no_std` + `alloc` code runs on the desktop and on a RAM-limited DAP streaming
-//! its SD-card `.soulidx` straight through.
+//! its SD-card `.soulidx` straight through. [`resolve_locator_ids`] is the same lean
+//! streaming match for a bare batch of locators (no view-model), e.g. a playlist's
+//! cover tracks.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::locator::TrackLocator;
 use crate::model::PlaylistEntry;
 
 /// A playlist's entries resolved against a catalog: the view-model the desktop
@@ -71,37 +74,23 @@ impl ResolvedPlaylist {
             wanted.entry(e.locator.key()).or_default().push(i);
         }
 
-        let mut resolved: Vec<Option<u32>> = vec![None; n];
-        let mut live_dur: Vec<Option<f64>> = vec![None; n];
-        let mut remaining = n;
-        for (key, id, dur) in tracks {
-            if remaining == 0 {
-                break; // every entry already resolved; don't scan the rest
-            }
-            if let Some(idxs) = wanted.get(key.as_ref()) {
-                for &i in idxs {
-                    if resolved[i].is_none() {
-                        remaining -= 1;
-                    }
-                    resolved[i] = Some(id);
-                    live_dur[i] = dur;
-                }
-            }
-        }
+        let matched = match_catalog(&wanted, n, tracks);
 
+        let mut resolved: Vec<Option<u32>> = Vec::with_capacity(n);
         let mut play_ids = Vec::new();
         let mut play_index_of = Vec::with_capacity(n);
         let mut total_secs = 0.0_f64;
         for (i, e) in entries.iter().enumerate() {
-            match resolved[i] {
+            let (id, dur) = matched[i];
+            resolved.push(id);
+            match id {
                 Some(id) => {
                     play_index_of.push(Some(play_ids.len()));
                     play_ids.push(id);
                     // Live duration where the catalog gave one, else the entry's
                     // captured snapshot duration (stable for a resolved-but-unmeasured
                     // track).
-                    total_secs +=
-                        live_dur[i].unwrap_or_else(|| f64::from(e.snapshot.duration_secs));
+                    total_secs += dur.unwrap_or_else(|| f64::from(e.snapshot.duration_secs));
                 }
                 None => {
                     play_index_of.push(None);
@@ -131,13 +120,70 @@ impl ResolvedPlaylist {
     }
 }
 
+/// Stream the catalog once, resolving each wanted key to a track `(id, duration)`.
+/// `wanted` maps a locator key to the indices wanting it (a key may be wanted by more
+/// than one index); the returned vec holds one `(Option<u32>, Option<f64>)` per index
+/// in `0..n`. Nothing from the stream is retained past the pass, and it stops early
+/// once every index has resolved, so memory stays O(wanted), not O(catalog). Shared
+/// by [`ResolvedPlaylist::resolve`] and [`resolve_locator_ids`].
+fn match_catalog<K, I>(
+    wanted: &BTreeMap<String, Vec<usize>>,
+    n: usize,
+    tracks: I,
+) -> Vec<(Option<u32>, Option<f64>)>
+where
+    K: AsRef<str>,
+    I: IntoIterator<Item = (K, u32, Option<f64>)>,
+{
+    let mut out = vec![(None, None); n];
+    let mut remaining = n;
+    for (key, id, dur) in tracks {
+        if remaining == 0 {
+            break; // every index already resolved; don't scan the rest
+        }
+        if let Some(idxs) = wanted.get(key.as_ref()) {
+            for &i in idxs {
+                if out[i].0.is_none() {
+                    remaining -= 1;
+                }
+                out[i] = (Some(id), dur);
+            }
+        }
+    }
+    out
+}
+
+/// Resolve a batch of durable locators to current track ids by STREAMING the catalog
+/// ONCE, holding only the wanted locator keys (O(locators) memory, not O(catalog)).
+/// Returns one `Option<u32>` per input locator, in the same order (`None` = the
+/// locator doesn't resolve). A locator may repeat in the input; every occurrence
+/// resolves. The lean, DAP-friendly counterpart to building a full reverse map;
+/// `tracks` yields each catalog track's `(locator_key, id)`.
+#[must_use]
+pub fn resolve_locator_ids<K, I>(locators: &[TrackLocator], tracks: I) -> Vec<Option<u32>>
+where
+    K: AsRef<str>,
+    I: IntoIterator<Item = (K, u32)>,
+{
+    let mut wanted: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, loc) in locators.iter().enumerate() {
+        wanted.entry(loc.key()).or_default().push(i);
+    }
+    let matched = match_catalog(
+        &wanted,
+        locators.len(),
+        tracks.into_iter().map(|(k, id)| (k, id, None)),
+    );
+    matched.into_iter().map(|(id, _)| id).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::string::String;
     use alloc::vec;
 
     use super::*;
-    use crate::locator::{TrackLocator, TrackSnapshot};
+    use crate::locator::TrackSnapshot;
 
     /// The catalog-side locator key for a local path, as a head would yield it.
     fn key(path: &str) -> String {
@@ -211,5 +257,22 @@ mod tests {
         assert_eq!(r.resolved, vec![None, None]);
         assert!(r.play_ids.is_empty());
         assert_eq!(r.total_secs, 7.0); // 3 + 4 from snapshots
+    }
+
+    #[test]
+    fn resolve_locator_ids_streams_in_order_with_repeats() {
+        let locs = vec![
+            TrackLocator::Local { path: "a".into() },
+            TrackLocator::Local {
+                path: "missing".into(),
+            },
+            TrackLocator::Local { path: "a".into() }, // a repeat resolves too
+        ];
+        // Catalog stream of (key, id), in catalog order: "a" -> 10, plus an unrelated.
+        let catalog = vec![(key("b"), 20u32), (key("a"), 10u32)];
+        assert_eq!(
+            resolve_locator_ids(&locs, catalog),
+            vec![Some(10), None, Some(10)]
+        );
     }
 }
