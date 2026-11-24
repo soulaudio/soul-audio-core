@@ -342,6 +342,17 @@ impl Catalog for MultiCatalog {
         self.member(s)?.genre_name(local, buf)
     }
 
+    fn resolve_locator(&self, key: &str) -> Option<TrackId> {
+        // A locator key (a card-relative path) belongs to at most one source in
+        // practice; try each, first match wins, packed to a compound id.
+        for (s, m) in self.members.iter().enumerate() {
+            if let Some(local) = m.resolve_locator(key) {
+                return Some(pack(s as u32, local));
+            }
+        }
+        None
+    }
+
     fn track(&self, id: TrackId) -> Result<TrackRec, CatalogError> {
         let (s, local) = unpack(id);
         let mut r = self.member(s)?.track(local)?;

@@ -257,6 +257,16 @@ pub trait Catalog {
     /// Convenience over `resolve_str(folder(id)?.path, buf)`.
     fn folder_path(&self, id: FolderId, buf: &mut [u8]) -> Result<usize, CatalogError>;
 
+    /// Resolve a durable locator KEY to its current track id, or `None`. `key` is a
+    /// NORMALIZED card-relative path (the caller lower-cases + folds `\`→`/` and
+    /// strips the card root, matching what the baker stored). Backed by the v7
+    /// locator-order section for an O(log n) binary search off SD; the default
+    /// returns `None` (a source without the index offers no locator resolution and
+    /// the caller resolves another way).
+    fn resolve_locator(&self, _key: &str) -> Option<TrackId> {
+        None
+    }
+
     // --- playlists live in the index (decision §8) ---
     fn playlist_count(&self) -> u32;
     fn playlist_name(&self, p: PlaylistId, buf: &mut [u8]) -> Result<usize, CatalogError>;
