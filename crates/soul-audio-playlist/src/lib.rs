@@ -32,4 +32,4 @@ pub use cover::{
 };
 pub use locator::{TrackLocator, TrackSnapshot};
 pub use model::{Playlist, PlaylistEntry, PlaylistId, slugify};
-pub use resolve::ResolvedPlaylist;
+pub use resolve::{ResolvedPlaylist, resolve_locator_ids};
