@@ -92,6 +92,58 @@ fn resolve<'a>(
 }
 
 #[test]
+fn soulidx_resolves_locators_by_normalized_card_relative_key() {
+    let mut input = fixture();
+    // A root-folder track (folder 0, empty path) to cover the no-prefix case.
+    input.tracks.push(TrackInput {
+        title: "Root".into(),
+        artist: 0,
+        album: 0,
+        album_artist: 0,
+        genre: 0,
+        folder: 0,
+        track_no: 1,
+        disc_no: 1,
+        duration_ms: 1000,
+        sample_rate: 44_100,
+        channels: 2,
+        file_name: "RootSong.flac".into(),
+        mbid: String::new(),
+        loudness: None,
+    }); // id 2
+    let bytes = write_index(&input);
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+
+    // The caller passes an ALREADY-normalized card-relative key (lower-cased, `/`).
+    assert_eq!(
+        rdr.resolve_locator("bach/open goldberg/01 - aria.flac"),
+        Some(0)
+    );
+    assert_eq!(
+        rdr.resolve_locator("bach/open goldberg/02 - variatio 1.flac"),
+        Some(1)
+    );
+    // Root file: card-relative is just the (normalized) file name, no folder prefix.
+    assert_eq!(rdr.resolve_locator("rootsong.flac"), Some(2));
+
+    // Not in the catalog.
+    assert_eq!(
+        rdr.resolve_locator("bach/open goldberg/03 - nope.flac"),
+        None
+    );
+    assert_eq!(rdr.resolve_locator("elsewhere/x.flac"), None);
+    // A strict prefix of a real key must NOT false-match.
+    assert_eq!(rdr.resolve_locator("bach/open goldberg/01 - aria"), None);
+    // A query longer than a real key must NOT match.
+    assert_eq!(
+        rdr.resolve_locator("bach/open goldberg/01 - aria.flac.extra"),
+        None
+    );
+    // An unbaked (default-None) catalog: a `MultiCatalog` with no sources resolves None.
+    assert_eq!(rdr.resolve_locator(""), None);
+}
+
+#[test]
 fn soulidx_round_trips_the_musicbrainz_recording_id() {
     let mbid = "d6d5e8e6-1234-4abc-9def-0123456789ab";
     let mut input = fixture();
@@ -598,7 +650,7 @@ fn loudness_fields_round_trip() {
 
     assert_eq!(
         soul_audio_index::FORMAT_VERSION,
-        6,
+        7,
         "record widened for loudness"
     );
     assert_eq!(

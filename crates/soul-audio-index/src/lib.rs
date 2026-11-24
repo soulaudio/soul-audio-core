@@ -16,7 +16,7 @@
 //! `(offset, len)` with the offset **relative to the string heap**.
 //!
 //! ```text
-//! HEADER (72 B, fixed):
+//! HEADER (76 B, fixed):
 //!    0  magic "SIDX"            [u8;4]
 //!    4  format_version          u16
 //!    6  reserved                u16
@@ -36,6 +36,7 @@
 //!   60  playlists_off           u32   (abs)
 //!   64  string_heap_off         u32   (abs)
 //!   68  string_heap_len         u32
+//!   72  locator_order_off       u32   (abs)  (v7)
 //!
 //! TRACK RECORD (85 B, fixed; `record[i]` at records_off + i*85):
 //!    0 id u32 · 4 title.off u32 · 8 title.len u16 · 10 artist u32 ·
@@ -74,6 +75,11 @@
 //!   pre-sorted by the baker, in axis order [Title, ArtistAlbumTrack, Album,
 //!   Folder, Genre]. axis `ax`, slot `i` → order_tables_off + (ax*track_count + i)*4.
 //!
+//! LOCATOR ORDER (v7): `track_count` × u32 record-ids, sorted by the track's
+//!   NORMALIZED card-relative path key (folder path + `/` + file name, per
+//!   `norm_locator_byte`). Lets `resolve_locator` binary-search a durable locator
+//!   to its id in O(log n) off SD instead of scanning the whole catalog.
+//!
 //! ALBUM→TRACKS: a directory of album_count × (count u32, run_abs_off u32),
 //!   then the concatenated u32 track-id runs.
 //!
@@ -107,9 +113,63 @@ use soul_audio_core::SeekSource;
 /// Magic at the head of `index.sidx` — `"SIDX"`.
 pub const MAGIC: [u8; 4] = *b"SIDX";
 /// Format version in the header.
-pub const FORMAT_VERSION: u16 = 6;
+pub const FORMAT_VERSION: u16 = 7;
 
-const HEADER_SIZE: usize = 72;
+const HEADER_SIZE: usize = 76; // +4 for the v7 locator_order_off
+
+/// Normalize one path byte for locator-key matching: `\` folds to `/` and ASCII
+/// `A..=Z` lower-cases (non-ASCII bytes pass through). Matches
+/// `TrackLocator::key()` (`replace('\\', "/").to_lowercase()`) for ASCII paths,
+/// which real file paths are; applied per byte so the no-alloc DAP reader can
+/// reconstruct + compare a probe's key without allocating or Unicode-casing. The
+/// baker and the reader MUST use this same function or the binary search breaks.
+#[inline]
+pub const fn norm_locator_byte(b: u8) -> u8 {
+    if b == b'\\' {
+        b'/'
+    } else {
+        b.to_ascii_lowercase()
+    }
+}
+
+/// Compare a normalized query key against a track's reconstructed key
+/// (`norm(folder_path)` + `/` + `norm(file_name)`, or just `norm(file_name)` at the
+/// card root), byte by byte with NO allocation. Returns `query.cmp(key)`, so a
+/// binary search over the locator-order section probes with it. The reconstruction
+/// re-applies [`norm_locator_byte`] exactly as the baker did when it sorted, so the
+/// comparison stays consistent with the stored order.
+fn cmp_locator_key(query: &[u8], folder_path: &[u8], file_name: &[u8]) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    let mut qi = 0usize;
+    for &b in folder_path {
+        let kb = norm_locator_byte(b);
+        match query.get(qi) {
+            Some(&q) if q == kb => qi += 1,
+            Some(&q) => return q.cmp(&kb),
+            None => return Ordering::Less, // query is a strict prefix of the key
+        }
+    }
+    if !folder_path.is_empty() {
+        match query.get(qi) {
+            Some(&b'/') => qi += 1,
+            Some(&q) => return q.cmp(&b'/'),
+            None => return Ordering::Less,
+        }
+    }
+    for &b in file_name {
+        let kb = norm_locator_byte(b);
+        match query.get(qi) {
+            Some(&q) if q == kb => qi += 1,
+            Some(&q) => return q.cmp(&kb),
+            None => return Ordering::Less,
+        }
+    }
+    if qi < query.len() {
+        Ordering::Greater // query runs past the key
+    } else {
+        Ordering::Equal
+    }
+}
 const RECORD_SIZE: usize = 85; // 65 (v5) + 5×f32 loudness (v6)
 const ALBUM_RECORD_SIZE: usize = 30;
 const ARTIST_REF_SIZE: usize = 6; // StrRef (off u32, len u16) per artist
@@ -164,6 +224,9 @@ struct Header {
     playlists_off: u32,
     string_heap_off: u32,
     string_heap_len: u32,
+    /// Offset of the `track_count × u32` track-id array sorted by locator key (v7),
+    /// for O(log n) `resolve_locator` binary search.
+    locator_order_off: u32,
 }
 
 impl Header {
@@ -191,6 +254,7 @@ impl Header {
             playlists_off: le_u32(&h, 60),
             string_heap_off: le_u32(&h, 64),
             string_heap_len: le_u32(&h, 68),
+            locator_order_off: le_u32(&h, 72),
         })
     }
 }
@@ -399,6 +463,38 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
         }
         let slot = axis_index(axis) * self.header.track_count + i;
         self.read_u32_at(self.header.order_tables_off + slot * 4)
+    }
+
+    fn resolve_locator(&self, key: &str) -> Option<TrackId> {
+        use core::cmp::Ordering;
+        let q = key.as_bytes();
+        let (mut lo, mut hi) = (0u32, self.header.track_count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            // The id at probe `mid` of the locator-key-sorted order.
+            let id = self
+                .read_u32_at(self.header.locator_order_off + mid * 4)
+                .ok()?;
+            let t = self.track(id).ok()?;
+            // Reconstruct the probe's key pieces into stack buffers (no alloc); a
+            // pathological path longer than these can't resolve through the index.
+            let mut path_buf = [0u8; 1024];
+            let mut name_buf = [0u8; 512];
+            let path: &[u8] = match self.folder(t.folder) {
+                Ok(f) => {
+                    let pl = self.resolve_str(f.path, &mut path_buf).ok()?;
+                    &path_buf[..pl]
+                }
+                Err(_) => &[], // a track with no folder record keys on its name alone
+            };
+            let nl = self.resolve_str(t.file_name, &mut name_buf).ok()?;
+            match cmp_locator_key(q, path, &name_buf[..nl]) {
+                Ordering::Equal => return Some(id),
+                Ordering::Less => hi = mid, // query < key: search left
+                Ordering::Greater => lo = mid + 1, // query > key: search right
+            }
+        }
+        None
     }
 
     fn album_track(&self, album: AlbumId, i: u32) -> Result<TrackId, CatalogError> {
@@ -795,6 +891,30 @@ pub mod build {
                 .then_with(|| (x.disc_no, x.track_no).cmp(&(y.disc_no, y.track_no)))
         });
 
+        // Track-id order sorted by LOCATOR KEY (v7): the normalized card-relative
+        // path (folder path + '/' + file name, per-byte `norm_locator_byte`), so the
+        // DAP can binary-search a playlist's durable locators to ids in O(log n) off
+        // the SD card instead of scanning the whole catalog. Ids break ties.
+        let locator_key: Vec<Vec<u8>> = tracks
+            .iter()
+            .map(|t| {
+                let folder_path = input
+                    .folders
+                    .get(t.folder as usize)
+                    .map_or("", |f| f.path.as_str());
+                let mut key = Vec::with_capacity(folder_path.len() + 1 + t.file_name.len());
+                key.extend(folder_path.bytes().map(crate::norm_locator_byte));
+                if !folder_path.is_empty() {
+                    key.push(b'/');
+                }
+                key.extend(t.file_name.bytes().map(crate::norm_locator_byte));
+                key
+            })
+            .collect();
+        let locator_order = sorted_ids(track_count, |a, b| {
+            locator_key[a].cmp(&locator_key[b]).then(a.cmp(&b))
+        });
+
         // Section sizes + absolute offsets.
         let records_size = tracks.len() * RECORD_SIZE;
         let albums_size = n_albums * ALBUM_RECORD_SIZE;
@@ -803,6 +923,7 @@ pub mod build {
         let genres_size = input.genres.len() * GENRE_REF_SIZE;
         let folders_size = input.folders.len() * FOLDER_RECORD_SIZE;
         let order_size = AXIS_COUNT * tracks.len() * 4;
+        let locator_order_size = tracks.len() * 4;
         let album_dir_size = n_albums * ALBUM_DIR_ENTRY;
         let album_runs_total: usize = album_tracks.iter().map(|r| r.len()).sum();
         let album_runs_size = album_runs_total * 4;
@@ -816,7 +937,8 @@ pub mod build {
         let genres_off = artist_sorts_off + artist_sorts_size;
         let folders_off = genres_off + genres_size;
         let order_tables_off = folders_off + folders_size;
-        let album_tracks_off = order_tables_off + order_size;
+        let locator_order_off = order_tables_off + order_size;
+        let album_tracks_off = locator_order_off + locator_order_size;
         let album_runs_off = album_tracks_off + album_dir_size;
         let playlists_off = album_runs_off + album_runs_size;
         let playlist_runs_off = playlists_off + playlist_dir_size;
@@ -844,6 +966,7 @@ pub mod build {
         out.extend_from_slice(&(playlists_off as u32).to_le_bytes());
         out.extend_from_slice(&(string_heap_off as u32).to_le_bytes());
         out.extend_from_slice(&(heap.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(locator_order_off as u32).to_le_bytes()); // v7
         debug_assert_eq!(out.len(), records_off);
 
         // --- Track records ---
@@ -946,6 +1069,13 @@ pub mod build {
             for &id in order {
                 out.extend_from_slice(&id.to_le_bytes());
             }
+        }
+        debug_assert_eq!(out.len(), locator_order_off);
+
+        // --- Locator-key order (v7): track ids sorted by normalized card-relative
+        // path, for `resolve_locator`'s O(log n) binary search. ---
+        for &id in &locator_order {
+            out.extend_from_slice(&id.to_le_bytes());
         }
         debug_assert_eq!(out.len(), album_tracks_off);
 
