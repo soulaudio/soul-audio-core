@@ -24,6 +24,7 @@ extern crate alloc;
 mod cover;
 mod locator;
 mod model;
+mod resolve;
 
 pub use cover::{
     PlaylistCover, choose_playlist_cover, entries_fingerprint, first_distinct_album_indices,
@@ -31,3 +32,4 @@ pub use cover::{
 };
 pub use locator::{TrackLocator, TrackSnapshot};
 pub use model::{Playlist, PlaylistEntry, PlaylistId, slugify};
+pub use resolve::ResolvedPlaylist;
