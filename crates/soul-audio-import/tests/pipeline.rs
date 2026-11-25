@@ -324,3 +324,395 @@ fn scan_collects_sort_names_and_bakes_sort_order() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ── Multi-disc albums (spec 2026-11-25) ─────────────────────────────────────
+
+/// A fresh, uniquely-named temp library root.
+fn fresh(tag: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("soul_import_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
+/// Write a minimal tagged FLAC at `root/rel`, creating parent folders.
+fn put(root: &Path, rel: &str, comments: &[&str]) {
+    let p = root.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, flac_with_comments(comments)).unwrap();
+}
+
+#[test]
+fn flat_multi_disc_album_is_one_album_with_disc_count() {
+    let root = fresh("md_flat");
+    put(
+        &root,
+        "Box/101.flac",
+        &["ALBUM=Box", "TITLE=d1t1", "TRACKNUMBER=1", "DISCNUMBER=1/2"],
+    );
+    put(
+        &root,
+        "Box/102.flac",
+        &["ALBUM=Box", "TITLE=d1t2", "TRACKNUMBER=2", "DISCNUMBER=1/2"],
+    );
+    put(
+        &root,
+        "Box/201.flac",
+        &["ALBUM=Box", "TITLE=d2t1", "TRACKNUMBER=1", "DISCNUMBER=2/2"],
+    );
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(input.albums.len(), 1);
+    assert_eq!(input.albums[0].disc_count, 2);
+    let discs: Vec<u16> = input.tracks.iter().map(|t| t.disc_no).collect();
+    assert_eq!(
+        discs,
+        vec![1, 1, 2],
+        "DISCNUMBER=n/total splits (was silently disc 1)"
+    );
+
+    // Baked v8: disc count on the album record, album run in (disc, track) order.
+    let bytes = soul_audio_index::build::write_index(&input);
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+    assert_eq!(rdr.album(0).unwrap().disc_count, 2);
+    let mut buf = [0u8; 128];
+    let run: Vec<String> = (0..rdr.album_track_count(0))
+        .map(|i| {
+            let t = rdr.track(rdr.album_track(0, i).unwrap()).unwrap();
+            resolve(&rdr, t.title, &mut buf).to_owned()
+        })
+        .collect();
+    assert_eq!(run, ["d1t1", "d1t2", "d2t1"]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn disc_subfolders_fold_into_the_album_root() {
+    let root = fresh("md_cd");
+    put(
+        &root,
+        "Box/CD1/01.flac",
+        &["ALBUM=Box", "TITLE=a", "TRACKNUMBER=1", "DISCNUMBER=1"],
+    );
+    put(
+        &root,
+        "Box/CD2/01.flac",
+        &["ALBUM=Box", "TITLE=b", "TRACKNUMBER=1", "DISCNUMBER=2"],
+    );
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(input.albums.len(), 1, "CD1 + CD2 = one album");
+    assert_eq!(input.albums[0].disc_count, 2);
+    let path = |f: u32| input.folders[f as usize].path.clone();
+    assert_eq!(
+        path(input.albums[0].folder),
+        "Box",
+        "album folder = album root"
+    );
+    assert_eq!(
+        path(input.tracks[0].folder),
+        "Box/CD1",
+        "track folder = its real location"
+    );
+    assert_eq!(path(input.tracks[1].folder), "Box/CD2");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn untagged_disc_folders_infer_disc_numbers() {
+    let root = fresh("md_infer");
+    put(
+        &root,
+        "Box/Disc 1/01.flac",
+        &["ALBUM=Box", "TITLE=a", "TRACKNUMBER=1"],
+    );
+    put(
+        &root,
+        "Box/Disc 2/01.flac",
+        &["ALBUM=Box", "TITLE=b", "TRACKNUMBER=1"],
+    );
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(input.albums.len(), 1);
+    assert_eq!(input.albums[0].disc_count, 2);
+    let discs: Vec<u16> = input.tracks.iter().map(|t| t.disc_no).collect();
+    assert_eq!(
+        discs,
+        vec![1, 2],
+        "disc number from the folder when untagged"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn disc_folder_numbered_zero_still_folds_but_falls_back_to_disc_one() {
+    let root = fresh("md_zero");
+    put(
+        &root,
+        "Box/CD0/01.flac",
+        &["ALBUM=Box", "TITLE=a", "TRACKNUMBER=1"],
+    );
+    put(
+        &root,
+        "Box/CD2/01.flac",
+        &["ALBUM=Box", "TITLE=b", "TRACKNUMBER=1"],
+    );
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(
+        input.albums.len(),
+        1,
+        "CD0 is still a disc folder for the album root"
+    );
+    assert_eq!(input.folders[input.albums[0].folder as usize].path, "Box");
+    let discs: Vec<u16> = input.tracks.iter().map(|t| t.disc_no).collect();
+    assert_eq!(discs, vec![1, 2], "folder number 0 is absent, so disc 1");
+    assert_eq!(input.albums[0].disc_count, 2);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn disc_folder_subtitle_is_a_fallback_for_the_tag() {
+    let root = fresh("md_sub");
+    put(
+        &root,
+        "Suite/Disc 1 - Mondstadt/01.flac",
+        &["ALBUM=Suite", "TITLE=a", "TRACKNUMBER=1"],
+    );
+    put(
+        &root,
+        "Suite/Disc 2 - Liyue/01.flac",
+        &[
+            "ALBUM=Suite",
+            "TITLE=b",
+            "TRACKNUMBER=1",
+            "DISCSUBTITLE=Liyue Harbor",
+        ],
+    );
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(input.albums.len(), 1);
+    assert_eq!(
+        input.tracks[0].disc_subtitle, "Mondstadt",
+        "folder fallback"
+    );
+    assert_eq!(
+        input.tracks[1].disc_subtitle, "Liyue Harbor",
+        "the tag wins"
+    );
+    let bytes = soul_audio_index::build::write_index(&input);
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+    let mut buf = [0u8; 128];
+    let t0 = rdr.track(0).unwrap();
+    assert_eq!(resolve(&rdr, t0.disc_subtitle, &mut buf), "Mondstadt");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn same_title_in_two_folders_is_two_albums() {
+    let root = fresh("md_iso");
+    put(&root, "A/01.flac", &["ALBUM=Greatest Hits", "TITLE=a"]);
+    put(&root, "B/01.flac", &["ALBUM=Greatest Hits", "TITLE=b"]);
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(input.albums.len(), 2, "folder isolation holds");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn two_musicbrainz_releases_in_one_folder_are_two_albums() {
+    let root = fresh("md_mb");
+    let (a, b) = (
+        "aaaaaaaa-0000-4000-8000-000000000001",
+        "bbbbbbbb-0000-4000-8000-000000000002",
+    );
+    let ma = format!("MUSICBRAINZ_ALBUMID={a}");
+    let mb = format!("MUSICBRAINZ_ALBUMID={b}");
+    put(
+        &root,
+        "Dump/01.flac",
+        &["ALBUM=Footprints", "TITLE=x", ma.as_str()],
+    );
+    put(
+        &root,
+        "Dump/02.flac",
+        &["ALBUM=Footprints", "TITLE=y", mb.as_str()],
+    );
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(
+        input.albums.len(),
+        2,
+        "two releases of one title stay apart"
+    );
+    assert_eq!(input.albums[0].mb_album_id, a);
+    let bytes = soul_audio_index::build::write_index(&input);
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+    let mut buf = [0u8; 128];
+    assert_eq!(
+        resolve(&rdr, rdr.album(1).unwrap().mb_album_id, &mut buf),
+        b
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn various_artists_without_album_artist_is_one_album() {
+    let root = fresh("md_va");
+    put(
+        &root,
+        "VA/01.flac",
+        &["ALBUM=Hits", "ARTIST=Alpha", "TITLE=a"],
+    );
+    put(
+        &root,
+        "VA/02.flac",
+        &["ALBUM=Hits", "ARTIST=Beta", "TITLE=b"],
+    );
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(input.albums.len(), 1, "album artist is not part of the key");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cover_in_album_root_serves_disc_folder_tracks() {
+    let root = fresh("md_cover");
+    put(
+        &root,
+        "Box/CD1/01.flac",
+        &["ALBUM=Box", "TITLE=a", "DISCNUMBER=1"],
+    );
+    put(
+        &root,
+        "Box/CD2/01.flac",
+        &["ALBUM=Box", "TITLE=b", "DISCNUMBER=2"],
+    );
+    let cover = b"album-root cover bytes".to_vec();
+    std::fs::write(root.join("Box/cover.jpg"), &cover).unwrap();
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(input.albums.len(), 1);
+    assert_eq!(input.covers.len(), 1);
+    assert_eq!(input.covers[0].as_deref(), Some(cover.as_slice()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_disc_named_scan_root_is_never_climbed() {
+    let outer = fresh("md_cdroot");
+    let root = outer.join("CD1");
+    std::fs::create_dir_all(&root).unwrap();
+    put(&root, "01.flac", &["ALBUM=X", "TITLE=a"]);
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(
+        input.folders[input.albums[0].folder as usize].path, "",
+        "the album root never leaves the scan root"
+    );
+    assert_eq!(input.tracks[0].disc_no, 1);
+    let _ = std::fs::remove_dir_all(&outer);
+}
+
+#[test]
+fn per_disc_folder_cover_beats_the_parent_decoy() {
+    let root = fresh("md_disc_cover");
+    put(
+        &root,
+        "Artist/Box/CD1/a.flac",
+        &["ALBUM=Box", "TITLE=a", "DISCNUMBER=1"],
+    );
+    put(
+        &root,
+        "Artist/Box/CD2/b.flac",
+        &["ALBUM=Box", "TITLE=b", "DISCNUMBER=2"],
+    );
+    let img_a = b"per-disc folder.jpg".to_vec();
+    std::fs::write(root.join("Artist/Box/CD1/folder.jpg"), &img_a).unwrap();
+    std::fs::write(root.join("Artist/cover.jpg"), b"artist photo decoy").unwrap();
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(input.albums.len(), 1);
+    assert_eq!(input.covers[0].as_deref(), Some(img_a.as_slice()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn partially_tagged_release_stays_one_album() {
+    let root = fresh("md_mb_partial");
+    let x = "aaaaaaaa-0000-4000-8000-00000000000a";
+    let mx = format!("MUSICBRAINZ_ALBUMID={x}");
+    put(&root, "Alb/01.flac", &["ALBUM=Alb", "TITLE=a", mx.as_str()]);
+    put(&root, "Alb/02.flac", &["ALBUM=Alb", "TITLE=b"]);
+    put(&root, "Alb/03.flac", &["ALBUM=Alb", "TITLE=c", mx.as_str()]);
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(
+        input.albums.len(),
+        1,
+        "an untagged track joins the tagged release"
+    );
+    assert_eq!(input.albums[0].mb_album_id, x);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn untagged_track_joins_the_first_seen_release() {
+    let root = fresh("md_mb_first");
+    let (a, b) = (
+        "aaaaaaaa-0000-4000-8000-000000000001",
+        "bbbbbbbb-0000-4000-8000-000000000002",
+    );
+    let ma = format!("MUSICBRAINZ_ALBUMID={a}");
+    let mb = format!("MUSICBRAINZ_ALBUMID={b}");
+    // The untagged track sorts first; it still joins release `a` (first seen with an id).
+    put(&root, "Dump/00.flac", &["ALBUM=Footprints", "TITLE=u"]);
+    put(
+        &root,
+        "Dump/01.flac",
+        &["ALBUM=Footprints", "TITLE=x", ma.as_str()],
+    );
+    put(
+        &root,
+        "Dump/02.flac",
+        &["ALBUM=Footprints", "TITLE=y", mb.as_str()],
+    );
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(input.albums.len(), 2);
+    assert_eq!(input.albums[0].mb_album_id, a);
+    assert_eq!(input.albums[1].mb_album_id, b);
+    let albums: Vec<u32> = input.tracks.iter().map(|t| t.album).collect();
+    assert_eq!(albums, vec![0, 0, 1]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn disc_folders_directly_under_the_scan_root_fold_into_it() {
+    let root = fresh("md_rootdiscs");
+    put(&root, "CD1/x.flac", &["ALBUM=R", "TITLE=x"]);
+    put(&root, "CD2/y.flac", &["ALBUM=R", "TITLE=y"]);
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(input.albums.len(), 1);
+    assert_eq!(input.folders[input.albums[0].folder as usize].path, "");
+    let discs: Vec<u16> = input.tracks.iter().map(|t| t.disc_no).collect();
+    assert_eq!(discs, vec![1, 2]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn out_of_range_disc_tag_is_treated_as_untagged() {
+    let root = fresh("md_disc_overflow");
+    // 65536 would wrap to 0 under an `as u16` cast and bypass the "tag if > 0" rule.
+    put(
+        &root,
+        "Box/CD2/01.flac",
+        &["ALBUM=Box", "TITLE=a", "DISCNUMBER=65536/65536"],
+    );
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(
+        input.tracks[0].disc_no, 2,
+        "falls back to the disc-folder number"
+    );
+    assert_eq!(input.albums[0].disc_count, 2);
+    let _ = std::fs::remove_dir_all(&root);
+}

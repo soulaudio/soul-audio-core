@@ -32,6 +32,8 @@ pub fn map_vorbis_key(key: &str) -> Option<Field> {
         Some(Field::TrackTotal)
     } else if key.eq_ignore_ascii_case("DISCNUMBER") {
         Some(Field::DiscNumber)
+    } else if key.eq_ignore_ascii_case("DISCTOTAL") || key.eq_ignore_ascii_case("TOTALDISCS") {
+        Some(Field::DiscTotal)
     } else if key.eq_ignore_ascii_case("DATE") || key.eq_ignore_ascii_case("YEAR") {
         Some(Field::Date)
     } else if key.eq_ignore_ascii_case("ORIGINALDATE") || key.eq_ignore_ascii_case("ORIGINALYEAR") {
@@ -46,6 +48,8 @@ pub fn map_vorbis_key(key: &str) -> Option<Field> {
         // comment-based containers.
         crate::util::map_replaygain_key(key)
             .or_else(|| crate::util::map_musicbrainz_recording_key(key))
+            .or_else(|| crate::util::map_disc_subtitle_key(key))
+            .or_else(|| crate::util::map_musicbrainz_album_key(key))
     }
 }
 
@@ -121,7 +125,7 @@ pub fn read_comment_vector<S: embedded_io::Read>(
                 // consumer's by-key walk.
                 pic_ordinal = pic_ordinal.saturating_add(1);
             } else {
-                sink.text(map_vorbis_key(key), key, value);
+                crate::util::emit_text(sink, map_vorbis_key(key), key, value);
             }
         }
         // No `=` found (malformed comment, or it fell in the truncated tail):
@@ -616,5 +620,63 @@ mod tests {
         let mut c = Collect::default();
         read_comment_vector(&mut src, body.len() as u32, &mut scratch, &mut c).unwrap();
         assert!(c.pics.is_empty());
+    }
+
+    #[test]
+    fn vorbis_splits_n_over_total_and_maps_disc_totals() {
+        let body = comment_body(&["DISCNUMBER=1/3", "TRACKNUMBER=05/12", "TOTALDISCS=3"]);
+        let mut src = SliceSource::new(&body);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        read_comment_vector(&mut src, body.len() as u32, &mut scratch, &mut c).unwrap();
+        let got: Vec<(Field, &str)> = c
+            .fields
+            .iter()
+            .filter_map(|(f, _, v)| f.map(|f| (f, v.as_str())))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Field::DiscNumber, "1"),
+                (Field::DiscTotal, "3"),
+                (Field::TrackNumber, "05"),
+                (Field::TrackTotal, "12"),
+                (Field::DiscTotal, "3"),
+            ]
+        );
+    }
+
+    #[test]
+    fn vorbis_disc_total_keys_map() {
+        assert_eq!(map_vorbis_key("DISCTOTAL"), Some(Field::DiscTotal));
+        assert_eq!(map_vorbis_key("totaldiscs"), Some(Field::DiscTotal));
+        assert_eq!(map_vorbis_key("TRACKTOTAL"), Some(Field::TrackTotal));
+    }
+
+    #[test]
+    fn vorbis_disc_subtitle_and_mb_album_id() {
+        let body = comment_body(&[
+            "DISCSUBTITLE=Mondstadt",
+            "MUSICBRAINZ_ALBUMID=0b1e5b0a-1111-4222-8333-444455556666",
+        ]);
+        let mut src = SliceSource::new(&body);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        read_comment_vector(&mut src, body.len() as u32, &mut scratch, &mut c).unwrap();
+        let got: Vec<(Field, &str)> = c
+            .fields
+            .iter()
+            .filter_map(|(f, _, v)| f.map(|f| (f, v.as_str())))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Field::DiscSubtitle, "Mondstadt"),
+                (
+                    Field::MusicBrainzAlbumId,
+                    "0b1e5b0a-1111-4222-8333-444455556666"
+                ),
+            ]
+        );
     }
 }

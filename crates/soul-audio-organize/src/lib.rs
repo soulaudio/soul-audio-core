@@ -11,22 +11,58 @@
 //! architecture (`docs/ARCHITECTURE.md` §9). It is a std adapter: the heavy,
 //! platform-specific filesystem work lives here, never on the DAP.
 //!
-//! Task A (this layer) is **pure logic** — filename sanitization, the
-//! [`Template`] renderer, and the [`presets`] catalog. Planning a move/copy of
-//! real files and applying it (reading tags off disk, collision handling) is the
-//! IO layer added on top later.
+//! Layers: [`Template`] (pure rendering, incl. the multi-disc tokens and the
+//! [`presets`]), [`plan`]/[`plan_with`] (album-aware planning: groups inputs into
+//! albums with the importer's identity rule, plans each album's side files —
+//! logs, cues, covers, scans, lyrics — and never mutates), and [`apply`] (the
+//! only mutating call: copy/move, never overwrite, prune emptied source folders
+//! after a Move).
+//!
+//! Paths are compared host-aware: a Windows verbatim prefix (`\\?\…`) is
+//! ignored and, on Windows/macOS, letter case is folded — for the source root
+//! vs. the inputs, and for every destination collision check (so `Abc` and
+//! `ABC` album folders, or `Cover.jpg` and `cover.jpg`, never land on one
+//! file). On Linux paths compare as-is.
+//!
+//! # Known limitations
+//!
+//! - **Interrupted Move.** Audio entries are applied before side files. If a
+//!   Move stops between the two, the album's side files stay orphaned in the
+//!   source album root: a fresh plan over the (now moved) audio no longer sees
+//!   that root. Re-apply the **same** plan (idempotent — finished entries are
+//!   skipped, emptied folders still pruned), or re-plan with the album root's
+//!   remaining files as inputs.
+//! - **Check-then-rename race.** [`apply`] checks that a destination does not
+//!   exist and then copies/renames onto it; a file created at that path by
+//!   another process in between may be overwritten (a rename replaces on every
+//!   platform). Do not organize into a folder something else is writing to.
+//! - **Disc folders named after the album.** Only folders whose name *starts*
+//!   with `CD`/`Disc`/`Disk`/`DVD`/`Side` + a number are disc folders
+//!   (`soul_audio_tags::disc_folder`). Sibling folders like `Album CD1/` and
+//!   `Album CD2/` are two album roots — two albums (the second gets an
+//!   `Album (2)` folder) — in the organizer and the importer alike. Tag the
+//!   discs (`DISCNUMBER`), or rename the folders to `Album/CD1`, `Album/CD2`.
+//! - A plan reports, but cannot fix, a multi-disc album whose disc numbers come
+//!   only from folder names when the template has no `{DiscDir}`
+//!   ([`OrganizePlan::folder_inferred_discs`]).
 #![forbid(unsafe_code)]
 #![deny(unconditional_recursion)]
 
+mod album;
 mod apply;
+mod paths;
 mod plan;
 mod sanitize;
+mod side;
 mod tags;
 mod template;
 
 pub use apply::{Progress, Summary, apply};
-pub use plan::{Action, OrganizePlan, PlanEntry, plan};
-pub use template::{Template, presets};
+pub use plan::{
+    Action, EntryKind, LeftInPlace, OrganizePlan, PlanEntry, PlanOptions, SideFilesLeft, plan,
+    plan_with,
+};
+pub use template::{Template, preset, presets};
 
 /// Whether organizing a file **copies** it to the destination (leaving the
 /// original in place) or **moves** it.

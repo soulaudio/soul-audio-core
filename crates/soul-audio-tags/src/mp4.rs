@@ -33,7 +33,10 @@
 //! visited, so neither its size nor any trailing padding/garbage after it can
 //! turn a successful tag read into a spurious `Malformed`.
 
-use crate::util::{map_musicbrainz_recording_key, map_replaygain_key, read_exact, utf8_prefix};
+use crate::util::{
+    map_disc_subtitle_key, map_musicbrainz_album_key, map_musicbrainz_recording_key,
+    map_replaygain_key, read_exact, utf8_prefix,
+};
 use crate::{DataEncoding, Field, MimeType, Picture, PictureKind, StreamFacts, TagError, TagSink};
 use embedded_io::SeekFrom;
 use soul_audio_core::SeekSource;
@@ -341,6 +344,8 @@ fn handle_freeform_entry<S: SeekSource>(
     let Some(field) = map_replaygain_key(name)
         .or_else(|| map_musicbrainz_recording_key(name))
         .or_else(|| map_original_date_key(name))
+        .or_else(|| map_disc_subtitle_key(name))
+        .or_else(|| map_musicbrainz_album_key(name))
     else {
         return Ok(());
     };
@@ -913,6 +918,43 @@ mod tests {
             c.fields
                 .iter()
                 .any(|(f, _, v)| *f == Some(Field::Title) && v == "Test Title")
+        );
+    }
+
+    #[test]
+    fn mp4_freeform_disc_subtitle_and_mb_album_id() {
+        let mbid = "0b1e5b0a-1111-4222-8333-444455556666";
+        let entries = ilst(&[
+            freeform_entry("com.apple.iTunes", "DISCSUBTITLE", "Inazuma"),
+            freeform_entry("com.apple.iTunes", "MusicBrainz Album Id", mbid),
+        ]);
+        let moov_body = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&mvhd_v0(44_100, 1000));
+            v.extend_from_slice(&udta(&meta(&entries)));
+            v
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&atom(b"ftyp", b"M4A \0\0\0\0M4A mp42isom"));
+        bytes.extend_from_slice(&atom(b"moov", &moov_body));
+
+        let mut src = SliceSource::new(&bytes);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        read_mp4(&mut src, &mut scratch, &mut c).unwrap();
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::DiscSubtitle) && v == "Inazuma"),
+            "{:?}",
+            c.fields
+        );
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::MusicBrainzAlbumId) && v == mbid),
+            "{:?}",
+            c.fields
         );
     }
 }

@@ -77,7 +77,7 @@ fn index_reader_does_not_allocate() {
     use soul_audio_core::SliceSource;
     use soul_audio_index::IndexReader;
 
-    let bytes = *b"SIDX\x03\x00"; // magic + format version (v3)
+    let bytes = *b"SIDX\x08\x00"; // magic + format version (v8), truncated -> empty catalog
     let reader = IndexReader::new(SliceSource::new(&bytes));
     let mut buf = [0u8; 64];
 

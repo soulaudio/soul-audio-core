@@ -20,7 +20,8 @@
 
 use crate::locate;
 use crate::util::{
-    discard, map_musicbrainz_recording_key, map_replaygain_key, read_exact, utf8_prefix,
+    discard, map_musicbrainz_album_key, map_musicbrainz_recording_key, map_replaygain_key,
+    read_exact, utf8_prefix,
 };
 use crate::{DataEncoding, Field, MimeType, Picture, PictureKind, StreamFacts, TagError, TagSink};
 use embedded_io::SeekFrom;
@@ -246,6 +247,7 @@ fn map_frame_id(id: &str) -> Option<Field> {
         "TDOR" | "TORY" => Some(Field::OriginalDate),
         "TCON" | "TCO" => Some(Field::Genre),
         "TCOM" | "TCM" => Some(Field::Composer),
+        "TSST" => Some(Field::DiscSubtitle),
         _ => None,
     }
 }
@@ -296,14 +298,14 @@ fn handle_text<S: embedded_io::Read>(
     Ok(())
 }
 
-/// `TRCK`/`TPOS` (and v2.2 `TRK`/`TPA`): "n" or "n/total" → one or two
-/// `sink.text` calls (number, then total if present).
+/// `TRCK`/`TPOS` (and v2.2 `TRK`/`TPA`): "n" or "n/total" -> one or two
+/// `sink.text` calls (number, then total if present) via the shared
+/// [`crate::util::emit_text`] split.
 fn handle_num_total<S: embedded_io::Read>(
     src: &mut S,
     raw_len: usize,
     raw_key: &str,
     number_field: Field,
-    total_field: Field,
     scratch: &mut [u8],
     sink: &mut impl TagSink,
 ) -> Result<(), TagError> {
@@ -313,16 +315,7 @@ fn handle_num_total<S: embedded_io::Read>(
     let mut enc = [0u8; 1];
     read_exact(src, &mut enc)?;
     let s = decode_text(src, enc[0], raw_len - 1, scratch)?;
-    if let Some(idx) = s.find('/') {
-        let (num, rest) = s.split_at(idx);
-        let total = &rest[1..];
-        sink.text(Some(number_field), raw_key, num);
-        if !total.is_empty() {
-            sink.text(Some(total_field), raw_key, total);
-        }
-    } else {
-        sink.text(Some(number_field), raw_key, s);
-    }
+    crate::util::emit_text(sink, Some(number_field), raw_key, s);
     Ok(())
 }
 
@@ -489,7 +482,9 @@ fn handle_txxx<S: embedded_io::Read>(
     let rest = &body[sep + 1..];
     let vend = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
     let value = utf8_prefix(&rest[..vend]);
-    let field = map_replaygain_key(desc).or_else(|| map_musicbrainz_recording_key(desc));
+    let field = map_replaygain_key(desc)
+        .or_else(|| map_musicbrainz_recording_key(desc))
+        .or_else(|| map_musicbrainz_album_key(desc));
     sink.text(field, desc, value);
     Ok(())
 }
@@ -636,24 +631,8 @@ fn handle_frame<S: SeekSource>(
         "TXXX" | "TXX" => handle_txxx(src, raw_len, scratch, sink),
         "UFID" | "UFI" => handle_ufid(src, raw_len, scratch, sink),
         "RVA2" => handle_rva2(src, raw_len, scratch, sink),
-        "TRCK" | "TRK" => handle_num_total(
-            src,
-            raw_len,
-            id,
-            Field::TrackNumber,
-            Field::TrackTotal,
-            scratch,
-            sink,
-        ),
-        "TPOS" | "TPA" => handle_num_total(
-            src,
-            raw_len,
-            id,
-            Field::DiscNumber,
-            Field::DiscTotal,
-            scratch,
-            sink,
-        ),
+        "TRCK" | "TRK" => handle_num_total(src, raw_len, id, Field::TrackNumber, scratch, sink),
+        "TPOS" | "TPA" => handle_num_total(src, raw_len, id, Field::DiscNumber, scratch, sink),
         "APIC" | "PIC" => handle_apic(src, ver_major, raw_len, sink),
         _ => match map_frame_id(id) {
             Some(field) => handle_text(src, raw_len, id, field, scratch, sink),
@@ -1350,6 +1329,47 @@ mod tests {
             &buf[off..][..4],
             b"\xFF\xD8\xFF\xEE",
             "data_offset must point at the image bytes"
+        );
+    }
+
+    #[test]
+    fn id3_tpos_splits_disc_and_total() {
+        let tag = id3v23(&[text_frame(b"TPOS", "2/3")]);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        read_id3v2(&mut SliceSource::new(&tag), &mut scratch, &mut c).unwrap();
+        let got: Vec<(Field, &str)> = c
+            .fields
+            .iter()
+            .filter_map(|(f, _, v)| f.map(|f| (f, v.as_str())))
+            .collect();
+        assert_eq!(got, vec![(Field::DiscNumber, "2"), (Field::DiscTotal, "3")]);
+    }
+
+    #[test]
+    fn id3_tsst_and_txxx_musicbrainz_album_id() {
+        let mbid = "0b1e5b0a-1111-4222-8333-444455556666";
+        let tag = id3v24(&[text_frame_v24(b"TSST", "璃月 Liyue")]);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        read_id3v2(&mut SliceSource::new(&tag), &mut scratch, &mut c).unwrap();
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::DiscSubtitle) && v == "璃月 Liyue"),
+            "TSST -> DiscSubtitle (full UTF-8): {:?}",
+            c.fields
+        );
+
+        let tag = id3v23(&[txxx_frame("MusicBrainz Album Id", mbid)]);
+        let mut c = Collect::default();
+        read_id3v2(&mut SliceSource::new(&tag), &mut scratch, &mut c).unwrap();
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::MusicBrainzAlbumId) && v == mbid),
+            "TXXX:MusicBrainz Album Id -> MusicBrainzAlbumId: {:?}",
+            c.fields
         );
     }
 }

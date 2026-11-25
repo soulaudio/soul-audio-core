@@ -34,9 +34,21 @@ These are settled. Each is enforced by docs + (where mechanizable) tests.
 3. **One on-disk format, `.soulidx`**, for desktop cache, DAP SD card, and
    server. Fixed-width records → O(1) seek; desktop-baked pre-sorted order
    tables → zero on-device sort; string heap; in-index playlists; `extended.blob`
-   (Tier-2/3) and `art.blob` (1-bit e-ink). Spec:
+   (Tier-2/3) and `art.blob` (1-bit e-ink). The current format is **v8**; the
+   canonical byte layout is the `soul-audio-index` module doc
+   (`crates/soul-audio-index/src/lib.rs`), and the reader is exact-match on the
+   version (any other version reads as an empty catalog; the desktop re-bakes,
+   a remote server and its clients must match). Records only ever grow by
+   **appending** fields so existing offsets never move (v8 appended a per-track
+   `disc_subtitle` and a per-album `disc_count` + MusicBrainz release id).
+   **Album identity** is `(album root folder, title, MusicBrainz release id)`:
+   the album root is a track's folder, or its parent when that folder is a disc
+   folder (`CD1`, `Disc 2 - Liyue`, …) below the scan root — one rule,
+   `soul_audio_tags::disc_folder`, shared by the importer and the organizer.
+   Spec:
    [`shared-catalog-index-architecture`](superpowers/specs/2026-11-08-shared-catalog-index-architecture.md),
-   [`dap-export-and-blobs`](superpowers/specs/2026-11-08-dap-export-and-blobs.md).
+   [`dap-export-and-blobs`](superpowers/specs/2026-11-08-dap-export-and-blobs.md);
+   multi-disc albums: `soul-player-ng/docs/superpowers/specs/2026-11-25-multi-disc-albums-design.md`.
 4. **Transport is a port (`SeekSource`), one reader, three transports:** local
    file, SD card, **HTTP Range**. The same `IndexReader` reads `.soulidx`, and
    the same decoder reads audio, over any of them.
@@ -136,6 +148,7 @@ gate. Adding a crate or a dep that violates these fails CI.
 | Core/catalog/index stay lean (exact allowlists) | `layering.rs` |
 | `.soulidx` round-trips (bake → read) | `soul-audio-index/tests/roundtrip.rs` |
 | Desktop pipeline (scan → bake → read) | `soul-audio-import/tests/` |
+| Organize and import agree on album identity (organize ∘ import round-trip) | `soul-audio-organize/tests/multi_disc_e2e.rs` |
 | *(planned)* on-disk export round-trip over a `File` SeekSource | `soul-audio-import` export test |
 
 **Reserved rules:** `tiers.rs` lists the planned std-adapter crates

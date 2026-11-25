@@ -91,18 +91,24 @@ Integer ids only — **not** UUID strings (the monorepo's INTEGER-vs-TEXT id
 mismatch is a cautionary tale). The canonical id of a record is its position in
 the index record table.
 
-- `Track { id, title, artist, album, album_artist, track_no, disc_no, duration,
-  sample_rate, channels, folder, art_id, flags, extended }` — string fields are
-  heap refs `(offset,len)` in the index; owned `&str`/`String` only on the
-  desktop in-RAM model.
-- `Album { id, title, album_artist, year, folder, art_id }`
+- `Track { id, title, artist, album, album_artist, genre, track_no, disc_no,
+  disc_subtitle, duration, sample_rate, channels, folder, art_id, flags,
+  extended, file_name, mbid, loudness }` — string fields are heap refs
+  `(offset,len)` in the index; owned `&str`/`String` only on the desktop in-RAM
+  model. (`disc_subtitle` new in format v8.)
+- `Album { id, title, album_artist, original_date, release_date, folder, art_id,
+  disc_count, mb_album_id }` (`disc_count`/`mb_album_id` new in format v8;
+  `folder` is the album ROOT folder)
 - `Artist { id, name, sort_name }`
 - `Folder { id, path, parent }`
 - `Playlist { id, name, tracks: [TrackId] }` — stored **in the index** (§6), no
   external file for v1.
 
 **Folder isolation (carried from the monorepo):** album identity is keyed by its
-parent folder — same title+artist in two folders = two albums, never merged.
+**album root folder** — a track's parent folder, or the grandparent when the
+parent is a disc folder (`CD1`, `Disc 2 - Liyue`; `soul_audio_tags::disc_folder`)
+— plus the title and the MusicBrainz release id. Same title+artist in two
+folders = two albums, never merged; `Album/CD1` + `Album/CD2` = one album.
 
 ## 6. The `.soulidx` on-SD format (the shared contract)
 

@@ -113,6 +113,8 @@ fn synth(n: u32) -> CatalogInput {
                 album_artist: a % artists,
                 original_date: soul_audio_catalog::PackedDate::from_year(year),
                 release_date: soul_audio_catalog::PackedDate::from_year(year),
+                disc_count: 1,
+                mb_album_id: String::new(),
                 folder: a,
             }
         })
@@ -134,6 +136,7 @@ fn synth(n: u32) -> CatalogInput {
                 channels: 2,
                 file_name: format!("{:02} - Track {i:06}.flac", i % 12 + 1),
                 mbid: String::new(),
+                disc_subtitle: String::new(),
                 loudness: None,
             }
         })

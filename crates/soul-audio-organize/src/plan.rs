@@ -1,12 +1,16 @@
-//! Planning: read each file's tags, compute its destination via the
-//! [`Template`](crate::Template), and classify the [`Action`] — **without**
-//! mutating the filesystem. `plan` only *reads* tags and *stats* any existing
-//! destination; it never creates directories or copies bytes.
+//! Planning: group the inputs into albums (the importer's identity rule), read
+//! each file's tags, compute its destination via the [`Template`], add each
+//! album's side files, and classify every [`Action`] — **without** mutating the
+//! filesystem. `plan` only *reads* tags, *lists* album folders and *stats* any
+//! existing destination; it never creates directories or copies bytes.
 
-use std::collections::HashSet;
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::tags::read_tags;
+use crate::album::{self, AlbumGroup, RootIndex};
+use crate::paths;
+use crate::side::{self, AlbumPlacement};
 use crate::{Strategy, Template};
 
 /// What [`apply`](crate::apply) will do with one source file.
@@ -25,87 +29,498 @@ pub enum Action {
     SkipConflict,
 }
 
+/// What kind of file a [`PlanEntry`] places.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EntryKind {
+    /// An input audio file, renamed per the template.
+    Audio,
+    /// A non-audio file travelling with its album (`.log`, `.cue`, covers,
+    /// `Scans/…`, lyrics, `.txt`/`.nfo`). Never modified — only copied/moved,
+    /// renamed only when it shares a track's stem (it follows that track) or its
+    /// name must be made unique / filesystem-safe.
+    SideFile,
+}
+
 /// One planned source → destination placement with its classified [`Action`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanEntry {
     /// The source file to copy/move.
     pub src: PathBuf,
-    /// Its computed destination (`dest_root` joined with the rendered template).
+    /// Its computed destination.
     pub dst: PathBuf,
     /// How [`apply`](crate::apply) will treat this entry.
     pub action: Action,
+    /// Audio input or album side file.
+    pub kind: EntryKind,
 }
 
-/// A computed, not-yet-executed organize plan: the destination root plus one
-/// [`PlanEntry`] per input file, in input order.
+/// Why an album's side files were left where they are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SideFilesLeft {
+    /// The source album root holds more than one album (another album shares
+    /// the folder, or sits in a sub-folder of it): ownership is ambiguous.
+    SharedAlbumRoot,
+    /// The template gives the album no folder of its own (e.g. `flat`,
+    /// `{Artist}/{Title}` — no `{Album}` folder — or its tracks render under
+    /// different folders).
+    NoAlbumFolder,
+    /// The album's tracks sit loose in the source root itself — its other files
+    /// are not album material to sweep along.
+    AtSourceRoot,
+    /// No [`PlanOptions::source_root`] contains the album root (none was given —
+    /// [`plan`](fn@plan) — or the album lies outside it, or an input path has a
+    /// `..` component): the folder may be an arbitrary user folder
+    /// (`~/Downloads`), so nothing in it is swept along.
+    NoSourceRoot,
+    /// One of the album's audio files is [`Action::SkipConflict`] (a different
+    /// file already sits at its destination): the album does not move, so its
+    /// side files stay with it.
+    AudioConflict,
+}
+
+/// An album root whose side files were **not** planned (reported, never guessed).
+///
+/// For [`SideFilesLeft::AudioConflict`] these are all the album's side files
+/// (its root lies in the source root and holds only this album, so it is
+/// walked); for every other reason only the album root's **own** files are
+/// counted — the planner never walks a folder whose files it will not plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LeftInPlace {
+    /// The source album root.
+    pub album_root: PathBuf,
+    /// Why.
+    pub reason: SideFilesLeft,
+    /// How many side files stay there (exact).
+    pub files: usize,
+    /// Those files, sorted — at most [`LeftInPlace::MAX_PATHS`] of them
+    /// (`files` stays exact).
+    pub paths: Vec<PathBuf>,
+}
+
+impl LeftInPlace {
+    /// The cap on [`LeftInPlace::paths`].
+    pub const MAX_PATHS: usize = 1000;
+
+    fn new(album_root: &Path, reason: SideFilesLeft, mut files: Vec<PathBuf>) -> Self {
+        let count = files.len();
+        files.truncate(Self::MAX_PATHS);
+        Self {
+            album_root: album_root.to_path_buf(),
+            reason,
+            files: count,
+            paths: files,
+        }
+    }
+}
+
+/// A computed, not-yet-executed organize plan.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct OrganizePlan {
     /// The root every entry's destination lives under.
     pub dest_root: PathBuf,
-    /// One entry per input file, preserving input order.
+    /// Audio entries in input order, then side-file entries album by album.
     pub entries: Vec<PlanEntry>,
+    /// Album roots whose side files stay in place, with the reason (each root at
+    /// most once).
+    pub side_files_left: Vec<LeftInPlace>,
+    /// [`Strategy::Move`] only: source folders [`apply`](crate::apply) removes
+    /// **if empty** after the moves, deepest first — only folders strictly
+    /// inside [`PlanOptions::source_root`]. Empty for Copy and without a source
+    /// root.
+    pub prune_dirs: Vec<PathBuf>,
+    /// Album roots (each once, first-seen order) of multi-disc albums where some
+    /// track's disc number came **only** from its disc-folder name (`CD2/`, no
+    /// disc tag) while the template has no `{DiscDir}`: the new layout puts all
+    /// discs in one folder, so a later re-import reads them as one disc. A UI
+    /// should warn, or suggest a `+disc-folders` preset or tagging the discs.
+    pub folder_inferred_discs: Vec<PathBuf>,
 }
 
-/// Compute an [`OrganizePlan`] for `files` against `dest_root`.
+/// Optional planning context. Construct with [`PlanOptions::new`] (or
+/// `Default` for none).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PlanOptions {
+    /// The folder the inputs were collected from (the scan/staging root). Album
+    /// roots never climb to or above it; an album whose tracks sit loose in it
+    /// keeps its side files in place; Move cleanup may prune emptied folders up
+    /// to — never including — it. `None`: **no** side files are planned (each
+    /// album's are reported as [`SideFilesLeft::NoSourceRoot`]) and nothing is
+    /// pruned.
+    ///
+    /// **Form:** the same form as the input paths — both absolute (preferred),
+    /// or both relative to the same working directory. A Windows verbatim
+    /// prefix on either side (`\\?\D:\…`, `\\?\UNC\…`, as `canonicalize`
+    /// returns) and, on Windows/macOS, letter-case differences are tolerated.
+    /// A root containing `..` is not trusted: no side files, no pruning.
+    pub source_root: Option<PathBuf>,
+}
+
+impl PlanOptions {
+    /// Options with [`source_root`](Self::source_root) set.
+    pub fn new(source_root: impl Into<PathBuf>) -> Self {
+        Self {
+            source_root: Some(source_root.into()),
+        }
+    }
+}
+
+/// [`plan_with`] with default [`PlanOptions`] (no source root): audio only.
 ///
-/// For each source (in input order) the destination is
-/// `dest_root.join(template.render(tags, src))`, where `tags` are read per file
-/// (an unreadable or untagged file degrades to
-/// [`Tags::default`](soul_audio_tags::Tags), never a panic). Each entry's
-/// [`Action`] is classified as:
-///
-/// - **[`SkipDuplicate`](Action::SkipDuplicate)** if an *earlier* entry in this
-///   same batch already claims the identical destination, **or** the destination
-///   already exists on disk with the **same byte length** as the source.
-/// - **[`SkipConflict`](Action::SkipConflict)** if the destination already exists
-///   but with a *different* byte length (a distinct file we must not overwrite).
-/// - otherwise **[`Copy`](Action::Copy)** or **[`Move`](Action::Move)** per
-///   `strategy`.
-///
-/// # Duplicate heuristic
-/// The already-exists check compares **sizes only** (`std::fs::metadata(..).len()`),
-/// not a content hash. Two files of equal length are assumed identical and the
-/// source is skipped; an unequal length is a conflict. In either case the
-/// existing destination is **never overwritten**. This is deliberately cheap; a
-/// caller needing byte-exact de-duplication must hash separately.
-///
-/// `plan` performs **no** filesystem mutation — it creates no directories and
-/// copies nothing.
+/// Without a source root an album root could be any user folder, so `plan`
+/// plans **no side files** (they are reported in
+/// [`OrganizePlan::side_files_left`] as [`SideFilesLeft::NoSourceRoot`]) and
+/// **no** Move cleanup ([`OrganizePlan::prune_dirs`] stays empty). Side files
+/// and pruning require [`plan_with`] with [`PlanOptions::source_root`].
 pub fn plan(
     files: &[PathBuf],
     dest_root: &Path,
     template: &Template,
     strategy: Strategy,
 ) -> OrganizePlan {
-    let mut entries = Vec::with_capacity(files.len());
-    // Destinations an earlier Copy/Move entry will write — later inputs mapping
-    // to the same path are duplicates of that pending write.
-    let mut claimed: HashSet<PathBuf> = HashSet::new();
-    for src in files {
-        let tags = read_tags(src);
-        let dst = dest_root.join(template.render(&tags, src));
-        let action = classify(src, &dst, strategy, &claimed);
-        if matches!(action, Action::Copy | Action::Move) {
-            claimed.insert(dst.clone());
-        }
-        entries.push(PlanEntry {
-            src: src.clone(),
-            dst,
-            action,
-        });
+    plan_with(
+        files,
+        dest_root,
+        template,
+        strategy,
+        &PlanOptions::default(),
+    )
+}
+
+/// Compute an [`OrganizePlan`] for `files` against `dest_root`.
+///
+/// Inputs are first grouped into **albums** exactly as the importer does
+/// (album root folder — a `CD1`/`Disc 2 - …` folder folds into its parent —
+/// plus album title plus MusicBrainz release id), so every track renders with
+/// its album's disc context (`{DiscPrefix}`, `{DiscDir}`, `{DiscTotal}`; a disc
+/// number missing from the tags comes from the disc folder). Each audio file's
+/// destination is `dest_root.join(template.render(..))`.
+///
+/// **Distinct same-title albums** (e.g. two editions in different source
+/// folders) never share an album folder: when a template with an `{Album}`
+/// folder renders a later album into a folder an earlier album of this batch
+/// already claims, the later one gets `<folder> (2)`, `(3)`, … (stable across
+/// re-runs, since input order is deterministic).
+///
+/// **Side files**: for every album root inside the source root that holds
+/// exactly one album with a folder of its own, each non-audio, non-junk file
+/// under it (recursively; not into a sub-folder holding another album's audio)
+/// is planned too — see [`EntryKind::SideFile`] — unless one of the album's
+/// audio files is a [`SkipConflict`](Action::SkipConflict). Otherwise the root
+/// is reported in [`OrganizePlan::side_files_left`].
+///
+/// Each entry's [`Action`] is classified as:
+/// - **[`SkipDuplicate`](Action::SkipDuplicate)** if an *earlier* entry in this
+///   batch already claims the identical destination, **or** the destination
+///   already exists on disk with the **same byte length** as the source.
+/// - **[`SkipConflict`](Action::SkipConflict)** if the destination already exists
+///   with a *different* byte length (a distinct file we must not overwrite).
+/// - otherwise **[`Copy`](Action::Copy)** or **[`Move`](Action::Move)** per
+///   `strategy`.
+///
+/// Destinations compare case-insensitively on Windows/macOS (see the crate
+/// docs), so `Abc` and `ABC` album folders are told apart with ` (2)` there.
+///
+/// # Duplicate heuristic
+/// The already-exists check compares **sizes only**, not a content hash; the
+/// existing destination is **never overwritten**.
+///
+/// `plan_with` performs **no** filesystem mutation.
+pub fn plan_with(
+    files: &[PathBuf],
+    dest_root: &Path,
+    template: &Template,
+    strategy: Strategy,
+    opts: &PlanOptions,
+) -> OrganizePlan {
+    let source_root = opts.source_root.as_deref();
+    let (tracks, albums) = album::group(files, source_root);
+    // Side files and pruning trust only a source root without `..`, and only
+    // albums inside it none of whose inputs has `..` (it may escape the root).
+    let trusted_root = source_root.filter(|r| !paths::has_parent_dir(r));
+    let trusted: Vec<bool> = albums
+        .iter()
+        .map(|a| {
+            trusted_root.is_some_and(|sr| paths::starts_with(&a.root, sr))
+                && !a.tracks.iter().any(|&i| paths::has_parent_dir(&files[i]))
+        })
+        .collect();
+
+    let mut entries: Vec<PlanEntry> = Vec::with_capacity(files.len());
+    // Parallel to `entries`: may a Move of this entry prune its source folders.
+    let mut prunable: Vec<bool> = Vec::with_capacity(files.len());
+    let mut dsts = Dsts::default();
+
+    // Each track's destination and album folder (relative), then distinct
+    // albums rendering to one folder are pulled apart (` (2)`, ` (3)`, …).
+    let mut rel_dsts: Vec<PathBuf> = Vec::with_capacity(files.len());
+    let mut album_dirs: Vec<PathBuf> = Vec::with_capacity(files.len());
+    for (src, info) in files.iter().zip(&tracks) {
+        rel_dsts.push(template.render(&info.tags, src));
+        album_dirs.push(template.render_album_dir(&info.tags, src));
     }
+    if template.has_album_dir() {
+        separate_albums(&albums, &mut rel_dsts, &mut album_dirs);
+    }
+
+    // 1. Audio, in input order (entry `i` is input `i`).
+    let mut audio_dst: Vec<PathBuf> = Vec::with_capacity(files.len());
+    for ((src, info), rel_dst) in files.iter().zip(&tracks).zip(&rel_dsts) {
+        let dst = dest_root.join(rel_dst);
+        audio_dst.push(dst.clone());
+        dsts.push(&mut entries, src, dst, strategy, EntryKind::Audio);
+        prunable.push(trusted[info.album]);
+    }
+
+    // 2. Side files, album by album; each album root is handled once.
+    let roots = RootIndex::new(&albums);
+    let mut side_files_left: Vec<LeftInPlace> = Vec::new();
+    let mut seen_roots: HashSet<&Path> = HashSet::new();
+    // An input is never also a side file (e.g. one with a non-audio extension).
+    let inputs: HashSet<PathBuf> = files.iter().map(|f| paths::key(f)).collect();
+    for (a, album) in albums.iter().enumerate() {
+        if !seen_roots.insert(album.root.as_path()) {
+            continue;
+        }
+        // Decided BEFORE any walk: an untrusted root may be any folder (a
+        // drive root, `~/Downloads`) and is never recursed into.
+        let reason = if !trusted[a] {
+            Some(SideFilesLeft::NoSourceRoot)
+        } else if trusted_root.is_some_and(|sr| paths::same(&album.root, sr)) {
+            Some(SideFilesLeft::AtSourceRoot)
+        } else if roots.is_shared(&album.root) {
+            Some(SideFilesLeft::SharedAlbumRoot)
+        } else if !template.has_album_dir() {
+            Some(SideFilesLeft::NoAlbumFolder)
+        } else {
+            None
+        };
+        let rel_dir = match reason {
+            None => album_dest_dir(&album_dirs, album),
+            Some(_) => None,
+        };
+        let Some(rel_dir) = rel_dir else {
+            let own = side::direct(&album.root, &inputs);
+            if !own.is_empty() {
+                let reason = reason.unwrap_or(SideFilesLeft::NoAlbumFolder);
+                side_files_left.push(LeftInPlace::new(&album.root, reason, own));
+            }
+            continue;
+        };
+        let side = side::collect(&album.root, dest_root, &inputs);
+        if side.is_empty() {
+            continue;
+        }
+        if album
+            .tracks
+            .iter()
+            .any(|&i| entries[i].action == Action::SkipConflict)
+        {
+            side_files_left.push(LeftInPlace::new(
+                &album.root,
+                SideFilesLeft::AudioConflict,
+                side,
+            ));
+            continue;
+        }
+        let album_dir = dest_root.join(rel_dir);
+        let stems: HashMap<PathBuf, PathBuf> = album
+            .tracks
+            .iter()
+            .filter(|&&i| files[i].extension().is_some())
+            .map(|&i| {
+                (
+                    paths::key(&files[i].with_extension("")),
+                    audio_dst[i].clone(),
+                )
+            })
+            .collect();
+        let placement = AlbumPlacement {
+            root: &album.root,
+            dir: &album_dir,
+            disc_dirs: template.has_disc_dir() && album.disc_count > 1,
+            disc_count: album.disc_count,
+            stems: &stems,
+        };
+        for (src, dst) in side::place(&placement, &side, &dsts.taken) {
+            dsts.push(&mut entries, &src, dst, strategy, EntryKind::SideFile);
+            prunable.push(true);
+        }
+    }
+
+    let prune_dirs = match (strategy, trusted_root) {
+        (Strategy::Move, Some(sr)) => prune_candidates(&entries, &prunable, sr),
+        _ => Vec::new(),
+    };
     OrganizePlan {
         dest_root: dest_root.to_path_buf(),
         entries,
+        side_files_left,
+        prune_dirs,
+        folder_inferred_discs: folder_inferred_discs(&albums, template),
     }
 }
 
-/// Classify one source against the destinations already claimed this batch and
-/// whatever currently sits on disk at `dst`.
-fn classify(src: &Path, dst: &Path, strategy: Strategy, claimed: &HashSet<PathBuf>) -> Action {
-    if claimed.contains(dst) {
-        return Action::SkipDuplicate;
+/// The destinations planned so far, as [`paths::key`]s.
+#[derive(Default)]
+struct Dsts {
+    /// Destinations an earlier Copy/Move entry will write — a later entry
+    /// mapping to one is a duplicate of that pending write.
+    claimed: HashSet<PathBuf>,
+    /// Every earlier entry's destination, whatever its action — the names a
+    /// side file must avoid. Independent of what is already on disk, so a
+    /// re-plan picks the same side-file names.
+    taken: HashSet<PathBuf>,
+}
+
+impl Dsts {
+    /// Classify and append one entry, claiming its destination when it will write.
+    fn push(
+        &mut self,
+        entries: &mut Vec<PlanEntry>,
+        src: &Path,
+        dst: PathBuf,
+        strategy: Strategy,
+        kind: EntryKind,
+    ) {
+        let key = paths::key(&dst);
+        let action = if self.claimed.contains(&key) {
+            Action::SkipDuplicate
+        } else {
+            classify(src, &dst, strategy)
+        };
+        if matches!(action, Action::Copy | Action::Move) {
+            self.claimed.insert(key.clone());
+        }
+        self.taken.insert(key);
+        entries.push(PlanEntry {
+            src: src.to_path_buf(),
+            dst,
+            action,
+            kind,
+        });
     }
+}
+
+/// [`OrganizePlan::folder_inferred_discs`]: album roots, each once.
+fn folder_inferred_discs(albums: &[AlbumGroup], template: &Template) -> Vec<PathBuf> {
+    if template.has_disc_dir() {
+        return Vec::new();
+    }
+    let mut seen: HashSet<&Path> = HashSet::new();
+    albums
+        .iter()
+        .filter(|a| a.disc_from_folder && a.disc_count > 1 && seen.insert(&a.root))
+        .map(|a| a.root.clone())
+        .collect()
+}
+
+/// Give every **distinct** album its own album folder within this batch.
+///
+/// Albums are walked in plan (first-seen input) order. The first album to
+/// render into an album folder keeps it; a later album (a different identity
+/// key) rendering into an already-claimed folder gets that folder's last
+/// component suffixed ` (2)`, ` (3)`, … — the lowest `n` whose name no album in
+/// this batch claims or renders to natively — and its destinations are
+/// re-rooted under it (the path below the album folder is unchanged). Folders
+/// compare as [`paths::key`]s (`Abc` and `ABC` are one folder on Windows/macOS).
+/// Folders already on disk are not considered: a re-run plans the same names,
+/// and its files classify as `SkipDuplicate` as before. A track with no album
+/// folder (it renders into the destination root) is left alone.
+fn separate_albums(albums: &[AlbumGroup], rel_dsts: &mut [PathBuf], album_dirs: &mut [PathBuf]) {
+    let native: HashSet<PathBuf> = album_dirs
+        .iter()
+        .filter(|d| d.components().next().is_some())
+        .map(|d| paths::key(d))
+        .collect();
+    let mut owner: HashMap<PathBuf, usize> = HashMap::new();
+    for (a, album) in albums.iter().enumerate() {
+        // This album's native folder (as a key) → its final folder.
+        let mut mine: HashMap<PathBuf, PathBuf> = HashMap::new();
+        for &i in &album.tracks {
+            let dir = album_dirs[i].clone();
+            let Some(name) = dir.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            let fin = mine
+                .entry(paths::key(&dir))
+                .or_insert_with(|| {
+                    let fin = match owner.get(&paths::key(&dir)) {
+                        Some(&o) if o != a => (2u32..)
+                            .map(|n| dir.with_file_name(format!("{name} ({n})")))
+                            .find(|c| {
+                                let k = paths::key(c);
+                                !owner.contains_key(&k) && !native.contains(&k)
+                            })
+                            .unwrap_or_else(|| dir.clone()),
+                        _ => dir.clone(),
+                    };
+                    owner.insert(paths::key(&fin), a);
+                    fin
+                })
+                .clone();
+            if fin != dir
+                && let Ok(below) = rel_dsts[i].strip_prefix(&dir)
+            {
+                rel_dsts[i] = fin.join(below);
+                album_dirs[i] = fin;
+            }
+        }
+    }
+}
+
+/// The album's own destination folder, relative to the destination root: the
+/// common ancestor of its tracks' album folders (rendered with `{DiscDir}`
+/// neutralized, after [`separate_albums`]). `None` when that is the destination
+/// root itself (e.g. `flat`, or tracks of one album rendering under different
+/// artist folders).
+fn album_dest_dir(album_dirs: &[PathBuf], album: &AlbumGroup) -> Option<PathBuf> {
+    let mut common: Option<PathBuf> = None;
+    for &i in &album.tracks {
+        let dir = &album_dirs[i];
+        common = Some(match common {
+            None => dir.clone(),
+            Some(c) => c
+                .components()
+                .zip(dir.components())
+                .take_while(|(a, b)| a == b)
+                .map(|(a, _)| a)
+                .collect(),
+        });
+    }
+    common.filter(|c| c.components().next().is_some())
+}
+
+/// Every source folder a Move may empty: for each moved, `prunable` entry, its
+/// parent and upward — up to but excluding `source_root` (compared as
+/// [`paths::key`]s). Never the source root or an ancestor of it. Deepest
+/// first, deterministic.
+fn prune_candidates(entries: &[PlanEntry], prunable: &[bool], source_root: &Path) -> Vec<PathBuf> {
+    let mut set: BTreeSet<PathBuf> = BTreeSet::new();
+    for (e, &ok) in entries.iter().zip(prunable) {
+        if e.action != Action::Move || !ok {
+            continue;
+        }
+        let mut dir = e.src.parent();
+        while let Some(d) = dir {
+            if paths::same(d, source_root) || !paths::starts_with(d, source_root) {
+                break;
+            }
+            set.insert(d.to_path_buf());
+            dir = d.parent();
+        }
+    }
+    let mut dirs: Vec<PathBuf> = set.into_iter().collect();
+    dirs.sort_by_key(|d| Reverse(d.components().count()));
+    dirs
+}
+
+/// Classify one source against whatever currently sits on disk at `dst` (the
+/// batch's own claims are checked by the caller).
+fn classify(src: &Path, dst: &Path, strategy: Strategy) -> Action {
     if let Ok(dst_meta) = std::fs::metadata(dst) {
         // Something already lives at `dst`. Equal size = treat as already
         // organized (SkipDuplicate); different size = a distinct file we refuse

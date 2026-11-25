@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use embedded_io::SeekFrom;
 use soul_audio_core::SeekSource;
 
-use crate::util::{parse_gain_db, parse_peak, parse_r128_gain_db, read_exact};
+use crate::util::{parse_count, parse_gain_db, parse_peak, parse_r128_gain_db, read_exact};
 use crate::{DataEncoding, Field, Picture, StreamFacts, TagError, TagSink, read};
 
 /// An owned tag snapshot — one heap-allocated value that outlives the read,
@@ -54,6 +54,11 @@ pub struct Tags {
     /// MusicBrainz **recording** MBID (a UUID), if the file is tagged with one —
     /// the stable key a later enrichment pass joins on. `None` when untagged.
     pub musicbrainz_recording_id: Option<String>,
+    /// Per-disc subtitle ("Mondstadt"), first value wins. `None` when untagged.
+    pub disc_subtitle: Option<String>,
+    /// MusicBrainz **release** MBID, first value wins — part of the album
+    /// identity key (two releases of one title in one folder stay apart).
+    pub musicbrainz_album_id: Option<String>,
 }
 
 /// [`TagSink`] that collects into an owned [`Tags`].
@@ -116,17 +121,25 @@ impl TagSink for OwnedTags {
                     .musicbrainz_recording_id
                     .get_or_insert_with(|| value.into());
             }
+            Field::DiscSubtitle => {
+                self.tags.disc_subtitle.get_or_insert_with(|| value.into());
+            }
+            Field::MusicBrainzAlbumId => {
+                self.tags
+                    .musicbrainz_album_id
+                    .get_or_insert_with(|| value.into());
+            }
             Field::TrackNumber if self.tags.track.is_none() => {
-                self.tags.track = value.parse().ok();
+                self.tags.track = parse_count(value);
             }
             Field::TrackTotal if self.tags.track_total.is_none() => {
-                self.tags.track_total = value.parse().ok();
+                self.tags.track_total = parse_count(value);
             }
             Field::DiscNumber if self.tags.disc.is_none() => {
-                self.tags.disc = value.parse().ok();
+                self.tags.disc = parse_count(value);
             }
             Field::DiscTotal if self.tags.disc_total.is_none() => {
-                self.tags.disc_total = value.parse().ok();
+                self.tags.disc_total = parse_count(value);
             }
             // ReplayGain wins over R128: keep the first ReplayGain gain and let
             // it override any R128 one already stored; only accept an R128 gain
@@ -462,5 +475,37 @@ mod tests {
             }
             MimeType::Other => {}
         }
+    }
+
+    #[test]
+    fn read_owned_splits_vorbis_disc_and_track_n_over_total() {
+        // Regression: `DISCNUMBER=2/3` used to fail `parse()` and become `None`
+        // (the importer then defaulted it to disc 1).
+        let bytes = flac_fixture(&["DISCNUMBER=2/3", "TRACKNUMBER=7/12"]);
+        let (tags, _) = read_owned(&mut SliceSource::new(&bytes)).unwrap();
+        assert_eq!((tags.disc, tags.disc_total), (Some(2), Some(3)));
+        assert_eq!((tags.track, tags.track_total), (Some(7), Some(12)));
+    }
+
+    #[test]
+    fn read_owned_reads_totaldiscs_and_tolerates_padding() {
+        let bytes = flac_fixture(&["DISCNUMBER= 01 ", "TOTALDISCS=4"]);
+        let (tags, _) = read_owned(&mut SliceSource::new(&bytes)).unwrap();
+        assert_eq!((tags.disc, tags.disc_total), (Some(1), Some(4)));
+    }
+
+    #[test]
+    fn read_owned_collects_disc_subtitle_and_mb_album_id() {
+        let bytes = flac_fixture(&[
+            "DISCSUBTITLE=Mondstadt",
+            "DISCSUBTITLE=ignored second value",
+            "MUSICBRAINZ_ALBUMID=0b1e5b0a-1111-4222-8333-444455556666",
+        ]);
+        let (tags, _) = read_owned(&mut SliceSource::new(&bytes)).unwrap();
+        assert_eq!(tags.disc_subtitle.as_deref(), Some("Mondstadt"));
+        assert_eq!(
+            tags.musicbrainz_album_id.as_deref(),
+            Some("0b1e5b0a-1111-4222-8333-444455556666")
+        );
     }
 }
