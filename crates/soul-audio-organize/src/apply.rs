@@ -1,6 +1,9 @@
 //! Execution: the one mutating layer. [`apply`] walks an
 //! [`OrganizePlan`](crate::OrganizePlan), copying or moving each file into
-//! place, reporting [`Progress`] per entry and tallying a [`Summary`]. It is
+//! place — a rewritten `.cue` ([`PlanEntry::rewritten`](crate::PlanEntry::rewritten))
+//! is written from the plan's bytes instead, its source removed only after the
+//! write on a Move — reporting [`Progress`] per entry and tallying a
+//! [`Summary`]. It is
 //! **idempotent** — a destination that already exists is skipped, never
 //! overwritten — so re-running a plan is safe, and a per-file error never aborts
 //! the batch (it is recorded in [`Summary::failed`] and the walk continues).
@@ -9,7 +12,8 @@
 //! empty (bottom-up; a non-empty folder is never touched) — also on a resumed
 //! re-apply that had nothing left to move.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use crate::{Action, OrganizePlan, PlanEntry};
 
@@ -86,10 +90,11 @@ pub fn apply(
 
 /// Apply a single entry, folding its outcome into `summary`.
 fn apply_one(entry: &PlanEntry, summary: &mut Summary) {
-    match entry.action {
-        Action::Copy => do_copy(entry, summary),
-        Action::Move => do_move(entry, summary),
-        Action::SkipDuplicate | Action::SkipConflict => summary.skipped += 1,
+    match (entry.action, &entry.rewritten) {
+        (Action::Copy | Action::Move, Some(bytes)) => do_write(entry, bytes, summary),
+        (Action::Copy, None) => do_copy(entry, summary),
+        (Action::Move, None) => do_move(entry, summary),
+        (Action::SkipDuplicate | Action::SkipConflict, _) => summary.skipped += 1,
     }
 }
 
@@ -146,10 +151,65 @@ fn do_move(entry: &PlanEntry, summary: &mut Summary) {
     }
 }
 
+/// A rewritten cue ([`PlanEntry::rewritten`]): write `bytes` at `dst` — never
+/// over an existing file — and, for a Move, remove the source only once the
+/// write succeeded. A failed write leaves the source untouched (and no partial
+/// destination); a failed removal leaves both files and is recorded.
+fn do_write(entry: &PlanEntry, bytes: &[u8], summary: &mut Summary) {
+    if !ensure_parent(entry, summary) {
+        return;
+    }
+    if entry.dst.exists() {
+        summary.skipped += 1;
+        return;
+    }
+    match write_new(&entry.dst, bytes) {
+        Ok(()) => {}
+        // Created by someone else since the check: still never overwritten.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            summary.skipped += 1;
+            return;
+        }
+        Err(e) => {
+            summary.failed.push((entry.src.clone(), e.to_string()));
+            return;
+        }
+    }
+    if entry.action != Action::Move {
+        summary.copied += 1;
+        return;
+    }
+    match std::fs::remove_file(&entry.src) {
+        Ok(()) => summary.moved += 1,
+        Err(e) => summary.failed.push((
+            entry.src.clone(),
+            format!(
+                "wrote {} but could not remove the source: {e}",
+                entry.dst.display()
+            ),
+        )),
+    }
+}
+
+/// Create `dst` (failing if it exists) holding exactly `bytes`; on error the
+/// partial file is removed.
+fn write_new(dst: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)?;
+    let res = f.write_all(bytes).and_then(|()| f.sync_all());
+    if res.is_err() {
+        drop(f);
+        let _ = std::fs::remove_file(dst);
+    }
+    res
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Progress, apply};
-    use crate::{Strategy, Template, plan, presets};
+    use crate::{Action, EntryKind, OrganizePlan, PlanEntry, Strategy, Template, plan, presets};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -351,5 +411,83 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// A one-entry plan writing `bytes` (a rewritten cue) for `src` → `dst`.
+    fn cue_plan(src: &Path, dst: &Path, action: Action, bytes: &[u8]) -> OrganizePlan {
+        OrganizePlan {
+            entries: vec![PlanEntry {
+                src: src.to_path_buf(),
+                dst: dst.to_path_buf(),
+                action,
+                kind: EntryKind::SideFile,
+                rewritten: Some(bytes.to_vec()),
+            }],
+            ..Default::default()
+        }
+    }
+
+    const OLD: &[u8] = b"FILE \"a.flac\" WAVE\r\n";
+    const NEW: &[u8] = b"FILE \"01 - A.flac\" WAVE\r\n";
+
+    #[test]
+    fn a_rewritten_cue_copy_writes_the_new_bytes_and_keeps_the_source() {
+        let dir = unique_dir("cue-copy");
+        let src = dir.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        let dst = join(&dir, &["out", "a.cue"]);
+        let s = apply(&cue_plan(&src, &dst, Action::Copy, NEW), |_| {}).unwrap();
+        assert_eq!((s.copied, s.moved, s.skipped), (1, 0, 0));
+        assert!(s.failed.is_empty(), "{:?}", s.failed);
+        assert_eq!(std::fs::read(&dst).unwrap(), NEW);
+        assert_eq!(std::fs::read(&src).unwrap(), OLD);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rewritten_cue_move_writes_then_removes_the_source() {
+        let dir = unique_dir("cue-move");
+        let src = dir.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        let dst = join(&dir, &["out", "a.cue"]);
+        let p = cue_plan(&src, &dst, Action::Move, NEW);
+        let s = apply(&p, |_| {}).unwrap();
+        assert_eq!((s.copied, s.moved, s.skipped), (0, 1, 0));
+        assert_eq!(std::fs::read(&dst).unwrap(), NEW);
+        assert!(!src.exists());
+        // Re-applying the same plan is a no-op.
+        let again = apply(&p, |_| {}).unwrap();
+        assert_eq!((again.moved, again.skipped), (0, 1));
+        assert!(again.failed.is_empty(), "{:?}", again.failed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rewritten_cue_never_overwrites() {
+        let dir = unique_dir("cue-exists");
+        let src = dir.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        let dst = dir.join("b.cue");
+        std::fs::write(&dst, b"someone else's").unwrap();
+        let s = apply(&cue_plan(&src, &dst, Action::Move, NEW), |_| {}).unwrap();
+        assert_eq!((s.moved, s.skipped), (0, 1));
+        assert_eq!(std::fs::read(&dst).unwrap(), b"someone else's");
+        assert_eq!(std::fs::read(&src).unwrap(), OLD, "the source stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_cue_write_keeps_the_source() {
+        let dir = unique_dir("cue-fail");
+        let src = dir.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        // The destination's parent is a FILE: the write cannot happen.
+        std::fs::write(dir.join("blocker"), b"x").unwrap();
+        let dst = join(&dir, &["blocker", "a.cue"]);
+        let s = apply(&cue_plan(&src, &dst, Action::Move, NEW), |_| {}).unwrap();
+        assert_eq!((s.moved, s.failed.len()), (0, 1));
+        assert_eq!(std::fs::read(&src).unwrap(), OLD, "never both missing");
+        assert!(!dst.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

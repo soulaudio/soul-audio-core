@@ -357,10 +357,18 @@ fn run_case(layout: Layout, preset_name: &str, strategy: Strategy) {
             p.side_files_left
         );
     }
+    // What each destination must hold: the source bytes, or — a rewritten
+    // cue — the plan's rewritten bytes.
     let snapshot: Vec<(std::path::PathBuf, Vec<u8>)> = p
         .entries
         .iter()
-        .map(|e| (e.dst.clone(), std::fs::read(&e.src).unwrap()))
+        .map(|e| {
+            let bytes = match &e.rewritten {
+                Some(b) => b.clone(),
+                None => std::fs::read(&e.src).unwrap(),
+            };
+            (e.dst.clone(), bytes)
+        })
         .collect();
 
     // Apply.

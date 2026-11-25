@@ -1,14 +1,17 @@
 //! Planning: group the inputs into albums (the importer's identity rule), read
 //! each file's tags, compute its destination via the [`Template`], add each
-//! album's side files, and classify every [`Action`] — **without** mutating the
-//! filesystem. `plan` only *reads* tags, *lists* album folders and *stats* any
-//! existing destination; it never creates directories or copies bytes.
+//! album's side files (rewriting a `.cue`'s `FILE` lines in memory), and
+//! classify every [`Action`] — **without** mutating the filesystem. `plan` only
+//! *reads* tags and `.cue` side files, *lists* album folders and *stats* (for a
+//! rewritten cue: reads) any existing destination; it never creates directories
+//! or copies bytes.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::album::{self, AlbumGroup, RootIndex};
+use crate::cue::{self, CueNotRewritten};
 use crate::paths;
 use crate::side::{self, AlbumPlacement};
 use crate::{Strategy, Template};
@@ -22,7 +25,8 @@ pub enum Action {
     Move,
     /// Skip: the destination is already claimed by an **earlier** entry in this
     /// batch, or already present on disk at the **same byte length** (treated as
-    /// already-organized — see the size heuristic on [`plan`]).
+    /// already-organized — see the size heuristic on [`plan_with`]; a rewritten
+    /// `.cue` must match its rewritten bytes exactly).
     SkipDuplicate,
     /// Skip: a **different** file already occupies the destination (same path,
     /// different byte length). We never overwrite.
@@ -36,9 +40,11 @@ pub enum EntryKind {
     /// An input audio file, renamed per the template.
     Audio,
     /// A non-audio file travelling with its album (`.log`, `.cue`, covers,
-    /// `Scans/…`, lyrics, `.txt`/`.nfo`). Never modified — only copied/moved,
-    /// renamed only when it shares a track's stem (it follows that track) or its
-    /// name must be made unique / filesystem-safe.
+    /// `Scans/…`, lyrics, `.txt`/`.nfo`). Never modified — only copied/moved —
+    /// except a `.cue` whose `FILE` lines are pointed at the renamed tracks
+    /// ([`PlanEntry::rewritten`]); renamed only when it shares a track's stem
+    /// (it follows that track) or its name must be made unique /
+    /// filesystem-safe.
     SideFile,
 }
 
@@ -53,6 +59,13 @@ pub struct PlanEntry {
     pub action: Action,
     /// Audio input or album side file.
     pub kind: EntryKind,
+    /// A `.cue` side file whose `FILE` lines name audio this plan renames:
+    /// the cue with those lines pointed at the new names (see
+    /// [`CueNotRewritten`] for when a cue is left as-is). When `Some`,
+    /// [`apply`](crate::apply) writes these bytes at `dst` instead of copying
+    /// `src` (a Move removes `src` only after the write succeeded). `None` for
+    /// every other entry.
+    pub rewritten: Option<Vec<u8>>,
 }
 
 /// Why an album's side files were left where they are.
@@ -146,6 +159,10 @@ pub struct OrganizePlan {
     /// discs in one folder, so a later re-import reads them as one disc. A UI
     /// should warn, or suggest a `+disc-folders` preset or tagging the discs.
     pub folder_inferred_discs: Vec<PathBuf>,
+    /// `.cue` side files planned **unchanged** although they may name audio
+    /// this plan renames, with the reason (source path, first-seen order). A
+    /// UI should warn that their `FILE` lines may point at missing files.
+    pub cues_not_rewritten: Vec<(PathBuf, CueNotRewritten)>,
 }
 
 /// Optional planning context. Construct with [`PlanOptions::new`] (or
@@ -236,8 +253,9 @@ pub fn plan(
 /// docs), so `Abc` and `ABC` album folders are told apart with ` (2)` there.
 ///
 /// # Duplicate heuristic
-/// The already-exists check compares **sizes only**, not a content hash; the
-/// existing destination is **never overwritten**.
+/// The already-exists check compares **sizes only**, not a content hash — except
+/// for a rewritten `.cue` ([`PlanEntry::rewritten`]), which must hold exactly
+/// the rewritten bytes; the existing destination is **never overwritten**.
 ///
 /// `plan_with` performs **no** filesystem mutation.
 pub fn plan_with(
@@ -288,9 +306,23 @@ pub fn plan_with(
     for ((src, info), rel_dst) in files.iter().zip(&tracks).zip(&rel_dsts) {
         let dst = dest_root.join(rel_dst);
         audio_dst.push(dst.clone());
-        dsts.push(&mut entries, src, dst, strategy, EntryKind::Audio);
+        dsts.push(&mut entries, src, dst, strategy, EntryKind::Audio, None);
         prunable.push(trusted[info.album]);
     }
+    // Each audio source (as a key) → where it lands: the names a cue's FILE
+    // lines move to. A conflicting track does not move (its album's side
+    // files stay too); the first entry for a source wins. Keyed by
+    // `paths::key` of the input path — the same form a cue's FILE names are
+    // resolved in (its folder is a walk of the album root, itself derived
+    // from the inputs), so a verbatim prefix or a case difference between
+    // the two never misses.
+    let mut audio_to: HashMap<PathBuf, PathBuf> = HashMap::new();
+    for e in entries.iter().filter(|e| e.action != Action::SkipConflict) {
+        audio_to
+            .entry(paths::key(&e.src))
+            .or_insert_with(|| e.dst.clone());
+    }
+    let mut cues_not_rewritten: Vec<(PathBuf, CueNotRewritten)> = Vec::new();
 
     // 2. Side files, album by album; each album root is handled once.
     let roots = RootIndex::new(&albums);
@@ -374,7 +406,22 @@ pub fn plan_with(
             stems: &stems,
         };
         for (src, dst) in side::place(&placement, &side, &dsts.taken) {
-            dsts.push(&mut entries, &src, dst, strategy, EntryKind::SideFile);
+            let rewritten = if cue::is_cue(&src) {
+                cue::plan_rewrite(&src, &dst, &audio_to).unwrap_or_else(|why| {
+                    cues_not_rewritten.push((src.clone(), why));
+                    None
+                })
+            } else {
+                None
+            };
+            dsts.push(
+                &mut entries,
+                &src,
+                dst,
+                strategy,
+                EntryKind::SideFile,
+                rewritten,
+            );
             prunable.push(true);
         }
     }
@@ -389,6 +436,7 @@ pub fn plan_with(
         side_files_left,
         prune_dirs,
         folder_inferred_discs: folder_inferred_discs(&albums, template),
+        cues_not_rewritten,
     }
 }
 
@@ -413,12 +461,13 @@ impl Dsts {
         dst: PathBuf,
         strategy: Strategy,
         kind: EntryKind,
+        rewritten: Option<Vec<u8>>,
     ) {
         let key = paths::key(&dst);
         let action = if self.claimed.contains(&key) {
             Action::SkipDuplicate
         } else {
-            classify(src, &dst, strategy)
+            classify(src, &dst, strategy, rewritten.as_deref())
         };
         if matches!(action, Action::Copy | Action::Move) {
             self.claimed.insert(key.clone());
@@ -429,6 +478,7 @@ impl Dsts {
             dst,
             action,
             kind,
+            rewritten,
         });
     }
 }
@@ -573,14 +623,21 @@ fn prune_candidates(entries: &[PlanEntry], prunable: &[bool], source_root: &Path
 }
 
 /// Classify one source against whatever currently sits on disk at `dst` (the
-/// batch's own claims are checked by the caller).
-fn classify(src: &Path, dst: &Path, strategy: Strategy) -> Action {
+/// batch's own claims are checked by the caller). A `rewritten` cue is a
+/// duplicate only when `dst` holds exactly those bytes (cues are small, so the
+/// content is compared); any other file only by size.
+fn classify(src: &Path, dst: &Path, strategy: Strategy, rewritten: Option<&[u8]>) -> Action {
     if let Ok(dst_meta) = std::fs::metadata(dst) {
-        // Something already lives at `dst`. Equal size = treat as already
-        // organized (SkipDuplicate); different size = a distinct file we refuse
-        // to clobber (SkipConflict). Size-only, not a content hash.
-        let src_len = std::fs::metadata(src).map(|m| m.len()).ok();
-        return if src_len == Some(dst_meta.len()) {
+        // Something already lives at `dst`: the same = treat as already
+        // organized (SkipDuplicate); different = a distinct file we refuse to
+        // clobber (SkipConflict).
+        let same = match rewritten {
+            Some(bytes) => {
+                dst_meta.len() == bytes.len() as u64 && std::fs::read(dst).is_ok_and(|d| d == bytes)
+            }
+            None => std::fs::metadata(src).map(|m| m.len()).ok() == Some(dst_meta.len()),
+        };
+        return if same {
             Action::SkipDuplicate
         } else {
             Action::SkipConflict

@@ -10,7 +10,6 @@
 //! byte-identical and reported ([`CueNotRewritten`]). This is the **only**
 //! side file the organizer ever modifies: a `.log` (whose checksum must stay
 //! valid) and everything else is copied/moved byte for byte.
-#![allow(dead_code)] // wired into plan.rs by the next task, which removes this
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -18,7 +17,8 @@ use std::path::{Component, Path, PathBuf};
 use crate::paths;
 
 /// Why a `.cue` side file was planned **unchanged** although it may reference
-/// audio this plan renames (reported in `OrganizePlan::cues_not_rewritten`).
+/// audio this plan renames (reported in
+/// [`OrganizePlan::cues_not_rewritten`](crate::OrganizePlan::cues_not_rewritten)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CueNotRewritten {
@@ -95,7 +95,9 @@ pub(crate) fn rewrite(bytes: &[u8], mut target: impl FnMut(&str) -> Option<PathB
             },
         };
         match new {
-            Some(n) if n != old => {
+            // Equal part by part (`Disc 1\01.flac` = `Disc 1/01.flac`,
+            // `./01.flac` = `01.flac`): the line stays as written.
+            Some(n) if !name_parts(&n).eq(name_parts(old)) => {
                 out.extend_from_slice(line.head);
                 out.push(b'"');
                 out.extend_from_slice(n.as_bytes());
@@ -195,11 +197,17 @@ fn cue_name(rel: &Path) -> Option<String> {
 }
 
 /// `to` relative to the folder `from_dir` (both under one destination root),
-/// walking up with `..` where needed.
+/// walking up with `..` where needed. Components compare as [`paths::key`]s
+/// (a Windows verbatim prefix on either side is ignored; case-insensitive on
+/// Windows/macOS), and the result keeps `to`'s own spelling.
 pub(crate) fn relative(from_dir: &Path, to: &Path) -> PathBuf {
+    let (from_dir, to) = (paths::strip_verbatim(from_dir), paths::strip_verbatim(to));
     let from: Vec<Component<'_>> = from_dir.components().collect();
     let to: Vec<Component<'_>> = to.components().collect();
-    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let same = |a: &Component<'_>, b: &Component<'_>| {
+        paths::key(Path::new(a.as_os_str())) == paths::key(Path::new(b.as_os_str()))
+    };
+    let common = from.iter().zip(&to).take_while(|(a, b)| same(a, b)).count();
     let mut out = PathBuf::new();
     for _ in common..from.len() {
         out.push("..");
@@ -210,15 +218,52 @@ pub(crate) fn relative(from_dir: &Path, to: &Path) -> PathBuf {
     out
 }
 
-/// `dir` joined with a `FILE` name as written (`/` or `\` separated; empty and
-/// `.` parts dropped).
-fn join_cue_name(dir: &Path, name: &str) -> PathBuf {
-    let mut p = dir.to_path_buf();
-    for part in name
-        .split(['/', '\\'])
+/// The parts of a `FILE` name (`/` or `\` separated; empty and `.` parts
+/// dropped).
+fn name_parts(name: &str) -> impl Iterator<Item = &str> {
+    name.split(['/', '\\'])
         .filter(|s| !s.is_empty() && *s != ".")
-    {
-        p.push(part);
+}
+
+/// The path a `FILE` name as written (`/` or `\` separated) names for a cue in
+/// `dir`, resolved lexically: empty and `.` parts dropped, `..` steps up. A
+/// name with a drive (`C:\…`, Windows) or a UNC prefix (`\\server\share\…`,
+/// Windows) is absolute; one with a leading separator starts at `dir`'s root.
+fn join_cue_name(dir: &Path, name: &str) -> PathBuf {
+    let b = name.as_bytes();
+    let is_sep = |c: u8| c == b'/' || c == b'\\';
+    let (mut p, rest) =
+        if cfg!(windows) && b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            (PathBuf::from(format!(r"{}\", &name[..2])), &name[2..])
+        } else if cfg!(windows) && b.len() >= 2 && is_sep(b[0]) && is_sep(b[1]) {
+            let mut it = name[2..].splitn(3, ['/', '\\']);
+            match (it.next(), it.next(), it.next()) {
+                (Some(server), Some(share), rest) if !server.is_empty() && !share.is_empty() => (
+                    PathBuf::from(format!(r"\\{server}\{share}\")),
+                    rest.unwrap_or(""),
+                ),
+                _ => (PathBuf::from(name), ""),
+            }
+        } else if b.first().copied().is_some_and(is_sep) {
+            let root: PathBuf = dir
+                .components()
+                .take_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
+                .collect();
+            let root = if root.as_os_str().is_empty() {
+                PathBuf::from(std::path::MAIN_SEPARATOR_STR)
+            } else {
+                root
+            };
+            (root, name)
+        } else {
+            (dir.to_path_buf(), name)
+        };
+    for part in name_parts(rest) {
+        if part == ".." {
+            p.pop();
+        } else {
+            p.push(part);
+        }
     }
     p
 }
@@ -255,7 +300,7 @@ pub(crate) fn plan_rewrite(
 
 #[cfg(test)]
 mod tests {
-    use super::{CueNotRewritten, Outcome, is_cue, relative, rewrite};
+    use super::{CueNotRewritten, Outcome, is_cue, join_cue_name, relative, rewrite};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
@@ -444,6 +489,101 @@ REM FILE \"01 a.flac\"\nFILE \"1-02 - b c.flac\" WAVE\n  TRACK 03 AUDIO\n";
         );
         assert_eq!(
             relative(Path::new("d/Box"), Path::new("d/Box/01.flac")),
+            PathBuf::from("01.flac")
+        );
+    }
+
+    #[test]
+    fn a_name_equal_component_wise_keeps_its_line() {
+        for (old, new) in [
+            (r"Disc 1\01.flac", "Disc 1/01.flac"),
+            ("./01.flac", "01.flac"),
+            ("Disc 1//./01.flac", "Disc 1/01.flac"),
+        ] {
+            let src = format!("FILE \"{old}\" WAVE\r\n");
+            assert_eq!(
+                run(src.as_bytes(), &[(old, new)]),
+                Outcome::Unchanged,
+                "{old} -> {new}"
+            );
+        }
+        // A different name (even only by case) is still rewritten.
+        assert_eq!(
+            rewritten(run(b"FILE \"01.FLAC\" WAVE\n", &[("01.FLAC", "01.flac")])),
+            b"FILE \"01.flac\" WAVE\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn parent_dir_parts_are_resolved_lexically() {
+        assert_eq!(
+            join_cue_name(Path::new("Album/CUE"), r"..\01.flac"),
+            Path::new("Album").join("01.flac")
+        );
+        assert_eq!(
+            join_cue_name(Path::new("lib/Album/CUE"), "../../Other/./01.flac"),
+            Path::new("lib").join("Other").join("01.flac")
+        );
+        assert_eq!(
+            join_cue_name(Path::new("Album"), r"Disc 1\01.flac"),
+            Path::new("Album").join("Disc 1").join("01.flac")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_rooted_name_is_absolute() {
+        assert_eq!(
+            join_cue_name(Path::new("/lib/Album"), "/music/Box/01.flac"),
+            PathBuf::from("/music/Box/01.flac")
+        );
+        assert_eq!(
+            join_cue_name(Path::new("/lib/Album"), r"\music\..\01.flac"),
+            PathBuf::from("/01.flac")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_rooted_or_drive_name_is_absolute_on_windows() {
+        assert_eq!(
+            join_cue_name(Path::new(r"D:\lib\Album"), r"C:\Music\Box\01.flac"),
+            PathBuf::from(r"C:\Music\Box\01.flac")
+        );
+        assert_eq!(
+            join_cue_name(Path::new(r"D:\lib\Album"), "c:/Music/../01.flac"),
+            PathBuf::from(r"c:\01.flac")
+        );
+        // Rooted without a drive: the cue's own drive.
+        assert_eq!(
+            join_cue_name(Path::new(r"D:\lib\Album"), r"\Music\01.flac"),
+            PathBuf::from(r"D:\Music\01.flac")
+        );
+        assert_eq!(
+            join_cue_name(Path::new(r"\\?\D:\lib\Album"), r"\Music\01.flac"),
+            PathBuf::from(r"\\?\D:\Music\01.flac")
+        );
+        assert_eq!(
+            join_cue_name(Path::new(r"D:\lib\Album"), r"\\nas\music\Box\01.flac"),
+            PathBuf::from(r"\\nas\music\Box\01.flac")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn relative_ignores_a_verbatim_prefix_and_case_on_windows() {
+        assert_eq!(
+            relative(
+                Path::new(r"\\?\D:\out\Box"),
+                Path::new(r"D:\out\Box\Disc 1\01.flac")
+            ),
+            Path::new("Disc 1").join("01.flac")
+        );
+        assert_eq!(
+            relative(
+                Path::new(r"d:\OUT\box"),
+                Path::new(r"\\?\D:\out\Box\01.flac")
+            ),
             PathBuf::from("01.flac")
         );
     }
