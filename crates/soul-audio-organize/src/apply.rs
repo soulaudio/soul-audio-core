@@ -176,10 +176,13 @@ fn do_move_with(
 /// A cross-volume Move's copy: create `dst` (never over an existing file),
 /// stream `src` into it, flush it to disk and check its length against the
 /// source's. On any error the partial `dst` — only ever one this call created
-/// — is removed; the source is never touched here.
+/// — is removed; the source is never touched here. Like `fs::copy`, the
+/// copy keeps the source's modification time and permissions (read-only
+/// flag); those are best-effort and never fail the move.
 fn copy_across(src: &Path, dst: &Path) -> std::io::Result<()> {
     let mut from = std::fs::File::open(src)?;
-    let want = from.metadata()?.len();
+    let src_meta = from.metadata()?;
+    let want = src_meta.len();
     let mut to = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -203,7 +206,13 @@ fn copy_across(src: &Path, dst: &Path) -> std::io::Result<()> {
     if res.is_err() {
         drop(to);
         let _ = std::fs::remove_file(dst);
+        return res;
     }
+    if let Ok(mtime) = src_meta.modified() {
+        let _ = to.set_modified(mtime);
+    }
+    drop(to);
+    let _ = std::fs::set_permissions(dst, src_meta.permissions());
     res
 }
 
@@ -226,7 +235,11 @@ fn copy_across(src: &Path, dst: &Path) -> std::io::Result<()> {
 fn do_write(entry: &PlanEntry, bytes: &[u8], summary: &mut Summary) {
     let is_move = entry.action == Action::Move;
     if entry.dst.exists() {
-        if is_move && std::fs::read(&entry.dst).is_ok_and(|d| d == bytes) && source_matches(entry) {
+        // Length first: only a same-length destination is read in full.
+        let holds_bytes = std::fs::metadata(&entry.dst)
+            .is_ok_and(|m| m.is_file() && m.len() == bytes.len() as u64)
+            && std::fs::read(&entry.dst).is_ok_and(|d| d == bytes);
+        if is_move && holds_bytes && source_matches(entry) {
             remove_source(entry, summary);
         } else {
             summary.skipped += 1;
@@ -237,7 +250,8 @@ fn do_write(entry: &PlanEntry, bytes: &[u8], summary: &mut Summary) {
         Some(_) if !source_matches(entry) => {
             summary.failed.push((
                 entry.src.clone(),
-                "the cue changed or vanished since it was planned; re-plan".to_owned(),
+                "the cue changed or vanished since it was planned; source kept — re-plan before moving this album, or move the cue by hand"
+                    .to_owned(),
             ));
             return;
         }
@@ -627,6 +641,11 @@ FILE \"a.flac\" WAVE
         assert_eq!(std::fs::read(&src).unwrap(), edited, "the edit survives");
         assert!(!dst.exists(), "nothing written");
         assert!(!dst.parent().unwrap().exists(), "not even its folder");
+        assert!(
+            s.failed[0].1.contains("source kept"),
+            "the message must not just say re-plan: {:?}",
+            s.failed
+        );
         // Same length, different bytes: still caught (content hash).
         let same_len: Vec<u8> = OLD.iter().map(|b| b.to_ascii_lowercase()).collect();
         assert_eq!(same_len.len(), OLD.len());
@@ -722,6 +741,14 @@ FILE \"a.flac\" WAVE
     fn a_cross_device_move_copies_verifies_then_removes() {
         let dir = unique_dir("mv-xdev");
         let (src, dst, e) = move_entry(&dir);
+        // An old modification time and the read-only flag, as fs::copy kept.
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let f = std::fs::OpenOptions::new().write(true).open(&src).unwrap();
+        f.set_modified(old).unwrap();
+        drop(f);
+        let mut perm = std::fs::metadata(&src).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&src, perm).unwrap();
         let mut s = Summary::default();
         do_move_with(&e, &mut s, |_, _| {
             Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
@@ -730,6 +757,15 @@ FILE \"a.flac\" WAVE
         assert_eq!(s.moved, 1);
         assert_eq!(std::fs::read(&dst).unwrap(), b"audio bytes");
         assert!(!src.exists());
+        let meta = std::fs::metadata(&dst).unwrap();
+        assert_eq!(meta.modified().unwrap(), old, "mtime preserved");
+        assert!(meta.permissions().readonly(), "read-only flag preserved");
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            let mut perm = meta.permissions();
+            perm.set_readonly(false);
+            std::fs::set_permissions(&dst, perm).unwrap();
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
