@@ -1226,12 +1226,18 @@ fn art_id_source_routes_when_nonzero_stays_zero_when_zero() {
 /// Multi-disc albums on two sources: each album run stays in (disc, track)
 /// order through the aggregate, and the v8 per-disc subtitle, the album's disc
 /// count + MusicBrainz release id, and the track MBID resolve against the OWNING
-/// source (their StrRef offsets are re-packed like every other string).
+/// source (their StrRef offsets are re-packed like every other string). An EMPTY
+/// one on a source >= 1 still resolves to "" — its re-packed offset is non-zero,
+/// so `len == 0` (never `off == 0`) is the emptiness test.
 #[test]
 fn multi_disc_v8_fields_route_per_source() {
     fn source(prefix: &str, subs: [&str; 2], mb: &str) -> CatalogInput {
         let t = |title: String, disc: u16, track: u16, sub: &str| TrackInput {
-            mbid: format!("{title}-mbid"),
+            mbid: if mb.is_empty() {
+                String::new()
+            } else {
+                format!("{title}-mbid")
+            },
             title,
             artist: 0,
             album: 0,
@@ -1293,6 +1299,8 @@ fn multi_disc_v8_fields_route_per_source() {
             ["Inazuma Archipelago", "Sumeru Rainforest"],
             "bbbbbbbb-0000-4000-8000-000000000002",
         ),
+        // Source 2: every v8 string (and the track MBID) empty.
+        ("bare", ["", ""], ""),
     ];
     let multi = MultiCatalog::new(
         cases
@@ -1300,12 +1308,13 @@ fn multi_disc_v8_fields_route_per_source() {
             .map(|(p, subs, mb)| boxed_member(&source(p, *subs, mb)))
             .collect(),
     );
-    assert_eq!(multi.album_count(), 2);
+    assert_eq!(multi.album_count(), 3);
     for (s, (prefix, subs, mb)) in cases.iter().enumerate() {
         let album = pack(s as u32, 0);
         let rec = multi.album(album).unwrap();
         assert_eq!(rec.disc_count, 2);
         assert_eq!(resolve(&multi, rec.mb_album_id), *mb);
+        assert_eq!(rec.mb_album_id.len == 0, mb.is_empty());
         let run: Vec<(String, String, String)> = (0..multi.album_track_count(album))
             .map(|i| {
                 let t = multi.track(multi.album_track(album, i).unwrap()).unwrap();
@@ -1316,7 +1325,14 @@ fn multi_disc_v8_fields_route_per_source() {
                 )
             })
             .collect();
-        let row = |name: String, sub: &str| (name.clone(), sub.to_owned(), format!("{name}-mbid"));
+        let row = |name: String, sub: &str| {
+            let mbid = if mb.is_empty() {
+                String::new()
+            } else {
+                format!("{name}-mbid")
+            };
+            (name, sub.to_owned(), mbid)
+        };
         assert_eq!(
             run,
             vec![
