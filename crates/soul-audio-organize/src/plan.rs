@@ -8,7 +8,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::album::{self, AlbumGroup, RootIndex, TrackInfo};
+use crate::album::{self, AlbumGroup, RootIndex};
 use crate::side::{self, AlbumPlacement};
 use crate::{Strategy, Template};
 
@@ -130,6 +130,12 @@ pub fn plan(
 /// number missing from the tags comes from the disc folder). Each audio file's
 /// destination is `dest_root.join(template.render(..))`.
 ///
+/// **Distinct same-title albums** (e.g. two editions in different source
+/// folders) never share an album folder: when a template with an `{Album}`
+/// folder renders a later album into a folder an earlier album of this batch
+/// already claims, the later one gets `<folder> (2)`, `(3)`, … (stable across
+/// re-runs, since input order is deterministic).
+///
 /// **Side files**: for every album root that holds exactly one album, each
 /// non-audio, non-junk file under it (recursively) is planned too — see
 /// [`EntryKind::SideFile`]; otherwise the root is reported in
@@ -165,10 +171,22 @@ pub fn plan_with(
     // to the same path are duplicates of that pending write.
     let mut claimed: HashSet<PathBuf> = HashSet::new();
 
+    // Each track's destination and album folder (relative), then distinct
+    // albums rendering to one folder are pulled apart (` (2)`, ` (3)`, …).
+    let mut rel_dsts: Vec<PathBuf> = Vec::with_capacity(files.len());
+    let mut album_dirs: Vec<PathBuf> = Vec::with_capacity(files.len());
+    for (src, info) in files.iter().zip(&tracks) {
+        rel_dsts.push(template.render(&info.tags, src));
+        album_dirs.push(template.render_album_dir(&info.tags, src));
+    }
+    if template.has_album_dir() {
+        separate_albums(&albums, &mut rel_dsts, &mut album_dirs);
+    }
+
     // 1. Audio, in input order.
     let mut audio_dst: Vec<PathBuf> = Vec::with_capacity(files.len());
-    for (src, info) in files.iter().zip(&tracks) {
-        let dst = dest_root.join(template.render(&info.tags, src));
+    for ((src, info), rel_dst) in files.iter().zip(&tracks).zip(&rel_dsts) {
+        let dst = dest_root.join(rel_dst);
         audio_dst.push(dst.clone());
         push(
             &mut entries,
@@ -201,7 +219,7 @@ pub fn plan_with(
             None
         };
         let rel_dir = match reason {
-            None => album_dest_dir(template, files, &tracks, album),
+            None => album_dest_dir(&album_dirs, album),
             Some(_) => None,
         };
         let Some(rel_dir) = rel_dir else {
@@ -272,21 +290,67 @@ fn push(
     });
 }
 
+/// Give every **distinct** album its own album folder within this batch.
+///
+/// Albums are walked in plan (first-seen input) order. The first album to
+/// render into an album folder keeps it; a later album (a different identity
+/// key) rendering into an already-claimed folder gets that folder's last
+/// component suffixed ` (2)`, ` (3)`, … — the lowest `n` whose name no album in
+/// this batch claims or renders to natively — and its destinations are
+/// re-rooted under it (the path below the album folder is unchanged). Folders
+/// already on disk are not considered: a re-run plans the same names, and its
+/// files classify as `SkipDuplicate` as before. A track with no album folder
+/// (it renders into the destination root) is left alone.
+fn separate_albums(albums: &[AlbumGroup], rel_dsts: &mut [PathBuf], album_dirs: &mut [PathBuf]) {
+    let native: HashSet<PathBuf> = album_dirs
+        .iter()
+        .filter(|d| d.components().next().is_some())
+        .cloned()
+        .collect();
+    let mut owner: HashMap<PathBuf, usize> = HashMap::new();
+    for (a, album) in albums.iter().enumerate() {
+        // This album's native folder → its final folder.
+        let mut mine: HashMap<PathBuf, PathBuf> = HashMap::new();
+        for &i in &album.tracks {
+            let dir = album_dirs[i].clone();
+            let Some(name) = dir.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            let fin = mine
+                .entry(dir.clone())
+                .or_insert_with(|| {
+                    let fin = match owner.get(&dir) {
+                        Some(&o) if o != a => (2u32..)
+                            .map(|n| dir.with_file_name(format!("{name} ({n})")))
+                            .find(|c| !owner.contains_key(c) && !native.contains(c))
+                            .unwrap_or_else(|| dir.clone()),
+                        _ => dir.clone(),
+                    };
+                    owner.insert(fin.clone(), a);
+                    fin
+                })
+                .clone();
+            if fin != dir
+                && let Ok(below) = rel_dsts[i].strip_prefix(&dir)
+            {
+                rel_dsts[i] = fin.join(below);
+                album_dirs[i] = fin;
+            }
+        }
+    }
+}
+
 /// The album's own destination folder, relative to the destination root: the
-/// common ancestor of its tracks' rendered folders with `{DiscDir}` neutralized.
-/// `None` when that is the destination root itself (e.g. `flat`, or tracks of
-/// one album rendering under different artist folders).
-fn album_dest_dir(
-    template: &Template,
-    files: &[PathBuf],
-    tracks: &[TrackInfo],
-    album: &AlbumGroup,
-) -> Option<PathBuf> {
+/// common ancestor of its tracks' album folders (rendered with `{DiscDir}`
+/// neutralized, after [`separate_albums`]). `None` when that is the destination
+/// root itself (e.g. `flat`, or tracks of one album rendering under different
+/// artist folders).
+fn album_dest_dir(album_dirs: &[PathBuf], album: &AlbumGroup) -> Option<PathBuf> {
     let mut common: Option<PathBuf> = None;
     for &i in &album.tracks {
-        let dir = template.render_album_dir(&tracks[i].tags, &files[i]);
+        let dir = &album_dirs[i];
         common = Some(match common {
-            None => dir,
+            None => dir.clone(),
             Some(c) => c
                 .components()
                 .zip(dir.components())

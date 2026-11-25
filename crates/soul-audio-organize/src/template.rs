@@ -69,6 +69,15 @@ impl Template {
             .unwrap_or_default()
     }
 
+    /// Whether the template gives an album a folder of its own: a directory
+    /// segment uses `{Album}`. Only then does the planner number the folders of
+    /// distinct same-title albums (never for `flat` or `{Artist}/{Title}`).
+    pub(crate) fn has_album_dir(&self) -> bool {
+        let mut segments: Vec<&str> = self.raw.split('/').collect();
+        segments.pop(); // the file name
+        segments.iter().any(|s| s.contains("{Album}"))
+    }
+
     /// Whether the template lays discs out as folders (`{DiscDir}`).
     pub(crate) fn has_disc_dir(&self) -> bool {
         self.raw.contains("{DiscDir}")
@@ -361,6 +370,9 @@ mod tests {
             expect(&["Unknown Artist", "Alb"])
         );
         assert!(t.has_disc_dir());
+        assert!(t.has_album_dir());
+        assert!(!Template::new(preset("flat").unwrap()).has_album_dir());
+        assert!(!Template::new("{Artist}/{Album} - {Title}").has_album_dir());
         let flat_prefix = Template::new(preset("artist-album").unwrap());
         assert!(!flat_prefix.has_disc_dir());
         assert_eq!(

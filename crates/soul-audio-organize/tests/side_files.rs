@@ -512,3 +512,223 @@ fn a_partially_mb_tagged_release_stays_one_album() {
     );
     assert!(p.side_files_left.is_empty(), "{:?}", p.side_files_left);
 }
+#[test]
+fn two_releases_in_one_folder_split_and_untagged_tracks_join_the_first() {
+    let (src, dest) = (unique_dir("mbsplit-src"), unique_dir("mbsplit-dest"));
+    put(&src, "Rel/01.flac", &mb_track("Rel", "a", 1, Some("rel-x")));
+    put(&src, "Rel/02.flac", &mb_track("Rel", "b", 2, Some("rel-y")));
+    put(&src, "Rel/03.flac", &mb_track("Rel", "c", 3, None));
+    put(&src, "Rel/cover.jpg", b"jpg");
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    // Two albums: {01, 03} (release x — 03 adopts the first id) and {02}.
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::Audio),
+        set(&[
+            "HOYO-MiX/Rel/01 - a.flac",
+            "HOYO-MiX/Rel (2)/02 - b.flac",
+            "HOYO-MiX/Rel/03 - c.flac"
+        ])
+    );
+    assert_eq!(
+        p.side_files_left,
+        vec![LeftInPlace {
+            album_root: src.join("Rel"),
+            reason: SideFilesLeft::SharedAlbumRoot,
+            files: 1,
+        }]
+    );
+}
+
+/// A `Footprints` track whose bytes differ per `edition` (same album identity
+/// tags, different files — two editions of one title).
+fn edition_track(title: &str, n: u32, edition: &str) -> Vec<u8> {
+    let c = [
+        "ALBUM=Footprints".to_owned(),
+        format!("TITLE={title}"),
+        "ARTIST=HOYO-MiX".to_owned(),
+        "ALBUMARTIST=HOYO-MiX".to_owned(),
+        format!("TRACKNUMBER={n}"),
+        format!("COMMENT={edition}"),
+    ];
+    let refs: Vec<&str> = c.iter().map(String::as_str).collect();
+    flac(&refs)
+}
+
+#[test]
+fn same_title_distinct_albums_get_numbered_folders_not_merged() {
+    let (src, dest) = (unique_dir("editions-src"), unique_dir("editions-dest"));
+    let (a, b) = (
+        "Footprints of the Traveler",
+        "Footprints of the Traveler(Chinese Version)",
+    );
+    put(
+        &src,
+        &format!("{a}/01.flac"),
+        &edition_track("a", 1, "original"),
+    );
+    put(
+        &src,
+        &format!("{a}/02.flac"),
+        &edition_track("b", 2, "original"),
+    );
+    put(&src, &format!("{a}/cover.jpg"), b"original cover");
+    put(
+        &src,
+        &format!("{b}/01.flac"),
+        &edition_track("a", 1, "chinese version"),
+    );
+    put(
+        &src,
+        &format!("{b}/02.flac"),
+        &edition_track("b", 2, "chinese version"),
+    );
+    put(&src, &format!("{b}/cover.jpg"), b"chinese cover, longer");
+    // Input order decides who keeps the plain name: edition A first. (A sorted
+    // listing would put `…(Chinese Version)` first — `(` sorts before `/`.)
+    let files: Vec<_> = [
+        format!("{a}/01.flac"),
+        format!("{a}/02.flac"),
+        format!("{b}/01.flac"),
+        format!("{b}/02.flac"),
+    ]
+    .iter()
+    .map(|r| support::at(&src, r))
+    .collect();
+    let p = plan_with(
+        &files,
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    let got: Vec<(String, String, Action)> = p
+        .entries
+        .iter()
+        .map(|e| (rel(&src, &e.src), rel(&dest, &e.dst), e.action))
+        .collect();
+    let want: Vec<(String, String, Action)> = [
+        (format!("{a}/01.flac"), "HOYO-MiX/Footprints/01 - a.flac"),
+        (format!("{a}/02.flac"), "HOYO-MiX/Footprints/02 - b.flac"),
+        (
+            format!("{b}/01.flac"),
+            "HOYO-MiX/Footprints (2)/01 - a.flac",
+        ),
+        (
+            format!("{b}/02.flac"),
+            "HOYO-MiX/Footprints (2)/02 - b.flac",
+        ),
+        (format!("{a}/cover.jpg"), "HOYO-MiX/Footprints/cover.jpg"),
+        (
+            format!("{b}/cover.jpg"),
+            "HOYO-MiX/Footprints (2)/cover.jpg",
+        ),
+    ]
+    .into_iter()
+    .map(|(s, d)| (s, d.to_owned(), Action::Copy))
+    .collect();
+    assert_eq!(got, want);
+    assert!(p.side_files_left.is_empty(), "{:?}", p.side_files_left);
+
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    assert_eq!(s.copied, 6);
+    for e in &p.entries {
+        assert_eq!(
+            std::fs::read(&e.src).unwrap(),
+            std::fs::read(&e.dst).unwrap()
+        );
+    }
+
+    // Re-plan: same suffix (deterministic input order), everything already there.
+    let again = plan_with(
+        &files,
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    let again_got: Vec<(String, String, Action)> = again
+        .entries
+        .iter()
+        .map(|e| (rel(&src, &e.src), rel(&dest, &e.dst), e.action))
+        .collect();
+    let want_again: Vec<(String, String, Action)> = want
+        .into_iter()
+        .map(|(s, d, _)| (s, d, Action::SkipDuplicate))
+        .collect();
+    assert_eq!(again_got, want_again);
+}
+
+#[test]
+fn numbered_folders_follow_disc_folders_and_skip_taken_names() {
+    // Disc-folder layout: the suffix goes on the album folder, not `Disc N`.
+    // A third album genuinely titled `Footprints (2)` keeps that name, so the
+    // second `Footprints` edition takes ` (3)`.
+    let (src, dest) = (
+        unique_dir("editions-df-src"),
+        unique_dir("editions-df-dest"),
+    );
+    put(&src, "A/CD1/01.flac", &edition_track("a", 1, "one"));
+    put(&src, "A/CD2/01.flac", &edition_track("b", 1, "one"));
+    put(&src, "B/CD1/01.flac", &edition_track("a", 1, "two"));
+    put(&src, "B/CD2/01.flac", &edition_track("b", 1, "two"));
+    put(&src, "B/CD2/B.log", b"disc 2 log");
+    put(&src, "C/01.flac", &track("Footprints (2)", "c", 1, None));
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &tpl("artist-album+disc-folders"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::Audio),
+        set(&[
+            "HOYO-MiX/Footprints/Disc 1/01 - a.flac",
+            "HOYO-MiX/Footprints/Disc 2/01 - b.flac",
+            "HOYO-MiX/Footprints (3)/Disc 1/01 - a.flac",
+            "HOYO-MiX/Footprints (3)/Disc 2/01 - b.flac",
+            "HOYO-MiX/Footprints (2)/01 - c.flac",
+        ])
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::SideFile),
+        set(&["HOYO-MiX/Footprints (3)/Disc 2/B.log"])
+    );
+    assert!(
+        p.entries.iter().all(|e| e.action == Action::Copy),
+        "{:#?}",
+        p.entries
+    );
+}
+
+#[test]
+fn flat_layout_never_numbers_folders() {
+    let (src, dest) = (
+        unique_dir("editions-flat-src"),
+        unique_dir("editions-flat-dest"),
+    );
+    put(&src, "A/01.flac", &edition_track("a", 1, "one"));
+    put(&src, "B/01.flac", &edition_track("a", 1, "two"));
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &tpl("flat"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::Audio),
+        set(&["HOYO-MiX - a.flac"])
+    );
+    assert_eq!(
+        p.entries.iter().map(|e| e.action).collect::<Vec<_>>(),
+        [Action::Copy, Action::SkipDuplicate]
+    );
+}
