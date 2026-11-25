@@ -73,9 +73,32 @@ impl Template {
     /// segment uses `{Album}`. Only then does the planner number the folders of
     /// distinct same-title albums (never for `flat` or `{Artist}/{Title}`).
     pub(crate) fn has_album_dir(&self) -> bool {
-        let mut segments: Vec<&str> = self.raw.split('/').collect();
-        segments.pop(); // the file name
-        segments.iter().any(|s| s.contains("{Album}"))
+        self.album_segment().is_some()
+    }
+
+    /// The index of the first **directory** segment that uses `{Album}`.
+    fn album_segment(&self) -> Option<usize> {
+        let segments: Vec<&str> = self.raw.split('/').collect();
+        segments[..segments.len() - 1]
+            .iter()
+            .position(|s| s.contains("{Album}"))
+    }
+
+    /// The `{Album}` folder a track renders into, relative to the destination
+    /// root: the path up to and including the first directory segment using
+    /// `{Album}`, with `{DiscDir}` neutralized and empty levels dropped exactly
+    /// as in [`render`](Self::render). `None` without such a segment. The
+    /// planner puts the ` (2)` of a second same-title album on this folder.
+    pub(crate) fn render_album_folder(&self, tags: &Tags, src: &Path) -> Option<PathBuf> {
+        let last = self.album_segment()?;
+        let mut path = PathBuf::new();
+        for segment in self.raw.split('/').take(last + 1) {
+            let substituted = substitute(segment, tags, src, true);
+            if !substituted.trim().is_empty() {
+                path.push(sanitize_segment(&substituted));
+            }
+        }
+        Some(path)
     }
 
     /// Whether the template lays discs out as folders: a **directory**
@@ -611,6 +634,44 @@ mod tests {
                 ),
                 ("flat", "{Artist} - {Title}"),
             ]
+        );
+    }
+
+    #[test]
+    fn the_album_folder_is_the_album_segment_not_the_last_folder() {
+        let tagged = |date: Option<&str>| Tags {
+            title: Some("T".into()),
+            album: Some("Alb".into()),
+            album_artist: Some("A".into()),
+            date: date.map(str::to_owned),
+            track: Some(1),
+            ..Default::default()
+        };
+        let src = Path::new("x.flac");
+        assert_eq!(
+            Template::new("{AlbumArtist}/{Album}/{Year}/{TrackNo}")
+                .render_album_folder(&tagged(Some("2020")), src),
+            Some(expect(&["A", "Alb"]))
+        );
+        assert_eq!(
+            Template::new(preset("artist-album+disc-folders").unwrap())
+                .render_album_folder(&disc_tags(2, Some(2)), src),
+            Some(expect(&["Unknown Artist", "Alb"])),
+            "{{DiscDir}} after the album folder is not part of it"
+        );
+        assert_eq!(
+            Template::new("{Year}/{Album}/{TrackNo}").render_album_folder(&tagged(None), src),
+            Some(expect(&["Alb"])),
+            "an empty level before it is dropped, as in render"
+        );
+        assert_eq!(
+            Template::new(preset("flat").unwrap()).render_album_folder(&tagged(None), src),
+            None
+        );
+        assert_eq!(
+            Template::new("{Artist}/{Album} - {Title}").render_album_folder(&tagged(None), src),
+            None,
+            "{{Album}} only in the file name"
         );
     }
 }

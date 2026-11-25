@@ -258,12 +258,18 @@ pub fn plan_with(
     // albums rendering to one folder are pulled apart (` (2)`, ` (3)`, …).
     let mut rel_dsts: Vec<PathBuf> = Vec::with_capacity(files.len());
     let mut album_dirs: Vec<PathBuf> = Vec::with_capacity(files.len());
+    let mut album_folders: Vec<PathBuf> = Vec::with_capacity(files.len());
     for (src, info) in files.iter().zip(&tracks) {
         rel_dsts.push(template.render(&info.tags, src));
         album_dirs.push(template.render_album_dir(&info.tags, src));
+        album_folders.push(
+            template
+                .render_album_folder(&info.tags, src)
+                .unwrap_or_default(),
+        );
     }
     if template.has_album_dir() {
-        separate_albums(&albums, &mut rel_dsts, &mut album_dirs);
+        separate_albums(&albums, &mut rel_dsts, &mut album_dirs, &album_folders);
     }
 
     // 1. Audio, in input order (entry `i` is input `i`).
@@ -421,16 +427,25 @@ fn folder_inferred_discs(albums: &[AlbumGroup], template: &Template) -> Vec<Path
 /// Give every **distinct** album its own album folder within this batch.
 ///
 /// Albums are walked in plan (first-seen input) order. The first album to
-/// render into an album folder keeps it; a later album (a different identity
-/// key) rendering into an already-claimed folder gets that folder's last
-/// component suffixed ` (2)`, ` (3)`, … — the lowest `n` whose name no album in
+/// render into an album dir keeps it; a later album (a different identity
+/// key) rendering into an already-claimed dir gets its **`{Album}` folder**
+/// (`album_folders[i]`, see [`Template::render_album_folder`]) suffixed
+/// ` (2)`, ` (3)`, … — the lowest `n` whose resulting album dir no album in
 /// this batch claims or renders to natively — and its destinations are
-/// re-rooted under it (the path below the album folder is unchanged). Folders
-/// compare as [`paths::key`]s (`Abc` and `ABC` are one folder on Windows/macOS).
-/// Folders already on disk are not considered: a re-run plans the same names,
-/// and its files classify as `SkipDuplicate` as before. A track with no album
-/// folder (it renders into the destination root) is left alone.
-fn separate_albums(albums: &[AlbumGroup], rel_dsts: &mut [PathBuf], album_dirs: &mut [PathBuf]) {
+/// re-rooted under it (`{AlbumArtist}/{Album}/{Year}/…` gives
+/// `Box (2)/2020`, never `Box/2020 (2)`). When the `{Album}` folder is not a
+/// prefix of the album dir (`{DiscDir}` before `{Album}`) the dir's last
+/// folder is suffixed instead. Dirs compare as [`paths::key`]s (`Abc` and
+/// `ABC` are one folder on Windows/macOS). Folders already on disk are not
+/// considered: a re-run plans the same names, and its files classify as
+/// `SkipDuplicate` as before. A track with no album dir (it renders into the
+/// destination root) is left alone.
+fn separate_albums(
+    albums: &[AlbumGroup],
+    rel_dsts: &mut [PathBuf],
+    album_dirs: &mut [PathBuf],
+    album_folders: &[PathBuf],
+) {
     let native: HashSet<PathBuf> = album_dirs
         .iter()
         .filter(|d| d.components().next().is_some())
@@ -438,37 +453,54 @@ fn separate_albums(albums: &[AlbumGroup], rel_dsts: &mut [PathBuf], album_dirs: 
         .collect();
     let mut owner: HashMap<PathBuf, usize> = HashMap::new();
     for (a, album) in albums.iter().enumerate() {
-        // This album's native folder (as a key) → its final folder.
+        // This album's native dir (as a key) → its final `{Album}` folder.
         let mut mine: HashMap<PathBuf, PathBuf> = HashMap::new();
         for &i in &album.tracks {
             let dir = album_dirs[i].clone();
-            let Some(name) = dir.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            let folder = Some(&album_folders[i])
+                .filter(|f| f.components().next().is_some() && dir.starts_with(f))
+                .unwrap_or(&dir)
+                .clone();
+            let Some(name) = folder.file_name().map(|n| n.to_string_lossy().into_owned()) else {
                 continue;
             };
+            let below = dir
+                .strip_prefix(&folder)
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
             let fin = mine
                 .entry(paths::key(&dir))
                 .or_insert_with(|| {
                     let fin = match owner.get(&paths::key(&dir)) {
                         Some(&o) if o != a => (2u32..)
-                            .map(|n| dir.with_file_name(format!("{name} ({n})")))
+                            .map(|n| folder.with_file_name(format!("{name} ({n})")))
                             .find(|c| {
-                                let k = paths::key(c);
+                                let k = paths::key(&under(c, &below));
                                 !owner.contains_key(&k) && !native.contains(&k)
                             })
-                            .unwrap_or_else(|| dir.clone()),
-                        _ => dir.clone(),
+                            .unwrap_or_else(|| folder.clone()),
+                        _ => folder.clone(),
                     };
-                    owner.insert(paths::key(&fin), a);
+                    owner.insert(paths::key(&under(&fin, &below)), a);
                     fin
                 })
                 .clone();
-            if fin != dir
-                && let Ok(below) = rel_dsts[i].strip_prefix(&dir)
+            if fin != folder
+                && let Ok(rest) = rel_dsts[i].strip_prefix(&folder)
             {
-                rel_dsts[i] = fin.join(below);
-                album_dirs[i] = fin;
+                rel_dsts[i] = fin.join(rest);
+                album_dirs[i] = under(&fin, &below);
             }
         }
+    }
+}
+
+/// `base/rest`, or `base` itself when `rest` is empty (no trailing separator).
+fn under(base: &Path, rest: &Path) -> PathBuf {
+    if rest.as_os_str().is_empty() {
+        base.to_path_buf()
+    } else {
+        base.join(rest)
     }
 }
 

@@ -1403,3 +1403,53 @@ fn disc_dir_in_the_file_name_is_no_disc_folder_layout() {
         set(&["HOYO-MiX/Suite/notes.txt"])
     );
 }
+
+/// A dated `album` track (DATE=2020) whose bytes differ per `edition`.
+fn dated(album: &str, title: &str, n: u32, edition: &str) -> Vec<u8> {
+    let c = [
+        format!("ALBUM={album}"),
+        format!("TITLE={title}"),
+        "ARTIST=HOYO-MiX".to_owned(),
+        "ALBUMARTIST=HOYO-MiX".to_owned(),
+        "DATE=2020".to_owned(),
+        format!("TRACKNUMBER={n}"),
+        format!("COMMENT={edition}"),
+    ];
+    let refs: Vec<&str> = c.iter().map(String::as_str).collect();
+    flac(&refs)
+}
+
+#[test]
+fn the_numbered_suffix_goes_on_the_album_folder_not_a_folder_after_it() {
+    let (src, dest) = (unique_dir("albseg-src"), unique_dir("albseg-dest"));
+    put(&src, "A/01.flac", &dated("Box", "a", 1, "one"));
+    put(&src, "A/cover.jpg", b"a cover");
+    put(&src, "B/01.flac", &dated("Box", "a", 1, "two"));
+    put(&src, "B/cover.jpg", b"b cover!");
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &Template::new("{AlbumArtist}/{Album}/{Year}/{TrackNo} - {Title}"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::Audio),
+        set(&[
+            "HOYO-MiX/Box/2020/01 - a.flac",
+            "HOYO-MiX/Box (2)/2020/01 - a.flac",
+        ])
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::SideFile),
+        set(&[
+            "HOYO-MiX/Box/2020/cover.jpg",
+            "HOYO-MiX/Box (2)/2020/cover.jpg",
+        ])
+    );
+    assert!(
+        p.entries.iter().all(|e| e.action == Action::Copy),
+        "{:#?}",
+        p.entries
+    );
+}
