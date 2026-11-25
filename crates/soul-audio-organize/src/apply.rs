@@ -772,4 +772,73 @@ FILE \"a.flac\" WAVE
         assert!(!dst.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A cue Move whose source cannot be removed after the write: both files
+    /// stay and the failure is recorded (never both missing). `hold` makes
+    /// the source unremovable and returns its release.
+    fn assert_cue_kept_when_unremovable(
+        dir: &Path,
+        src: &Path,
+        hold: impl FnOnce() -> Box<dyn FnOnce()>,
+    ) {
+        let dst = join(dir, &["out", "a.cue"]);
+        let release = hold();
+        let s = apply(&cue_plan(src, &dst, Action::Move, NEW), |_| {}).unwrap();
+        release();
+        assert_eq!((s.moved, s.failed.len()), (0, 1), "{:?}", s.failed);
+        assert!(
+            s.failed[0].1.contains("could not remove the source"),
+            "{:?}",
+            s.failed
+        );
+        assert_eq!(std::fs::read(&dst).unwrap(), NEW);
+        assert_eq!(std::fs::read(src).unwrap(), OLD);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_cue_source_that_cannot_be_removed_is_kept_with_its_copy() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = unique_dir("cue-unremovable");
+        let src = dir.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        let held = src.clone();
+        assert_cue_kept_when_unremovable(&dir, &src, move || {
+            // Others may read it (the stamp check) but not delete it.
+            const FILE_SHARE_READ: u32 = 1;
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&held)
+                .unwrap();
+            Box::new(move || drop(f))
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cue_source_that_cannot_be_removed_is_kept_with_its_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_dir("cue-unremovable");
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let src = locked.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        let mode = |m: u32| std::fs::Permissions::from_mode(m);
+        std::fs::set_permissions(&locked, mode(0o555)).unwrap();
+        // root ignores directory permissions: nothing to test there.
+        let probe = locked.join("probe");
+        if std::fs::write(&probe, b"").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            std::fs::set_permissions(&locked, mode(0o755)).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let unlock = locked.clone();
+        assert_cue_kept_when_unremovable(&dir, &src, move || {
+            Box::new(move || std::fs::set_permissions(&unlock, mode(0o755)).unwrap())
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

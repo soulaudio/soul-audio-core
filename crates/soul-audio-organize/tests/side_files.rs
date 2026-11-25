@@ -1667,3 +1667,60 @@ fn an_album_split_over_album_folders_keeps_its_side_files() {
         assert!(p.cues_not_rewritten.is_empty());
     }
 }
+
+#[test]
+fn audio_that_is_never_an_input_makes_the_selection_partial() {
+    // `.wma`/`.ape` are audio this build never lists as an input: the album
+    // folder still holds part of the album, so its side files stay.
+    for other in ["Album/03 c.wma", "Album/04 d.APE"] {
+        let (src, dest) = (unique_dir("wma-src"), unique_dir("wma-dest"));
+        put(&src, "Album/01 a.flac", &track("Album", "a", 1, None));
+        put(&src, other, b"not decodable here");
+        put(&src, "Album/cover.jpg", b"cover");
+        let p = plan_with(
+            &audio_files(&src),
+            &dest,
+            &tpl("artist-album"),
+            Strategy::Move,
+            &opts(&src),
+        );
+        assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty(), "{other}");
+        assert_eq!(
+            left(&p),
+            vec![(src.join("Album"), SideFilesLeft::PartialSelection, 1)],
+            "{other}"
+        );
+        let s = apply(&p, |_| {}).unwrap();
+        assert!(s.failed.is_empty(), "{:?}", s.failed);
+        assert!(at(&src, other).exists() && at(&src, "Album/cover.jpg").exists());
+    }
+}
+
+#[test]
+fn moving_only_cd1_leaves_the_album_side_files_and_folder() {
+    let (src, dest) = (unique_dir("cd1-src"), unique_dir("cd1-dest"));
+    let a = put(&src, "Box/CD1/01 a.flac", &track("Box", "a", 1, Some("1")));
+    put(&src, "Box/CD2/01 c.flac", &track("Box", "c", 1, Some("2")));
+    put(&src, "Box/cover.jpg", b"cover");
+    put(&src, "Box/CD1/Box.log", b"disc 1 log");
+    let p = plan_with(
+        &[a],
+        &dest,
+        &tpl("artist-album+disc-folders"),
+        Strategy::Move,
+        &opts(&src),
+    );
+    assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty());
+    assert_eq!(
+        left(&p),
+        vec![(src.join("Box"), SideFilesLeft::PartialSelection, 2)]
+    );
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    assert_eq!(s.moved, 1);
+    assert_eq!(
+        tree(&src),
+        set(&["Box/CD1/Box.log", "Box/CD2/01 c.flac", "Box/cover.jpg"]),
+        "the log, the cover and CD2 stay; Box/ and Box/CD1/ are not pruned"
+    );
+}

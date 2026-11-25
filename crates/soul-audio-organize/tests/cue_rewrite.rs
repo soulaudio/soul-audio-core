@@ -408,3 +408,82 @@ fn a_cue_edited_between_plan_and_move_is_kept() {
     assert!(at(&dest, "HOYO-MiX/Box/Box.log").exists());
     assert_eq!(tree(&src), ["Box/Box.cue".to_owned()].into_iter().collect());
 }
+
+/// A `Box` track by HOYO-MiX (one disc).
+fn one(title: &str, n: u32) -> Vec<u8> {
+    track("Box", title, n, None)
+}
+
+const CUE_XY: &[u8] = b"FILE \"1 x.flac\" WAVE\r\nFILE \"2 y.flac\" WAVE\r\n";
+
+#[test]
+fn the_cue_of_a_partly_selected_album_is_untouched() {
+    let (src, dest) = (unique_dir("cue-part-src"), unique_dir("cue-part-dest"));
+    let x = put(&src, "A/1 x.flac", &one("X", 1));
+    put(&src, "A/2 y.flac", &one("Y", 2));
+    put(&src, "A/a.cue", CUE_XY);
+    let p = plan_with(
+        &[x],
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+        &PlanOptions::new(&src),
+    );
+    assert!(p.entries.iter().all(|e| e.kind == EntryKind::Audio));
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    assert_eq!(std::fs::read(at(&src, "A/a.cue")).unwrap(), CUE_XY);
+    assert!(!at(&dest, "HOYO-MiX/Box/a.cue").exists());
+}
+
+#[test]
+fn the_cue_of_an_album_with_a_conflicting_track_is_untouched() {
+    let (src, dest) = (unique_dir("cue-conf-src"), unique_dir("cue-conf-dest"));
+    put(&src, "A/1 x.flac", &one("X", 1));
+    put(&src, "A/2 y.flac", &one("Y", 2));
+    put(&src, "A/a.cue", CUE_XY);
+    put(&dest, "HOYO-MiX/Box/02 - Y.flac", b"a different file");
+    let p = plan_box(&src, &dest, "artist-album", Strategy::Move);
+    assert!(p.entries.iter().all(|e| e.kind == EntryKind::Audio));
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    assert_eq!(std::fs::read(at(&src, "A/a.cue")).unwrap(), CUE_XY);
+    assert!(
+        at(&src, "A/2 y.flac").exists(),
+        "the conflicting track stays"
+    );
+    assert!(!at(&dest, "HOYO-MiX/Box/a.cue").exists());
+}
+
+#[test]
+fn a_numbered_album_cue_names_its_own_tracks() {
+    // Two distinct `Box` albums: B's cue points at `Box (2)`'s track, A's at
+    // `Box`'s — the same relative name, resolved against each cue's folder.
+    let (src, dest) = (unique_dir("cue-num-src"), unique_dir("cue-num-dest"));
+    put(&src, "A/1 x.flac", &one("X", 1));
+    put(&src, "A/a.cue", b"FILE \"1 x.flac\" WAVE\r\n");
+    put(&src, "B/1 x.flac", &track("Box", "X", 1, Some("1/1")));
+    put(&src, "B/b.cue", b"REM B\r\nFILE \"1 x.flac\" WAVE\r\n");
+    let p = plan_box(&src, &dest, "artist-album", Strategy::Move);
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    let want: std::collections::BTreeSet<String> = [
+        "HOYO-MiX/Box (2)/01 - X.flac",
+        "HOYO-MiX/Box (2)/b.cue",
+        "HOYO-MiX/Box/01 - X.flac",
+        "HOYO-MiX/Box/a.cue",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    assert_eq!(tree(&dest), want);
+    assert_eq!(
+        std::fs::read(at(&dest, "HOYO-MiX/Box (2)/b.cue")).unwrap(),
+        b"REM B\r\nFILE \"01 - X.flac\" WAVE\r\n"
+    );
+    assert_eq!(
+        std::fs::read(at(&dest, "HOYO-MiX/Box/a.cue")).unwrap(),
+        b"FILE \"01 - X.flac\" WAVE\r\n"
+    );
+    assert!(tree(&src).is_empty());
+}

@@ -329,7 +329,7 @@ pub(crate) fn plan_rewrite(
 
 #[cfg(test)]
 mod tests {
-    use super::{CueNotRewritten, Outcome, is_cue, join_cue_name, relative, rewrite};
+    use super::{CueNotRewritten, Outcome, is_cue, join_cue_name, plan_rewrite, relative, rewrite};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
@@ -621,5 +621,62 @@ REM FILE \"01 a.flac\"\nFILE \"1-02 - b c.flac\" WAVE\n  TRACK 03 AUDIO\n";
     fn cue_extension_any_case() {
         assert!(is_cue(Path::new("a/Box.cue")) && is_cue(Path::new("a/Box.CUE")));
         assert!(!is_cue(Path::new("a/Box.log")) && !is_cue(Path::new("a/cue")));
+    }
+
+    #[test]
+    fn big_endian_utf16_is_not_rewritten_either() {
+        let utf16be: Vec<u8> = [0xFE, 0xFF]
+            .into_iter()
+            .chain("FILE \"a.flac\" WAVE\r\n".bytes().flat_map(|b| [0, b]))
+            .collect();
+        assert_eq!(
+            run(&utf16be, &[("a.flac", "A.flac")]),
+            Outcome::NotRewritten(CueNotRewritten::UnsupportedEncoding)
+        );
+    }
+
+    #[test]
+    fn a_tab_after_file_and_a_missing_type_are_handled() {
+        assert_eq!(
+            rewritten(run(b"FILE\t\"a.flac\" WAVE\n", &[("a.flac", "A.flac")])),
+            b"FILE\t\"A.flac\" WAVE\n".to_vec(),
+            "FILE<TAB>"
+        );
+        assert_eq!(
+            rewritten(run(b"FILE \"a.flac\"\r\n", &[("a.flac", "A.flac")])),
+            b"FILE \"A.flac\"\r\n".to_vec(),
+            "no file type"
+        );
+        assert_eq!(
+            rewritten(run(b"FILE a.flac", &[("a.flac", "A.flac")])),
+            b"FILE \"A.flac\"".to_vec(),
+            "unquoted, no type, no line end"
+        );
+    }
+
+    #[test]
+    fn a_missing_or_oversized_cue_is_unreadable() {
+        let dir = std::env::temp_dir().join(format!("organize-cue-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio_to: HashMap<PathBuf, PathBuf> = HashMap::new();
+        let dst = dir.join("out").join("a.cue");
+        assert_eq!(
+            plan_rewrite(&dir.join("missing.cue"), &dst, &audio_to),
+            Err(CueNotRewritten::Unreadable)
+        );
+        // Exactly 1 MiB is still read; one byte more is not a cue sheet.
+        let cue = dir.join("big.cue");
+        let mut bytes = b"FILE \"a.flac\" WAVE\n".to_vec();
+        bytes.resize(1 << 20, b' ');
+        std::fs::write(&cue, &bytes).unwrap();
+        assert_eq!(plan_rewrite(&cue, &dst, &audio_to), Ok(None));
+        bytes.push(b' ');
+        std::fs::write(&cue, &bytes).unwrap();
+        assert_eq!(
+            plan_rewrite(&cue, &dst, &audio_to),
+            Err(CueNotRewritten::Unreadable)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
