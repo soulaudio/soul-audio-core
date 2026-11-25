@@ -9,6 +9,21 @@
 //! Reading needs `&mut` on the byte source, but [`Catalog`] is `&self`, so the
 //! reader wraps the source in a [`core::cell::RefCell`] (no_std, no-alloc).
 //!
+//! # Versioning
+//!
+//! The reader is **exact-version**: a header whose `format_version` differs
+//! from [`FORMAT_VERSION`] (older or newer) reads as an **empty catalog**,
+//! never as a misparsed one. [`IndexReader::format_version`] /
+//! [`IndexReader::is_current`] distinguish that "stale index, re-bake" case from
+//! a current index of an empty library.
+//!
+//! # Empty strings
+//!
+//! An empty string is `StrRef { off: 0, len: 0 }` as baked, but `len == 0` is
+//! the **only** emptiness test: a [`StrRef`] read through the desktop
+//! `MultiCatalog` has its offset re-packed with the source index (non-zero for
+//! source >= 1 even when empty), so never test `off == 0`.
+//!
 //! # Byte layout (`index.sidx`, all little-endian)
 //!
 //! Sections are laid out back-to-back; the header records each one's absolute
@@ -245,12 +260,18 @@ struct Header {
 }
 
 impl Header {
-    fn read<S: SeekSource>(src: &mut S) -> Result<Self, ()> {
+    /// Parse the header. `Err(Some(v))`: a `.soulidx` of another format
+    /// version `v`; `Err(None)`: no readable `.soulidx` header at all.
+    fn read<S: SeekSource>(src: &mut S) -> Result<Self, Option<u16>> {
         let mut h = [0u8; HEADER_SIZE];
-        src.seek(SeekFrom::Start(0)).map_err(|_| ())?;
-        src.read_exact(&mut h).map_err(|_| ())?;
-        if h[0..4] != MAGIC || le_u16(&h, 4) != FORMAT_VERSION {
-            return Err(());
+        src.seek(SeekFrom::Start(0)).map_err(|_| None)?;
+        src.read_exact(&mut h).map_err(|_| None)?;
+        if h[0..4] != MAGIC {
+            return Err(None);
+        }
+        let version = le_u16(&h, 4);
+        if version != FORMAT_VERSION {
+            return Err(Some(version));
         }
         Ok(Header {
             track_count: le_u32(&h, 8),
@@ -279,17 +300,40 @@ impl Header {
 pub struct IndexReader<S> {
     src: RefCell<S>,
     header: Header,
+    /// The header's `format_version`, `None` when there is no readable header.
+    version: Option<u16>,
 }
 
 impl<S: SeekSource> IndexReader<S> {
-    /// Open a reader over `src`, parsing the header. A malformed/short source
-    /// yields an empty catalog (all counts 0) rather than a panic.
+    /// Open a reader over `src`, parsing the header. A malformed/short source,
+    /// or an index of any other [`FORMAT_VERSION`] (the reader is exact-version),
+    /// yields an empty catalog (all counts 0) rather than a panic —
+    /// [`is_current`](Self::is_current) tells that apart from an empty library.
     pub fn new(mut src: S) -> Self {
-        let header = Header::read(&mut src).unwrap_or_default();
+        let (header, version) = match Header::read(&mut src) {
+            Ok(h) => (h, Some(FORMAT_VERSION)),
+            Err(v) => (Header::default(), v),
+        };
         Self {
             src: RefCell::new(src),
             header,
+            version,
         }
+    }
+
+    /// The `format_version` in the source's header: [`FORMAT_VERSION`] for a
+    /// readable current index, another value for a `.soulidx` of a different
+    /// version (read as an empty catalog — re-bake it), `None` when the source
+    /// holds no `.soulidx` header at all (wrong magic, or too short).
+    pub fn format_version(&self) -> Option<u16> {
+        self.version
+    }
+
+    /// Whether the source is a `.soulidx` of this reader's [`FORMAT_VERSION`]:
+    /// `false` means the (empty) catalog is a stale or missing index, not an
+    /// empty library.
+    pub fn is_current(&self) -> bool {
+        self.version == Some(FORMAT_VERSION)
     }
 
     /// Consume the reader, returning the source.

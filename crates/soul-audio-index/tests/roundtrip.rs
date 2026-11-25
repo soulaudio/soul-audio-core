@@ -767,3 +767,37 @@ fn a_v7_file_reads_as_empty() {
     assert_eq!(rdr.album_count(), 0);
     assert!(rdr.track(0).is_err());
 }
+
+/// The reader is exact-version: an index of another `format_version` reads as an
+/// EMPTY catalog, and `format_version()` / `is_current()` let the app tell that
+/// "stale index" apart from a current index of an empty library (and from a
+/// source that is no index at all).
+#[test]
+fn format_version_tells_a_stale_index_from_an_empty_library() {
+    let current = write_index(&fixture());
+    let rdr = IndexReader::new(SliceSource::new(&current));
+    assert_eq!(rdr.format_version(), Some(soul_audio_index::FORMAT_VERSION));
+    assert!(rdr.is_current());
+
+    let mut empty_input = fixture();
+    empty_input.tracks.clear();
+    empty_input.albums.clear();
+    let empty = write_index(&empty_input);
+    let rdr = IndexReader::new(SliceSource::new(&empty));
+    assert!(
+        rdr.is_current(),
+        "an empty library is still a current index"
+    );
+    assert_eq!(rdr.track_count(), 0);
+
+    let mut stale = current.clone();
+    stale[4..6].copy_from_slice(&7u16.to_le_bytes());
+    let rdr = IndexReader::new(SliceSource::new(&stale));
+    assert_eq!(rdr.track_count(), 0, "a version mismatch reads as empty");
+    assert_eq!(rdr.format_version(), Some(7));
+    assert!(!rdr.is_current());
+
+    let rdr = IndexReader::new(SliceSource::new(b"not an index at all"));
+    assert_eq!(rdr.format_version(), None);
+    assert!(!rdr.is_current());
+}
