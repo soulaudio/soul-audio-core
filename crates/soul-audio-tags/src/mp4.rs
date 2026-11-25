@@ -935,7 +935,7 @@ mod tests {
             v
         };
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&atom(b"ftyp", b"M4A     M4A mp42isom"));
+        bytes.extend_from_slice(&atom(b"ftyp", b"M4A \0\0\0\0M4A mp42isom"));
         bytes.extend_from_slice(&atom(b"moov", &moov_body));
 
         let mut src = SliceSource::new(&bytes);

@@ -96,6 +96,7 @@ mod tests {
         assert_eq!(parse("CD 100"), df(100, None));
         // ASCII word boundary: a CJK subtitle glued to the number still matches.
         assert_eq!(parse("Disc 1 中文"), df(1, Some("中文")));
+        assert_eq!(parse("Disc 1中文"), df(1, Some("中文")));
     }
 
     #[test]
