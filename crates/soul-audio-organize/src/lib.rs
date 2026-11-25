@@ -26,7 +26,7 @@ mod template;
 
 pub use apply::{Progress, Summary, apply};
 pub use plan::{Action, OrganizePlan, PlanEntry, plan};
-pub use template::{Template, presets};
+pub use template::{Template, preset, presets};
 
 /// Whether organizing a file **copies** it to the destination (leaving the
 /// original in place) or **moves** it.
