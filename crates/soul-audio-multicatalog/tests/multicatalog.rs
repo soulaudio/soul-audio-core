@@ -1222,3 +1222,109 @@ fn art_id_source_routes_when_nonzero_stays_zero_when_zero() {
     // extended_off is always 0 today → stays 0 on both.
     assert_eq!(t1.extended_off, 0);
 }
+
+/// Multi-disc albums on two sources: each album run stays in (disc, track)
+/// order through the aggregate, and the v8 per-disc subtitle, the album's disc
+/// count + MusicBrainz release id, and the track MBID resolve against the OWNING
+/// source (their StrRef offsets are re-packed like every other string).
+#[test]
+fn multi_disc_v8_fields_route_per_source() {
+    fn source(prefix: &str, subs: [&str; 2], mb: &str) -> CatalogInput {
+        let t = |title: String, disc: u16, track: u16, sub: &str| TrackInput {
+            mbid: format!("{title}-mbid"),
+            title,
+            artist: 0,
+            album: 0,
+            album_artist: 0,
+            genre: 0,
+            folder: 1,
+            track_no: track,
+            disc_no: disc,
+            duration_ms: 0,
+            sample_rate: 44_100,
+            channels: 2,
+            file_name: format!("{disc}-{track}.flac"),
+            disc_subtitle: sub.into(),
+            loudness: None,
+        };
+        CatalogInput {
+            // Deliberately out of (disc, track) order.
+            tracks: vec![
+                t(format!("{prefix}_d2t1"), 2, 1, subs[1]),
+                t(format!("{prefix}_d1t2"), 1, 2, subs[0]),
+                t(format!("{prefix}_d1t1"), 1, 1, subs[0]),
+            ],
+            artists: vec![format!("{prefix}_artist")],
+            artist_sorts: Vec::new(),
+            genres: vec!["Game".into()],
+            albums: vec![AlbumMeta {
+                title: "Jade Moon".into(),
+                album_artist: 0,
+                original_date: PackedDate::UNKNOWN,
+                release_date: PackedDate::UNKNOWN,
+                folder: 1,
+                disc_count: 2,
+                mb_album_id: mb.into(),
+            }],
+            folders: vec![
+                FolderInput {
+                    path: String::new(),
+                    parent: NO_FOLDER,
+                },
+                FolderInput {
+                    path: format!("{prefix}/Jade Moon"),
+                    parent: 0,
+                },
+            ],
+            playlists: Vec::new(),
+            covers: Vec::new(),
+        }
+    }
+    // Different string lengths per source, so an un-re-packed offset would land
+    // on the wrong heap (wrong text, or a resolve error).
+    let cases = [
+        (
+            "local",
+            ["Mondstadt", "Liyue"],
+            "aaaaaaaa-0000-4000-8000-000000000001",
+        ),
+        (
+            "remote_server_copy",
+            ["Inazuma Archipelago", "Sumeru Rainforest"],
+            "bbbbbbbb-0000-4000-8000-000000000002",
+        ),
+    ];
+    let multi = MultiCatalog::new(
+        cases
+            .iter()
+            .map(|(p, subs, mb)| boxed_member(&source(p, *subs, mb)))
+            .collect(),
+    );
+    assert_eq!(multi.album_count(), 2);
+    for (s, (prefix, subs, mb)) in cases.iter().enumerate() {
+        let album = pack(s as u32, 0);
+        let rec = multi.album(album).unwrap();
+        assert_eq!(rec.disc_count, 2);
+        assert_eq!(resolve(&multi, rec.mb_album_id), *mb);
+        let run: Vec<(String, String, String)> = (0..multi.album_track_count(album))
+            .map(|i| {
+                let t = multi.track(multi.album_track(album, i).unwrap()).unwrap();
+                (
+                    resolve(&multi, t.title),
+                    resolve(&multi, t.disc_subtitle),
+                    resolve(&multi, t.mbid),
+                )
+            })
+            .collect();
+        let row = |name: String, sub: &str| (name.clone(), sub.to_owned(), format!("{name}-mbid"));
+        assert_eq!(
+            run,
+            vec![
+                row(format!("{prefix}_d1t1"), subs[0]),
+                row(format!("{prefix}_d1t2"), subs[0]),
+                row(format!("{prefix}_d2t1"), subs[1]),
+            ],
+            "source {s}"
+        );
+    }
+}

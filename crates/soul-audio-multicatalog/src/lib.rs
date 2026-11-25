@@ -364,6 +364,8 @@ impl Catalog for MultiCatalog {
         r.folder = pack(s, r.folder);
         r.title.off = pack(s, r.title.off);
         r.file_name.off = pack(s, r.file_name.off);
+        r.mbid.off = pack(s, r.mbid.off);
+        r.disc_subtitle.off = pack(s, r.disc_subtitle.off); // v8
         // `art_id` / `extended_off` are per-source refs (into art.blob / extended.blob);
         // re-pack with the source, but keep the 0 sentinel (no art / no extended) as 0.
         if r.art_id != 0 {
@@ -382,6 +384,7 @@ impl Catalog for MultiCatalog {
         r.album_artist = pack(s, r.album_artist);
         r.folder = pack(s, r.folder);
         r.title.off = pack(s, r.title.off);
+        r.mb_album_id.off = pack(s, r.mb_album_id.off); // v8
         if r.art_id != 0 {
             r.art_id = pack(s, r.art_id);
         }
