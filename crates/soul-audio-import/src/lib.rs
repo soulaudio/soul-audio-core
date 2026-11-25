@@ -371,14 +371,14 @@ fn normalize_rel(rel: &Path) -> String {
 
 /// A track's **album root** and the disc folder it sits in, if any. The album
 /// root is the track's parent folder, unless that folder's name is a disc folder
-/// (`CD1`, `Disc 2 - Liyue`; [`disc_folder::parse`]) strictly below the scan
-/// `root` — then it is the grandparent, so `Album/CD1` + `Album/CD2` are one
-/// album. Never climbs to or above `root`. `soul-audio-organize` applies the
-/// same rule with the same matcher (it may not depend on this crate).
+/// (`CD1`, `Disc 2 - Liyue`; [`disc_folder::parse`]) that is neither the scan
+/// `root` nor an ancestor of it — then it is the grandparent, so `Album/CD1` +
+/// `Album/CD2` are one album. Never climbs out of `root`. The comparison is
+/// host-aware ([`path_key`]). `soul-audio-organize` applies the same rule with
+/// the same matcher and comparison (it may not depend on this crate).
 fn album_root<'a>(track: &'a Path, root: &'a Path) -> (&'a Path, Option<DiscFolder<'a>>) {
     let parent = track.parent().unwrap_or(root);
-    if parent != root
-        && parent.starts_with(root)
+    if !path_key(root).starts_with(path_key(parent))
         && let Some(df) = parent
             .file_name()
             .and_then(|n| n.to_str())
@@ -388,6 +388,30 @@ fn album_root<'a>(track: &'a Path, root: &'a Path) -> (&'a Path, Option<DiscFold
         return (grandparent, Some(df));
     }
     (parent, None)
+}
+
+/// The comparison key of a path on this host: a Windows verbatim prefix
+/// (`\\?\C:\…`, `\\?\UNC\…`) stripped and, on Windows/macOS (case-insensitive
+/// filesystems by default), case-folded; the path itself elsewhere. The same
+/// rule as `soul-audio-organize`'s `paths::key`, so both crates agree on
+/// album roots whatever form the root is given in.
+fn path_key(p: &Path) -> PathBuf {
+    let mut key = p.to_path_buf();
+    if cfg!(windows)
+        && let Some(s) = p.to_str()
+    {
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            key = PathBuf::from(format!(r"\\{rest}"));
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            key = PathBuf::from(rest);
+        }
+    }
+    if cfg!(any(windows, target_os = "macos"))
+        && let Some(s) = key.to_str()
+    {
+        key = PathBuf::from(s.to_lowercase());
+    }
+    key
 }
 
 /// One file's tag-derived metadata, extracted BEFORE interning. This is the
@@ -994,6 +1018,63 @@ pub fn export(root: &Path, out_dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join(INDEX_FILE), &bytes)?;
     std::fs::write(dir.join(ART_FILE), &art_blob)
+}
+
+#[cfg(test)]
+mod album_root_tests {
+    use super::album_root;
+    use std::path::Path;
+
+    fn root_of(track: &str, root: &str) -> (String, Option<u16>) {
+        let (r, df) = album_root(Path::new(track), Path::new(root));
+        (r.to_string_lossy().into_owned(), df.map(|d| d.number))
+    }
+
+    #[test]
+    fn disc_folders_below_the_root_fold_into_their_parent() {
+        let (r, df) = album_root(Path::new("lib/Box/CD2/01.flac"), Path::new("lib"));
+        assert_eq!((r, df.map(|d| d.number)), (Path::new("lib/Box"), Some(2)));
+        let (r, df) = album_root(Path::new("lib/CD1/01.flac"), Path::new("lib"));
+        assert_eq!((r, df.map(|d| d.number)), (Path::new("lib"), Some(1)));
+    }
+
+    #[test]
+    fn never_climbs_out_of_the_root_or_an_ancestor_of_it() {
+        let (r, df) = album_root(Path::new("lib/CD1/01.flac"), Path::new("lib/CD1"));
+        assert_eq!((r, df.is_none()), (Path::new("lib/CD1"), true));
+        let (r, df) = album_root(Path::new("CD1/01.flac"), Path::new("CD1/sub"));
+        assert_eq!((r, df.is_none()), (Path::new("CD1"), true));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_or_differently_cased_root_still_folds_disc_folders() {
+        for root in [r"\\?\D:\lib", r"d:\LIB"] {
+            assert_eq!(
+                root_of(r"D:\lib\Box\CD2\01.flac", root),
+                (r"D:\lib\Box".to_owned(), Some(2)),
+                "{root}"
+            );
+            assert_eq!(
+                root_of(r"D:\lib\01.flac", root),
+                (r"D:\lib".to_owned(), None)
+            );
+        }
+        assert_eq!(
+            root_of(r"D:\lib\CD1\01.flac", r"\\?\D:\LIB\cd1"),
+            (r"D:\lib\CD1".to_owned(), None),
+            "never climbs out of a (verbatim, re-cased) root"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn root_of_is_used_off_windows_too() {
+        assert_eq!(
+            root_of("lib/Box/CD2/01.flac", "lib"),
+            ("lib/Box".to_owned(), Some(2))
+        );
+    }
 }
 
 #[cfg(test)]
