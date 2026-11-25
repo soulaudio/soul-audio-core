@@ -12,3 +12,9 @@ workspace = true
 [dependencies]
 soul-audio-tags = { path = "../soul-audio-tags", features = ["std"] }
 embedded-io-adapters = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+# organize ∘ import round-trip (tests/multi_disc_e2e.rs). Dev-only: the organizer
+# itself must not depend on the importer (both are std adapters; tiers.rs and
+# layering.rs only inspect normal dependencies).
+soul-audio-import = { path = "../soul-audio-import" }
