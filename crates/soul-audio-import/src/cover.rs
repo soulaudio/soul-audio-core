@@ -28,10 +28,17 @@ const COVER_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
 
 /// Resolve one cover for an album: the embedded front-cover picture of
 /// `a_track_path` (any one track belonging to the album) if present, else the
-/// best sidecar image found in `album_dir` or (failing that) its immediate
-/// parent folder, as long as that parent is still inside `root`. `None` when
-/// neither source yields one, or a read fails — cover art is best-effort and
-/// never fails the surrounding scan.
+/// first sidecar found, in order:
+/// 1. the best cover-named image in the album root `album_dir`;
+/// 2. the largest `Front*` scan in the album root's `Scans/` folder;
+/// 3. when the track sits in a disc folder below the album root (`Box/CD1/`):
+///    the best cover-named image in that disc (track) folder, then its
+///    `Scans/Front*`;
+/// 4. the best cover-named image in the album root's immediate parent — only
+///    while that parent is still inside `root`.
+///
+/// `None` when nothing yields one, or a read fails — cover art is best-effort
+/// and never fails the surrounding scan.
 #[must_use]
 pub(crate) fn find_album_cover(
     album_dir: &Path,
@@ -62,9 +69,9 @@ fn embedded_cover(track_path: &Path) -> Option<Vec<u8>> {
 /// album-local `Scans/Front*` scan, then the same two checks in `track_dir`
 /// (the representative track's folder) when it differs from `album_dir` (a
 /// `CD1/` disc folder under the album root), then (only if those yield
-/// nothing) the album folder's immediate parent — but only when the parent is still inside `root`. An
-/// album folder sitting directly at `root` (or outside it) never falls back to
-/// a read above the library.
+/// nothing) the album folder's immediate parent — but only when the parent is
+/// still inside `root`. An album folder sitting directly at `root` (or outside
+/// it) never falls back to a read above the library.
 fn sidecar_cover(album_dir: &Path, track_dir: &Path, root: &Path) -> Option<Vec<u8>> {
     best_in_dir(album_dir)
         .or_else(|| scans_front_cover(album_dir))
