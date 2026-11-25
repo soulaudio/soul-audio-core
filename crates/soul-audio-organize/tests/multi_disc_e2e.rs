@@ -306,9 +306,7 @@ fn run_case(layout: Layout, preset_name: &str, strategy: Strategy) {
     let before = albums(&src);
     let files = audio_files(&src);
     let template = Template::new(preset(preset_name).expect("preset"));
-    let opts = PlanOptions {
-        source_root: Some(src.clone()),
-    };
+    let opts = PlanOptions::new(&src);
 
     // Plan: every entry is a fresh write.
     let p = plan_with(&files, &dest, &template, strategy, &opts);
@@ -320,6 +318,18 @@ fn run_case(layout: Layout, preset_name: &str, strategy: Strategy) {
         p.entries.iter().all(|e| e.action == want),
         "{tag}: every entry {want:?}: {:#?}",
         p.entries
+    );
+    // Suite's discs come only from its `Disc N - …` folders: a layout without
+    // `{DiscDir}` flattens them, and the plan says so.
+    let inferred = layout == Layout::Mixed && !preset_name.ends_with("+disc-folders");
+    assert_eq!(
+        p.folder_inferred_discs,
+        if inferred {
+            vec![src.join("Suite")]
+        } else {
+            Vec::new()
+        },
+        "{tag}"
     );
     // Side files: all planned (album presets) / all left, reported (flat).
     if preset_name == "flat" {
@@ -518,9 +528,11 @@ fn plan_without_a_source_root_moves_audio_only() {
     assert_eq!(
         left,
         [
-            ("Box".to_owned(), SideFilesLeft::NoSourceRoot, 6),
+            // Only each album root's own files (no source root: nothing is
+            // walked) — Box/Scans/ and Suite's disc folders are not counted.
+            ("Box".to_owned(), SideFilesLeft::NoSourceRoot, 5),
             ("Single".to_owned(), SideFilesLeft::NoSourceRoot, 1),
-            ("Suite".to_owned(), SideFilesLeft::NoSourceRoot, 4),
+            ("Suite".to_owned(), SideFilesLeft::NoSourceRoot, 1),
         ]
     );
     let s = apply(&p, |_| {}).unwrap();
@@ -632,9 +644,7 @@ fn identity_edges_round_trip() {
             &dest,
             &Template::new(preset(preset_name).unwrap()),
             Strategy::Copy,
-            &PlanOptions {
-                source_root: Some(src.clone()),
-            },
+            &PlanOptions::new(&src),
         );
         let s = apply(&p, |_| {}).unwrap();
         assert!(s.failed.is_empty(), "{tag}: {:?}", s.failed);
@@ -702,9 +712,7 @@ fn existing_destination_files_are_never_overwritten() {
             &dest,
             &Template::new(preset("artist-album").unwrap()),
             strategy,
-            &PlanOptions {
-                source_root: Some(src.clone()),
-            },
+            &PlanOptions::new(&src),
         );
         let action = |rel: &str| {
             let want = support::at(&dest, rel);

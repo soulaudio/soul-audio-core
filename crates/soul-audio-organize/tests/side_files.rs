@@ -4,11 +4,11 @@
 mod support;
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use soul_audio_organize::{
-    Action, EntryKind, LeftInPlace, OrganizePlan, PlanOptions, SideFilesLeft, Strategy, Template,
-    apply, plan, plan_with, preset,
+    Action, EntryKind, OrganizePlan, PlanOptions, SideFilesLeft, Strategy, Template, apply, plan,
+    plan_with, preset,
 };
 use support::{at, audio_files, flac, put, rel, tree, unique_dir};
 
@@ -45,10 +45,16 @@ fn set(items: &[&str]) -> BTreeSet<String> {
     items.iter().map(|s| (*s).to_owned()).collect()
 }
 
+/// `(album root, reason, file count)` of every root left in place.
+fn left(p: &OrganizePlan) -> Vec<(PathBuf, SideFilesLeft, usize)> {
+    p.side_files_left
+        .iter()
+        .map(|l| (l.album_root.clone(), l.reason, l.files))
+        .collect()
+}
+
 fn opts(src: &Path) -> PlanOptions {
-    PlanOptions {
-        source_root: Some(src.to_path_buf()),
-    }
+    PlanOptions::new(src)
 }
 
 #[test]
@@ -269,12 +275,8 @@ fn two_albums_in_one_folder_leave_side_files_in_place() {
     );
     assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty());
     assert_eq!(
-        p.side_files_left,
-        vec![LeftInPlace {
-            album_root: src.join("Dump"),
-            reason: SideFilesLeft::SharedAlbumRoot,
-            files: 1,
-        }]
+        left(&p),
+        vec![(src.join("Dump"), SideFilesLeft::SharedAlbumRoot, 1)]
     );
 }
 
@@ -297,12 +299,14 @@ fn a_nested_album_makes_the_outer_root_ambiguous() {
         set(&["HOYO-MiX/Y/cover.jpg"])
     );
     assert_eq!(
-        p.side_files_left,
-        vec![LeftInPlace {
-            album_root: src.join("Artist"),
-            reason: SideFilesLeft::SharedAlbumRoot,
-            files: 2,
-        }]
+        // Only the ambiguous root's own files are counted (it is not walked);
+        // Y's cover travels with Y.
+        left(&p),
+        vec![(src.join("Artist"), SideFilesLeft::SharedAlbumRoot, 1)]
+    );
+    assert_eq!(
+        p.side_files_left[0].paths,
+        vec![at(&src, "Artist/artist.jpg")]
     );
 }
 
@@ -320,12 +324,8 @@ fn loose_tracks_in_the_source_root_never_sweep_it() {
     );
     assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty());
     assert_eq!(
-        p.side_files_left,
-        vec![LeftInPlace {
-            album_root: src.clone(),
-            reason: SideFilesLeft::AtSourceRoot,
-            files: 1,
-        }]
+        left(&p),
+        vec![(src.clone(), SideFilesLeft::AtSourceRoot, 1)]
     );
 }
 
@@ -347,12 +347,8 @@ fn flat_layout_leaves_side_files_in_place() {
     );
     assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty());
     assert_eq!(
-        p.side_files_left,
-        vec![LeftInPlace {
-            album_root: src.join("Box"),
-            reason: SideFilesLeft::NoAlbumFolder,
-            files: 1,
-        }]
+        left(&p),
+        vec![(src.join("Box"), SideFilesLeft::NoAlbumFolder, 1)]
     );
 }
 
@@ -536,12 +532,8 @@ fn two_releases_in_one_folder_split_and_untagged_tracks_join_the_first() {
         ])
     );
     assert_eq!(
-        p.side_files_left,
-        vec![LeftInPlace {
-            album_root: src.join("Rel"),
-            reason: SideFilesLeft::SharedAlbumRoot,
-            files: 1,
-        }]
+        left(&p),
+        vec![(src.join("Rel"), SideFilesLeft::SharedAlbumRoot, 1)]
     );
 }
 
@@ -754,12 +746,8 @@ fn plan_without_a_source_root_sweeps_and_prunes_nothing() {
     assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty());
     assert!(p.prune_dirs.is_empty(), "{:?}", p.prune_dirs);
     assert_eq!(
-        p.side_files_left,
-        vec![LeftInPlace {
-            album_root: src.join("Box"),
-            reason: SideFilesLeft::NoSourceRoot,
-            files: 2,
-        }]
+        left(&p),
+        vec![(src.join("Box"), SideFilesLeft::NoSourceRoot, 2)]
     );
 }
 
@@ -856,12 +844,20 @@ fn a_stem_followed_lyric_never_shadows_another_side_file() {
         Strategy::Copy,
         &opts(&src),
     );
+    // The lyric that follows the track wins the track's name; the unrelated
+    // file that already carried it is numbered.
+    let by_src = |name: &str| {
+        let e = p
+            .entries
+            .iter()
+            .find(|e| e.src == at(&src, &format!("Box/{name}")))
+            .unwrap();
+        rel(&dest, &e.dst)
+    };
+    assert_eq!(by_src("101 Intro.lrc"), "HOYO-MiX/Box/1-01 - Intro.lrc");
     assert_eq!(
-        dsts(&p, &dest, EntryKind::SideFile),
-        set(&[
-            "HOYO-MiX/Box/1-01 - Intro.lrc",
-            "HOYO-MiX/Box/1-01 - Intro (2).lrc"
-        ])
+        by_src("1-01 - Intro.lrc"),
+        "HOYO-MiX/Box/1-01 - Intro (2).lrc"
     );
     assert!(
         p.entries.iter().all(|e| e.action == Action::Copy),
@@ -1056,4 +1052,317 @@ fn a_failed_move_keeps_its_folder() {
     assert!(at(&src, "Bad/01.flac").exists());
     assert!(at(&src, "Bad").exists(), "a failed move keeps its folder");
     assert!(!at(&src, "Good").exists());
+}
+
+// --- final review fixes --------------------------------------------------
+
+#[test]
+fn side_files_stay_with_audio_that_conflicts_at_the_destination() {
+    let (src, dest) = (unique_dir("audioclash-src"), unique_dir("audioclash-dest"));
+    put(&src, "Box/01 Intro.flac", &track("Box", "Intro", 1, None));
+    put(&src, "Box/01 Intro.lrc", b"[00:00.00]Intro");
+    put(&src, "Box/Box.log", b"log");
+    put(&src, "Box/Scans/Front.jpg", b"front");
+    // A different same-title album already sits at the target path.
+    put(
+        &dest,
+        "HOYO-MiX/Box/01 - Intro.flac",
+        b"another album's track",
+    );
+    let before = tree(&src);
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+        &opts(&src),
+    );
+    assert_eq!(p.entries.len(), 1, "{:#?}", p.entries);
+    assert_eq!(p.entries[0].action, Action::SkipConflict);
+    assert_eq!(
+        left(&p),
+        vec![(src.join("Box"), SideFilesLeft::AudioConflict, 3)]
+    );
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    assert_eq!(tree(&src), before, "nothing moved away from the album");
+}
+
+#[test]
+fn an_untrusted_album_root_is_never_walked() {
+    // No source root: `<tmp>/CD1/x.flac` climbs to `<tmp>` (identity rule), but
+    // `<tmp>` may be a drive root — only its own files are listed.
+    let (tmp, dest) = (unique_dir("nowalk-src"), unique_dir("nowalk-dest"));
+    put(&tmp, "CD1/x.flac", &track("X", "x", 1, None));
+    put(&tmp, "readme.txt", b"top-level file");
+    let mut deep = String::from("deep");
+    for i in 0..12 {
+        deep.push_str(&format!("/d{i}"));
+        put(&tmp, &format!("{deep}/f.txt"), b"unrelated");
+    }
+    let p = plan(
+        &audio_files(&tmp),
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Copy,
+    );
+    assert_eq!(
+        left(&p),
+        vec![(tmp.clone(), SideFilesLeft::NoSourceRoot, 1)]
+    );
+    assert_eq!(p.side_files_left[0].paths, vec![tmp.join("readme.txt")]);
+}
+
+#[test]
+fn an_input_with_a_parent_dir_component_sweeps_and_prunes_nothing() {
+    let (src, dest) = (unique_dir("dotdot-src"), unique_dir("dotdot-dest"));
+    put(&src, "Box/01 Intro.flac", &track("Box", "Intro", 1, None));
+    put(&src, "Box/cover.jpg", b"jpg");
+    let input = src.join("Box").join("..").join("Box").join("01 Intro.flac");
+    let p = plan_with(
+        &[input],
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+        &opts(&src),
+    );
+    assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty());
+    assert!(p.prune_dirs.is_empty(), "{:?}", p.prune_dirs);
+    assert_eq!(p.side_files_left[0].reason, SideFilesLeft::NoSourceRoot);
+}
+
+/// `Box/CD1` + `Box/CD2` (untagged discs) with a cover, planned against the
+/// source root `root(src)`.
+#[cfg(windows)]
+fn box_against_root(tag: &str, root: impl Fn(&Path) -> PathBuf) {
+    let src = unique_dir(&format!("{tag}-src"));
+    let dest = unique_dir(&format!("{tag}-dest"));
+    put(
+        &src,
+        "Box/CD1/01 Intro.flac",
+        &track("Box", "Intro", 1, None),
+    );
+    put(
+        &src,
+        "Box/CD2/01 Reprise.flac",
+        &track("Box", "Reprise", 1, None),
+    );
+    put(&src, "Box/cover.jpg", b"jpg");
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+        &PlanOptions::new(root(&src)),
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::Audio),
+        set(&[
+            "HOYO-MiX/Box/1-01 - Intro.flac",
+            "HOYO-MiX/Box/2-01 - Reprise.flac"
+        ]),
+        "{tag}: one two-disc album"
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::SideFile),
+        set(&["HOYO-MiX/Box/cover.jpg"]),
+        "{tag}"
+    );
+    assert!(
+        p.side_files_left.is_empty(),
+        "{tag}: {:?}",
+        p.side_files_left
+    );
+    assert_eq!(p.prune_dirs.len(), 3, "{tag}: {:?}", p.prune_dirs);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_verbatim_prefixed_source_root_matches_plain_inputs() {
+    box_against_root("verbatim", |src| {
+        PathBuf::from(format!(r"\\?\{}", src.display()))
+    });
+}
+
+#[cfg(windows)]
+#[test]
+fn a_source_root_differing_only_by_case_matches_on_windows() {
+    box_against_root("case", |src| {
+        PathBuf::from(src.to_str().unwrap().to_uppercase())
+    });
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn album_folders_differing_only_by_case_are_numbered() {
+    let (src, dest) = (unique_dir("casefold-src"), unique_dir("casefold-dest"));
+    put(&src, "One/01.flac", &track("Abc", "a", 1, None));
+    put(&src, "One/cover.jpg", b"one");
+    put(&src, "Two/01.flac", &track("ABC", "b", 1, None));
+    put(&src, "Two/cover.jpg", b"two!");
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::Audio),
+        set(&["HOYO-MiX/Abc/01 - a.flac", "HOYO-MiX/ABC (2)/01 - b.flac"])
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::SideFile),
+        set(&["HOYO-MiX/Abc/cover.jpg", "HOYO-MiX/ABC (2)/cover.jpg"])
+    );
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    assert_eq!(s.copied, 4);
+}
+
+#[test]
+fn a_nested_unselected_album_keeps_its_files() {
+    let src = unique_dir("nested-unsel-src");
+    let dest = unique_dir("nested-unsel-dest");
+    let input = put(&src, "Box/01 Intro.flac", &track("Box", "Intro", 1, None));
+    put(&src, "Box/cover.jpg", b"box cover");
+    put(
+        &src,
+        "Box/Bonus Album/01.flac",
+        &track("Bonus", "b", 1, None),
+    );
+    put(&src, "Box/Bonus Album/cover.jpg", b"bonus cover");
+    put(
+        &src,
+        "Box/Extras/Live/01.flac",
+        &track("Live", "l", 1, None),
+    );
+    put(&src, "Box/Extras/notes.txt", b"live notes");
+    put(&src, "Box/Scans/Front.jpg", b"front");
+    let p = plan_with(
+        &[input],
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::SideFile),
+        set(&["HOYO-MiX/Box/cover.jpg", "HOYO-MiX/Box/Scans/Front.jpg"])
+    );
+}
+
+#[test]
+fn folder_inferred_discs_are_reported_unless_the_layout_keeps_disc_folders() {
+    let src = unique_dir("inferred-src");
+    put(
+        &src,
+        "Suite/Disc 1 - Mondstadt/01 Dawn.flac",
+        &track("Suite", "Dawn", 1, None),
+    );
+    put(
+        &src,
+        "Suite/Disc 2 - Liyue/01 Night.flac",
+        &track("Suite", "Night", 1, None),
+    );
+    put(
+        &src,
+        "Tagged/CD1/01 a.flac",
+        &track("Tagged", "a", 1, Some("1")),
+    );
+    put(
+        &src,
+        "Tagged/CD2/01 b.flac",
+        &track("Tagged", "b", 1, Some("2")),
+    );
+    put(&src, "One/CD1/01 c.flac", &track("One", "c", 1, None));
+    for (preset_name, want) in [
+        ("artist-album", vec![src.join("Suite")]),
+        ("flat", vec![src.join("Suite")]),
+        ("artist-album+disc-folders", vec![]),
+    ] {
+        let dest = unique_dir("inferred-dest");
+        let p = plan_with(
+            &audio_files(&src),
+            &dest,
+            &tpl(preset_name),
+            Strategy::Copy,
+            &opts(&src),
+        );
+        assert_eq!(p.folder_inferred_discs, want, "{preset_name}");
+    }
+}
+
+#[test]
+fn a_template_without_an_album_folder_plans_no_side_files() {
+    let (src, dest) = (unique_dir("noalbumdir-src"), unique_dir("noalbumdir-dest"));
+    put(&src, "A/01.flac", &track("A", "a", 1, None));
+    put(&src, "A/cover.jpg", b"a");
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &Template::new("{Artist}/{Title}"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty());
+    assert_eq!(
+        left(&p),
+        vec![(src.join("A"), SideFilesLeft::NoAlbumFolder, 1)]
+    );
+}
+
+/// A FLAC of `album` by `artist`.
+fn by(album: &str, artist: &str, title: &str, n: u32) -> Vec<u8> {
+    let c = [
+        format!("ALBUM={album}"),
+        format!("ARTIST={artist}"),
+        format!("TITLE={title}"),
+        format!("TRACKNUMBER={n}"),
+    ];
+    let refs: Vec<&str> = c.iter().map(String::as_str).collect();
+    flac(&refs)
+}
+
+#[test]
+fn a_replan_after_apply_picks_the_same_side_file_names() {
+    // `{Album}/{Artist}/…`: the compilation's folder is `Hits/`, the solo
+    // album's is `Hits/R/` — where the compilation's `R/cover.jpg` also lands.
+    let (src, dest) = (unique_dir("replan-src"), unique_dir("replan-dest"));
+    put(&src, "CompA/01.flac", &by("Hits", "P", "p", 1));
+    put(&src, "CompA/02.flac", &by("Hits", "Q", "q", 2));
+    put(&src, "CompA/R/cover.jpg", b"compilation's R page");
+    put(&src, "SoloB/01.flac", &by("Hits", "R", "r", 1));
+    put(&src, "SoloB/cover.jpg", b"solo cover");
+    let template = Template::new("{Album}/{Artist}/{TrackNo} - {Title}");
+    let files = audio_files(&src);
+    let first = plan_with(&files, &dest, &template, Strategy::Copy, &opts(&src));
+    let side = |p: &OrganizePlan| -> Vec<(String, String)> {
+        p.entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::SideFile)
+            .map(|e| (rel(&src, &e.src), rel(&dest, &e.dst)))
+            .collect()
+    };
+    let names = side(&first);
+    assert_eq!(
+        names,
+        [
+            ("CompA/R/cover.jpg", "Hits/R/cover.jpg"),
+            ("SoloB/cover.jpg", "Hits/R/cover (2).jpg"),
+        ]
+        .map(|(a, b)| (a.to_owned(), b.to_owned()))
+    );
+    let s = apply(&first, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    let again = plan_with(&files, &dest, &template, Strategy::Copy, &opts(&src));
+    assert_eq!(side(&again), names, "re-plan picks the same names");
+    assert!(
+        again
+            .entries
+            .iter()
+            .all(|e| e.action == Action::SkipDuplicate),
+        "{:#?}",
+        again.entries
+    );
 }

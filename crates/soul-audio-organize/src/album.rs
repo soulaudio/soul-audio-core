@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use soul_audio_tags::{Tags, disc_folder};
 
+use crate::paths;
 use crate::tags::read_tags;
 
 /// One input track after grouping.
@@ -27,15 +28,19 @@ pub(crate) struct AlbumGroup {
     pub(crate) root: PathBuf,
     pub(crate) disc_count: u32,
     pub(crate) tracks: Vec<usize>,
+    /// Some track's disc number came only from its disc-folder name (no disc
+    /// tag) — a layout without `{DiscDir}` loses it on re-import.
+    pub(crate) disc_from_folder: bool,
 }
 
 /// `(album root, disc-folder number)` for `src`: its parent folder, or the
-/// grandparent when the parent's name is a disc folder strictly below
-/// `source_root` (when given). Mirrors `soul-audio-import`'s `album_root`.
+/// grandparent when the parent's name is a disc folder that is neither
+/// `source_root` nor an ancestor of it (compared host-aware, see
+/// [`paths::key`]). Mirrors `soul-audio-import`'s `album_root`.
 pub(crate) fn album_root(src: &Path, source_root: Option<&Path>) -> (PathBuf, Option<u32>) {
     let parent = src.parent().unwrap_or(Path::new(""));
-    let below_root = source_root.is_none_or(|r| parent != r && parent.starts_with(r));
-    if below_root
+    let may_climb = source_root.is_none_or(|r| !paths::starts_with(r, parent));
+    if may_climb
         && let Some(df) = parent
             .file_name()
             .and_then(|n| n.to_str())
@@ -135,6 +140,7 @@ pub(crate) fn group(
                     root,
                     disc_count: 1,
                     tracks: Vec::new(),
+                    disc_from_folder: false,
                 });
                 ids.insert(key, albums.len() - 1);
                 albums.len() - 1
@@ -146,8 +152,10 @@ pub(crate) fn group(
             .disc_total
             .filter(|&d| d <= u32::from(u16::MAX))
             .unwrap_or(0);
-        let disc = disc_tag.or(folder_disc.filter(|&n| n > 0)).unwrap_or(1);
+        let from_folder = folder_disc.filter(|&n| n > 0 && disc_tag.is_none());
+        let disc = disc_tag.or(from_folder).unwrap_or(1);
         let group = &mut albums[album];
+        group.disc_from_folder |= from_folder.is_some();
         group.disc_count = group.disc_count.max(disc).max(disc_total);
         group.tracks.push(i);
         tags.disc = Some(disc);
@@ -216,6 +224,46 @@ mod tests {
             album_root(Path::new("CD1/01.flac"), Some(Path::new("CD1"))),
             (PathBuf::from("CD1"), None)
         );
+        // A disc folder that is an ANCESTOR of the source root stays too.
+        assert_eq!(
+            album_root(Path::new("CD1/01.flac"), Some(Path::new("CD1/sub"))),
+            (PathBuf::from("CD1"), None)
+        );
+        // Outside the source root the disc-folder rule still applies (identity
+        // only; side files and pruning stay off there).
+        assert_eq!(
+            album_root(Path::new("x/CD2/01.flac"), Some(Path::new("lib"))),
+            (PathBuf::from("x"), Some(2))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_or_differently_cased_source_root_still_folds_disc_folders() {
+        for root in [r"\\?\D:\lib", r"d:\LIB"] {
+            assert_eq!(
+                album_root(Path::new(r"D:\lib\Box\CD2\01.flac"), Some(Path::new(root))),
+                (PathBuf::from(r"D:\lib\Box"), Some(2)),
+                "{root}"
+            );
+            assert_eq!(
+                album_root(Path::new(r"D:\lib\CD1\01.flac"), Some(Path::new(root))).1,
+                Some(1),
+                "{root}: CD1 is strictly below the root"
+            );
+            assert_eq!(
+                album_root(Path::new(r"D:\lib\01.flac"), Some(Path::new(root))),
+                (PathBuf::from(r"D:\lib"), None)
+            );
+        }
+        assert_eq!(
+            album_root(
+                Path::new(r"D:\lib\CD1\01.flac"),
+                Some(Path::new(r"\\?\D:\LIB\cd1"))
+            ),
+            (PathBuf::from(r"D:\lib\CD1"), None),
+            "never climbs out of a (verbatim, re-cased) source root"
+        );
     }
 
     #[test]
@@ -224,6 +272,7 @@ mod tests {
             root: PathBuf::from(r),
             disc_count: 1,
             tracks: Vec::new(),
+            disc_from_folder: false,
         };
         let idx = RootIndex::new(&[
             g("a/Dump"),

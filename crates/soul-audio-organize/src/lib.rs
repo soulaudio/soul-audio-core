@@ -22,6 +22,7 @@
 
 mod album;
 mod apply;
+mod paths;
 mod plan;
 mod sanitize;
 mod side;

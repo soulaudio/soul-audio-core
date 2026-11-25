@@ -36,8 +36,21 @@ fn is_reserved_stem(stem: &str) -> bool {
     false
 }
 
-/// Make `s` safe to use as a single path segment on the host filesystem.
-pub(crate) fn sanitize_segment(s: &str) -> String {
+/// Make `s` safe as a file **name** that keeps its extension: like
+/// [`sanitize_segment`], except that a reserved device stem gets its `_`
+/// before the extension (`con.txt` → `con_.txt`, not `con.txt_`).
+pub(crate) fn sanitize_file_name(s: &str) -> String {
+    let mut out = clean(s);
+    let stem_end = out.find('.').unwrap_or(out.len());
+    if is_reserved_stem(&out[..stem_end]) {
+        out.insert(stem_end, '_');
+    }
+    out
+}
+
+/// Illegal/control characters → `_`, surrounding spaces and trailing dots
+/// trimmed, empty → `_` (the shared part of the two sanitizers).
+fn clean(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if ILLEGAL.contains(&c) || matches!(c, '\u{0}'..='\u{1f}') {
@@ -46,29 +59,39 @@ pub(crate) fn sanitize_segment(s: &str) -> String {
             out.push(c);
         }
     }
-
-    // Windows strips trailing dots/spaces; also drop surrounding spaces. Leading
-    // dots are preserved on purpose.
     let trimmed = out.trim_start_matches(' ').trim_end_matches([' ', '.']);
     if trimmed.is_empty() {
-        return "_".to_owned();
-    }
-
-    // Reserved-name check on the stem (before any `.`), so `CON.foo` is caught too.
-    let stem = trimmed.split('.').next().unwrap_or(trimmed);
-    if is_reserved_stem(stem) {
-        let mut res = String::with_capacity(trimmed.len() + 1);
-        res.push_str(trimmed);
-        res.push('_');
-        res
+        "_".to_owned()
     } else {
         trimmed.to_owned()
     }
 }
 
+/// Make `s` safe to use as a single path segment on the host filesystem.
+pub(crate) fn sanitize_segment(s: &str) -> String {
+    // Windows strips trailing dots/spaces; also drop surrounding spaces. Leading
+    // dots are preserved on purpose.
+    let mut out = clean(s);
+    // Reserved-name check on the stem (before any `.`), so `CON.foo` is caught too.
+    let stem = out.split('.').next().unwrap_or(&out);
+    if is_reserved_stem(stem) {
+        out.push('_');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::sanitize_segment;
+    use super::{sanitize_file_name, sanitize_segment};
+
+    #[test]
+    fn file_names_keep_their_extension() {
+        assert_eq!(sanitize_file_name("a:b?.txt"), "a_b_.txt");
+        assert_eq!(sanitize_file_name("con.txt"), "con_.txt");
+        assert_eq!(sanitize_file_name("Lpt1"), "Lpt1_");
+        assert_eq!(sanitize_file_name("notes. "), "notes");
+        assert_eq!(sanitize_file_name(""), "_");
+    }
 
     #[test]
     fn replaces_path_separator() {
