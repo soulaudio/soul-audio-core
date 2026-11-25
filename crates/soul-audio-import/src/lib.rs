@@ -417,7 +417,7 @@ fn path_key(p: &Path) -> PathBuf {
 /// One file's tag-derived metadata, extracted BEFORE interning. This is the
 /// *costly* per-file product (a file open + tag/header parse) that the
 /// incremental scanner caches by [`FileStamp`] so an unchanged file is never
-/// re-read. `path` is the key; the rest mirrors what [`extract_raw`] pulls from
+/// re-read. `path` is the key; the rest mirrors what `extract_raw` pulls from
 /// `Tags`/`StreamFacts`. `Clone` so the cache can hand copies back; `Send` (all
 /// fields are) so extraction can fan out across threads.
 #[derive(Clone, Debug, PartialEq)]
