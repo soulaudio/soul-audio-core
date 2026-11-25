@@ -65,6 +65,10 @@ fn run(args: &[&str]) -> Result<(), String> {
 }
 
 /// [`run`] with extra environment variables set for the child cargo.
+///
+/// `env` **replaces** any ambient value of the same variable, by design: the
+/// rustdoc gate passes `RUSTDOCFLAGS=-D warnings` so a developer's own
+/// `RUSTDOCFLAGS` can neither weaken nor change the gate.
 fn run_env(env: &[(&str, &str)], args: &[&str]) -> Result<(), String> {
     let shown: String = env.iter().map(|(k, v)| format!("{k}={v:?} ")).collect();
     println!("+ {shown}cargo {}", args.join(" "));

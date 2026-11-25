@@ -1,8 +1,10 @@
 //! The organize e2e matrix (multi-disc spec, "Testing"): three source layouts ×
 //! every preset (one-folder + `+disc-folders` album presets, and `flat`) ×
 //! Copy/Move. Each case asserts the exact destination tree (audio + side-file
-//! placement + collision prefixes), that nothing but a .cue's FILE lines was modified (the EAC cue names the renamed tracks, the log stays byte-identical), the source left
-//! intact (Copy) or pruned (Move), re-run idempotence, and finally that
+//! placement + collision prefixes), that nothing but a .cue's FILE lines was
+//! modified (the EAC cue names the renamed tracks, the log stays
+//! byte-identical), the source left intact (Copy) or pruned (Move), re-run
+//! idempotence, and finally that
 //! re-importing the destination yields the same albums (organize ∘ import).
 //!
 //! The matrix plans with a source root (`plan_with`), as the app does. Extra

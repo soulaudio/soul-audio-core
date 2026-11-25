@@ -13,11 +13,10 @@
 //!
 //! Layers: [`Template`] (pure rendering, incl. the multi-disc tokens and the
 //! [`presets`]), [`plan`]/[`plan_with`] (album-aware planning: groups inputs into
-//! albums with the importer's identity rule, plans each album's side files —
-//! logs, cues, covers, scans, lyrics; a cue's `FILE` lines are pointed at the
-//! renamed tracks — and never mutates), and [`apply`] (the
-//! only mutating call: copy/move, never overwrite, prune emptied source folders
-//! after a Move).
+//! albums with the importer's identity rule, plans each album's side files
+//! (logs, cues, covers, scans, lyrics), points a cue's `FILE` lines at the
+//! renamed tracks, and never mutates), and [`apply`] (the only mutating call:
+//! copy/move, never overwrite, prune emptied source folders after a Move).
 //!
 //! Paths are compared host-aware: a Windows verbatim prefix (`\\?\…`) is
 //! ignored and, on Windows/macOS, letter case is folded — for the source root
@@ -31,8 +30,11 @@
 //!   Move stops between the two, the album's side files stay orphaned in the
 //!   source album root: a fresh plan over the (now moved) audio no longer sees
 //!   that root. Re-apply the **same** plan (idempotent — finished entries are
-//!   skipped, emptied folders still pruned), or re-plan with the album root's
-//!   remaining files as inputs.
+//!   skipped, emptied folders still pruned; a cue written but not yet removed
+//!   from the source is finished). Do **not** re-plan instead: the tracks
+//!   already moved are no longer inputs, so a fresh plan cannot point a cue's
+//!   `FILE` lines at them — the cue would come out half-rewritten, naming
+//!   source files that are gone.
 //! - **Check-then-rename race.** [`apply`] checks that a destination does not
 //!   exist and then copies/renames onto it; a file created at that path by
 //!   another process in between may be overwritten (a rename replaces on every
@@ -44,13 +46,18 @@
 //!   `Album (2)` folder) — in the organizer and the importer alike. Tag the
 //!   discs (`DISCNUMBER`), or rename the folders to `Album/CD1`, `Album/CD2`.
 //! - A plan reports, but cannot fix, a multi-disc album whose disc numbers come
-//!   only from folder names when the template has no `{DiscDir}`
-//!   ([`OrganizePlan::folder_inferred_discs`]).
+//!   only from folder names when the template has no `{DiscDir}` directory
+//!   segment ([`OrganizePlan::folder_inferred_discs`]).
 //! - **Cue sheets left behind.** A `.cue` is rewritten only when its album's
 //!   side files move with the album. One left in place
 //!   ([`OrganizePlan::side_files_left`]) keeps naming the old paths, and one
 //!   that cannot be rewritten safely (legacy encoding with non-ASCII names) is
 //!   moved unchanged and listed in [`OrganizePlan::cues_not_rewritten`].
+//! - **Unicode normalization.** Names are compared as stored, never
+//!   normalized: on macOS a cue's `FILE "Café.flac"` written in NFC does not
+//!   match a file name stored in NFD (the line is kept as-is).
+//! - **Legacy cues that happen to be valid UTF-8** are treated as UTF-8 (a
+//!   Windows-1252 cue whose bytes form valid UTF-8 is indistinguishable).
 //! - **Partial selections.** Selecting only some tracks of an album (or an
 //!   album folder holding audio this build never lists as an input) moves its
 //!   tracks but leaves all its side files in place

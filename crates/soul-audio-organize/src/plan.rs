@@ -29,7 +29,8 @@ pub enum Action {
     /// `.cue` must match its rewritten bytes exactly).
     SkipDuplicate,
     /// Skip: a **different** file already occupies the destination (same path,
-    /// different byte length). We never overwrite.
+    /// different byte length — for a rewritten `.cue`, any different bytes,
+    /// even of the same length). We never overwrite.
     SkipConflict,
 }
 
@@ -190,7 +191,8 @@ pub struct OrganizePlan {
     pub prune_dirs: Vec<PathBuf>,
     /// Album roots (each once, first-seen order) of multi-disc albums where some
     /// track's disc number came **only** from its disc-folder name (`CD2/`, no
-    /// disc tag) while the template has no `{DiscDir}`: the new layout puts all
+    /// disc tag) while the template has no `{DiscDir}` directory segment: the
+    /// new layout puts all
     /// discs in one folder, so a later re-import reads them as one disc. A UI
     /// should warn, or suggest a `+disc-folders` preset or tagging the discs.
     pub folder_inferred_discs: Vec<PathBuf>,
