@@ -911,6 +911,36 @@ fn move_prunes_emptied_folders_bottom_up_but_never_the_source_root() {
 }
 
 #[test]
+fn a_resumed_move_still_prunes_folders_emptied_by_the_first_run() {
+    let (src, dest) = (unique_dir("resume-src"), unique_dir("resume-dest"));
+    put(
+        &src,
+        "Box/CD1/01 Intro.flac",
+        &track("Box", "Intro", 1, None),
+    );
+    put(&src, "Box/CD1/Box.log", b"log");
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+        &opts(&src),
+    );
+    assert!(!p.prune_dirs.is_empty());
+    // An interrupted first run: every file moved, the cleanup never ran.
+    let mut interrupted = p.clone();
+    interrupted.prune_dirs.clear();
+    let first = apply(&interrupted, |_| {}).unwrap();
+    assert!(first.failed.is_empty(), "{:?}", first.failed);
+    assert!(src.join("Box").exists());
+    // The re-apply moves nothing (all already there) but still prunes.
+    let again = apply(&p, |_| {}).unwrap();
+    assert_eq!(again.moved, 0);
+    assert_eq!(again.pruned_dirs, 2);
+    assert!(!src.join("Box").exists());
+}
+
+#[test]
 fn move_keeps_a_folder_that_still_holds_junk() {
     let (src, dest) = (unique_dir("junk-src"), unique_dir("junk-dest"));
     put(&src, "Box/101 Intro.flac", &track("Box", "Intro", 1, None));

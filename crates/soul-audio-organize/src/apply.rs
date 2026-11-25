@@ -4,9 +4,10 @@
 //! **idempotent** — a destination that already exists is skipped, never
 //! overwritten — so re-running a plan is safe, and a per-file error never aborts
 //! the batch (it is recorded in [`Summary::failed`] and the walk continues).
-//! After a run that moved files, it removes the plan's
-//! [`prune_dirs`](crate::OrganizePlan::prune_dirs) that are now empty
-//! (bottom-up; a non-empty folder is never touched).
+//! After the entries it removes the plan's
+//! [`prune_dirs`](crate::OrganizePlan::prune_dirs) (a Move plan's) that are now
+//! empty (bottom-up; a non-empty folder is never touched) — also on a resumed
+//! re-apply that had nothing left to move.
 
 use std::path::PathBuf;
 
@@ -71,12 +72,13 @@ pub fn apply(
     }
     // Move cleanup: `remove_dir` only ever removes an EMPTY folder, so a folder
     // still holding a file (junk, an ambiguous album's side files, an
-    // unplanned file) survives. Errors are expected and ignored.
-    if summary.moved > 0 {
-        for dir in &plan.prune_dirs {
-            if std::fs::remove_dir(dir).is_ok() {
-                summary.pruned_dirs += 1;
-            }
+    // unplanned file) survives. Errors are expected and ignored. Not gated on
+    // this run having moved anything: `prune_dirs` is only ever set for a Move
+    // plan, and a resumed re-apply (every move already done by an interrupted
+    // run) must still clean up.
+    for dir in &plan.prune_dirs {
+        if std::fs::remove_dir(dir).is_ok() {
+            summary.pruned_dirs += 1;
         }
     }
     Ok(summary)
