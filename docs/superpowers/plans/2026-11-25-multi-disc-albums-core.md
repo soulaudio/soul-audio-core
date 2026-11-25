@@ -3579,6 +3579,48 @@ git add crates/soul-audio-organize/
 git commit -m "feat(organize): album-aware planning with side files that travel with the album"
 ```
 
+- [ ] **Step 11 (controller amendment): Distinct albums must not merge into one destination folder**
+
+Real-corpus case: `Footprints of the Traveler/` and `Footprints of the Traveler(Chinese Version)/` carry the same album
+title + album artist, so every album preset renders both into `HOYO-MiX/Footprints of the Traveler/`, and the second
+album is silently `SkipDuplicate`/`SkipConflict`ed (or, worse, interleaved). The importer keeps them apart (D2); the
+organizer must too.
+
+Rule (applies to every preset that has an album folder; `flat` is exempt — it has no album folder):
+- After rendering, each planned album has an **album destination dir** = the track destination's parent, or its parent's
+  parent when the template used `{DiscDir}` and the album is multi-disc (i.e. the dir that holds the album's side files).
+- Walk albums in plan (input) order. The first album to claim an album destination dir keeps it. A **later, distinct**
+  album (different identity key) that renders to an already-claimed album destination dir gets that directory name
+  suffixed with ` (2)`, ` (3)`, … — the lowest free n within this batch — and **all** of its track and side-file
+  destinations are re-rooted under the suffixed dir (keep the path below the album dir unchanged).
+- Only collisions **within one plan batch** are disambiguated; a destination that already exists on disk from an earlier
+  run keeps today's semantics (equal size → `SkipDuplicate`, else `SkipConflict`), so re-running a plan stays idempotent.
+- Re-run idempotence must hold for the suffixed album too: planning the same inputs again yields the same suffix
+  (input order is deterministic), and its files then classify as `SkipDuplicate`.
+
+Test (add to the organize side-files/plan tests, using the `tests/support` FLAC writer):
+
+```rust
+#[test]
+fn same_title_distinct_albums_get_numbered_folders_not_merged() {
+    // two source folders, identical tags (album "Footprints", album artist "HOYO-MiX"), 2 tracks each,
+    // different audio bytes; plus a cover.jpg in each.
+    // plan with preset "artist-album", Strategy::Copy:
+    //   folder A → dest/HOYO-MiX/Footprints/01 - a.flac, 02 - b.flac, cover.jpg
+    //   folder B → dest/HOYO-MiX/Footprints (2)/01 - a.flac, 02 - b.flac, cover.jpg
+    // every entry's action is Copy (none SkipDuplicate/SkipConflict).
+    // apply, then plan again with the same inputs: every entry is SkipDuplicate and B's dsts still use "Footprints (2)".
+}
+```
+
+Write the test with real assertions on every destination path and action (no placeholders), then implement, run
+`cargo test -p soul-audio-organize`, and commit:
+
+```bash
+git add crates/soul-audio-organize/
+git commit -m "fix(organize): give distinct same-title albums their own numbered folder"
+```
+
 ---
 
 ## Task 9: Organize — prune emptied source folders after a Move
