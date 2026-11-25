@@ -148,8 +148,8 @@ fn token_value(name: &str, tags: &Tags, src: &Path, neutral_disc_dir: bool) -> O
         "Genre" => non_empty(&tags.genre).unwrap_or_else(|| "Unknown Genre".to_owned()),
         // Zero-padded width 2 (track 3 -> "03"; missing -> "00").
         "TrackNo" => format!("{:02}", tags.track.unwrap_or(0)),
-        // Plain decimal (missing -> "1").
-        "Disc" => tags.disc.unwrap_or(1).to_string(),
+        // Plain decimal; missing or 0 -> "1" (the disc `{DiscPrefix}` uses).
+        "Disc" => disc_and_count(tags).0.to_string(),
         "DiscPrefix" => {
             let (disc, count) = disc_and_count(tags);
             if count > 1 {
@@ -464,6 +464,15 @@ mod tests {
         assert_eq!(
             t.render(&Tags::default(), Path::new("x.flac")),
             expect(&["1 of 1.flac"])
+        );
+    }
+
+    #[test]
+    fn disc_token_treats_disc_zero_as_one_like_disc_prefix() {
+        let t = Template::new("{Disc}/{DiscPrefix}{TrackNo}");
+        assert_eq!(
+            t.render(&disc_tags(0, Some(2)), Path::new("x.flac")),
+            expect(&["1", "1-05.flac"])
         );
     }
 
