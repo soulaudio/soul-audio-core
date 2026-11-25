@@ -106,9 +106,14 @@ pub enum SideFilesLeft {
     /// the folder, or sits in a sub-folder of it): ownership is ambiguous.
     SharedAlbumRoot,
     /// The template gives the album no folder of its own (e.g. `flat`,
-    /// `{Artist}/{Title}` — no `{Album}` folder — or its tracks render under
-    /// different folders).
+    /// `{Artist}/{Title}` — no `{Album}` folder). Tracks rendering into
+    /// different album folders are [`SplitAlbumFolders`](Self::SplitAlbumFolders).
     NoAlbumFolder,
+    /// The album's tracks render into **different** album folders (compared
+    /// as on the destination filesystem): e.g. `artist-year-album` with
+    /// per-track dates (`2020 - Box`, `2021 - Box`). No one folder owns the
+    /// album's side files.
+    SplitAlbumFolders,
     /// The album's tracks sit loose in the source root itself — its other files
     /// are not album material to sweep along.
     AtSourceRoot,
@@ -262,7 +267,8 @@ pub fn plan(
 /// re-runs, since input order is deterministic).
 ///
 /// **Side files**: for every album root inside the source root that holds
-/// exactly one album with a folder of its own, each non-audio, non-junk file
+/// exactly one album with a folder of its own (every track in the same
+/// `{Album}` folder — else [`SideFilesLeft::SplitAlbumFolders`]), each non-audio, non-junk file
 /// under it (recursively; not into a sub-folder holding another album's audio)
 /// is planned too — see [`EntryKind::SideFile`] — unless only part of the
 /// album was selected (its root or a disc folder holds non-input audio:
@@ -386,6 +392,8 @@ pub fn plan_with(
             Some(SideFilesLeft::SharedAlbumRoot)
         } else if !template.has_album_dir() {
             Some(SideFilesLeft::NoAlbumFolder)
+        } else if !one_album_folder(&album_folders, album) {
+            Some(SideFilesLeft::SplitAlbumFolders)
         } else {
             None
         };
@@ -549,8 +557,9 @@ fn folder_inferred_discs(albums: &[AlbumGroup], template: &Template) -> Vec<Path
 /// render into an album dir keeps it; a later album (a different identity
 /// key) rendering into an already-claimed dir gets its **`{Album}` folder**
 /// (`album_folders[i]`, see [`Template::render_album_folder`]) suffixed
-/// ` (2)`, ` (3)`, … — the lowest `n` whose resulting album dir no album in
-/// this batch claims or renders to natively — and its destinations are
+/// ` (2)`, ` (3)`, … — **one** `n` for the whole album, the lowest whose
+/// resulting album dirs no other album in this batch claims or renders to
+/// natively (so an album never splits across numbers) — and its destinations are
 /// re-rooted under it (`{AlbumArtist}/{Album}/{Year}/…` gives
 /// `Box (2)/2020`, never `Box/2020 (2)`). When the `{Album}` folder is not a
 /// prefix of the album dir (`{DiscDir}` before `{Album}`) the dir's last
@@ -570,40 +579,50 @@ fn separate_albums(
         .filter(|d| d.components().next().is_some())
         .map(|d| paths::key(d))
         .collect();
+    // Final album dir (as a key) → the album that claimed it.
     let mut owner: HashMap<PathBuf, usize> = HashMap::new();
     for (a, album) in albums.iter().enumerate() {
-        // This album's native dir (as a key) → its final `{Album}` folder.
-        let mut mine: HashMap<PathBuf, PathBuf> = HashMap::new();
-        for &i in &album.tracks {
-            let dir = album_dirs[i].clone();
-            let folder = Some(&album_folders[i])
-                .filter(|f| f.components().next().is_some() && dir.starts_with(f))
-                .unwrap_or(&dir)
-                .clone();
-            let Some(name) = folder.file_name().map(|n| n.to_string_lossy().into_owned()) else {
-                continue;
-            };
-            let below = dir
-                .strip_prefix(&folder)
-                .map(Path::to_path_buf)
-                .unwrap_or_default();
-            let fin = mine
-                .entry(paths::key(&dir))
-                .or_insert_with(|| {
-                    let fin = match owner.get(&paths::key(&dir)) {
-                        Some(&o) if o != a => (2u32..)
-                            .map(|n| folder.with_file_name(format!("{name} ({n})")))
-                            .find(|c| {
-                                let k = paths::key(&under(c, &below));
-                                !owner.contains_key(&k) && !native.contains(&k)
-                            })
-                            .unwrap_or_else(|| folder.clone()),
-                        _ => folder.clone(),
-                    };
-                    owner.insert(paths::key(&under(&fin, &below)), a);
-                    fin
+        // Per track: its `{Album}` folder (or, when that is not a prefix of
+        // the album dir, the dir itself), the folder's name, and the rest of
+        // the album dir below it.
+        let parts: Vec<(usize, PathBuf, String, PathBuf)> = album
+            .tracks
+            .iter()
+            .filter_map(|&i| {
+                let dir = &album_dirs[i];
+                let folder = Some(&album_folders[i])
+                    .filter(|f| f.components().next().is_some() && dir.starts_with(f))
+                    .unwrap_or(dir)
+                    .clone();
+                let name = folder.file_name()?.to_string_lossy().into_owned();
+                let below = dir
+                    .strip_prefix(&folder)
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                Some((i, folder, name, below))
+            })
+            .collect();
+        let others = |k: &PathBuf| owner.get(k).is_some_and(|&o| o != a);
+        let numbered =
+            |n: u32, folder: &Path, name: &str| folder.with_file_name(format!("{name} ({n})"));
+        // One number for the whole album, so it never splits across `(2)`
+        // and `(3)` (or across `Box` and `Box (2)`): needed when any of its
+        // dirs is claimed by an earlier album, and free for all of them.
+        let n = parts
+            .iter()
+            .any(|(_, folder, _, below)| others(&paths::key(&under(folder, below))))
+            .then(|| {
+                (2u32..).find(|&n| {
+                    parts.iter().all(|(_, folder, name, below)| {
+                        let k = paths::key(&under(&numbered(n, folder, name), below));
+                        !others(&k) && !native.contains(&k)
+                    })
                 })
-                .clone();
+            })
+            .flatten();
+        for (i, folder, name, below) in parts {
+            let fin = n.map_or_else(|| folder.clone(), |n| numbered(n, &folder, &name));
+            owner.insert(paths::key(&under(&fin, &below)), a);
             if fin != folder
                 && let Ok(rest) = rel_dsts[i].strip_prefix(&folder)
             {
@@ -612,6 +631,15 @@ fn separate_albums(
             }
         }
     }
+}
+
+/// Whether every track of `album` renders into the same `{Album}` folder
+/// (compared as [`paths::key`]s, before [`separate_albums`] — which numbers
+/// an album as a whole, so it cannot change the answer).
+fn one_album_folder(album_folders: &[PathBuf], album: &AlbumGroup) -> bool {
+    let mut keys = album.tracks.iter().map(|&i| paths::key(&album_folders[i]));
+    let first = keys.next();
+    keys.all(|k| Some(k) == first)
 }
 
 /// `base/rest`, or `base` itself when `rest` is empty (no trailing separator).

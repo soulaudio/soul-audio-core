@@ -1574,3 +1574,96 @@ fn unselected_audio_in_a_disc_folder_is_a_partial_selection() {
         set(&["HOYO-MiX/Box/Box.log", "HOYO-MiX/Box/cover.jpg"])
     );
 }
+
+/// A `Box` track by H with `DATE=year`.
+fn yeared(title: &str, n: u32, year: &str) -> Vec<u8> {
+    let c = [
+        "ALBUM=Box".to_owned(),
+        format!("TITLE={title}"),
+        "ALBUMARTIST=H".to_owned(),
+        format!("TRACKNUMBER={n}"),
+        format!("DATE={year}"),
+    ];
+    let refs: Vec<&str> = c.iter().map(String::as_str).collect();
+    flac(&refs)
+}
+
+#[test]
+fn a_numbered_album_never_splits_across_numbers() {
+    // B shares A's `Box/2020` folder but its 2021 track has `Box/2021` to
+    // itself: still all of B goes to `Box (2)`, and so do its side files.
+    let (src, dest) = (unique_dir("yr-src"), unique_dir("yr-dest"));
+    put(&src, "A/1.flac", &yeared("a", 1, "2020"));
+    put(&src, "B/1.flac", &yeared("b", 1, "2020"));
+    put(&src, "B/2.flac", &yeared("c", 2, "2021"));
+    put(&src, "B/b.log", b"log");
+    let t = Template::new("{AlbumArtist}/{Album}/{Year}/{TrackNo} - {Title}");
+    let p = plan_with(&audio_files(&src), &dest, &t, Strategy::Copy, &opts(&src));
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::Audio),
+        set(&[
+            "H/Box/2020/01 - a.flac",
+            "H/Box (2)/2020/01 - b.flac",
+            "H/Box (2)/2021/02 - c.flac",
+        ])
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::SideFile),
+        set(&["H/Box (2)/b.log"])
+    );
+    assert!(p.side_files_left.is_empty(), "{:?}", p.side_files_left);
+
+    // Re-plan after apply: the same names, everything already there.
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    let again = plan_with(&audio_files(&src), &dest, &t, Strategy::Copy, &opts(&src));
+    let pairs = |p: &OrganizePlan| -> Vec<(String, String)> {
+        p.entries
+            .iter()
+            .map(|e| (rel(&src, &e.src), rel(&dest, &e.dst)))
+            .collect()
+    };
+    assert_eq!(pairs(&again), pairs(&p));
+    assert!(
+        again
+            .entries
+            .iter()
+            .all(|e| e.action == Action::SkipDuplicate),
+        "{:#?}",
+        again.entries
+    );
+}
+
+#[test]
+fn an_album_split_over_album_folders_keeps_its_side_files() {
+    // `artist-year-album` with per-track dates: `2020 - Box` and `2021 - Box`.
+    // No one folder owns the log and the cue — they must not land in `H/`.
+    let (src, dest) = (unique_dir("split-src"), unique_dir("split-dest"));
+    put(&src, "B/1.flac", &yeared("b", 1, "2020"));
+    put(&src, "B/2.flac", &yeared("c", 2, "2021"));
+    put(&src, "B/b.log", b"log");
+    put(
+        &src,
+        "B/b.cue",
+        b"FILE \"1.flac\" WAVE\nFILE \"2.flac\" WAVE\n",
+    );
+    for strategy in [Strategy::Copy, Strategy::Move] {
+        let p = plan_with(
+            &audio_files(&src),
+            &dest,
+            &tpl("artist-year-album"),
+            strategy,
+            &opts(&src),
+        );
+        assert_eq!(
+            dsts(&p, &dest, EntryKind::Audio),
+            set(&["H/2020 - Box/01 - b.flac", "H/2021 - Box/02 - c.flac"])
+        );
+        assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty());
+        assert_eq!(
+            left(&p),
+            vec![(src.join("B"), SideFilesLeft::SplitAlbumFolders, 2)]
+        );
+        assert!(p.cues_not_rewritten.is_empty());
+    }
+}
