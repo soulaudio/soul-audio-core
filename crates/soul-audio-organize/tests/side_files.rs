@@ -732,3 +732,143 @@ fn flat_layout_never_numbers_folders() {
         [Action::Copy, Action::SkipDuplicate]
     );
 }
+
+#[test]
+fn plan_without_a_source_root_sweeps_and_prunes_nothing() {
+    // `plan` has no source root: the album root could be `~/Downloads`, so its
+    // other files are reported, never moved, and no folder is pruned.
+    let (src, dest) = (unique_dir("noroot-src"), unique_dir("noroot-dest"));
+    put(&src, "Box/01 Intro.flac", &track("Box", "Intro", 1, None));
+    put(&src, "Box/cover.jpg", b"jpg");
+    put(&src, "Box/Box.log", b"log");
+    let p = plan(
+        &audio_files(&src),
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::Audio),
+        set(&["HOYO-MiX/Box/01 - Intro.flac"])
+    );
+    assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty());
+    assert!(p.prune_dirs.is_empty(), "{:?}", p.prune_dirs);
+    assert_eq!(
+        p.side_files_left,
+        vec![LeftInPlace {
+            album_root: src.join("Box"),
+            reason: SideFilesLeft::NoSourceRoot,
+            files: 2,
+        }]
+    );
+}
+
+#[test]
+fn move_with_a_source_root_prunes_inside_it_only() {
+    let (src, dest) = (unique_dir("prune-src"), unique_dir("prune-dest"));
+    put(
+        &src,
+        "Box/CD1/01 Intro.flac",
+        &track("Box", "Intro", 1, Some("1")),
+    );
+    put(&src, "Box/cover.jpg", b"jpg");
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+        &opts(&src),
+    );
+    assert_eq!(
+        p.prune_dirs,
+        vec![src.join("Box").join("CD1"), src.join("Box")]
+    );
+    assert!(p.entries.iter().all(|e| e.action == Action::Move));
+}
+
+#[test]
+fn an_album_outside_the_source_root_keeps_its_side_files() {
+    let (src, other, dest) = (
+        unique_dir("outside-src"),
+        unique_dir("outside-other"),
+        unique_dir("outside-dest"),
+    );
+    put(&other, "Box/01.flac", &track("Box", "Intro", 1, None));
+    put(&other, "Box/cover.jpg", b"jpg");
+    let p = plan_with(
+        &audio_files(&other),
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+        &opts(&src),
+    );
+    assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty());
+    assert!(p.prune_dirs.is_empty(), "{:?}", p.prune_dirs);
+    assert_eq!(p.side_files_left[0].reason, SideFilesLeft::NoSourceRoot);
+}
+
+#[test]
+fn an_input_is_never_also_a_side_file() {
+    // An input with a non-audio extension (a ringtone, an extension-less rip)
+    // is planned once, as Audio — never a second time as a side file.
+    let (src, dest) = (unique_dir("input-src"), unique_dir("input-dest"));
+    let a = put(&src, "Box/01 Intro.flac", &track("Box", "Intro", 1, None));
+    let b = put(&src, "Box/02 Tone.m4r", &track("Box", "Tone", 2, None));
+    let c = put(&src, "Box/03 Raw", &track("Box", "Raw", 3, None));
+    put(&src, "Box/cover.jpg", b"jpg");
+    let p = plan_with(
+        &[a, b, c],
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+        &opts(&src),
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::Audio),
+        set(&[
+            "HOYO-MiX/Box/01 - Intro.flac",
+            "HOYO-MiX/Box/02 - Tone.m4r",
+            "HOYO-MiX/Box/03 - Raw",
+        ])
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::SideFile),
+        set(&["HOYO-MiX/Box/cover.jpg"])
+    );
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+}
+
+#[test]
+fn a_stem_followed_lyric_never_shadows_another_side_file() {
+    let (src, dest) = (unique_dir("lrcclash-src"), unique_dir("lrcclash-dest"));
+    put(
+        &src,
+        "Box/101 Intro.flac",
+        &track("Box", "Intro", 1, Some("1/2")),
+    );
+    put(&src, "Box/101 Intro.lrc", b"[00:00.00]follows the track");
+    put(&src, "Box/1-01 - Intro.lrc", b"[00:00.00]already named so");
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::SideFile),
+        set(&[
+            "HOYO-MiX/Box/1-01 - Intro.lrc",
+            "HOYO-MiX/Box/1-01 - Intro (2).lrc"
+        ])
+    );
+    assert!(
+        p.entries.iter().all(|e| e.action == Action::Copy),
+        "{:#?}",
+        p.entries
+    );
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty());
+    assert_eq!(tree(&dest).len(), 3, "every file arrived");
+}

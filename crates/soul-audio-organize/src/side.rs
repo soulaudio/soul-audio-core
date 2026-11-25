@@ -6,6 +6,7 @@
 //! are renamed (documented limitation).
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use soul_audio_tags::disc_folder;
@@ -38,10 +39,18 @@ pub(crate) fn is_junk(name: &str) -> bool {
 }
 
 /// Every side file under `album_root`, recursively, sorted. Skips junk/hidden
-/// entries, audio files, symlinks, and the `skip` directory (the destination
-/// root, when it sits inside a source album root).
-pub(crate) fn collect(album_root: &Path, skip: &Path) -> Vec<PathBuf> {
-    fn walk(dir: &Path, skip: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+/// entries, audio files, symlinks, the planner's `inputs` (an input is never
+/// also a side file), and the `skip` directory (the destination root, when it
+/// sits inside a source album root). Non-UTF-8 names are side files like any
+/// other (never renamed lossily — see [`place`]).
+pub(crate) fn collect(album_root: &Path, skip: &Path, inputs: &HashSet<&Path>) -> Vec<PathBuf> {
+    fn walk(
+        dir: &Path,
+        skip: &Path,
+        inputs: &HashSet<&Path>,
+        depth: usize,
+        out: &mut Vec<PathBuf>,
+    ) {
         if depth > MAX_DEPTH || dir == skip {
             return;
         }
@@ -50,24 +59,25 @@ pub(crate) fn collect(album_root: &Path, skip: &Path) -> Vec<PathBuf> {
         };
         for entry in rd.flatten() {
             let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            let Some(name) = path.file_name() else {
                 continue;
             };
-            if is_junk(name) {
+            // Junk names are ASCII, so a lossy view classifies them exactly.
+            if is_junk(&name.to_string_lossy()) {
                 continue;
             }
             let Ok(ft) = entry.file_type() else {
                 continue;
             };
             if ft.is_dir() {
-                walk(&path, skip, depth + 1, out);
-            } else if ft.is_file() && !is_audio(&path) {
+                walk(&path, skip, inputs, depth + 1, out);
+            } else if ft.is_file() && !is_audio(&path) && !inputs.contains(path.as_path()) {
                 out.push(path);
             }
         }
     }
     let mut out = Vec::new();
-    walk(album_root, skip, 0, &mut out);
+    walk(album_root, skip, inputs, 0, &mut out);
     out.sort();
     out
 }
@@ -92,6 +102,12 @@ pub(crate) struct AlbumPlacement<'a> {
 ///    `<dir>/<rest>`, prefixed `Disc N - ` only when that destination collides
 ///    (with another side file or with a `taken` path);
 /// 3. anything else → `<dir>/<path relative to the album root>`.
+///
+/// Finally every destination is made unique: one already `taken` (by the batch)
+/// or given to an earlier side file gets ` (2)`, ` (3)`, … before its extension,
+/// so two distinct files never share a destination (one would be skipped as a
+/// duplicate and silently left behind). Names are built from `OsStr`s, never
+/// lossily.
 pub(crate) fn place(
     p: &AlbumPlacement<'_>,
     side: &[PathBuf],
@@ -135,29 +151,52 @@ pub(crate) fn place(
     for (_, dst, _) in &cands {
         *count.entry(dst.clone()).or_insert(0) += 1;
     }
+    // Pass 3: every final destination is unique in the batch — a file landing
+    // on an already-claimed path (a stem-followed lyric next to a file already
+    // carrying that name, a root `Disc 1 - Box.log`, …) gets ` (2)`, ` (3)`, ….
+    let mut used: HashSet<PathBuf> = HashSet::new();
     cands
         .into_iter()
         .map(|(src, dst, disc)| {
             let collides = count.get(&dst).is_some_and(|&n| n > 1) || taken.contains(&dst);
-            match disc {
+            let dst = match disc {
                 Some(n) if collides => {
-                    let name = dst
-                        .file_name()
-                        .map(|f| f.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let renamed = dst
-                        .with_file_name(format!("Disc {} - {name}", disc_label(n, p.disc_count)));
-                    (src, renamed)
+                    let mut name =
+                        OsString::from(format!("Disc {} - ", disc_label(n, p.disc_count)));
+                    name.push(dst.file_name().unwrap_or_default());
+                    dst.with_file_name(name)
                 }
-                _ => (src, dst),
-            }
+                _ => dst,
+            };
+            let free = |c: &PathBuf| !taken.contains(c) && !used.contains(c);
+            let dst = if free(&dst) {
+                dst
+            } else {
+                (2u32..)
+                    .map(|n| numbered(&dst, n))
+                    .find(free)
+                    .unwrap_or(dst)
+            };
+            used.insert(dst.clone());
+            (src, dst)
         })
         .collect()
 }
 
+/// `dir/name (n).ext` for `dir/name.ext` (`dir/name (n)` without an extension).
+fn numbered(path: &Path, n: u32) -> PathBuf {
+    let mut name = path.file_stem().unwrap_or_default().to_os_string();
+    name.push(format!(" ({n})"));
+    if let Some(ext) = path.extension() {
+        name.push(".");
+        name.push(ext);
+    }
+    path.with_file_name(name)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AlbumPlacement, is_audio, is_junk, place};
+    use super::{AlbumPlacement, is_audio, is_junk, numbered, place};
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
 
@@ -232,6 +271,78 @@ mod tests {
                 "d/Box/cover.jpg",
             ]
             .map(PathBuf::from)
+        );
+    }
+
+    fn dsts(p: &AlbumPlacement<'_>, side: &[&str], taken: &[&str]) -> Vec<PathBuf> {
+        let side: Vec<PathBuf> = side.iter().map(PathBuf::from).collect();
+        let taken: HashSet<PathBuf> = taken.iter().map(PathBuf::from).collect();
+        place(p, &side, &taken)
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect()
+    }
+
+    #[test]
+    fn distinct_side_files_never_share_a_destination() {
+        let stems = HashMap::from([(
+            PathBuf::from("s/Box/101 Intro"),
+            PathBuf::from("d/Box/1-01 - Intro.flac"),
+        )]);
+        let flat = AlbumPlacement {
+            root: Path::new("s/Box"),
+            dir: Path::new("d/Box"),
+            disc_dirs: false,
+            disc_count: 2,
+            stems: &stems,
+        };
+        // A stem-followed lyric lands on a name another side file already has.
+        assert_eq!(
+            dsts(
+                &flat,
+                &["s/Box/1-01 - Intro.lrc", "s/Box/101 Intro.lrc"],
+                &[]
+            ),
+            ["d/Box/1-01 - Intro.lrc", "d/Box/1-01 - Intro (2).lrc"].map(PathBuf::from)
+        );
+        // The `Disc N - ` prefix lands on a root file of that very name.
+        assert_eq!(
+            dsts(
+                &flat,
+                &[
+                    "s/Box/CD1/Box.log",
+                    "s/Box/CD2/Box.log",
+                    "s/Box/Disc 1 - Box.log"
+                ],
+                &[]
+            ),
+            [
+                "d/Box/Disc 1 - Box.log",
+                "d/Box/Disc 2 - Box.log",
+                "d/Box/Disc 1 - Box (2).log"
+            ]
+            .map(PathBuf::from)
+        );
+        // A plain side file on a path the batch already claims (an audio dst).
+        assert_eq!(
+            dsts(
+                &flat,
+                &["s/Box/README"],
+                &["d/Box/README", "d/Box/README (2)"]
+            ),
+            ["d/Box/README (3)"].map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn numbered_goes_before_the_extension() {
+        assert_eq!(
+            numbered(Path::new("d/a.b.log"), 2),
+            PathBuf::from("d/a.b (2).log")
+        );
+        assert_eq!(
+            numbered(Path::new("d/README"), 3),
+            PathBuf::from("d/README (3)")
         );
     }
 }

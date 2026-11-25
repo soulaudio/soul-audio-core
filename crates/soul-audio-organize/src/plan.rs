@@ -64,6 +64,10 @@ pub enum SideFilesLeft {
     /// The album's tracks sit loose in the source root itself — its other files
     /// are not album material to sweep along.
     AtSourceRoot,
+    /// No [`PlanOptions::source_root`] contains the album root (none was given —
+    /// [`plan`](fn@plan) — or the album lies outside it): the folder may be an
+    /// arbitrary user folder (`~/Downloads`), so nothing in it is swept along.
+    NoSourceRoot,
 }
 
 /// An album root whose side files were **not** planned (reported, never guessed).
@@ -88,9 +92,9 @@ pub struct OrganizePlan {
     /// most once).
     pub side_files_left: Vec<LeftInPlace>,
     /// [`Strategy::Move`] only: source folders [`apply`](crate::apply) removes
-    /// **if empty** after the moves, deepest first. Never the source root or
-    /// above it; without a source root, never above a moved file's album root.
-    /// Empty for Copy.
+    /// **if empty** after the moves, deepest first — only folders strictly
+    /// inside [`PlanOptions::source_root`]. Empty for Copy and without a source
+    /// root.
     pub prune_dirs: Vec<PathBuf>,
 }
 
@@ -100,12 +104,19 @@ pub struct PlanOptions {
     /// The folder the inputs were collected from (the scan/staging root). Album
     /// roots never climb to or above it; an album whose tracks sit loose in it
     /// keeps its side files in place; Move cleanup may prune emptied folders up
-    /// to — never including — it. `None`: cleanup stops at each album root
-    /// (inclusive).
+    /// to — never including — it. `None`: **no** side files are planned (each
+    /// album's are reported as [`SideFilesLeft::NoSourceRoot`]) and nothing is
+    /// pruned.
     pub source_root: Option<PathBuf>,
 }
 
-/// [`plan_with`] with default [`PlanOptions`] (no source root).
+/// [`plan_with`] with default [`PlanOptions`] (no source root): audio only.
+///
+/// Without a source root an album root could be any user folder, so `plan`
+/// plans **no side files** (they are reported in
+/// [`OrganizePlan::side_files_left`] as [`SideFilesLeft::NoSourceRoot`]) and
+/// **no** Move cleanup ([`OrganizePlan::prune_dirs`] stays empty). Side files
+/// and pruning require [`plan_with`] with [`PlanOptions::source_root`].
 pub fn plan(
     files: &[PathBuf],
     dest_root: &Path,
@@ -203,15 +214,19 @@ pub fn plan_with(
     let roots = RootIndex::new(&albums);
     let mut side_files_left: Vec<LeftInPlace> = Vec::new();
     let mut seen_roots: HashSet<&Path> = HashSet::new();
+    // An input is never also a side file (e.g. one with a non-audio extension).
+    let inputs: HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
     for album in &albums {
         if !seen_roots.insert(album.root.as_path()) {
             continue;
         }
-        let side = side::collect(&album.root, dest_root);
+        let side = side::collect(&album.root, dest_root, &inputs);
         if side.is_empty() {
             continue;
         }
-        let reason = if source_root == Some(album.root.as_path()) {
+        let reason = if !source_root.is_some_and(|sr| album.root.starts_with(sr)) {
+            Some(SideFilesLeft::NoSourceRoot)
+        } else if source_root == Some(album.root.as_path()) {
             Some(SideFilesLeft::AtSourceRoot)
         } else if roots.is_shared(&album.root) {
             Some(SideFilesLeft::SharedAlbumRoot)
@@ -257,9 +272,9 @@ pub fn plan_with(
         }
     }
 
-    let prune_dirs = match strategy {
-        Strategy::Move => prune_candidates(&entries, &entry_roots, source_root),
-        Strategy::Copy => Vec::new(),
+    let prune_dirs = match (strategy, source_root) {
+        (Strategy::Move, Some(sr)) => prune_candidates(&entries, &entry_roots, sr),
+        _ => Vec::new(),
     };
     OrganizePlan {
         dest_root: dest_root.to_path_buf(),
@@ -362,33 +377,19 @@ fn album_dest_dir(album_dirs: &[PathBuf], album: &AlbumGroup) -> Option<PathBuf>
     common.filter(|c| c.components().next().is_some())
 }
 
-/// Every source folder a Move may empty: for each moved entry, its parent and
-/// upward — up to and including the album root, or (with a source root above
-/// the album root) up to but excluding the source root. Never the source root
-/// or an ancestor of it. Deepest first, deterministic.
-fn prune_candidates(
-    entries: &[PlanEntry],
-    roots: &[&Path],
-    source_root: Option<&Path>,
-) -> Vec<PathBuf> {
+/// Every source folder a Move may empty: for each moved entry whose album root
+/// lies inside `source_root`, its parent and upward — up to but excluding
+/// `source_root`. Never the source root or an ancestor of it. Deepest first,
+/// deterministic.
+fn prune_candidates(entries: &[PlanEntry], roots: &[&Path], source_root: &Path) -> Vec<PathBuf> {
     let mut set: BTreeSet<PathBuf> = BTreeSet::new();
     for (e, root) in entries.iter().zip(roots) {
-        if e.action != Action::Move {
+        if e.action != Action::Move || !root.starts_with(source_root) {
             continue;
         }
-        let limit = match source_root {
-            Some(sr) if root.starts_with(sr) => Some(sr),
-            _ => root.parent(),
-        };
-        let Some(limit) = limit else {
-            continue;
-        };
         let mut dir = e.src.parent();
         while let Some(d) = dir {
-            if d == limit || !d.starts_with(limit) {
-                break;
-            }
-            if source_root.is_some_and(|sr| sr.starts_with(d)) {
+            if d == source_root || !d.starts_with(source_root) {
                 break;
             }
             set.insert(d.to_path_buf());

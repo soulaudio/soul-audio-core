@@ -52,7 +52,7 @@ impl Template {
 
     /// Render a **relative**, sanitized destination path from `tags`. The path
     /// uses native separators, each segment is run through
-    /// [`sanitize_segment`](crate::sanitize), and the original extension of
+    /// `sanitize_segment`, and the original extension of
     /// `src` is preserved (keeping its case; none is appended if `src` has no
     /// extension). The caller joins the result onto the destination root.
     pub fn render(&self, tags: &Tags, src: &Path) -> PathBuf {
