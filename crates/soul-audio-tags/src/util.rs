@@ -1,6 +1,6 @@
 //! Small byte-parsing helpers shared across container/tag readers.
 
-use crate::{Field, TagError, locate};
+use crate::{Field, TagError, TagSink, locate};
 
 /// Map a ReplayGain/R128 tag key to its [`Field`], case-insensitively. The key
 /// spelling is identical across VorbisComment keys, ID3 `TXXX` descriptions and
@@ -37,6 +37,44 @@ pub(crate) fn map_musicbrainz_recording_key(key: &str) -> Option<Field> {
         || k.eq_ignore_ascii_case("MusicBrainz Track Id")
         || k.eq_ignore_ascii_case("MusicBrainz Recording Id"))
     .then_some(Field::MusicBrainzRecordingId)
+}
+
+/// Split an `n/total` number tag (`"1/3"`, `" 05 / 12 "`) into its trimmed
+/// number and, when non-empty, its total. A bare number has no total. ID3
+/// `TRCK`/`TPOS`, VorbisComment and APE `TRACKNUMBER`/`DISCNUMBER` all use this
+/// form.
+pub(crate) fn split_num_total(s: &str) -> (&str, Option<&str>) {
+    match s.split_once('/') {
+        Some((n, t)) => (n.trim(), Some(t.trim()).filter(|t| !t.is_empty())),
+        None => (s.trim(), None),
+    }
+}
+
+/// Hand one text value to `sink`, splitting a `TrackNumber`/`DiscNumber` value
+/// of the form `n/total` into the number plus a `TrackTotal`/`DiscTotal` call
+/// (the total only when present). Every other field passes through verbatim.
+pub(crate) fn emit_text(sink: &mut impl TagSink, field: Option<Field>, raw_key: &str, value: &str) {
+    let total = match field {
+        Some(Field::TrackNumber) => Field::TrackTotal,
+        Some(Field::DiscNumber) => Field::DiscTotal,
+        _ => {
+            sink.text(field, raw_key, value);
+            return;
+        }
+    };
+    let (number, total_value) = split_num_total(value);
+    sink.text(field, raw_key, number);
+    if let Some(t) = total_value {
+        sink.text(Some(total), raw_key, t);
+    }
+}
+
+/// Parse a track/disc number or total, tolerating whitespace and a stray
+/// `n/total` form (`"2/3"` -> 2). `None` on garbage. `alloc`-gated (only the
+/// owned snapshot parses values; see [`parse_gain_db`]).
+#[cfg(feature = "alloc")]
+pub(crate) fn parse_count(s: &str) -> Option<u32> {
+    split_num_total(s).0.parse().ok()
 }
 
 /// Parse a ReplayGain gain string like `"-7.89 dB"` (or a bare `"-7.89"`) into
@@ -149,5 +187,19 @@ mod tests {
         assert_eq!(parse_r128_gain_db("256"), Some(1.0));
         assert_eq!(parse_r128_gain_db("0.5"), None); // not an integer
         assert_eq!(parse_r128_gain_db("x"), None);
+    }
+}
+
+#[cfg(test)]
+mod num_total_tests {
+    use super::split_num_total;
+
+    #[test]
+    fn splits_number_and_total() {
+        assert_eq!(split_num_total("1/3"), ("1", Some("3")));
+        assert_eq!(split_num_total(" 2 / 4 "), ("2", Some("4")));
+        assert_eq!(split_num_total("05/"), ("05", None));
+        assert_eq!(split_num_total("7"), ("7", None));
+        assert_eq!(split_num_total(" 01 "), ("01", None));
     }
 }

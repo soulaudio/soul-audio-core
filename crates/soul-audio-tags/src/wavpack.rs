@@ -113,7 +113,7 @@ fn read_apev2<S: SeekSource>(
                 let s = s.trim_end_matches('\0').trim();
                 if !s.is_empty() {
                     let raw = core::str::from_utf8(&key_buf[..nul]).unwrap_or("");
-                    sink.text(Some(field), raw, s);
+                    crate::util::emit_text(sink, Some(field), raw, s);
                 }
             }
         }
@@ -132,6 +132,12 @@ fn map_key(key: &[u8]) -> Option<Field> {
         Some(Field::Album)
     } else if key.eq_ignore_ascii_case(b"Track") {
         Some(Field::TrackNumber)
+    } else if key.eq_ignore_ascii_case(b"Disc") {
+        Some(Field::DiscNumber)
+    } else if key.eq_ignore_ascii_case(b"DISCTOTAL") || key.eq_ignore_ascii_case(b"TOTALDISCS") {
+        Some(Field::DiscTotal)
+    } else if key.eq_ignore_ascii_case(b"TRACKTOTAL") || key.eq_ignore_ascii_case(b"TOTALTRACKS") {
+        Some(Field::TrackTotal)
     } else if key.eq_ignore_ascii_case(b"Year") || key.eq_ignore_ascii_case(b"Date") {
         Some(Field::Date)
     } else if key.eq_ignore_ascii_case(b"Original Date")
@@ -235,5 +241,36 @@ mod tests {
         assert_eq!(facts.channels, Some(1));
         assert_eq!(facts.total_frames, Some(1000));
         assert!(c.fields.is_empty());
+    }
+
+    #[test]
+    fn apev2_disc_and_track_split_n_over_total() {
+        let mut v = Vec::new();
+        v.extend_from_slice(&wvpk_header(1000, 9, false));
+        v.extend_from_slice(&[0u8; 32]);
+        v.extend_from_slice(&apev2(&[
+            ("Track", "3/9"),
+            ("Disc", "2/2"),
+            ("TOTALDISCS", "2"),
+        ]));
+        let mut src = SliceSource::new(&v);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        read_wavpack(&mut src, &mut scratch, &mut c).unwrap();
+        let got: Vec<(Field, &str)> = c
+            .fields
+            .iter()
+            .filter_map(|(f, _, v)| f.map(|f| (f, v.as_str())))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Field::TrackNumber, "3"),
+                (Field::TrackTotal, "9"),
+                (Field::DiscNumber, "2"),
+                (Field::DiscTotal, "2"),
+                (Field::DiscTotal, "2"),
+            ]
+        );
     }
 }

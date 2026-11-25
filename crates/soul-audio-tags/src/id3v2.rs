@@ -296,14 +296,14 @@ fn handle_text<S: embedded_io::Read>(
     Ok(())
 }
 
-/// `TRCK`/`TPOS` (and v2.2 `TRK`/`TPA`): "n" or "n/total" → one or two
-/// `sink.text` calls (number, then total if present).
+/// `TRCK`/`TPOS` (and v2.2 `TRK`/`TPA`): "n" or "n/total" -> one or two
+/// `sink.text` calls (number, then total if present) via the shared
+/// [`crate::util::emit_text`] split.
 fn handle_num_total<S: embedded_io::Read>(
     src: &mut S,
     raw_len: usize,
     raw_key: &str,
     number_field: Field,
-    total_field: Field,
     scratch: &mut [u8],
     sink: &mut impl TagSink,
 ) -> Result<(), TagError> {
@@ -313,16 +313,7 @@ fn handle_num_total<S: embedded_io::Read>(
     let mut enc = [0u8; 1];
     read_exact(src, &mut enc)?;
     let s = decode_text(src, enc[0], raw_len - 1, scratch)?;
-    if let Some(idx) = s.find('/') {
-        let (num, rest) = s.split_at(idx);
-        let total = &rest[1..];
-        sink.text(Some(number_field), raw_key, num);
-        if !total.is_empty() {
-            sink.text(Some(total_field), raw_key, total);
-        }
-    } else {
-        sink.text(Some(number_field), raw_key, s);
-    }
+    crate::util::emit_text(sink, Some(number_field), raw_key, s);
     Ok(())
 }
 
@@ -636,24 +627,8 @@ fn handle_frame<S: SeekSource>(
         "TXXX" | "TXX" => handle_txxx(src, raw_len, scratch, sink),
         "UFID" | "UFI" => handle_ufid(src, raw_len, scratch, sink),
         "RVA2" => handle_rva2(src, raw_len, scratch, sink),
-        "TRCK" | "TRK" => handle_num_total(
-            src,
-            raw_len,
-            id,
-            Field::TrackNumber,
-            Field::TrackTotal,
-            scratch,
-            sink,
-        ),
-        "TPOS" | "TPA" => handle_num_total(
-            src,
-            raw_len,
-            id,
-            Field::DiscNumber,
-            Field::DiscTotal,
-            scratch,
-            sink,
-        ),
+        "TRCK" | "TRK" => handle_num_total(src, raw_len, id, Field::TrackNumber, scratch, sink),
+        "TPOS" | "TPA" => handle_num_total(src, raw_len, id, Field::DiscNumber, scratch, sink),
         "APIC" | "PIC" => handle_apic(src, ver_major, raw_len, sink),
         _ => match map_frame_id(id) {
             Some(field) => handle_text(src, raw_len, id, field, scratch, sink),
@@ -1351,5 +1326,19 @@ mod tests {
             b"\xFF\xD8\xFF\xEE",
             "data_offset must point at the image bytes"
         );
+    }
+
+    #[test]
+    fn id3_tpos_splits_disc_and_total() {
+        let tag = id3v23(&[text_frame(b"TPOS", "2/3")]);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        read_id3v2(&mut SliceSource::new(&tag), &mut scratch, &mut c).unwrap();
+        let got: Vec<(Field, &str)> = c
+            .fields
+            .iter()
+            .filter_map(|(f, _, v)| f.map(|f| (f, v.as_str())))
+            .collect();
+        assert_eq!(got, vec![(Field::DiscNumber, "2"), (Field::DiscTotal, "3")]);
     }
 }
