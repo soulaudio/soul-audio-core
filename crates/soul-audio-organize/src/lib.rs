@@ -14,7 +14,8 @@
 //! Layers: [`Template`] (pure rendering, incl. the multi-disc tokens and the
 //! [`presets`]), [`plan`]/[`plan_with`] (album-aware planning: groups inputs into
 //! albums with the importer's identity rule, plans each album's side files —
-//! logs, cues, covers, scans, lyrics — and never mutates), and [`apply`] (the
+//! logs, cues, covers, scans, lyrics; a cue's `FILE` lines are pointed at the
+//! renamed tracks — and never mutates), and [`apply`] (the
 //! only mutating call: copy/move, never overwrite, prune emptied source folders
 //! after a Move).
 //!
@@ -45,6 +46,15 @@
 //! - A plan reports, but cannot fix, a multi-disc album whose disc numbers come
 //!   only from folder names when the template has no `{DiscDir}`
 //!   ([`OrganizePlan::folder_inferred_discs`]).
+//! - **Cue sheets left behind.** A `.cue` is rewritten only when its album's
+//!   side files move with the album. One left in place
+//!   ([`OrganizePlan::side_files_left`]) keeps naming the old paths, and one
+//!   that cannot be rewritten safely (legacy encoding with non-ASCII names) is
+//!   moved unchanged and listed in [`OrganizePlan::cues_not_rewritten`].
+//! - **Partial selections.** Selecting only some tracks of an album (or an
+//!   album folder holding audio this build never lists as an input) moves its
+//!   tracks but leaves all its side files in place
+//!   ([`SideFilesLeft::PartialSelection`]).
 #![forbid(unsafe_code)]
 #![deny(unconditional_recursion)]
 

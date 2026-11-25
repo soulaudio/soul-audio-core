@@ -1,9 +1,9 @@
 //! Side files: the non-audio files that travel with an album — rip logs and cue
 //! sheets, covers, `Scans/`, lyrics, `.txt`/`.nfo`. Discovery walks the album
 //! root; placement decides each file's destination in the album's new folder.
-//! Side files are never opened or modified, only copied/moved (a `.log`'s
-//! checksum must stay valid). `.cue` `FILE` lines are NOT rewritten when tracks
-//! are renamed (documented limitation).
+//! Side files are only copied/moved, never modified (a `.log`'s checksum must
+//! stay valid) — except a `.cue` sheet, whose `FILE` lines the planner points
+//! at the renamed tracks (`crate::cue`).
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;

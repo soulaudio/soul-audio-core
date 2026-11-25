@@ -240,6 +240,18 @@ pub fn plan(
 /// [`SkipConflict`](Action::SkipConflict). Otherwise the root is reported in
 /// [`OrganizePlan::side_files_left`].
 ///
+/// **Cue sheets**: a planned `.cue` side file whose `FILE` lines name inputs
+/// of this plan (relative to the cue's folder; case-insensitive on
+/// Windows/macOS) gets those lines pointed at the inputs' new destinations,
+/// relative to the cue's own destination folder, in
+/// [`PlanEntry::rewritten`]; everything else in it (BOM, line endings, other
+/// commands, `REM` lines) is kept byte for byte, and a `FILE` line naming
+/// anything else is kept as-is. A cue that is not UTF-8 is rewritten only when
+/// the names involved are ASCII; otherwise — or when a new name cannot be
+/// written — it is planned unchanged and listed in
+/// [`OrganizePlan::cues_not_rewritten`]. Every other side file is never
+/// modified.
+///
 /// Each entry's [`Action`] is classified as:
 /// - **[`SkipDuplicate`](Action::SkipDuplicate)** if an *earlier* entry in this
 ///   batch already claims the identical destination, **or** the destination
