@@ -610,3 +610,109 @@ fn a_disc_named_scan_root_is_never_climbed() {
     assert_eq!(input.tracks[0].disc_no, 1);
     let _ = std::fs::remove_dir_all(&outer);
 }
+
+#[test]
+fn per_disc_folder_cover_beats_the_parent_decoy() {
+    let root = fresh("md_disc_cover");
+    put(
+        &root,
+        "Artist/Box/CD1/a.flac",
+        &["ALBUM=Box", "TITLE=a", "DISCNUMBER=1"],
+    );
+    put(
+        &root,
+        "Artist/Box/CD2/b.flac",
+        &["ALBUM=Box", "TITLE=b", "DISCNUMBER=2"],
+    );
+    let img_a = b"per-disc folder.jpg".to_vec();
+    std::fs::write(root.join("Artist/Box/CD1/folder.jpg"), &img_a).unwrap();
+    std::fs::write(root.join("Artist/cover.jpg"), b"artist photo decoy").unwrap();
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(input.albums.len(), 1);
+    assert_eq!(input.covers[0].as_deref(), Some(img_a.as_slice()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn partially_tagged_release_stays_one_album() {
+    let root = fresh("md_mb_partial");
+    let x = "aaaaaaaa-0000-4000-8000-00000000000a";
+    let mx = format!("MUSICBRAINZ_ALBUMID={x}");
+    put(&root, "Alb/01.flac", &["ALBUM=Alb", "TITLE=a", mx.as_str()]);
+    put(&root, "Alb/02.flac", &["ALBUM=Alb", "TITLE=b"]);
+    put(&root, "Alb/03.flac", &["ALBUM=Alb", "TITLE=c", mx.as_str()]);
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(
+        input.albums.len(),
+        1,
+        "an untagged track joins the tagged release"
+    );
+    assert_eq!(input.albums[0].mb_album_id, x);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn untagged_track_joins_the_first_seen_release() {
+    let root = fresh("md_mb_first");
+    let (a, b) = (
+        "aaaaaaaa-0000-4000-8000-000000000001",
+        "bbbbbbbb-0000-4000-8000-000000000002",
+    );
+    let ma = format!("MUSICBRAINZ_ALBUMID={a}");
+    let mb = format!("MUSICBRAINZ_ALBUMID={b}");
+    // The untagged track sorts first; it still joins release `a` (first seen with an id).
+    put(&root, "Dump/00.flac", &["ALBUM=Footprints", "TITLE=u"]);
+    put(
+        &root,
+        "Dump/01.flac",
+        &["ALBUM=Footprints", "TITLE=x", ma.as_str()],
+    );
+    put(
+        &root,
+        "Dump/02.flac",
+        &["ALBUM=Footprints", "TITLE=y", mb.as_str()],
+    );
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(input.albums.len(), 2);
+    assert_eq!(input.albums[0].mb_album_id, a);
+    assert_eq!(input.albums[1].mb_album_id, b);
+    let albums: Vec<u32> = input.tracks.iter().map(|t| t.album).collect();
+    assert_eq!(albums, vec![0, 0, 1]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn disc_folders_directly_under_the_scan_root_fold_into_it() {
+    let root = fresh("md_rootdiscs");
+    put(&root, "CD1/x.flac", &["ALBUM=R", "TITLE=x"]);
+    put(&root, "CD2/y.flac", &["ALBUM=R", "TITLE=y"]);
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(input.albums.len(), 1);
+    assert_eq!(input.folders[input.albums[0].folder as usize].path, "");
+    let discs: Vec<u16> = input.tracks.iter().map(|t| t.disc_no).collect();
+    assert_eq!(discs, vec![1, 2]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn out_of_range_disc_tag_is_treated_as_untagged() {
+    let root = fresh("md_disc_overflow");
+    // 65536 would wrap to 0 under an `as u16` cast and bypass the "tag if > 0" rule.
+    put(
+        &root,
+        "Box/CD2/01.flac",
+        &["ALBUM=Box", "TITLE=a", "DISCNUMBER=65536/65536"],
+    );
+
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(
+        input.tracks[0].disc_no, 2,
+        "falls back to the disc-folder number"
+    );
+    assert_eq!(input.albums[0].disc_count, 2);
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -200,7 +200,7 @@ struct Interner {
     genres: Vec<String>,
     folder_ids: HashMap<PathBuf, u32>,
     folders: Vec<FolderInput>,
-    // album key = (album-root folder id, title, MB release id) → folder-isolation
+    // album key = (album-root folder id, title, effective MB release id) → folder-isolation
     // that folds disc folders and splits releases dumped into one folder.
     album_ids: HashMap<(u32, String, String), u32>,
     albums: Vec<AlbumMeta>,
@@ -472,8 +472,15 @@ fn extract_raw(path: &Path) -> RawTrack {
         release_date,
         genre_name,
         track_no: tags.track.unwrap_or(0) as u16,
-        disc_no: tags.disc.filter(|&d| d > 0).map(|d| d as u16),
-        disc_total: tags.disc_total.unwrap_or(0) as u16,
+        // `try_from`, not `as`: a bogus 65536 must not wrap to 0 / a small disc.
+        disc_no: tags
+            .disc
+            .and_then(|d| u16::try_from(d).ok())
+            .filter(|&d| d > 0),
+        disc_total: tags
+            .disc_total
+            .and_then(|d| u16::try_from(d).ok())
+            .unwrap_or(0),
         disc_subtitle: tags
             .disc_subtitle
             .as_deref()
@@ -501,12 +508,30 @@ fn extract_raw(path: &Path) -> RawTrack {
 fn build_catalog(raw: &[RawTrack], root: &Path) -> CatalogInput {
     let mut interner = Interner::default();
     let mut tracks = Vec::with_capacity(raw.len());
+    // Pre-pass (walk order): the first non-empty MB release id per (album root,
+    // title). An untagged track adopts it, so a partially tagged release stays
+    // one album while two distinct releases in one folder still split.
+    let mut first_mb: HashMap<(&Path, &str), &str> = HashMap::new();
+    for r in raw.iter().filter(|r| !r.mb_album_id.is_empty()) {
+        let (album_dir, _) = album_root(&r.path, root);
+        first_mb
+            .entry((album_dir, r.album_name.as_str()))
+            .or_insert(r.mb_album_id.as_str());
+    }
     for r in raw {
         // The track's real folder (its playback locator) …
         let folder = interner.folder(r.path.parent().unwrap_or(root), root);
         // … vs. its album root (a disc folder folds into its parent).
         let (album_dir, disc_dir) = album_root(&r.path, root);
         let album_folder = interner.folder(album_dir, root);
+        let mb_album_id = if r.mb_album_id.is_empty() {
+            first_mb
+                .get(&(album_dir, r.album_name.as_str()))
+                .copied()
+                .unwrap_or("")
+        } else {
+            r.mb_album_id.as_str()
+        };
         let artist = interner.artist(&r.artist_name, r.artist_sort.as_deref());
         let album_artist = interner.artist(
             &r.album_artist_name,
@@ -515,7 +540,7 @@ fn build_catalog(raw: &[RawTrack], root: &Path) -> CatalogInput {
         let album = interner.album(
             &r.album_name,
             album_folder,
-            &r.mb_album_id,
+            mb_album_id,
             album_artist,
             r.original_date,
             r.release_date,
