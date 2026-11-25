@@ -1366,3 +1366,40 @@ fn a_replan_after_apply_picks_the_same_side_file_names() {
         again.entries
     );
 }
+
+#[test]
+fn disc_dir_in_the_file_name_is_no_disc_folder_layout() {
+    // `{DiscDir}` only in the file name: every disc lands in one folder, so
+    // folder-inferred discs are reported and disc-folder side files go flat.
+    let (src, dest) = (unique_dir("dd-name-src"), unique_dir("dd-name-dest"));
+    put(
+        &src,
+        "Suite/Disc 1 - Mondstadt/01 Dawn.flac",
+        &track("Suite", "Dawn", 1, None),
+    );
+    put(
+        &src,
+        "Suite/Disc 2 - Liyue/01 Night.flac",
+        &track("Suite", "Night", 1, None),
+    );
+    put(&src, "Suite/Disc 2 - Liyue/notes.txt", b"notes");
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &Template::new("{AlbumArtist}/{Album}/{DiscDir} {TrackNo} - {Title}"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::Audio),
+        set(&[
+            "HOYO-MiX/Suite/Disc 1 01 - Dawn.flac",
+            "HOYO-MiX/Suite/Disc 2 01 - Night.flac",
+        ])
+    );
+    assert_eq!(p.folder_inferred_discs, vec![src.join("Suite")]);
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::SideFile),
+        set(&["HOYO-MiX/Suite/notes.txt"])
+    );
+}

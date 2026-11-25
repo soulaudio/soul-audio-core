@@ -78,9 +78,14 @@ impl Template {
         segments.iter().any(|s| s.contains("{Album}"))
     }
 
-    /// Whether the template lays discs out as folders (`{DiscDir}`).
+    /// Whether the template lays discs out as folders: a **directory**
+    /// segment (not the file name) uses `{DiscDir}`. A `{DiscDir}` in the file
+    /// name keeps every disc in one folder.
     pub(crate) fn has_disc_dir(&self) -> bool {
-        self.raw.contains("{DiscDir}")
+        let segments: Vec<&str> = self.raw.split('/').collect();
+        segments[..segments.len() - 1]
+            .iter()
+            .any(|s| s.contains("{DiscDir}"))
     }
 
     /// [`render`](Self::render), optionally forcing `{DiscDir}` empty (the
@@ -379,6 +384,19 @@ mod tests {
             flat_prefix.render_album_dir(&tags, Path::new("x.flac")),
             expect(&["Unknown Artist", "Alb"])
         );
+    }
+
+    #[test]
+    fn disc_dir_counts_only_in_a_directory_segment() {
+        assert!(Template::new("{Album}/{DiscDir}/{TrackNo}").has_disc_dir());
+        assert!(Template::new("{Album}/CD {DiscDir}/{TrackNo}").has_disc_dir());
+        assert!(
+            !Template::new("{Album}/{DiscDir} {TrackNo} - {Title}").has_disc_dir(),
+            "in the file name it is no disc folder"
+        );
+        assert!(!Template::new("{DiscDir}").has_disc_dir());
+        assert!(Template::new(preset("artist-album+disc-folders").unwrap()).has_disc_dir());
+        assert!(!Template::new(preset("artist-album").unwrap()).has_disc_dir());
     }
 
     #[test]
