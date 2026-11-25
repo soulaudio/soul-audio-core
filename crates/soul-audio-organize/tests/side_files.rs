@@ -1452,4 +1452,125 @@ fn the_numbered_suffix_goes_on_the_album_folder_not_a_folder_after_it() {
         "{:#?}",
         p.entries
     );
+
+    // Re-plan after apply: the same numbered folders, everything already there.
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    let again = plan_with(
+        &audio_files(&src),
+        &dest,
+        &Template::new("{AlbumArtist}/{Album}/{Year}/{TrackNo} - {Title}"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    let pairs = |p: &OrganizePlan| -> Vec<(String, String)> {
+        p.entries
+            .iter()
+            .map(|e| (rel(&src, &e.src), rel(&dest, &e.dst)))
+            .collect()
+    };
+    assert_eq!(pairs(&again), pairs(&p));
+    assert!(
+        again
+            .entries
+            .iter()
+            .all(|e| e.action == Action::SkipDuplicate),
+        "{:#?}",
+        again.entries
+    );
+}
+
+#[test]
+fn a_partial_selection_leaves_the_album_side_files_in_place() {
+    // Select 3 of 10 tracks and Move them: the cover and the log stay with
+    // the 7 tracks left behind. Then select the rest: now they all go.
+    let (src, dest) = (unique_dir("partial-src"), unique_dir("partial-dest"));
+    let all: Vec<PathBuf> = (1..=10)
+        .map(|n| {
+            put(
+                &src,
+                &format!("Album/{n:02} t{n}.flac"),
+                &track("Album", &format!("t{n}"), n, None),
+            )
+        })
+        .collect();
+    put(&src, "Album/cover.jpg", b"cover");
+    put(&src, "Album/Album.log", b"EAC log");
+    let p = plan_with(
+        &all[..3],
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+        &opts(&src),
+    );
+    assert_eq!(dsts(&p, &dest, EntryKind::Audio).len(), 3);
+    assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty());
+    assert_eq!(
+        left(&p),
+        vec![(src.join("Album"), SideFilesLeft::PartialSelection, 2)]
+    );
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    assert!(at(&src, "Album/cover.jpg").exists());
+    assert!(at(&src, "Album/Album.log").exists());
+
+    // The rest of the album: a complete selection sweeps as before.
+    let rest = audio_files(&src);
+    assert_eq!(rest.len(), 7);
+    let p = plan_with(
+        &rest,
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+        &opts(&src),
+    );
+    assert!(p.side_files_left.is_empty(), "{:?}", p.side_files_left);
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::SideFile),
+        set(&["HOYO-MiX/Album/Album.log", "HOYO-MiX/Album/cover.jpg"])
+    );
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    assert!(!src.join("Album").exists(), "emptied album folder pruned");
+}
+
+#[test]
+fn unselected_audio_in_a_disc_folder_is_a_partial_selection() {
+    let (src, dest) = (unique_dir("partial-df-src"), unique_dir("partial-df-dest"));
+    let a = put(&src, "Box/CD1/01 a.flac", &track("Box", "a", 1, Some("1")));
+    let b = put(&src, "Box/CD1/02 b.flac", &track("Box", "b", 2, Some("1")));
+    let c = put(&src, "Box/CD2/01 c.flac", &track("Box", "c", 1, Some("2")));
+    put(&src, "Box/cover.jpg", b"cover");
+    put(&src, "Box/CD1/Box.log", b"disc 1 log");
+    for (inputs, why) in [
+        (vec![a.clone()], "a track of CD1 is missing"),
+        (vec![a.clone(), b.clone()], "all of CD2 is missing"),
+    ] {
+        let p = plan_with(
+            &inputs,
+            &dest,
+            &tpl("artist-album"),
+            Strategy::Copy,
+            &opts(&src),
+        );
+        assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty(), "{why}");
+        assert_eq!(
+            left(&p),
+            vec![(src.join("Box"), SideFilesLeft::PartialSelection, 2)],
+            "{why}"
+        );
+    }
+    // Every disc selected: swept.
+    let p = plan_with(
+        &[a, b, c],
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    assert!(p.side_files_left.is_empty(), "{:?}", p.side_files_left);
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::SideFile),
+        set(&["HOYO-MiX/Box/Box.log", "HOYO-MiX/Box/cover.jpg"])
+    );
 }

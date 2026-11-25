@@ -78,14 +78,23 @@ pub enum SideFilesLeft {
     /// file already sits at its destination): the album does not move, so its
     /// side files stay with it.
     AudioConflict,
+    /// Only part of the album was selected: its root, or one of its disc
+    /// folders (`CD2/`), still holds audio that is not among the inputs. The
+    /// side files belong with the whole album, so none of them move.
+    ///
+    /// Conservative by design: audio that can never be an input (a format the
+    /// importer does not decode, e.g. `.wma`/`.ape`) also counts, so an album
+    /// folder holding such files never sweeps its side files.
+    PartialSelection,
 }
 
 /// An album root whose side files were **not** planned (reported, never guessed).
 ///
-/// For [`SideFilesLeft::AudioConflict`] these are all the album's side files
-/// (its root lies in the source root and holds only this album, so it is
-/// walked); for every other reason only the album root's **own** files are
-/// counted — the planner never walks a folder whose files it will not plan.
+/// For [`SideFilesLeft::AudioConflict`] and [`SideFilesLeft::PartialSelection`]
+/// these are all the album's side files (its root lies in the source root and
+/// holds only this album, so it is walked); for every other reason only the
+/// album root's **own** files are counted — the planner never walks a folder
+/// whose files it will not plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct LeftInPlace {
@@ -208,9 +217,11 @@ pub fn plan(
 /// **Side files**: for every album root inside the source root that holds
 /// exactly one album with a folder of its own, each non-audio, non-junk file
 /// under it (recursively; not into a sub-folder holding another album's audio)
-/// is planned too — see [`EntryKind::SideFile`] — unless one of the album's
-/// audio files is a [`SkipConflict`](Action::SkipConflict). Otherwise the root
-/// is reported in [`OrganizePlan::side_files_left`].
+/// is planned too — see [`EntryKind::SideFile`] — unless only part of the
+/// album was selected (its root or a disc folder holds non-input audio:
+/// [`SideFilesLeft::PartialSelection`]) or one of the album's audio files is a
+/// [`SkipConflict`](Action::SkipConflict). Otherwise the root is reported in
+/// [`OrganizePlan::side_files_left`].
 ///
 /// Each entry's [`Action`] is classified as:
 /// - **[`SkipDuplicate`](Action::SkipDuplicate)** if an *earlier* entry in this
@@ -316,8 +327,19 @@ pub fn plan_with(
             }
             continue;
         };
-        let side = side::collect(&album.root, dest_root, &inputs);
+        let side::Collected {
+            files: side,
+            partial,
+        } = side::collect(&album.root, dest_root, &inputs);
         if side.is_empty() {
+            continue;
+        }
+        if partial {
+            side_files_left.push(LeftInPlace::new(
+                &album.root,
+                SideFilesLeft::PartialSelection,
+                side,
+            ));
             continue;
         }
         if album
