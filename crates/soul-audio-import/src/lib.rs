@@ -1,8 +1,9 @@
 //! Desktop library importer (std).
 //!
 //! Walks a music tree, reads tags with `soul-audio-tags`, interns names into a
-//! dense-id catalog with **folder-isolation** (album identity = parent folder),
-//! and bakes a `.soulidx` the DAP reads verbatim. This is the "desktop bakes,
+//! dense-id catalog with **folder-isolation** (album identity = album root
+//! folder + title + MusicBrainz release id; a `CD1`/`Disc 2` folder folds into
+//! its parent), and bakes a `.soulidx` the DAP reads verbatim. This is the "desktop bakes,
 //! device reads" split from the architecture spec — the heavy scan happens here,
 //! never on the DAP.
 #![forbid(unsafe_code)]
@@ -15,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use soul_audio_catalog::NO_FOLDER;
 use soul_audio_index::build::{AlbumMeta, CatalogInput, FolderInput, TrackInput};
+use soul_audio_tags::disc_folder::{self, DiscFolder};
 use soul_audio_tags::{StreamFacts, Tags, read_owned};
 
 mod cover;
@@ -198,8 +200,9 @@ struct Interner {
     genres: Vec<String>,
     folder_ids: HashMap<PathBuf, u32>,
     folders: Vec<FolderInput>,
-    // album key = (title, folder id) → folder-isolation.
-    album_ids: HashMap<(String, u32), u32>,
+    // album key = (album-root folder id, title, MB release id) → folder-isolation
+    // that folds disc folders and splits releases dumped into one folder.
+    album_ids: HashMap<(u32, String, String), u32>,
     albums: Vec<AlbumMeta>,
     // Parallel to `albums`, recorded on first sight: the album's filesystem
     // folder and one representative track path — cover-art discovery's inputs.
@@ -271,22 +274,24 @@ impl Interner {
         id
     }
 
-    /// Intern an album under folder-isolation; fills its metadata on first
-    /// sight, along with `dir` (the album's filesystem folder) and
-    /// `track_path` (a representative track, for embedded cover-art
-    /// discovery) — both recorded only on first sight, same as the metadata.
+    /// Intern an album under folder-isolation, keyed on its ALBUM ROOT folder,
+    /// title and MusicBrainz release id; fills its metadata on first sight
+    /// (first track wins), along with `dir` (the album root on disk) and
+    /// `track_path` (a representative track, for embedded cover-art discovery).
+    /// `disc_count` starts at 1 and grows via [`Interner::note_disc`].
     #[allow(clippy::too_many_arguments)] // album identity + both dates + cover-discovery inputs
     fn album(
         &mut self,
         title: &str,
         folder: u32,
+        mb_album_id: &str,
         album_artist: u32,
         original_date: soul_audio_catalog::PackedDate,
         release_date: soul_audio_catalog::PackedDate,
         dir: &Path,
         track_path: &Path,
     ) -> u32 {
-        let key = (title.to_owned(), folder);
+        let key = (folder, title.to_owned(), mb_album_id.to_owned());
         if let Some(&id) = self.album_ids.get(&key) {
             return id;
         }
@@ -298,12 +303,19 @@ impl Interner {
             release_date,
             folder,
             disc_count: 1,
-            mb_album_id: String::new(),
+            mb_album_id: mb_album_id.to_owned(),
         });
         self.album_dirs.push(dir.to_owned());
         self.album_tracks.push(track_path.to_owned());
         self.album_ids.insert(key, id);
         id
+    }
+
+    /// Fold one track's disc facts into its album:
+    /// `disc_count = max(max disc_total tag, max disc_no seen, 1)`.
+    fn note_disc(&mut self, album: u32, disc_no: u16, disc_total: u16) {
+        let a = &mut self.albums[album as usize];
+        a.disc_count = a.disc_count.max(disc_no).max(disc_total).max(1);
     }
 }
 
@@ -357,6 +369,27 @@ fn normalize_rel(rel: &Path) -> String {
         .join("/")
 }
 
+/// A track's **album root** and the disc folder it sits in, if any. The album
+/// root is the track's parent folder, unless that folder's name is a disc folder
+/// (`CD1`, `Disc 2 - Liyue`; [`disc_folder::parse`]) strictly below the scan
+/// `root` — then it is the grandparent, so `Album/CD1` + `Album/CD2` are one
+/// album. Never climbs to or above `root`. `soul-audio-organize` applies the
+/// same rule with the same matcher (it may not depend on this crate).
+fn album_root<'a>(track: &'a Path, root: &'a Path) -> (&'a Path, Option<DiscFolder<'a>>) {
+    let parent = track.parent().unwrap_or(root);
+    if parent != root
+        && parent.starts_with(root)
+        && let Some(df) = parent
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(disc_folder::parse)
+        && let Some(grandparent) = parent.parent()
+    {
+        return (grandparent, Some(df));
+    }
+    (parent, None)
+}
+
 /// One file's tag-derived metadata, extracted BEFORE interning. This is the
 /// *costly* per-file product (a file open + tag/header parse) that the
 /// incremental scanner caches by [`FileStamp`] so an unchanged file is never
@@ -377,7 +410,15 @@ pub struct RawTrack {
     release_date: soul_audio_catalog::PackedDate,
     genre_name: String,
     track_no: u16,
-    disc_no: u16,
+    /// The tagged disc number, `None` when untagged (then the disc folder's
+    /// number, else 1, is used at intern time — that needs the scan root).
+    disc_no: Option<u16>,
+    /// The tagged disc total (`DISCTOTAL`/`TOTALDISCS`/`n/total`), 0 when untagged.
+    disc_total: u16,
+    /// The tagged disc subtitle (trimmed), empty when untagged.
+    disc_subtitle: String,
+    /// The MusicBrainz release id (trimmed), empty when untagged — album key part.
+    mb_album_id: String,
     duration_ms: u32,
     sample_rate: u32,
     channels: u8,
@@ -431,7 +472,20 @@ fn extract_raw(path: &Path) -> RawTrack {
         release_date,
         genre_name,
         track_no: tags.track.unwrap_or(0) as u16,
-        disc_no: tags.disc.unwrap_or(1) as u16,
+        disc_no: tags.disc.filter(|&d| d > 0).map(|d| d as u16),
+        disc_total: tags.disc_total.unwrap_or(0) as u16,
+        disc_subtitle: tags
+            .disc_subtitle
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_owned(),
+        mb_album_id: tags
+            .musicbrainz_album_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_owned(),
         duration_ms: duration_ms(&facts),
         sample_rate: facts.sample_rate.unwrap_or(0),
         channels: facts.channels.unwrap_or(0) as u8,
@@ -448,22 +502,38 @@ fn build_catalog(raw: &[RawTrack], root: &Path) -> CatalogInput {
     let mut interner = Interner::default();
     let mut tracks = Vec::with_capacity(raw.len());
     for r in raw {
+        // The track's real folder (its playback locator) …
         let folder = interner.folder(r.path.parent().unwrap_or(root), root);
+        // … vs. its album root (a disc folder folds into its parent).
+        let (album_dir, disc_dir) = album_root(&r.path, root);
+        let album_folder = interner.folder(album_dir, root);
         let artist = interner.artist(&r.artist_name, r.artist_sort.as_deref());
         let album_artist = interner.artist(
             &r.album_artist_name,
             r.album_artist_sort.as_deref().or(r.artist_sort.as_deref()),
         );
-        let album_dir = r.path.parent().unwrap_or(root);
         let album = interner.album(
             &r.album_name,
-            folder,
+            album_folder,
+            &r.mb_album_id,
             album_artist,
             r.original_date,
             r.release_date,
             album_dir,
             &r.path,
         );
+        // Disc: tag → disc-folder number (0, e.g. `CD0`, counts as absent) → 1.
+        // Subtitle: tag → folder text → "".
+        let disc_no = r
+            .disc_no
+            .or(disc_dir.map(|d| d.number).filter(|&n| n > 0))
+            .unwrap_or(1);
+        let disc_subtitle = if r.disc_subtitle.is_empty() {
+            disc_dir.and_then(|d| d.subtitle).unwrap_or("").to_owned()
+        } else {
+            r.disc_subtitle.clone()
+        };
+        interner.note_disc(album, disc_no, r.disc_total);
         let genre = interner.genre(&r.genre_name);
         tracks.push(TrackInput {
             title: r.title.clone(),
@@ -473,13 +543,13 @@ fn build_catalog(raw: &[RawTrack], root: &Path) -> CatalogInput {
             genre,
             folder,
             track_no: r.track_no,
-            disc_no: r.disc_no,
+            disc_no,
             duration_ms: r.duration_ms,
             sample_rate: r.sample_rate,
             channels: r.channels,
             file_name: r.file_name.clone(),
             mbid: r.mbid.clone(),
-            disc_subtitle: String::new(),
+            disc_subtitle,
             // Loudness is a deferred Tier-2 analysis pass (full decode), not the metadata scan.
             loudness: None,
         });
@@ -554,7 +624,9 @@ fn stamp_of(meta: &std::fs::Metadata) -> FileStamp {
 /// Bump when [`RawTrack`]/extraction changes so a persisted cache from an older
 /// build is discarded (re-extracted) instead of silently reused with stale fields.
 /// The desktop head stores this alongside the serialized cache and compares on load.
-pub const SCAN_CACHE_VERSION: u32 = 3;
+/// v4 (multi-disc albums): `RawTrack` gained `disc_total`, `disc_subtitle`,
+/// `mb_album_id`; `disc_no` became `Option`.
+pub const SCAN_CACHE_VERSION: u32 = 4;
 
 #[derive(Default, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
