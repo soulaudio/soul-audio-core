@@ -20,6 +20,10 @@ mod aiff;
 mod base64;
 mod caf;
 mod dff;
+/// Disc-folder name matcher (`CD1`, `Disc 2 - Liyue`, `Side A`) — the single
+/// rule the importer and the organizer share for "this folder is one disc of an
+/// album". `no_std`, no-alloc.
+pub mod disc_folder;
 mod dsf;
 mod id3v2;
 mod locate;
