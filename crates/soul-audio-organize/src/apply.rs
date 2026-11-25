@@ -15,6 +15,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::cue::SourceStamp;
 use crate::{Action, OrganizePlan, PlanEntry};
 
 /// Progress for one processed entry, delivered to the `on_progress` callback
@@ -153,15 +154,49 @@ fn do_move(entry: &PlanEntry, summary: &mut Summary) {
 
 /// A rewritten cue ([`PlanEntry::rewritten`]): write `bytes` at `dst` — never
 /// over an existing file — and, for a Move, remove the source only once the
-/// write succeeded. A failed write leaves the source untouched (and no partial
-/// destination); a failed removal leaves both files and is recorded.
+/// write succeeded.
+///
+/// The source is re-read first and must still match what was planned (its
+/// stamp: length + content hash): a cue edited, replaced or removed since
+/// planning is a failure — nothing is written, nothing removed — so an edit
+/// is never lost. A hand-built entry has no stamp: a Copy writes, a Move
+/// fails (it would delete a source nobody verified). A failed write leaves
+/// the source untouched (and no partial destination); a failed removal
+/// leaves both files and is recorded.
+///
+/// An existing `dst` is skipped — except on a Move whose `dst` already holds
+/// exactly `bytes` while the source is unchanged (a run stopped between the
+/// write and the removal): the removal is finished and the entry counts as
+/// moved.
 fn do_write(entry: &PlanEntry, bytes: &[u8], summary: &mut Summary) {
     if !ensure_parent(entry, summary) {
         return;
     }
+    let is_move = entry.action == Action::Move;
     if entry.dst.exists() {
-        summary.skipped += 1;
+        if is_move && std::fs::read(&entry.dst).is_ok_and(|d| d == bytes) && source_matches(entry) {
+            remove_source(entry, summary);
+        } else {
+            summary.skipped += 1;
+        }
         return;
+    }
+    match entry.source_stamp {
+        Some(_) if !source_matches(entry) => {
+            summary.failed.push((
+                entry.src.clone(),
+                "the cue changed or vanished since it was planned; re-plan".to_owned(),
+            ));
+            return;
+        }
+        None if is_move => {
+            summary.failed.push((
+                entry.src.clone(),
+                "a rewritten cue without a plan-time source check is never moved".to_owned(),
+            ));
+            return;
+        }
+        _ => {}
     }
     match write_new(&entry.dst, bytes) {
         Ok(()) => {}
@@ -175,10 +210,26 @@ fn do_write(entry: &PlanEntry, bytes: &[u8], summary: &mut Summary) {
             return;
         }
     }
-    if entry.action != Action::Move {
+    if is_move {
+        remove_source(entry, summary);
+    } else {
         summary.copied += 1;
-        return;
     }
+}
+
+/// Whether `entry`'s source still matches its plan-time stamp (`false`
+/// without one, or when it cannot be read).
+fn source_matches(entry: &PlanEntry) -> bool {
+    let Some(stamp) = entry.source_stamp else {
+        return false;
+    };
+    // Cheap length check first: a grown file is never read whole.
+    std::fs::metadata(&entry.src).is_ok_and(|m| m.is_file() && m.len() == stamp.len())
+        && std::fs::read(&entry.src).is_ok_and(|b| SourceStamp::of(&b) == stamp)
+}
+
+/// The rewritten cue is in place: remove the (verified) source of a Move.
+fn remove_source(entry: &PlanEntry, summary: &mut Summary) {
     match std::fs::remove_file(&entry.src) {
         Ok(()) => summary.moved += 1,
         Err(e) => summary.failed.push((
@@ -209,6 +260,7 @@ fn write_new(dst: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{Progress, apply};
+    use crate::cue::SourceStamp;
     use crate::{Action, EntryKind, OrganizePlan, PlanEntry, Strategy, Template, plan, presets};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -413,16 +465,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dest);
     }
 
-    /// A one-entry plan writing `bytes` (a rewritten cue) for `src` → `dst`.
+    /// A one-entry plan writing `bytes` (a rewritten cue) for `src` → `dst`,
+    /// planned from a source holding `OLD` (as the planner stamps it).
     fn cue_plan(src: &Path, dst: &Path, action: Action, bytes: &[u8]) -> OrganizePlan {
+        let mut p = hand_cue_plan(src, dst, action, bytes);
+        p.entries[0].source_stamp = Some(SourceStamp::of(OLD));
+        p
+    }
+
+    /// [`cue_plan`] without a source stamp (a hand-built entry).
+    fn hand_cue_plan(src: &Path, dst: &Path, action: Action, bytes: &[u8]) -> OrganizePlan {
+        let mut e = PlanEntry::new(src, dst, action, EntryKind::SideFile);
+        e.rewritten = Some(bytes.to_vec());
         OrganizePlan {
-            entries: vec![PlanEntry {
-                src: src.to_path_buf(),
-                dst: dst.to_path_buf(),
-                action,
-                kind: EntryKind::SideFile,
-                rewritten: Some(bytes.to_vec()),
-            }],
+            entries: vec![e],
             ..Default::default()
         }
     }
@@ -441,6 +497,11 @@ mod tests {
         assert!(s.failed.is_empty(), "{:?}", s.failed);
         assert_eq!(std::fs::read(&dst).unwrap(), NEW);
         assert_eq!(std::fs::read(&src).unwrap(), OLD);
+        // A hand-built Copy (no stamp) writes too: the source is never touched.
+        let dst2 = join(&dir, &["out", "b.cue"]);
+        let s = apply(&hand_cue_plan(&src, &dst2, Action::Copy, NEW), |_| {}).unwrap();
+        assert_eq!((s.copied, s.failed.len()), (1, 0), "{:?}", s.failed);
+        assert_eq!(std::fs::read(&dst2).unwrap(), NEW);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -488,6 +549,92 @@ mod tests {
         assert_eq!((s.moved, s.failed.len()), (0, 1));
         assert_eq!(std::fs::read(&src).unwrap(), OLD, "never both missing");
         assert!(!dst.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cue_edited_after_planning_is_never_moved() {
+        // The user edits the cue between plan and apply: writing the planned
+        // bytes and deleting the source would lose the edit.
+        let dir = unique_dir("cue-edited");
+        let src = dir.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        let dst = join(&dir, &["out", "a.cue"]);
+        let p = cue_plan(&src, &dst, Action::Move, NEW);
+        let edited: &[u8] = b"REM EDITED
+FILE \"a.flac\" WAVE
+";
+        std::fs::write(&src, edited).unwrap();
+        let s = apply(&p, |_| {}).unwrap();
+        assert_eq!((s.moved, s.copied, s.skipped), (0, 0, 0));
+        assert_eq!(s.failed.len(), 1, "{:?}", s.failed);
+        assert_eq!(std::fs::read(&src).unwrap(), edited, "the edit survives");
+        assert!(!dst.exists(), "nothing written");
+        // Same length, different bytes: still caught (content hash).
+        let same_len: Vec<u8> = OLD.iter().map(|b| b.to_ascii_lowercase()).collect();
+        assert_eq!(same_len.len(), OLD.len());
+        std::fs::write(&src, &same_len).unwrap();
+        let s = apply(&p, |_| {}).unwrap();
+        assert_eq!((s.moved, s.failed.len()), (0, 1), "{:?}", s.failed);
+        assert_eq!(std::fs::read(&src).unwrap(), same_len);
+        assert!(!dst.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_vanished_cue_source_writes_nothing() {
+        for action in [Action::Move, Action::Copy] {
+            let dir = unique_dir("cue-vanished");
+            let src = dir.join("a.cue");
+            let dst = join(&dir, &["out", "a.cue"]);
+            // Planned from OLD, gone by apply time.
+            let s = apply(&cue_plan(&src, &dst, action, NEW), |_| {}).unwrap();
+            assert_eq!((s.moved, s.copied, s.failed.len()), (0, 0, 1), "{action:?}");
+            assert!(!dst.exists(), "{action:?}: nothing written");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_hand_built_rewritten_move_never_deletes_the_source() {
+        // No stamp: apply cannot tell whether the source changed since the
+        // bytes were made, so a Move fails safe.
+        let dir = unique_dir("cue-hand");
+        let src = dir.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        let dst = join(&dir, &["out", "a.cue"]);
+        let s = apply(&hand_cue_plan(&src, &dst, Action::Move, NEW), |_| {}).unwrap();
+        assert_eq!((s.moved, s.failed.len()), (0, 1), "{:?}", s.failed);
+        assert_eq!(std::fs::read(&src).unwrap(), OLD);
+        assert!(!dst.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_interrupted_cue_move_is_completed_on_reapply() {
+        // The rewritten cue was written but the source was not removed (the
+        // run stopped in between): re-applying finishes the Move.
+        let dir = unique_dir("cue-complete");
+        let src = dir.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        let dst = join(&dir, &["out", "a.cue"]);
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::write(&dst, NEW).unwrap();
+        let s = apply(&cue_plan(&src, &dst, Action::Move, NEW), |_| {}).unwrap();
+        assert!(s.failed.is_empty(), "{:?}", s.failed);
+        assert_eq!((s.moved, s.skipped), (1, 0));
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), NEW);
+
+        // ...but never when the source was edited, or dst is someone else's.
+        for (src_bytes, dst_bytes) in [(&b"edited"[..], NEW), (OLD, &b"other"[..])] {
+            std::fs::write(&src, src_bytes).unwrap();
+            std::fs::write(&dst, dst_bytes).unwrap();
+            let s = apply(&cue_plan(&src, &dst, Action::Move, NEW), |_| {}).unwrap();
+            assert_eq!((s.moved, s.skipped), (0, 1), "{:?}", s.failed);
+            assert_eq!(std::fs::read(&src).unwrap(), src_bytes, "source kept");
+            assert_eq!(std::fs::read(&dst).unwrap(), dst_bytes, "dst untouched");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

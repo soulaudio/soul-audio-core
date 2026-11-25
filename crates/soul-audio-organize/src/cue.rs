@@ -34,6 +34,34 @@ pub enum CueNotRewritten {
     Unreadable,
 }
 
+/// The length and a content hash of a rewritten cue's **source** as it was
+/// read while planning. [`apply`](crate::apply) re-reads the source and writes
+/// the rewritten bytes only when it still matches, so an edit made between
+/// plan and apply is never lost (a Move would otherwise delete it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SourceStamp {
+    len: u64,
+    hash: u64,
+}
+
+impl SourceStamp {
+    /// The stamp of `bytes`.
+    pub(crate) fn of(bytes: &[u8]) -> Self {
+        use std::hash::Hasher;
+        let mut h = std::hash::DefaultHasher::new();
+        h.write(bytes);
+        Self {
+            len: bytes.len() as u64,
+            hash: h.finish(),
+        }
+    }
+
+    /// The byte length that was stamped.
+    pub(crate) fn len(self) -> u64 {
+        self.len
+    }
+}
+
 /// A larger `.cue` is not a cue sheet; it is copied as-is.
 const MAX_CUE_BYTES: u64 = 1 << 20;
 
@@ -272,13 +300,14 @@ fn join_cue_name(dir: &Path, name: &str) -> PathBuf {
 /// that references (relative to the cue's own folder, compared as
 /// [`paths::key`]s — case-insensitive on Windows/macOS) an audio source in
 /// `audio_to` (`key(src)` → its planned destination) at that destination,
-/// relative to `dst`'s folder. `Ok(None)`: copy as-is; `Ok(Some(bytes))`:
-/// write these instead; `Err(why)`: copy as-is and report.
+/// relative to `dst`'s folder. `Ok(None)`: copy as-is; `Ok(Some((bytes,
+/// stamp)))`: write these instead, provided the source still matches `stamp`
+/// (of the bytes read here); `Err(why)`: copy as-is and report.
 pub(crate) fn plan_rewrite(
     src: &Path,
     dst: &Path,
     audio_to: &HashMap<PathBuf, PathBuf>,
-) -> Result<Option<Vec<u8>>, CueNotRewritten> {
+) -> Result<Option<(Vec<u8>, SourceStamp)>, CueNotRewritten> {
     match std::fs::metadata(src) {
         Ok(m) if m.len() <= MAX_CUE_BYTES => {}
         _ => return Err(CueNotRewritten::Unreadable),
@@ -293,7 +322,7 @@ pub(crate) fn plan_rewrite(
     });
     match outcome {
         Outcome::Unchanged => Ok(None),
-        Outcome::Rewritten(b) => Ok(Some(b)),
+        Outcome::Rewritten(b) => Ok(Some((b, SourceStamp::of(&bytes)))),
         Outcome::NotRewritten(why) => Err(why),
     }
 }

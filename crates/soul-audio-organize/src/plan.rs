@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::album::{self, AlbumGroup, RootIndex};
-use crate::cue::{self, CueNotRewritten};
+use crate::cue::{self, CueNotRewritten, SourceStamp};
 use crate::paths;
 use crate::side::{self, AlbumPlacement};
 use crate::{Strategy, Template};
@@ -49,7 +49,11 @@ pub enum EntryKind {
 }
 
 /// One planned source → destination placement with its classified [`Action`].
+///
+/// Built by the planner; [`PlanEntry::new`] builds one by hand (it never
+/// carries [`rewritten`](Self::rewritten) bytes the planner verified).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PlanEntry {
     /// The source file to copy/move.
     pub src: PathBuf,
@@ -63,9 +67,35 @@ pub struct PlanEntry {
     /// the cue with those lines pointed at the new names (see
     /// [`CueNotRewritten`] for when a cue is left as-is). When `Some`,
     /// [`apply`](crate::apply) writes these bytes at `dst` instead of copying
-    /// `src` (a Move removes `src` only after the write succeeded). `None` for
-    /// every other entry.
+    /// `src` (a Move removes `src` only after the write succeeded) — and only
+    /// while `src` still holds the bytes it was planned from: a cue edited
+    /// after planning is a failure, never overwritten by the plan's copy.
+    /// `None` for every other entry.
     pub rewritten: Option<Vec<u8>>,
+    /// With `rewritten`: the source cue's length + content hash when it was
+    /// read for planning. `apply` writes `rewritten` only while the source
+    /// still matches; without a stamp (a hand-built entry) a Move refuses.
+    pub(crate) source_stamp: Option<SourceStamp>,
+}
+
+impl PlanEntry {
+    /// An entry placing `src` at `dst` as-is (no [`rewritten`](Self::rewritten)
+    /// bytes).
+    pub fn new(
+        src: impl Into<PathBuf>,
+        dst: impl Into<PathBuf>,
+        action: Action,
+        kind: EntryKind,
+    ) -> Self {
+        Self {
+            src: src.into(),
+            dst: dst.into(),
+            action,
+            kind,
+            rewritten: None,
+            source_stamp: None,
+        }
+    }
 }
 
 /// Why an album's side files were left where they are.
@@ -473,8 +503,12 @@ impl Dsts {
         dst: PathBuf,
         strategy: Strategy,
         kind: EntryKind,
-        rewritten: Option<Vec<u8>>,
+        rewritten: Option<(Vec<u8>, SourceStamp)>,
     ) {
+        let (rewritten, source_stamp) = match rewritten {
+            Some((bytes, stamp)) => (Some(bytes), Some(stamp)),
+            None => (None, None),
+        };
         let key = paths::key(&dst);
         let action = if self.claimed.contains(&key) {
             Action::SkipDuplicate
@@ -491,6 +525,7 @@ impl Dsts {
             action,
             kind,
             rewritten,
+            source_stamp,
         });
     }
 }

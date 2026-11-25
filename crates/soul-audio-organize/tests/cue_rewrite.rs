@@ -390,3 +390,21 @@ fn move_writes_the_rewritten_cue_removes_the_source_and_prunes() {
     assert_eq!((again.moved, again.skipped), (0, p.entries.len()));
     assert!(again.failed.is_empty(), "{:?}", again.failed);
 }
+
+#[test]
+fn a_cue_edited_between_plan_and_move_is_kept() {
+    let (src, dest) = (unique_dir("cue-stale-src"), unique_dir("cue-stale-dest"));
+    eac_box(&src);
+    let p = plan_box(&src, &dest, "artist-album", Strategy::Move);
+    assert!(entry(&p, &at(&src, "Box/Box.cue")).rewritten.is_some());
+    let edited = b"REM EDITED BY USER\r\nFILE \"101 Intro.flac\" WAVE\r\n";
+    std::fs::write(at(&src, "Box/Box.cue"), edited).unwrap();
+    let s = apply(&p, |_| {}).unwrap();
+    assert_eq!(s.failed.len(), 1, "{:?}", s.failed);
+    assert_eq!(s.failed[0].0, at(&src, "Box/Box.cue"));
+    assert_eq!(std::fs::read(at(&src, "Box/Box.cue")).unwrap(), edited);
+    assert!(!at(&dest, "HOYO-MiX/Box/Box.cue").exists());
+    // Everything else moved; the folder holding the kept cue is not pruned.
+    assert!(at(&dest, "HOYO-MiX/Box/Box.log").exists());
+    assert_eq!(tree(&src), ["Box/Box.cue".to_owned()].into_iter().collect());
+}
