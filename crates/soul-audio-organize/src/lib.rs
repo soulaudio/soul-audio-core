@@ -50,6 +50,7 @@
 
 mod album;
 mod apply;
+mod cue;
 mod paths;
 mod plan;
 mod sanitize;
@@ -58,6 +59,7 @@ mod tags;
 mod template;
 
 pub use apply::{Progress, Summary, apply};
+pub use cue::CueNotRewritten;
 pub use plan::{
     Action, EntryKind, LeftInPlace, OrganizePlan, PlanEntry, PlanOptions, SideFilesLeft, plan,
     plan_with,
