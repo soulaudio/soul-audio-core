@@ -224,9 +224,6 @@ fn copy_across(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// write and the removal): the removal is finished and the entry counts as
 /// moved.
 fn do_write(entry: &PlanEntry, bytes: &[u8], summary: &mut Summary) {
-    if !ensure_parent(entry, summary) {
-        return;
-    }
     let is_move = entry.action == Action::Move;
     if entry.dst.exists() {
         if is_move && std::fs::read(&entry.dst).is_ok_and(|d| d == bytes) && source_matches(entry) {
@@ -252,6 +249,10 @@ fn do_write(entry: &PlanEntry, bytes: &[u8], summary: &mut Summary) {
             return;
         }
         _ => {}
+    }
+    // Only now — a refused cue leaves no empty folder behind.
+    if !ensure_parent(entry, summary) {
+        return;
     }
     match write_new(&entry.dst, bytes) {
         Ok(()) => {}
@@ -625,6 +626,7 @@ FILE \"a.flac\" WAVE
         assert_eq!(s.failed.len(), 1, "{:?}", s.failed);
         assert_eq!(std::fs::read(&src).unwrap(), edited, "the edit survives");
         assert!(!dst.exists(), "nothing written");
+        assert!(!dst.parent().unwrap().exists(), "not even its folder");
         // Same length, different bytes: still caught (content hash).
         let same_len: Vec<u8> = OLD.iter().map(|b| b.to_ascii_lowercase()).collect();
         assert_eq!(same_len.len(), OLD.len());
