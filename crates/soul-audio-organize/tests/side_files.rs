@@ -10,7 +10,7 @@ use soul_audio_organize::{
     Action, EntryKind, LeftInPlace, OrganizePlan, PlanOptions, SideFilesLeft, Strategy, Template,
     apply, plan, plan_with, preset,
 };
-use support::{audio_files, flac, put, rel, tree, unique_dir};
+use support::{at, audio_files, flac, put, rel, tree, unique_dir};
 
 fn tpl(name: &str) -> Template {
     Template::new(preset(name).expect("preset"))
@@ -871,4 +871,159 @@ fn a_stem_followed_lyric_never_shadows_another_side_file() {
     let s = apply(&p, |_| {}).unwrap();
     assert!(s.failed.is_empty());
     assert_eq!(tree(&dest).len(), 3, "every file arrived");
+}
+
+#[test]
+fn move_prunes_emptied_folders_bottom_up_but_never_the_source_root() {
+    let (src, dest) = (unique_dir("prune-src"), unique_dir("prune-dest"));
+    put(
+        &src,
+        "Box/CD1/01 Intro.flac",
+        &track("Box", "Intro", 1, Some("1")),
+    );
+    put(
+        &src,
+        "Box/CD2/01 Reprise.flac",
+        &track("Box", "Reprise", 1, Some("2")),
+    );
+    put(&src, "Box/CD1/Box.log", b"log");
+    put(&src, "Box/cover.jpg", b"jpg");
+    put(&src, "Box/Scans/Front.jpg", b"front");
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+        &opts(&src),
+    );
+    let order: Vec<String> = p.prune_dirs.iter().map(|d| rel(&src, d)).collect();
+    assert_eq!(
+        order,
+        ["Box/CD1", "Box/CD2", "Box/Scans", "Box"],
+        "deepest first"
+    );
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    assert_eq!(s.pruned_dirs, 4);
+    assert!(src.exists(), "the source root itself is never removed");
+    assert!(tree(&src).is_empty());
+    assert!(!src.join("Box").exists());
+}
+
+#[test]
+fn move_keeps_a_folder_that_still_holds_junk() {
+    let (src, dest) = (unique_dir("junk-src"), unique_dir("junk-dest"));
+    put(&src, "Box/101 Intro.flac", &track("Box", "Intro", 1, None));
+    put(&src, "Box/Scans/Front.jpg", b"front");
+    put(&src, "Box/Thumbs.db", b"junk");
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+        &opts(&src),
+    );
+    let s = apply(&p, |_| {}).unwrap();
+    assert_eq!(s.pruned_dirs, 1, "only Scans/ emptied");
+    assert_eq!(tree(&src), set(&["Box/Thumbs.db"]));
+}
+
+#[test]
+fn move_with_a_source_root_prunes_emptied_parents_below_it() {
+    let (src, dest) = (unique_dir("parents-src"), unique_dir("parents-dest"));
+    put(&src, "Artist/Box/01.flac", &track("Box", "a", 1, None));
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+        &opts(&src),
+    );
+    let order: Vec<String> = p.prune_dirs.iter().map(|d| rel(&src, d)).collect();
+    assert_eq!(order, ["Artist/Box", "Artist"]);
+    let s = apply(&p, |_| {}).unwrap();
+    assert_eq!(s.pruned_dirs, 2);
+    assert!(src.exists() && !src.join("Artist").exists());
+}
+
+#[test]
+fn move_without_a_source_root_never_prunes() {
+    let (src, dest) = (unique_dir("bound-src"), unique_dir("bound-dest"));
+    put(&src, "Lib/Artist/Box/01.flac", &track("Box", "a", 1, None));
+    let p = plan(
+        &audio_files(&src),
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+    );
+    assert!(p.prune_dirs.is_empty(), "no source root, no pruning");
+    let s = apply(&p, |_| {}).unwrap();
+    assert_eq!(s.moved, 1);
+    assert_eq!(s.pruned_dirs, 0);
+    assert!(at(&src, "Lib/Artist/Box").exists());
+}
+
+#[test]
+fn copy_never_prunes() {
+    let (src, dest) = (unique_dir("copyprune-src"), unique_dir("copyprune-dest"));
+    put(&src, "Box/01.flac", &track("Box", "a", 1, None));
+    let before = tree(&src);
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    assert!(p.prune_dirs.is_empty());
+    let s = apply(&p, |_| {}).unwrap();
+    assert_eq!(s.pruned_dirs, 0);
+    assert_eq!(tree(&src), before);
+}
+
+#[test]
+fn move_keeps_a_folder_with_a_left_in_place_side_file() {
+    let (src, dest) = (unique_dir("left-src"), unique_dir("left-dest"));
+    put(&src, "Box/01.flac", &track("Box", "a", 1, None));
+    put(&src, "Box/cover.jpg", b"jpg");
+    let p = plan(
+        &audio_files(&src),
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+    );
+    let s = apply(&p, |_| {}).unwrap();
+    assert_eq!(s.moved, 1);
+    assert_eq!(s.pruned_dirs, 0);
+    assert_eq!(tree(&src), set(&["Box/cover.jpg"]));
+}
+
+#[test]
+fn a_failed_move_keeps_its_folder() {
+    let (src, dest) = (unique_dir("fail-src"), unique_dir("fail-dest"));
+    put(&src, "Good/01.flac", &track("Good", "a", 1, None));
+    put(&src, "Bad/01.flac", &track("Bad", "b", 1, None));
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+        &opts(&src),
+    );
+    // A file where Bad's destination folder must go makes its move fail (the
+    // parent cannot be created) while Good/ still moves.
+    let bad = p
+        .entries
+        .iter()
+        .find(|e| rel(&src, &e.src) == "Bad/01.flac")
+        .unwrap();
+    let blocked = bad.dst.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+    std::fs::write(&blocked, b"x").unwrap();
+    let s = apply(&p, |_| {}).unwrap();
+    assert_eq!(s.failed.len(), 1, "{s:?}");
+    assert_eq!(s.moved, 1);
+    assert!(at(&src, "Bad/01.flac").exists());
+    assert!(at(&src, "Bad").exists(), "a failed move keeps its folder");
+    assert!(!at(&src, "Good").exists());
 }

@@ -4,6 +4,9 @@
 //! **idempotent** — a destination that already exists is skipped, never
 //! overwritten — so re-running a plan is safe, and a per-file error never aborts
 //! the batch (it is recorded in [`Summary::failed`] and the walk continues).
+//! After a run that moved files, it removes the plan's
+//! [`prune_dirs`](crate::OrganizePlan::prune_dirs) that are now empty
+//! (bottom-up; a non-empty folder is never touched).
 
 use std::path::PathBuf;
 
@@ -34,6 +37,10 @@ pub struct Summary {
     pub skipped: usize,
     /// Per-entry failures as `(source, error message)`; these never abort the run.
     pub failed: Vec<(PathBuf, String)>,
+    /// Source folders removed after a Move because they were left empty
+    /// ([`OrganizePlan::prune_dirs`](crate::OrganizePlan::prune_dirs)). Not
+    /// part of the per-entry tally.
+    pub pruned_dirs: usize,
 }
 
 /// Execute `plan` — the only call in this crate that mutates the filesystem.
@@ -61,6 +68,16 @@ pub fn apply(
             total,
             current: entry.src.clone(),
         });
+    }
+    // Move cleanup: `remove_dir` only ever removes an EMPTY folder, so a folder
+    // still holding a file (junk, an ambiguous album's side files, an
+    // unplanned file) survives. Errors are expected and ignored.
+    if summary.moved > 0 {
+        for dir in &plan.prune_dirs {
+            if std::fs::remove_dir(dir).is_ok() {
+                summary.pruned_dirs += 1;
+            }
+        }
     }
     Ok(summary)
 }
