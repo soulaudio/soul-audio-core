@@ -146,6 +146,10 @@ fn map_key(key: &[u8]) -> Option<Field> {
         Some(Field::OriginalDate)
     } else if key.eq_ignore_ascii_case(b"Genre") {
         Some(Field::Genre)
+    } else if key.eq_ignore_ascii_case(b"DiscSubtitle") {
+        Some(Field::DiscSubtitle)
+    } else if key.eq_ignore_ascii_case(b"MUSICBRAINZ_ALBUMID") {
+        Some(Field::MusicBrainzAlbumId)
     } else {
         None
     }
@@ -270,6 +274,39 @@ mod tests {
                 (Field::DiscNumber, "2"),
                 (Field::DiscTotal, "2"),
                 (Field::DiscTotal, "2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn apev2_disc_subtitle_and_mb_album_id() {
+        let mut v = Vec::new();
+        v.extend_from_slice(&wvpk_header(1000, 9, false));
+        v.extend_from_slice(&[0u8; 32]);
+        v.extend_from_slice(&apev2(&[
+            ("DiscSubtitle", "Sumeru"),
+            (
+                "MUSICBRAINZ_ALBUMID",
+                "0b1e5b0a-1111-4222-8333-444455556666",
+            ),
+        ]));
+        let mut src = SliceSource::new(&v);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        read_wavpack(&mut src, &mut scratch, &mut c).unwrap();
+        let got: Vec<(Field, &str)> = c
+            .fields
+            .iter()
+            .filter_map(|(f, _, v)| f.map(|f| (f, v.as_str())))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Field::DiscSubtitle, "Sumeru"),
+                (
+                    Field::MusicBrainzAlbumId,
+                    "0b1e5b0a-1111-4222-8333-444455556666"
+                ),
             ]
         );
     }

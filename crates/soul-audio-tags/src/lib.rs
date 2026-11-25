@@ -52,6 +52,9 @@ pub enum Field {
     TrackTotal,
     DiscNumber,
     DiscTotal,
+    /// Per-disc subtitle ("Mondstadt"): Vorbis/APE `DISCSUBTITLE`, ID3v2.4
+    /// `TSST`, MP4 freeform `----:com.apple.iTunes:DISCSUBTITLE`.
+    DiscSubtitle,
     /// The main release/recording date (ID3 `TDRC`/`TYER`, Vorbis `DATE`, MP4 `©day`).
     Date,
     /// The ORIGINAL release date of a reissue/remaster (ID3 `TDOR`/`TORY`,
@@ -87,6 +90,10 @@ pub enum Field {
     /// `----:com.apple.iTunes:MusicBrainz Track Id`, ID3 `UFID` owner
     /// `http://musicbrainz.org` (and the occasional `TXXX:MusicBrainz Recording Id`).
     MusicBrainzRecordingId,
+    /// The MusicBrainz **release** MBID (a UUID) — splits two releases of one
+    /// title dumped in one folder. Vorbis/APE `MUSICBRAINZ_ALBUMID`, ID3
+    /// `TXXX:MusicBrainz Album Id`, MP4 `----:com.apple.iTunes:MusicBrainz Album Id`.
+    MusicBrainzAlbumId,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

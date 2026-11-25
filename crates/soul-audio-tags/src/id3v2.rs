@@ -20,7 +20,8 @@
 
 use crate::locate;
 use crate::util::{
-    discard, map_musicbrainz_recording_key, map_replaygain_key, read_exact, utf8_prefix,
+    discard, map_musicbrainz_album_key, map_musicbrainz_recording_key, map_replaygain_key,
+    read_exact, utf8_prefix,
 };
 use crate::{DataEncoding, Field, MimeType, Picture, PictureKind, StreamFacts, TagError, TagSink};
 use embedded_io::SeekFrom;
@@ -246,6 +247,7 @@ fn map_frame_id(id: &str) -> Option<Field> {
         "TDOR" | "TORY" => Some(Field::OriginalDate),
         "TCON" | "TCO" => Some(Field::Genre),
         "TCOM" | "TCM" => Some(Field::Composer),
+        "TSST" => Some(Field::DiscSubtitle),
         _ => None,
     }
 }
@@ -480,7 +482,9 @@ fn handle_txxx<S: embedded_io::Read>(
     let rest = &body[sep + 1..];
     let vend = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
     let value = utf8_prefix(&rest[..vend]);
-    let field = map_replaygain_key(desc).or_else(|| map_musicbrainz_recording_key(desc));
+    let field = map_replaygain_key(desc)
+        .or_else(|| map_musicbrainz_recording_key(desc))
+        .or_else(|| map_musicbrainz_album_key(desc));
     sink.text(field, desc, value);
     Ok(())
 }
@@ -1340,5 +1344,32 @@ mod tests {
             .filter_map(|(f, _, v)| f.map(|f| (f, v.as_str())))
             .collect();
         assert_eq!(got, vec![(Field::DiscNumber, "2"), (Field::DiscTotal, "3")]);
+    }
+
+    #[test]
+    fn id3_tsst_and_txxx_musicbrainz_album_id() {
+        let mbid = "0b1e5b0a-1111-4222-8333-444455556666";
+        let tag = id3v24(&[text_frame_v24(b"TSST", "璃月 Liyue")]);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        read_id3v2(&mut SliceSource::new(&tag), &mut scratch, &mut c).unwrap();
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::DiscSubtitle) && v == "璃月 Liyue"),
+            "TSST -> DiscSubtitle (full UTF-8): {:?}",
+            c.fields
+        );
+
+        let tag = id3v23(&[txxx_frame("MusicBrainz Album Id", mbid)]);
+        let mut c = Collect::default();
+        read_id3v2(&mut SliceSource::new(&tag), &mut scratch, &mut c).unwrap();
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::MusicBrainzAlbumId) && v == mbid),
+            "TXXX:MusicBrainz Album Id -> MusicBrainzAlbumId: {:?}",
+            c.fields
+        );
     }
 }

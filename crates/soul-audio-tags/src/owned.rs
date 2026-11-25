@@ -54,6 +54,11 @@ pub struct Tags {
     /// MusicBrainz **recording** MBID (a UUID), if the file is tagged with one —
     /// the stable key a later enrichment pass joins on. `None` when untagged.
     pub musicbrainz_recording_id: Option<String>,
+    /// Per-disc subtitle ("Mondstadt"), first value wins. `None` when untagged.
+    pub disc_subtitle: Option<String>,
+    /// MusicBrainz **release** MBID, first value wins — part of the album
+    /// identity key (two releases of one title in one folder stay apart).
+    pub musicbrainz_album_id: Option<String>,
 }
 
 /// [`TagSink`] that collects into an owned [`Tags`].
@@ -114,6 +119,14 @@ impl TagSink for OwnedTags {
             Field::MusicBrainzRecordingId => {
                 self.tags
                     .musicbrainz_recording_id
+                    .get_or_insert_with(|| value.into());
+            }
+            Field::DiscSubtitle => {
+                self.tags.disc_subtitle.get_or_insert_with(|| value.into());
+            }
+            Field::MusicBrainzAlbumId => {
+                self.tags
+                    .musicbrainz_album_id
                     .get_or_insert_with(|| value.into());
             }
             Field::TrackNumber if self.tags.track.is_none() => {
@@ -479,5 +492,20 @@ mod tests {
         let bytes = flac_fixture(&["DISCNUMBER= 01 ", "TOTALDISCS=4"]);
         let (tags, _) = read_owned(&mut SliceSource::new(&bytes)).unwrap();
         assert_eq!((tags.disc, tags.disc_total), (Some(1), Some(4)));
+    }
+
+    #[test]
+    fn read_owned_collects_disc_subtitle_and_mb_album_id() {
+        let bytes = flac_fixture(&[
+            "DISCSUBTITLE=Mondstadt",
+            "DISCSUBTITLE=ignored second value",
+            "MUSICBRAINZ_ALBUMID=0b1e5b0a-1111-4222-8333-444455556666",
+        ]);
+        let (tags, _) = read_owned(&mut SliceSource::new(&bytes)).unwrap();
+        assert_eq!(tags.disc_subtitle.as_deref(), Some("Mondstadt"));
+        assert_eq!(
+            tags.musicbrainz_album_id.as_deref(),
+            Some("0b1e5b0a-1111-4222-8333-444455556666")
+        );
     }
 }

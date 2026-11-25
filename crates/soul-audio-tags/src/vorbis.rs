@@ -48,6 +48,8 @@ pub fn map_vorbis_key(key: &str) -> Option<Field> {
         // comment-based containers.
         crate::util::map_replaygain_key(key)
             .or_else(|| crate::util::map_musicbrainz_recording_key(key))
+            .or_else(|| crate::util::map_disc_subtitle_key(key))
+            .or_else(|| crate::util::map_musicbrainz_album_key(key))
     }
 }
 
@@ -649,5 +651,32 @@ mod tests {
         assert_eq!(map_vorbis_key("DISCTOTAL"), Some(Field::DiscTotal));
         assert_eq!(map_vorbis_key("totaldiscs"), Some(Field::DiscTotal));
         assert_eq!(map_vorbis_key("TRACKTOTAL"), Some(Field::TrackTotal));
+    }
+
+    #[test]
+    fn vorbis_disc_subtitle_and_mb_album_id() {
+        let body = comment_body(&[
+            "DISCSUBTITLE=Mondstadt",
+            "MUSICBRAINZ_ALBUMID=0b1e5b0a-1111-4222-8333-444455556666",
+        ]);
+        let mut src = SliceSource::new(&body);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        read_comment_vector(&mut src, body.len() as u32, &mut scratch, &mut c).unwrap();
+        let got: Vec<(Field, &str)> = c
+            .fields
+            .iter()
+            .filter_map(|(f, _, v)| f.map(|f| (f, v.as_str())))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Field::DiscSubtitle, "Mondstadt"),
+                (
+                    Field::MusicBrainzAlbumId,
+                    "0b1e5b0a-1111-4222-8333-444455556666"
+                ),
+            ]
+        );
     }
 }

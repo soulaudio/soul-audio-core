@@ -39,6 +39,23 @@ pub(crate) fn map_musicbrainz_recording_key(key: &str) -> Option<Field> {
     .then_some(Field::MusicBrainzRecordingId)
 }
 
+/// `DISCSUBTITLE` (VorbisComment / APE `DiscSubtitle` / MP4 freeform name),
+/// case-insensitive.
+pub(crate) fn map_disc_subtitle_key(key: &str) -> Option<Field> {
+    key.trim()
+        .eq_ignore_ascii_case("DISCSUBTITLE")
+        .then_some(Field::DiscSubtitle)
+}
+
+/// The MusicBrainz **release** id key across containers: VorbisComment/APE
+/// `MUSICBRAINZ_ALBUMID`, ID3 `TXXX` / MP4 freeform `MusicBrainz Album Id`.
+pub(crate) fn map_musicbrainz_album_key(key: &str) -> Option<Field> {
+    let k = key.trim();
+    (k.eq_ignore_ascii_case("MUSICBRAINZ_ALBUMID")
+        || k.eq_ignore_ascii_case("MusicBrainz Album Id"))
+    .then_some(Field::MusicBrainzAlbumId)
+}
+
 /// Split an `n/total` number tag (`"1/3"`, `" 05 / 12 "`) into its trimmed
 /// number and, when non-empty, its total. A bare number has no total. ID3
 /// `TRCK`/`TPOS`, VorbisComment and APE `TRACKNUMBER`/`DISCNUMBER` all use this
