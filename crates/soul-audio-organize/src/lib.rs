@@ -11,21 +11,28 @@
 //! architecture (`docs/ARCHITECTURE.md` §9). It is a std adapter: the heavy,
 //! platform-specific filesystem work lives here, never on the DAP.
 //!
-//! Task A (this layer) is **pure logic** — filename sanitization, the
-//! [`Template`] renderer, and the [`presets`] catalog. Planning a move/copy of
-//! real files and applying it (reading tags off disk, collision handling) is the
-//! IO layer added on top later.
+//! Layers: [`Template`] (pure rendering, incl. the multi-disc tokens and the
+//! [`presets`]), [`plan`]/[`plan_with`] (album-aware planning: groups inputs into
+//! albums with the importer's identity rule, plans each album's side files —
+//! logs, cues, covers, scans, lyrics — and never mutates), and [`apply`] (the
+//! only mutating call: copy/move, never overwrite, prune emptied source folders
+//! after a Move).
 #![forbid(unsafe_code)]
 #![deny(unconditional_recursion)]
 
+mod album;
 mod apply;
 mod plan;
 mod sanitize;
+mod side;
 mod tags;
 mod template;
 
 pub use apply::{Progress, Summary, apply};
-pub use plan::{Action, OrganizePlan, PlanEntry, plan};
+pub use plan::{
+    Action, EntryKind, LeftInPlace, OrganizePlan, PlanEntry, PlanOptions, SideFilesLeft, plan,
+    plan_with,
+};
 pub use template::{Template, preset, presets};
 
 /// Whether organizing a file **copies** it to the destination (leaving the

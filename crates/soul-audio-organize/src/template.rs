@@ -59,6 +59,21 @@ impl Template {
         self.render_inner(tags, src, false)
     }
 
+    /// The folder a track renders into with `{DiscDir}` forced empty — relative
+    /// to the destination root. The planner takes the common ancestor of these
+    /// over an album's tracks as the album's own folder (where side files go).
+    pub(crate) fn render_album_dir(&self, tags: &Tags, src: &Path) -> PathBuf {
+        self.render_inner(tags, src, true)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+    }
+
+    /// Whether the template lays discs out as folders (`{DiscDir}`).
+    pub(crate) fn has_disc_dir(&self) -> bool {
+        self.raw.contains("{DiscDir}")
+    }
+
     /// [`render`](Self::render), optionally forcing `{DiscDir}` empty (the
     /// planner uses that to find an album's own folder).
     pub(crate) fn render_inner(&self, tags: &Tags, src: &Path, neutral_disc_dir: bool) -> PathBuf {
@@ -326,6 +341,32 @@ mod tests {
         };
         let got = Template::new("{Artist}/{TrackNo} - {Title}").render(&tags, Path::new("noext"));
         assert_eq!(got, expect(&["A", "03 - T"]));
+    }
+
+    #[test]
+    fn neutral_disc_dir_renders_empty_and_gives_the_album_folder() {
+        let tags = disc_tags(2, Some(3));
+        let t = Template::new(preset("artist-album+disc-folders").unwrap());
+        assert_eq!(
+            t.render(&tags, Path::new("x.flac")),
+            expect(&["Unknown Artist", "Alb", "Disc 2", "05 - T.flac"])
+        );
+        assert_eq!(
+            t.render_inner(&tags, Path::new("x.flac"), true),
+            expect(&["Unknown Artist", "Alb", "05 - T.flac"]),
+            "{{DiscDir}} neutralized: the segment is dropped"
+        );
+        assert_eq!(
+            t.render_album_dir(&tags, Path::new("x.flac")),
+            expect(&["Unknown Artist", "Alb"])
+        );
+        assert!(t.has_disc_dir());
+        let flat_prefix = Template::new(preset("artist-album").unwrap());
+        assert!(!flat_prefix.has_disc_dir());
+        assert_eq!(
+            flat_prefix.render_album_dir(&tags, Path::new("x.flac")),
+            expect(&["Unknown Artist", "Alb"])
+        );
     }
 
     #[test]
