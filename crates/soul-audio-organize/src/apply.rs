@@ -61,6 +61,11 @@ pub struct Summary {
 /// is recorded in [`Summary::failed`] and the batch continues. The outer
 /// `io::Result` is reserved for a catastrophic failure; in practice this always
 /// returns `Ok(summary)`.
+///
+/// A Move renames. Only when the rename fails because the destination is on
+/// another volume does it copy instead (never over an existing file, synced
+/// and length-checked) and then remove the source; any other rename error is
+/// a failure and the source stays.
 pub fn apply(
     plan: &OrganizePlan,
     mut on_progress: impl FnMut(Progress),
@@ -127,6 +132,16 @@ fn do_copy(entry: &PlanEntry, summary: &mut Summary) {
 }
 
 fn do_move(entry: &PlanEntry, summary: &mut Summary) {
+    do_move_with(entry, summary, |src, dst| std::fs::rename(src, dst));
+}
+
+/// [`do_move`] with the rename injected (tests simulate a cross-device or a
+/// failing rename).
+fn do_move_with(
+    entry: &PlanEntry,
+    summary: &mut Summary,
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) {
     if !ensure_parent(entry, summary) {
         return;
     }
@@ -134,22 +149,62 @@ fn do_move(entry: &PlanEntry, summary: &mut Summary) {
         summary.skipped += 1;
         return;
     }
-    match std::fs::rename(&entry.src, &entry.dst) {
+    match rename(&entry.src, &entry.dst) {
         Ok(()) => summary.moved += 1,
-        // Source genuinely missing: a real failure, not a cross-device rename.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            summary.failed.push((entry.src.clone(), e.to_string()));
-        }
-        // Cross-device (or other) rename failure: fall back to copy + remove.
-        Err(_) => {
-            match std::fs::copy(&entry.src, &entry.dst)
-                .and_then(|_| std::fs::remove_file(&entry.src))
-            {
-                Ok(()) => summary.moved += 1,
+        // Another volume: copy, verify, and only then remove the source.
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            match copy_across(&entry.src, &entry.dst) {
+                Ok(()) => match std::fs::remove_file(&entry.src) {
+                    Ok(()) => summary.moved += 1,
+                    Err(e) => summary.failed.push((
+                        entry.src.clone(),
+                        format!(
+                            "copied to {} but could not remove the source: {e}",
+                            entry.dst.display()
+                        ),
+                    )),
+                },
                 Err(e) => summary.failed.push((entry.src.clone(), e.to_string())),
             }
         }
+        // Anything else (missing source, locked file, permissions, …) is a
+        // failure: the source stays where it is.
+        Err(e) => summary.failed.push((entry.src.clone(), e.to_string())),
     }
+}
+
+/// A cross-volume Move's copy: create `dst` (never over an existing file),
+/// stream `src` into it, flush it to disk and check its length against the
+/// source's. On any error the partial `dst` — only ever one this call created
+/// — is removed; the source is never touched here.
+fn copy_across(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut from = std::fs::File::open(src)?;
+    let want = from.metadata()?.len();
+    let mut to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)?;
+    let res = std::io::copy(&mut from, &mut to)
+        .and_then(|n| {
+            to.sync_all()?;
+            Ok(n)
+        })
+        .and_then(|n| {
+            let written = to.metadata()?.len();
+            if n == want && written == want {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!(
+                    "copied {written} of {want} bytes to {}",
+                    dst.display()
+                )))
+            }
+        });
+    if res.is_err() {
+        drop(to);
+        let _ = std::fs::remove_file(dst);
+    }
+    res
 }
 
 /// A rewritten cue ([`PlanEntry::rewritten`]): write `bytes` at `dst` — never
@@ -259,7 +314,7 @@ fn write_new(dst: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Progress, apply};
+    use super::{Progress, Summary, apply, do_move_with};
     use crate::cue::SourceStamp;
     use crate::{Action, EntryKind, OrganizePlan, PlanEntry, Strategy, Template, plan, presets};
     use std::path::{Path, PathBuf};
@@ -635,6 +690,86 @@ FILE \"a.flac\" WAVE
             assert_eq!(std::fs::read(&src).unwrap(), src_bytes, "source kept");
             assert_eq!(std::fs::read(&dst).unwrap(), dst_bytes, "dst untouched");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A one-entry audio Move plan `src` → `dst` (both under `dir`).
+    fn move_entry(dir: &Path) -> (PathBuf, PathBuf, PlanEntry) {
+        let src = dir.join("a.flac");
+        std::fs::write(&src, b"audio bytes").unwrap();
+        let dst = join(dir, &["out", "01 - A.flac"]);
+        let e = PlanEntry::new(&src, &dst, Action::Move, EntryKind::Audio);
+        (src, dst, e)
+    }
+
+    #[test]
+    fn a_failed_rename_that_is_not_cross_device_keeps_the_source() {
+        let dir = unique_dir("mv-denied");
+        let (src, dst, e) = move_entry(&dir);
+        let mut s = Summary::default();
+        do_move_with(&e, &mut s, |_, _| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!((s.moved, s.failed.len()), (0, 1), "{:?}", s.failed);
+        assert_eq!(std::fs::read(&src).unwrap(), b"audio bytes");
+        assert!(!dst.exists(), "no copy fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cross_device_move_copies_verifies_then_removes() {
+        let dir = unique_dir("mv-xdev");
+        let (src, dst, e) = move_entry(&dir);
+        let mut s = Summary::default();
+        do_move_with(&e, &mut s, |_, _| {
+            Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
+        });
+        assert!(s.failed.is_empty(), "{:?}", s.failed);
+        assert_eq!(s.moved, 1);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"audio bytes");
+        assert!(!src.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cross_device_move_never_overwrites_a_file_that_appeared() {
+        // Something creates dst between the exists-check and the copy.
+        let dir = unique_dir("mv-xdev-race");
+        let (src, dst, e) = move_entry(&dir);
+        let mut s = Summary::default();
+        do_move_with(&e, &mut s, |_, d| {
+            std::fs::write(d, b"someone else's").unwrap();
+            Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
+        });
+        assert_eq!((s.moved, s.failed.len()), (0, 1), "{:?}", s.failed);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"someone else's");
+        assert_eq!(std::fs::read(&src).unwrap(), b"audio bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_move_of_a_locked_source_fails_and_keeps_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = unique_dir("mv-locked");
+        let (src, dst, e) = move_entry(&dir);
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&src)
+            .unwrap();
+        let s = apply(
+            &OrganizePlan {
+                entries: vec![e],
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        drop(lock);
+        assert_eq!((s.moved, s.failed.len()), (0, 1), "{:?}", s.failed);
+        assert_eq!(std::fs::read(&src).unwrap(), b"audio bytes");
+        assert!(!dst.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
