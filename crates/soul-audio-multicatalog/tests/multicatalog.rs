@@ -140,6 +140,7 @@ fn track_input(t: &TrackData) -> TrackInput {
         channels: 2,
         file_name: t.file.into(),
         mbid: String::new(),
+        disc_subtitle: String::new(),
         loudness: None,
     }
 }
@@ -159,6 +160,8 @@ fn to_input(m: &MemberData) -> CatalogInput {
                 album_artist: *aa,
                 original_date: PackedDate::UNKNOWN,
                 release_date: PackedDate::UNKNOWN,
+                disc_count: 1,
+                mb_album_id: String::new(),
                 folder: *folder,
             })
             .collect(),
@@ -205,6 +208,8 @@ fn to_union(ms: &[MemberData]) -> CatalogInput {
                 album_artist: *aa + artist_base,
                 original_date: PackedDate::UNKNOWN,
                 release_date: PackedDate::UNKNOWN,
+                disc_count: 1,
+                mb_album_id: String::new(),
                 folder: *folder + folder_base,
             });
         }
@@ -440,6 +445,7 @@ fn merge_orders_albums_chronologically_across_sources() {
                 channels: 2,
                 file_name: format!("{track}.flac"),
                 mbid: String::new(),
+                disc_subtitle: String::new(),
                 loudness: None,
             }],
             artists: vec![artist.into()],
@@ -450,6 +456,8 @@ fn merge_orders_albums_chronologically_across_sources() {
                 album_artist: 0,
                 original_date: PackedDate::from_year(year),
                 release_date: PackedDate::from_year(year),
+                disc_count: 1,
+                mb_album_id: String::new(),
                 folder: 1,
             }],
             folders: vec![
@@ -508,6 +516,7 @@ fn merge_orders_artists_by_sort_name_across_sources() {
                 channels: 2,
                 file_name: format!("{track}.flac"),
                 mbid: String::new(),
+                disc_subtitle: String::new(),
                 loudness: None,
             }],
             artists: vec![artist.into()],
@@ -518,6 +527,8 @@ fn merge_orders_artists_by_sort_name_across_sources() {
                 album_artist: 0,
                 original_date: PackedDate::UNKNOWN,
                 release_date: PackedDate::UNKNOWN,
+                disc_count: 1,
+                mb_album_id: String::new(),
                 folder: 1,
             }],
             folders: vec![
@@ -586,6 +597,7 @@ fn merge_orders_tracks_by_genre_across_sources() {
                 channels: 2,
                 file_name: format!("{track}.flac"),
                 mbid: String::new(),
+                disc_subtitle: String::new(),
                 loudness: None,
             }],
             artists: vec!["Artist".into()],
@@ -596,6 +608,8 @@ fn merge_orders_tracks_by_genre_across_sources() {
                 album_artist: 0,
                 original_date: PackedDate::UNKNOWN,
                 release_date: PackedDate::UNKNOWN,
+                disc_count: 1,
+                mb_album_id: String::new(),
                 folder: 1,
             }],
             folders: vec![

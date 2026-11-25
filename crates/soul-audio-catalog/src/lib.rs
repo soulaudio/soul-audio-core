@@ -92,6 +92,10 @@ pub struct TrackRec {
     /// Baked R128 loudness, `Some` iff the track was analyzed ([`FLAG_HAS_LOUDNESS`] in
     /// [`Self::flags`]); `None` otherwise. (New in format v6.)
     pub loudness: Option<LoudnessRec>,
+    /// Per-disc subtitle ("Mondstadt"), a heap ref — the tag, else the
+    /// `Disc N - Subtitle` folder's text; empty `StrRef` when neither. Tracks of
+    /// one disc share one heap string. (New in format v8.)
+    pub disc_subtitle: StrRef,
 }
 
 /// Tier-1 folder record. `path` is the folder's location **relative to the card
@@ -182,6 +186,13 @@ pub struct AlbumRec {
     pub release_date: PackedDate,
     pub folder: FolderId,
     pub art_id: u32,
+    /// Number of discs: `max(max disc-total tag, max disc number seen, 1)`.
+    /// `0` only in a `Default` value; a baked album is always ≥ 1. (New in
+    /// format v8.)
+    pub disc_count: u16,
+    /// MusicBrainz **release** MBID, a heap ref (empty when untagged) — part of
+    /// the album identity key. (New in format v8.)
+    pub mb_album_id: StrRef,
 }
 
 /// Browse axes the desktop pre-sorts into order tables. The DAP (and desktop

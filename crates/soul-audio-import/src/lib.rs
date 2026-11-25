@@ -297,6 +297,8 @@ impl Interner {
             original_date,
             release_date,
             folder,
+            disc_count: 1,
+            mb_album_id: String::new(),
         });
         self.album_dirs.push(dir.to_owned());
         self.album_tracks.push(track_path.to_owned());
@@ -477,6 +479,7 @@ fn build_catalog(raw: &[RawTrack], root: &Path) -> CatalogInput {
             channels: r.channels,
             file_name: r.file_name.clone(),
             mbid: r.mbid.clone(),
+            disc_subtitle: String::new(),
             // Loudness is a deferred Tier-2 analysis pass (full decode), not the metadata scan.
             loudness: None,
         });

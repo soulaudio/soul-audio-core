@@ -38,20 +38,26 @@
 //!   68  string_heap_len         u32
 //!   72  locator_order_off       u32   (abs)  (v7)
 //!
-//! TRACK RECORD (85 B, fixed; `record[i]` at records_off + i*85):
+//! TRACK RECORD (91 B, fixed; `record[i]` at records_off + i*91):
 //!    0 id u32 · 4 title.off u32 · 8 title.len u16 · 10 artist u32 ·
 //!   14 album u32 · 18 album_artist u32 · 22 genre u32 · 26 folder u32 ·
 //!   30 track_no u16 · 32 disc_no u16 · 34 duration_ms u32 · 38 sample_rate u32 ·
 //!   42 channels u8 · 43 art_id u32 · 47 flags u16 · 49 extended_off u32 ·
 //!   53 file_name.off u32 · 57 file_name.len u16 · 59 mbid.off u32 ·
 //!   63 mbid.len u16 · 65 loudness: integrated_lufs f32 · 69 lra f32 ·
-//!   73 true_peak_dbtp f32 · 77 plr f32 · 81 dr f32
-//!   (mbid new in v4; loudness new in v6, valid iff flags & FLAG_HAS_LOUDNESS)
+//!   73 true_peak_dbtp f32 · 77 plr f32 · 81 dr f32 ·
+//!   85 disc_subtitle.off u32 · 89 disc_subtitle.len u16
+//!   (mbid new in v4; loudness new in v6, valid iff flags & FLAG_HAS_LOUDNESS;
+//!    disc_subtitle new in v8 — appended, `(0,0)` = none, one heap string per
+//!    distinct value)
 //!
-//! ALBUM RECORD (30 B, fixed; indexed by dense album id):
+//! ALBUM RECORD (38 B, fixed; indexed by dense album id):
 //!    0 id u32 · 4 title.off u32 · 8 title.len u16 · 10 album_artist u32 ·
-//!   14 original_date u32 · 18 release_date u32 · 22 folder u32 · 26 art_id u32
-//!   (original_date/release_date are PackedDate; year u16 replaced in format v5)
+//!   14 original_date u32 · 18 release_date u32 · 22 folder u32 · 26 art_id u32 ·
+//!   30 disc_count u16 · 32 mb_album_id.off u32 · 36 mb_album_id.len u16
+//!   (original_date/release_date are PackedDate, v5; disc_count/mb_album_id
+//!    new in v8 — appended; `folder` is the album ROOT folder, so the tracks of
+//!    `Album/CD1` + `Album/CD2` share one album)
 //!
 //! ARTIST NAME TABLE: artist_count × StrRef (6 B: off u32, len u16), indexed by
 //!   artist id; each resolves to the artist's display name in the string heap.
@@ -113,7 +119,7 @@ use soul_audio_core::SeekSource;
 /// Magic at the head of `index.sidx` — `"SIDX"`.
 pub const MAGIC: [u8; 4] = *b"SIDX";
 /// Format version in the header.
-pub const FORMAT_VERSION: u16 = 7;
+pub const FORMAT_VERSION: u16 = 8;
 
 const HEADER_SIZE: usize = 76; // +4 for the v7 locator_order_off
 
@@ -170,8 +176,17 @@ fn cmp_locator_key(query: &[u8], folder_path: &[u8], file_name: &[u8]) -> core::
         Ordering::Equal
     }
 }
-const RECORD_SIZE: usize = 85; // 65 (v5) + 5×f32 loudness (v6)
-const ALBUM_RECORD_SIZE: usize = 30;
+const RECORD_SIZE: usize = 91; // 65 (v5) + 5×f32 loudness (v6) + disc_subtitle StrRef (v8)
+const ALBUM_RECORD_SIZE: usize = 38; // 30 (v5) + disc_count u16 + mb_album_id StrRef (v8)
+/// v8 appended-field offsets. The compile-time checks pin them to the record
+/// ends, so an append that forgets to grow a record (or an insert that shifts
+/// them) fails to build.
+const TRACK_DISC_SUBTITLE_OFF: usize = 85;
+const ALBUM_DISC_COUNT_OFF: usize = 30;
+const ALBUM_MB_ID_OFF: usize = 32;
+const _: () = assert!(TRACK_DISC_SUBTITLE_OFF + 6 == RECORD_SIZE);
+const _: () = assert!(ALBUM_DISC_COUNT_OFF + 2 == ALBUM_MB_ID_OFF);
+const _: () = assert!(ALBUM_MB_ID_OFF + 6 == ALBUM_RECORD_SIZE);
 const ARTIST_REF_SIZE: usize = 6; // StrRef (off u32, len u16) per artist
 const GENRE_REF_SIZE: usize = 6; // StrRef (off u32, len u16) per genre
 const FOLDER_RECORD_SIZE: usize = 10; // path StrRef (6) + parent u32 (4)
@@ -414,6 +429,10 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
                 plr: le_f32(&r, 77),
                 dr: le_f32(&r, 81),
             }),
+            disc_subtitle: StrRef {
+                off: le_u32(&r, TRACK_DISC_SUBTITLE_OFF),
+                len: le_u16(&r, TRACK_DISC_SUBTITLE_OFF + 4),
+            },
         })
     }
 
@@ -437,6 +456,11 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
             release_date: PackedDate(le_u32(&r, 18)),
             folder: le_u32(&r, 22),
             art_id: le_u32(&r, 26),
+            disc_count: le_u16(&r, ALBUM_DISC_COUNT_OFF),
+            mb_album_id: StrRef {
+                off: le_u32(&r, ALBUM_MB_ID_OFF),
+                len: le_u16(&r, ALBUM_MB_ID_OFF + 4),
+            },
         })
     }
 
@@ -590,7 +614,7 @@ pub mod build {
         ALBUM_DIR_ENTRY, ALBUM_RECORD_SIZE, ARTIST_REF_SIZE, AXIS_COUNT, FOLDER_RECORD_SIZE,
         FORMAT_VERSION, GENRE_REF_SIZE, HEADER_SIZE, MAGIC, PLAYLIST_DIR_ENTRY, RECORD_SIZE,
     };
-    use alloc::{string::String, vec, vec::Vec};
+    use alloc::{collections::BTreeMap, string::String, vec, vec::Vec};
     use core::cmp::Ordering;
 
     /// One track to bake into the index. `artist`/`album`/`folder` are dense ids
@@ -613,6 +637,9 @@ pub mod build {
         pub file_name: String,
         /// MusicBrainz recording MBID, or empty when the file carried none. (v4)
         pub mbid: String,
+        /// Per-disc subtitle ("Mondstadt"), or empty. Interned once per distinct
+        /// value. (v8)
+        pub disc_subtitle: String,
         /// Baked R128 loudness, `Some` iff this track has been analyzed. (v6)
         pub loudness: Option<soul_audio_catalog::LoudnessRec>,
     }
@@ -639,6 +666,11 @@ pub mod build {
         /// else `PackedDate::UNKNOWN`; baked at offset 18 of the album record (v5).
         pub release_date: soul_audio_catalog::PackedDate,
         pub folder: u32,
+        /// Number of discs (`max(disc totals, disc numbers, 1)`); the baker floors
+        /// `0` to `1`. (v8)
+        pub disc_count: u16,
+        /// MusicBrainz release MBID, or empty. (v8)
+        pub mb_album_id: String,
     }
 
     /// One playlist (lives inside the index — decision §8).
@@ -675,6 +707,25 @@ pub mod build {
         let off = heap.len() as u32;
         heap.extend_from_slice(s.as_bytes());
         (off, s.len() as u16)
+    }
+
+    /// Intern `s` once per distinct value — every track of a disc repeats its
+    /// subtitle, so they share one heap string. The empty string is the
+    /// canonical `(0, 0)` ref (it never touches the heap).
+    fn intern_shared(
+        heap: &mut Vec<u8>,
+        memo: &mut BTreeMap<String, (u32, u16)>,
+        s: &str,
+    ) -> (u32, u16) {
+        if s.is_empty() {
+            return (0, 0);
+        }
+        if let Some(&r) = memo.get(s) {
+            return r;
+        }
+        let r = intern(heap, s);
+        memo.insert(String::from(s), r);
+        r
     }
 
     /// Artist `i`'s sort-name: the tagged sort-name when present and non-empty,
@@ -783,6 +834,18 @@ pub mod build {
             .playlists
             .iter()
             .map(|p| intern(&mut heap, &p.name))
+            .collect();
+        // v8: per-disc subtitles + MB release ids, deduplicated (a 30-track
+        // disc costs one string); empty → (0, 0).
+        let mut shared: BTreeMap<String, (u32, u16)> = BTreeMap::new();
+        let track_subtitles: Vec<(u32, u16)> = tracks
+            .iter()
+            .map(|t| intern_shared(&mut heap, &mut shared, &t.disc_subtitle))
+            .collect();
+        let album_mb_ids: Vec<(u32, u16)> = input
+            .albums
+            .iter()
+            .map(|a| intern_shared(&mut heap, &mut shared, &a.mb_album_id))
             .collect();
 
         // Per-album track runs (sorted disc/track). A track with an out-of-range
@@ -971,6 +1034,7 @@ pub mod build {
 
         // --- Track records ---
         for (i, t) in tracks.iter().enumerate() {
+            let rec_start = out.len();
             let (toff, tlen) = track_titles[i];
             let (foff, flen) = track_file_names[i];
             out.extend_from_slice(&(i as u32).to_le_bytes());
@@ -1007,11 +1071,16 @@ pub mod build {
             out.extend_from_slice(&l.true_peak_dbtp.to_le_bytes());
             out.extend_from_slice(&l.plr.to_le_bytes());
             out.extend_from_slice(&l.dr.to_le_bytes());
+            let (soff, slen) = track_subtitles[i];
+            out.extend_from_slice(&soff.to_le_bytes()); // disc_subtitle.off @85 (v8)
+            out.extend_from_slice(&slen.to_le_bytes()); // disc_subtitle.len @89 (v8)
+            debug_assert_eq!(out.len() - rec_start, RECORD_SIZE);
         }
         debug_assert_eq!(out.len(), albums_off);
 
         // --- Album records (real titles from the albums table) ---
         for (a, meta) in input.albums.iter().enumerate() {
+            let rec_start = out.len();
             let (toff, tlen) = album_titles[a];
             out.extend_from_slice(&(a as u32).to_le_bytes());
             out.extend_from_slice(&toff.to_le_bytes());
@@ -1024,6 +1093,11 @@ pub mod build {
             out.extend_from_slice(&meta.folder.to_le_bytes());
             let art_id = album_art_id.get(a).copied().unwrap_or(0);
             out.extend_from_slice(&art_id.to_le_bytes()); // art_id
+            out.extend_from_slice(&meta.disc_count.max(1).to_le_bytes()); // @30 (v8)
+            let (moff, mlen) = album_mb_ids[a];
+            out.extend_from_slice(&moff.to_le_bytes()); // mb_album_id.off @32 (v8)
+            out.extend_from_slice(&mlen.to_le_bytes()); // mb_album_id.len @36 (v8)
+            debug_assert_eq!(out.len() - rec_start, ALBUM_RECORD_SIZE);
         }
         debug_assert_eq!(out.len(), artists_off);
 

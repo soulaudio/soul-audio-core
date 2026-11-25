@@ -34,6 +34,7 @@ fn fixture() -> CatalogInput {
                 channels: 2,
                 file_name: "01 - Aria.flac".into(),
                 mbid: String::new(),
+                disc_subtitle: String::new(),
                 loudness: None,
             },
             TrackInput {
@@ -50,6 +51,7 @@ fn fixture() -> CatalogInput {
                 channels: 2,
                 file_name: "02 - Variatio 1.flac".into(),
                 mbid: String::new(),
+                disc_subtitle: String::new(),
                 loudness: None,
             },
         ],
@@ -61,6 +63,8 @@ fn fixture() -> CatalogInput {
             album_artist: 0,
             original_date: PackedDate::new(1973, 8, 7),
             release_date: PackedDate::from_year(2015),
+            disc_count: 1,
+            mb_album_id: String::new(),
             folder: 1,
         }],
         // Folder 0 = root (empty path, no parent); folder 1 = the album dir.
@@ -109,6 +113,7 @@ fn soulidx_resolves_locators_by_normalized_card_relative_key() {
         channels: 2,
         file_name: "RootSong.flac".into(),
         mbid: String::new(),
+        disc_subtitle: String::new(),
         loudness: None,
     }); // id 2
     let bytes = write_index(&input);
@@ -254,6 +259,7 @@ fn baked_title_order_is_collation_sorted() {
             channels: 2,
             file_name: format!("{t}.flac"),
             mbid: String::new(),
+            disc_subtitle: String::new(),
             loudness: None,
         })
         .collect();
@@ -267,6 +273,8 @@ fn baked_title_order_is_collation_sorted() {
             album_artist: 0,
             original_date: PackedDate::UNKNOWN,
             release_date: PackedDate::UNKNOWN,
+            disc_count: 1,
+            mb_album_id: String::new(),
             folder: 0,
         }],
         folders: vec![FolderInput {
@@ -330,6 +338,7 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
                 channels: 2,
                 file_name: "a.flac".into(),
                 mbid: String::new(),
+                disc_subtitle: String::new(),
                 loudness: None,
             },
             TrackInput {
@@ -346,6 +355,7 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
                 channels: 2,
                 file_name: "b.flac".into(),
                 mbid: String::new(),
+                disc_subtitle: String::new(),
                 loudness: None,
             },
         ],
@@ -358,6 +368,8 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
                 album_artist: 0,
                 original_date: PackedDate::from_year(2020),
                 release_date: PackedDate::from_year(2020),
+                disc_count: 1,
+                mb_album_id: String::new(),
                 folder: 0,
             },
             AlbumMeta {
@@ -365,6 +377,8 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
                 album_artist: 0,
                 original_date: PackedDate::from_year(2021),
                 release_date: PackedDate::from_year(2021),
+                disc_count: 1,
+                mb_album_id: String::new(),
                 folder: 0,
             },
         ],
@@ -435,6 +449,7 @@ fn artist_album_track_orders_by_sort_name() {
                 channels: 2,
                 file_name: "eno.flac".into(),
                 mbid: String::new(),
+                disc_subtitle: String::new(),
                 loudness: None,
             },
             TrackInput {
@@ -451,6 +466,7 @@ fn artist_album_track_orders_by_sort_name() {
                 channels: 2,
                 file_name: "clapton.flac".into(),
                 mbid: String::new(),
+                disc_subtitle: String::new(),
                 loudness: None,
             },
         ],
@@ -463,6 +479,8 @@ fn artist_album_track_orders_by_sort_name() {
                 album_artist: 0,
                 original_date: PackedDate::from_year(1974),
                 release_date: PackedDate::from_year(1974),
+                disc_count: 1,
+                mb_album_id: String::new(),
                 folder: 0,
             },
             AlbumMeta {
@@ -470,6 +488,8 @@ fn artist_album_track_orders_by_sort_name() {
                 album_artist: 1,
                 original_date: PackedDate::from_year(1977),
                 release_date: PackedDate::from_year(1977),
+                disc_count: 1,
+                mb_album_id: String::new(),
                 folder: 0,
             },
         ],
@@ -524,6 +544,7 @@ fn artist_sort_name_falls_back_to_display_when_untagged() {
             channels: 2,
             file_name: "t.flac".into(),
             mbid: String::new(),
+            disc_subtitle: String::new(),
             loudness: None,
         }],
         artists: vec!["Miles Davis".into()],
@@ -534,6 +555,8 @@ fn artist_sort_name_falls_back_to_display_when_untagged() {
             album_artist: 0,
             original_date: PackedDate::from_year(1959),
             release_date: PackedDate::from_year(1959),
+            disc_count: 1,
+            mb_album_id: String::new(),
             folder: 0,
         }],
         folders: vec![FolderInput {
@@ -574,6 +597,7 @@ fn baked_genre_order_groups_by_genre_collation() {
             channels: 2,
             file_name: format!("{title}.flac"),
             mbid: String::new(),
+            disc_subtitle: String::new(),
             loudness: None,
         }
     }
@@ -591,6 +615,8 @@ fn baked_genre_order_groups_by_genre_collation() {
             album_artist: 0,
             original_date: PackedDate::from_year(2000),
             release_date: PackedDate::from_year(2000),
+            disc_count: 1,
+            mb_album_id: String::new(),
             folder: 0,
         }],
         folders: vec![FolderInput {
@@ -650,8 +676,8 @@ fn loudness_fields_round_trip() {
 
     assert_eq!(
         soul_audio_index::FORMAT_VERSION,
-        7,
-        "record widened for loudness"
+        8,
+        "v8: disc subtitle / disc count / MB release id appended"
     );
     assert_eq!(
         rdr.track(0).unwrap().loudness,
@@ -663,4 +689,81 @@ fn loudness_fields_round_trip() {
         None,
         "un-analyzed track reads None"
     );
+}
+
+/// v8: the per-disc subtitle (track) and disc count + MusicBrainz release id
+/// (album) round-trip; a subtitle shared by several tracks is ONE heap string;
+/// every pre-v8 field still reads back from its unchanged offset.
+#[test]
+fn v8_disc_fields_round_trip_and_share_heap_strings() {
+    let mbid = "0b1e5b0a-1111-4222-8333-444455556666";
+    let mut input = fixture();
+    input.tracks[0].disc_subtitle = "Mondstadt".into();
+    input.tracks[1].disc_subtitle = "Mondstadt".into();
+    input.tracks[0].mbid = "rec-mbid".into();
+    input.albums[0].disc_count = 2;
+    input.albums[0].mb_album_id = mbid.into();
+    let bytes = write_index(&input);
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+    let mut buf = [0u8; 64];
+
+    let t0 = rdr.track(0).unwrap();
+    let t1 = rdr.track(1).unwrap();
+    assert_eq!(resolve(&rdr, t0.disc_subtitle, &mut buf), "Mondstadt");
+    assert_eq!(
+        t0.disc_subtitle, t1.disc_subtitle,
+        "one heap string per distinct subtitle"
+    );
+    let a = rdr.album(0).unwrap();
+    assert_eq!(a.disc_count, 2);
+    assert_eq!(resolve(&rdr, a.mb_album_id, &mut buf), mbid);
+
+    // Append-only: v7 fields at their old offsets are untouched.
+    assert_eq!(resolve(&rdr, t0.title, &mut buf), "Aria");
+    assert_eq!(resolve(&rdr, t0.file_name, &mut buf), "01 - Aria.flac");
+    assert_eq!(resolve(&rdr, t0.mbid, &mut buf), "rec-mbid");
+    assert_eq!((t0.track_no, t0.disc_no, t0.duration_ms), (1, 1, 299_520));
+    assert_eq!(t0.loudness, None);
+    assert_eq!(resolve(&rdr, a.title, &mut buf), "Open Goldberg Variations");
+    assert_eq!(a.original_date, PackedDate::new(1973, 8, 7));
+    assert_eq!(a.release_date, PackedDate::from_year(2015));
+    assert_eq!((a.folder, a.art_id), (1, 0));
+}
+
+/// Untagged v8 fields are the canonical empty ref `(0, 0)`, and a `0` disc
+/// count is floored to 1 by the baker.
+#[test]
+fn v8_untagged_disc_fields_are_empty_and_disc_count_is_at_least_one() {
+    let mut input = fixture();
+    input.albums[0].disc_count = 0;
+    let bytes = write_index(&input);
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+    let t0 = rdr.track(0).unwrap();
+    assert_eq!(t0.disc_subtitle, soul_audio_catalog::StrRef::default());
+    let a = rdr.album(0).unwrap();
+    assert_eq!(a.disc_count, 1);
+    assert_eq!(a.mb_album_id, soul_audio_catalog::StrRef::default());
+}
+
+/// The header's section offsets prove the v8 record strides: 91 B per track,
+/// 38 B per album.
+#[test]
+fn v8_record_strides() {
+    let bytes = write_index(&fixture()); // 2 tracks, 1 album
+    let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize;
+    let (records_off, albums_off, artists_off) = (u32_at(32), u32_at(36), u32_at(40));
+    assert_eq!(albums_off - records_off, 2 * 91, "TRACK RECORD is 91 B");
+    assert_eq!(artists_off - albums_off, 38, "ALBUM RECORD is 38 B");
+}
+
+/// The reader is exact-match on the version: a v7 file reads as an empty
+/// catalog (the desktop re-bakes), never as garbage.
+#[test]
+fn a_v7_file_reads_as_empty() {
+    let mut bytes = write_index(&fixture());
+    bytes[4..6].copy_from_slice(&7u16.to_le_bytes());
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+    assert_eq!(rdr.track_count(), 0);
+    assert_eq!(rdr.album_count(), 0);
+    assert!(rdr.track(0).is_err());
 }
