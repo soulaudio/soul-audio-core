@@ -13,6 +13,7 @@
 //! already-opened decoders via [`load`](Deck::load) / [`preload`](Deck::preload).
 
 use crate::decoder::{DecodeError, SeekableDecoder};
+use crate::dsp::Chain;
 use crate::model::{SampleFormat, SourceCodec, StreamInfo};
 use crate::resample::{Quality, ResampleError, Resampler};
 use crate::sink::{Sink, SinkError};
@@ -53,6 +54,9 @@ pub struct DecodeInfo {
     /// ([`Sink::modifies_samples`](crate::sink::Sink::modifies_samples)) — an
     /// active DSP decorator the deck cannot see past.
     pub sink_modifies: bool,
+    /// Whether the deck's own DSP chain ([`Deck::dsp`]) has an active stage.
+    /// `false` for an empty chain, an all-flat one, or a master-bypassed one.
+    pub dsp_active: bool,
 }
 
 impl DecodeInfo {
@@ -90,6 +94,7 @@ impl DecodeInfo {
             || self.gain_applied
             || self.channel_mapped
             || self.sink_modifies
+            || self.dsp_active
         {
             return false;
         }
@@ -305,6 +310,13 @@ pub struct Deck<K, D, const PRELOAD: usize> {
     in_buf: [i32; IN_FIFO * MAX_CH],
     rs_buf: [i32; BLOCK * MAX_CH],
     out_buf: [i32; BLOCK * MAX_CH],
+    /// This output's DSP chain, run on each finished output block (see
+    /// [`dsp`](crate::dsp)). Empty by default, and skipped entirely while
+    /// inactive — which is what keeps a bypassed chain bit-exact.
+    dsp: Chain,
+    /// `f32` working copy of one output block for the DSP chain. Only touched
+    /// while the chain is active.
+    dsp_buf: [f32; BLOCK * MAX_CH],
 }
 
 impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
@@ -328,6 +340,8 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             in_buf: [0; IN_FIFO * MAX_CH],
             rs_buf: [0; BLOCK * MAX_CH],
             out_buf: [0; BLOCK * MAX_CH],
+            dsp: Chain::new(),
+            dsp_buf: [0.0; BLOCK * MAX_CH],
         }
     }
 
@@ -766,6 +780,11 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         // Arm the seek de-click fade-in (re-arming overwrites any in-flight fade),
         // so `produce_block` ramps the first post-seek frames up from zero.
         track.fade_remaining = fade_len;
+        // A seek is a discontinuity: clear the DSP stages' filter state so the
+        // pre-seek tail cannot ring into the landing point. (A gapless track
+        // swap is NOT a discontinuity — the audio is continuous there, so the
+        // chain's state deliberately carries across it.)
+        self.dsp.reset();
         // The `track` borrow of `self.current` ends above; drop the sink's
         // already-buffered pre-seek audio so the landing point is heard promptly
         // instead of after the old buffer drains.
@@ -777,6 +796,21 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
     #[must_use]
     pub fn state(&self) -> DeckState {
         self.state
+    }
+
+    /// This output's DSP chain — the ordered, bypassable stages run on each
+    /// output block after decode/resample/downmix and before the sink. One
+    /// chain per deck, i.e. per output.
+    #[must_use]
+    pub fn dsp(&self) -> &Chain {
+        &self.dsp
+    }
+
+    /// The DSP chain, mutably: add/remove/reorder stages, configure one, or
+    /// bypass the lot. Changes take effect on the next block — stages are
+    /// configuration, not audio, so there is nothing to synchronize.
+    pub fn dsp_mut(&mut self) -> &mut Chain {
+        &mut self.dsp
     }
 
     /// Borrow the output sink (e.g. to query its stream info).
@@ -825,6 +859,7 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             gain_applied: t.rg_linear != 1.0 || self.volume != 1.0,
             channel_mapped: !matches!(t.map, Map::Passthrough),
             sink_modifies: self.sink.modifies_samples(),
+            dsp_active: self.dsp.is_active(),
         })
     }
 
@@ -973,8 +1008,25 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         }
         // Persist the fade progress for the next block (a fade can span several).
         self.current.as_mut().unwrap().fade_remaining = fade_remaining;
+        // DSP chain (EQ / crossfeed / …), on the finished output block. Skipped
+        // whole while inactive — stages, conversion and all — so a bypassed
+        // chain costs nothing and is a bit-exact passthrough.
+        let n = out_frames * sink_ch;
+        if self.dsp.is_active() {
+            for (dst, &src) in self.dsp_buf[..n].iter_mut().zip(&self.out_buf[..n]) {
+                *dst = src as f32;
+            }
+            self.dsp
+                .process(&mut self.dsp_buf[..n], sink_ch, self.sink_rate);
+            for (dst, &src) in self.out_buf[..n].iter_mut().zip(&self.dsp_buf[..n]) {
+                // Same round-half-away-from-zero + hard clamp as the output
+                // stage above: a stage's boost clips rather than wrapping.
+                let r = if src >= 0.0 { src + 0.5 } else { src - 0.5 };
+                *dst = r.clamp(-CANONICAL_MAX - 1.0, CANONICAL_MAX) as i32;
+            }
+        }
         self.sink
-            .write(&self.out_buf[..out_frames * sink_ch])
+            .write(&self.out_buf[..n])
             .map_err(DeckError::Sink)?;
         Ok(finished)
     }
@@ -2220,6 +2272,166 @@ mod tests {
         let c = run_rg(100, 100, Some(-1000.0));
         let d = run_rg(100, 100, Some(-60.0));
         assert_eq!(c, d, "attenuation clamps to -60 dB");
+    }
+
+    // --- the DSP chain in the deck ---------------------------------------
+
+    /// A non-flat biquad — enough to make the EQ stage active and audibly
+    /// change the block (the coefficient *design* lives outside core).
+    fn non_flat_band() -> crate::eq::Biquad {
+        crate::eq::Biquad::new(1.5, -0.5, 0.1, -0.4, 0.05)
+    }
+
+    fn eq_stage(active: bool) -> crate::dsp::Stage {
+        let mut st = crate::dsp::EqStage::new();
+        if active {
+            st.equalizer_mut().set_band(0, non_flat_band());
+        }
+        crate::dsp::Stage::Eq(st)
+    }
+
+    /// Play a 24-bit ramp (norm = 1, so the deck's arithmetic is the identity)
+    /// through a stereo deck whose chain is configured by `setup`.
+    fn run_with_dsp(setup: impl FnOnce(&mut crate::dsp::Chain)) -> Vec<i32> {
+        let sink = MockSink {
+            rate: 48_000,
+            ch: 2,
+            written: Vec::new(),
+            last_volume: None,
+        };
+        let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
+        setup(deck.dsp_mut());
+        deck.load(ConstDecoder {
+            rate: 48_000,
+            ch: 2,
+            bits: 24,
+            value: 100_000,
+            frames: 1_000,
+            pos: 0,
+        })
+        .unwrap();
+        run(&mut deck);
+        deck.sink.written
+    }
+
+    /// The headline property of the chain: **bypass is bit-exact**. An empty
+    /// chain, a chain holding a flat stage, and a master-bypassed chain holding
+    /// an active one must each produce output identical — sample for sample —
+    /// to no chain at all. Anything else (an `i32`→`f32`→`i32` round trip left
+    /// switched on, say) would quietly cost every listener their bit-perfect
+    /// path.
+    #[test]
+    fn a_bypassed_dsp_chain_is_bit_identical() {
+        let plain = run_with_dsp(|_| {});
+        assert!(!plain.is_empty());
+        assert_eq!(
+            plain,
+            run_with_dsp(|c| {
+                c.push(eq_stage(false));
+            }),
+            "a flat stage must be bit-identical"
+        );
+        assert_eq!(
+            plain,
+            run_with_dsp(|c| {
+                c.push(eq_stage(true));
+                c.set_bypass_all(true);
+            }),
+            "a master-bypassed chain must be bit-identical"
+        );
+    }
+
+    /// An active stage actually processes the deck's output — and the result is
+    /// still bounded (the chain's write-back clamps exactly like the output
+    /// stage, so a stage's boost clips rather than wrapping).
+    #[test]
+    fn an_active_dsp_stage_processes_the_output_and_stays_clamped() {
+        let plain = run_with_dsp(|_| {});
+        let eqd = run_with_dsp(|c| {
+            c.push(eq_stage(true));
+        });
+        assert_eq!(eqd.len(), plain.len(), "the chain must not change length");
+        assert_ne!(plain, eqd, "an active stage must change the audio");
+        assert!(
+            eqd.iter()
+                .all(|&s| s >= -(CANONICAL_MAX as i32) - 1 && s <= CANONICAL_MAX as i32),
+            "the chain's write-back must clamp to the canonical range"
+        );
+    }
+
+    /// The chain is a term of the bit-perfect verdict, and the signal path can
+    /// list which stages are active.
+    #[test]
+    fn an_active_dsp_chain_costs_the_bit_perfect_claim() {
+        let mut deck = bp_deck(44_100, 2, INT24, true, false);
+        deck.load(bp_track(24, 44_100, 2)).unwrap();
+        assert!(deck.decode_info().unwrap().bit_perfect());
+
+        deck.dsp_mut().push(eq_stage(true));
+        let di = deck.decode_info().unwrap();
+        assert!(di.dsp_active);
+        assert!(!di.bit_perfect(), "an active DSP stage is not bit-perfect");
+
+        let mut kinds = [crate::dsp::StageKind::Eq; crate::dsp::MAX_STAGES];
+        assert_eq!(deck.dsp().active_kinds(&mut kinds), 1);
+        assert_eq!(kinds[0], crate::dsp::StageKind::Eq);
+
+        // Bypassing it restores the claim without discarding the configuration.
+        deck.dsp_mut().set_bypass_all(true);
+        let di = deck.decode_info().unwrap();
+        assert!(!di.dsp_active);
+        assert!(di.bit_perfect(), "a bypassed chain is bit-perfect again");
+        assert_eq!(deck.dsp().len(), 1, "the stage is still configured");
+    }
+
+    /// A seek clears the stages' filter state: the pre-seek tail must not ring
+    /// into the landing point. (A gapless track swap deliberately does **not**
+    /// reset — the audio is continuous there, so the filters should carry.)
+    ///
+    /// Compared as "played-then-seeked vs immediately-seeked": both decks seek
+    /// to frame 0, so both have the de-click fade armed, the same resampler
+    /// state and the same decoder position. The *only* thing that can differ is
+    /// the DSP chain's biquad history — so the blocks match iff the seek reset
+    /// it.
+    #[test]
+    fn a_seek_resets_the_dsp_chain_state() {
+        let deck_with = |warmup: usize| {
+            let sink = MockSink {
+                rate: 48_000,
+                ch: 2,
+                written: Vec::new(),
+                last_volume: None,
+            };
+            let mut deck: Deck<_, _, 1> = Deck::new(sink, Quality::Fast);
+            deck.dsp_mut().push(eq_stage(true));
+            deck.load(RampDecoder {
+                ch: 2,
+                frames: 40_000,
+                pos: 0,
+                delay: 0,
+                playable: None,
+            })
+            .unwrap();
+            for _ in 0..warmup {
+                deck.pump().unwrap();
+            }
+            deck.seek(0).unwrap();
+            let before = deck.sink.written.len();
+            deck.pump().unwrap();
+            deck.sink.written[before..].to_vec()
+        };
+        // 8 blocks of real audio leave the biquads with substantial history.
+        let played_then_seeked = deck_with(8);
+        let seeked_immediately = deck_with(0);
+        assert!(
+            played_then_seeked.iter().any(|&s| s != 0),
+            "the compared block must contain real audio"
+        );
+        assert_eq!(
+            played_then_seeked, seeked_immediately,
+            "a seek must reset the chain, so the landing block cannot depend on \
+             what played before it"
+        );
     }
 
     // --- the bit-perfect verdict -----------------------------------------

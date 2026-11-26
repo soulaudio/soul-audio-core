@@ -15,6 +15,7 @@ pub mod decoder;
 pub mod demux;
 pub mod dispatch;
 pub mod dsd;
+pub mod dsp;
 pub mod eq;
 pub mod formats;
 pub mod io;

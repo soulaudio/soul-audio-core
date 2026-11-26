@@ -193,6 +193,182 @@ fn an_inactive_chain_is_identity_even_just_inside_the_tolerance() {
     );
 }
 
+/// Guarantee 2b: the **runtime chain in the deck** keeps the same implication,
+/// end to end through a real `Deck` rather than over a bare buffer.
+///
+/// `soul_audio_core::dsp::Chain` is where the bit-exact claim is now most
+/// easily lost by composition: the deck hands it a block, it converts `i32` →
+/// `f32` → `i32` around whatever stages it holds, and every one of those steps
+/// is a chance to perturb the low bits. The contract is that an **inactive**
+/// chain — empty, holding a flat stage, or master-bypassed while holding a
+/// boosting one — leaves the sink's samples untouched, bit for bit, and that
+/// `DecodeInfo` never claims bit-perfect while a stage is running.
+#[test]
+fn an_inactive_deck_dsp_chain_is_identity_and_an_active_one_is_declared() {
+    use soul_audio_core::dsp::{Chain, EqStage, Stage};
+    use soul_audio_core::{
+        Deck, Decoder, Progress, Quality, SampleFormat, SeekableDecoder, Sink, SinkError,
+        StreamInfo,
+    };
+
+    /// A 24-bit source whose samples are a deterministic xorshift pattern —
+    /// non-trivial low bits, so any perturbation shows (a tone would mask it).
+    /// 24-bit means the deck's normalization is the identity.
+    struct NoisyDecoder {
+        pos: u64,
+        frames: u64,
+        ch: usize,
+    }
+    impl NoisyDecoder {
+        fn sample(i: u64) -> i32 {
+            let mut x = (i as u32).wrapping_mul(2_654_435_761).max(1);
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            // Into ±(2^22), well clear of the clamp so a boost cannot clip and
+            // make the active-vs-inactive comparison trivial.
+            (x % 8_388_608) as i32 - 4_194_304
+        }
+    }
+    impl Decoder for NoisyDecoder {
+        fn stream_info(&self) -> StreamInfo {
+            StreamInfo {
+                sample_rate: 48_000,
+                channels: self.ch as u16,
+                format: SampleFormat::Int { bits: 24 },
+            }
+        }
+        fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, soul_audio_core::DecodeError> {
+            let want = ((out.len() / self.ch) as u64).min(self.frames - self.pos) as usize;
+            for f in 0..want {
+                for c in 0..self.ch {
+                    out[f * self.ch + c] = Self::sample((self.pos + f as u64) * 2 + c as u64);
+                }
+            }
+            self.pos += want as u64;
+            Ok(want * self.ch)
+        }
+    }
+    impl SeekableDecoder for NoisyDecoder {
+        fn seek_to(&mut self, s: u64) -> Result<u64, soul_audio_core::DecodeError> {
+            self.pos = s.min(self.frames);
+            Ok(self.pos)
+        }
+        fn total_frames(&self) -> Option<u64> {
+            Some(self.frames)
+        }
+    }
+
+    /// An exclusive 48 kHz / 24-bit capturing sink — exclusive and rate-matched
+    /// so the *only* thing that can cost bit-perfection is the DSP chain.
+    struct CaptureSink {
+        written: Vec<i32>,
+    }
+    impl Sink for CaptureSink {
+        fn stream_info(&self) -> StreamInfo {
+            StreamInfo {
+                sample_rate: 48_000,
+                channels: 2,
+                format: SampleFormat::Int { bits: 24 },
+            }
+        }
+        fn exclusive(&self) -> bool {
+            true
+        }
+        fn write(&mut self, frames: &[i32]) -> Result<(), SinkError> {
+            self.written.extend_from_slice(frames);
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), SinkError> {
+            Ok(())
+        }
+    }
+
+    /// A clearly audible band, as real coefficients from the shared designer.
+    fn boosting_band() -> soul_audio_core::eq::Biquad {
+        let band = Band {
+            kind: BandKind::Peaking,
+            freq: 1_000.0,
+            gain_db: 9.0,
+            q: 0.7,
+            enabled: true,
+        };
+        soul_audio_dsp::design(&band, 48_000.0)
+    }
+
+    /// Render the same source through a deck configured by `setup`, returning
+    /// the captured samples and the bit-perfect verdict reported while playing.
+    fn render(setup: impl FnOnce(&mut Chain)) -> (Vec<i32>, bool) {
+        let mut deck: Deck<CaptureSink, NoisyDecoder, 0> = Deck::new(
+            CaptureSink {
+                written: Vec::new(),
+            },
+            Quality::Hq,
+        );
+        setup(deck.dsp_mut());
+        deck.load(NoisyDecoder {
+            pos: 0,
+            frames: 4_096,
+            ch: 2,
+        })
+        .expect("load");
+        let declared = deck.decode_info().expect("decode info").bit_perfect();
+        for _ in 0..10_000 {
+            match deck.pump() {
+                Ok(Progress::Ended | Progress::Idle) => break,
+                Ok(_) => {}
+                Err(e) => panic!("pump: {e:?}"),
+            }
+        }
+        (deck.sink().written.clone(), declared)
+    }
+
+    let (plain, plain_bp) = render(|_| {});
+    assert!(!plain.is_empty(), "the reference render produced no audio");
+    assert!(
+        plain_bp,
+        "an exclusive, rate-matched, unprocessed path must report bit-perfect"
+    );
+
+    // A stage that is present but flat.
+    let (flat, flat_bp) = render(|chain| {
+        chain.push(Stage::Eq(EqStage::new()));
+    });
+    assert_eq!(
+        plain, flat,
+        "a flat stage in the chain must leave every sample untouched"
+    );
+    assert!(flat_bp, "a flat stage must not cost the bit-perfect claim");
+
+    // A boosting stage with the master bypass engaged.
+    let (bypassed, bypassed_bp) = render(|chain| {
+        let mut stage = EqStage::new();
+        stage.equalizer_mut().set_band(0, boosting_band());
+        chain.push(Stage::Eq(stage));
+        chain.set_bypass_all(true);
+    });
+    assert_eq!(
+        plain, bypassed,
+        "a master-bypassed chain must leave every sample untouched"
+    );
+    assert!(bypassed_bp, "bypass-all must restore the bit-perfect claim");
+
+    // The converse: a running stage must both change the audio and be declared.
+    let (active, active_bp) = render(|chain| {
+        let mut stage = EqStage::new();
+        stage.equalizer_mut().set_band(0, boosting_band());
+        chain.push(Stage::Eq(stage));
+    });
+    assert_ne!(
+        plain, active,
+        "an active stage that changes nothing would make every bypass test vacuous"
+    );
+    assert!(
+        !active_bp,
+        "processing while still reporting bit-perfect is the lie this file exists to catch"
+    );
+}
+
 /// Guarantee 5a: AutoEQ **text** is a LOSSY interchange format — pinned, so it is
 /// a known property rather than a surprise.
 ///
