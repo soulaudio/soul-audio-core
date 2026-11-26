@@ -1,3 +1,12 @@
+<!-- Theme-aware Soul Audio mark: white-bodied on GitHub's dark theme, dark-bodied
+     on light. Uses GitHub's #gh-*-mode-only fragments, hidden/shown by CSS keyed on
+     GitHub's OWN theme (data-color-mode), rather than <picture>/prefers-color-scheme:
+     fingerprint-resistant browsers (LibreWolf, Tor) force prefers-color-scheme to
+     light, leaving the dark mark on a dark page. The shared mark lives in
+     soul-player-ng. -->
+<img alt="Soul Audio" src="https://raw.githubusercontent.com/soulaudio/soul-player-ng/main/app/icons/icon.png#gh-dark-mode-only" width="84" height="84">
+<img alt="Soul Audio" src="https://raw.githubusercontent.com/soulaudio/soul-player-ng/main/app/icons/icon-light.png#gh-light-mode-only" width="84" height="84">
+
 # soul-audio-core
 
 A cross-platform, **`no_std` / no-alloc / `forbid(unsafe_code)`** audio
