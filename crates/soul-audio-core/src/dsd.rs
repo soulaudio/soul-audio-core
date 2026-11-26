@@ -52,6 +52,17 @@ impl<D: DsdDecoder> DopAdapter<D> {
         }
     }
 
+    /// Total output DoP frames, if the inner DSD decoder declares its length.
+    /// One DoP frame carries 16 DSD samples per channel, so this is the inner
+    /// per-channel sample count divided by 16 (a trailing partial group is
+    /// dropped, matching [`Self::load_group`]). `None` for a length-unknown
+    /// source. Lets the deck report a DoP track's duration and gives the
+    /// gapless trim a length to work with.
+    #[must_use]
+    pub fn total_frames(&self) -> Option<u64> {
+        self.inner.total_samples().map(|s| s / 16)
+    }
+
     /// Read the next DoP frame's `2*C` DSD bytes (t0 row then t1 row) into
     /// `self.group`. Returns `false` at end of stream (an incomplete trailing
     /// group is dropped).
@@ -95,6 +106,12 @@ impl<D: DsdDecoder + DsdSeek> DopAdapter<D> {
 }
 
 impl<D: DsdDecoder> Decoder for DopAdapter<D> {
+    /// DoP hands the DAC the file's own DSD bits, repacked but unaltered —
+    /// the one PCM-shaped path that is still bit-exact DSD.
+    fn dsd_passthrough(&self) -> bool {
+        true
+    }
+
     fn stream_info(&self) -> StreamInfo {
         let si = self.inner.stream_info();
         // DoP carries 16 DSD bits per frame → frame rate = bit rate / 16.

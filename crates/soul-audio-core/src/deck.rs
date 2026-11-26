@@ -57,6 +57,10 @@ pub struct DecodeInfo {
     /// Whether the deck's own DSP chain ([`Deck::dsp`]) has an active stage.
     /// `false` for an empty chain, an all-flat one, or a master-bypassed one.
     pub dsp_active: bool,
+    /// For a **DSD** source: whether the decoder hands the device the file's
+    /// DSD bits untouched (DoP), rather than decimated PCM. See
+    /// [`Decoder::dsd_passthrough`](crate::decoder::Decoder::dsd_passthrough).
+    pub dsd_passthrough: bool,
 }
 
 impl DecodeInfo {
@@ -84,9 +88,13 @@ impl DecodeInfo {
     /// it would be noise rather than information about the configured path.
     #[must_use]
     pub fn bit_perfect(&self) -> bool {
-        // DSD arrives decimated — the samples the device gets are not the ones
-        // in the file, however pristine the rest of the chain is.
-        if matches!(self.source, SampleFormat::Dsd { .. }) {
+        // A DSD source is bit-perfect only on the DoP path, which repacks the
+        // file's 1-bit stream into carrier words without altering a sample. A
+        // *decimated* DSD source is not: the device gets a conversion, however
+        // pristine the rest of the chain is. (The remaining terms still apply —
+        // DoP through a mixer, a volume multiply or a resampler is not merely
+        // imperfect, it is noise: the markers would be rewritten.)
+        if matches!(self.source, SampleFormat::Dsd { .. }) && !self.dsd_passthrough {
             return false;
         }
         if !self.exclusive
@@ -116,6 +124,9 @@ impl DecodeInfo {
         };
         let decoded_bits = match self.decoded.format {
             SampleFormat::Int { bits } | SampleFormat::Float { bits } => u32::from(bits),
+            // A decoder handing the deck raw DSD is not on this PCM path at
+            // all (native DSD goes straight to the device); DoP arrives as the
+            // 24-bit carrier, which is the `Int` arm above.
             SampleFormat::Dsd { .. } => return false,
         };
         decoded_bits <= device_bits.min(CANONICAL_BITS as u32)
@@ -860,6 +871,7 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             channel_mapped: !matches!(t.map, Map::Passthrough),
             sink_modifies: self.sink.modifies_samples(),
             dsp_active: self.dsp.is_active(),
+            dsd_passthrough: t.decoder.dsd_passthrough(),
         })
     }
 
@@ -2575,6 +2587,76 @@ mod tests {
         // Nothing loaded: there is no signal path to call bit-perfect.
         let deck = bp_deck(44_100, 2, INT24, true, false);
         assert!(deck.decode_info().is_none());
+    }
+
+    /// **DoP is bit-perfect; decimated DSD is not.** A DoP path hands the DAC
+    /// the file's own 1-bit stream, repacked into 24-bit carrier words without
+    /// altering a sample, so an exclusive device at the carrier rate with no
+    /// gain, no resampling and no DSP really is delivering the file. A
+    /// *decimated* DSD source on the identical chain is a conversion and must
+    /// never claim otherwise.
+    #[test]
+    fn dop_is_bit_perfect_but_decimated_dsd_is_not() {
+        /// A stand-in for the two DSD adapters: PCM out, a DSD *source*, and
+        /// the passthrough flag the DoP framer sets.
+        struct DsdSource {
+            passthrough: bool,
+        }
+        impl Decoder for DsdSource {
+            fn stream_info(&self) -> StreamInfo {
+                StreamInfo {
+                    sample_rate: 176_400, // the DSD64 DoP carrier
+                    channels: 2,
+                    format: SampleFormat::Int { bits: 24 },
+                }
+            }
+            fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {
+                out.fill(0);
+                Ok(out.len())
+            }
+            fn source_format(&self) -> SampleFormat {
+                SampleFormat::Dsd {
+                    rate: crate::model::DsdRate::Dsd64,
+                }
+            }
+            fn dsd_passthrough(&self) -> bool {
+                self.passthrough
+            }
+        }
+        impl SeekableDecoder for DsdSource {
+            fn seek_to(&mut self, s: u64) -> Result<u64, DecodeError> {
+                Ok(s)
+            }
+            fn total_frames(&self) -> Option<u64> {
+                Some(10_000)
+            }
+        }
+
+        let verdict = |passthrough: bool| {
+            let mut deck: Deck<_, DsdSource, 1> = Deck::new(
+                BpSink {
+                    rate: 176_400, // the device opened at the carrier rate
+                    ch: 2,
+                    format: INT24,
+                    exclusive: true,
+                    modifies: false,
+                },
+                Quality::Fast,
+            );
+            deck.load(DsdSource { passthrough }).unwrap();
+            let di = deck.decode_info().unwrap();
+            (di.bit_perfect(), di.dsd_passthrough)
+        };
+        assert_eq!(
+            verdict(true),
+            (true, true),
+            "DoP on an exclusive device at the carrier rate is bit-perfect"
+        );
+        assert_eq!(
+            verdict(false),
+            (false, false),
+            "decimated DSD is a conversion, never bit-perfect"
+        );
     }
 
     /// A float device is not a reduction: a 24-bit integer sample is exact in
