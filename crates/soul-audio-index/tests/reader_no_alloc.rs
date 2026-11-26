@@ -49,6 +49,7 @@ fn v8_reader_reads_disc_fields_without_allocating() {
             mbid: String::new(),
             disc_subtitle: "Mondstadt".into(),
             loudness: None,
+            cue_range: None,
         }],
         artists: vec!["HOYO-MiX".into()],
         artist_sorts: Vec::new(),

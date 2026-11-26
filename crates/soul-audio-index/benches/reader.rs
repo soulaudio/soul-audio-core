@@ -138,6 +138,7 @@ fn synth(n: u32) -> CatalogInput {
                 mbid: String::new(),
                 disc_subtitle: String::new(),
                 loudness: None,
+                cue_range: None,
             }
         })
         .collect();

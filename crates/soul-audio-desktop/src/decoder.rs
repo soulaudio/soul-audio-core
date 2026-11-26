@@ -203,6 +203,35 @@ pub fn open_seekable_src<R: Read + Seek + Send + 'static>(reader: R) -> Result<O
     build_owned_decoder(boxed, "stream")
 }
 
+/// Open `path` and present only frames `start .. start + frames` of it — the
+/// playable form of a **cue-sheet track**.
+///
+/// A single-file album's tracks all carry the same `file_name` plus their own
+/// slice ([`TrackRec::cue_range`](soul_audio_catalog::TrackRec::cue_range), as
+/// the index bakes it); this turns one such record into a decoder whose
+/// position 0 is the track's first frame and whose end is the track's end. The
+/// deck, its gapless preload, seeking and the duration display then work on it
+/// unchanged — the swap from one cue track to the next is sample-exact, with no
+/// device reset and no re-seek.
+///
+/// `frames: None` runs to the end of the file (a sheet's last track when the
+/// file's length is unknown). For an ordinary whole-file track, use
+/// [`open_track`]: wrapping it in a full-file range would work but costs a seek
+/// and says something less clear.
+///
+/// # Errors
+/// As [`open_track`], plus a decoder that cannot seek (a range of an unseekable
+/// stream is not playable).
+pub fn open_track_range(
+    path: &Path,
+    start: u64,
+    frames: Option<u64>,
+) -> Result<soul_audio_core::SubRange<OwnedDecoder>> {
+    let inner = open_track(path)?;
+    soul_audio_core::SubRange::new(inner, start, frames)
+        .map_err(|e| anyhow!("sub-range of {}: {e:?}", path.display()))
+}
+
 /// Shared probe → match → build body for [`open_track`] and
 /// [`open_seekable_src`], so the two entry points can never drift: `label` is
 /// only used to name the source in error messages (a path for the former, a
@@ -475,5 +504,56 @@ mod tests {
             "OwnedDecoder grew to {size} bytes — bump the CLI/driver worker \
              thread stack sizes (and this bound) if that's intentional"
         );
+    }
+
+    /// A cue track's slice, through the desktop entry point a host calls with
+    /// a catalog record's `cue_range`: position 0 is the track's first frame,
+    /// the length is the track's, and the decode stops at the slice's end
+    /// rather than running into the next track's audio.
+    #[test]
+    fn open_track_range_plays_only_its_slice() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../testdata/tone.flac");
+                // The whole file first, as the reference.
+                let mut whole = open_track(&path).expect("open whole");
+                let total = whole.total_frames().expect("tone.flac declares a length");
+                let mut all = Vec::new();
+                let mut buf = vec![0i32; 4096];
+                loop {
+                    let n = whole.decode_into(&mut buf).expect("decode");
+                    if n == 0 {
+                        break;
+                    }
+                    all.extend_from_slice(&buf[..n]);
+                }
+
+                // A slice from the middle: 0.4 s in, 0.8 s long, at 44.1 kHz.
+                let (start, frames) = (17_640u64, 35_280u64);
+                assert!(start + frames < total);
+                let mut slice = open_track_range(&path, start, Some(frames)).expect("open range");
+                assert_eq!(slice.total_frames(), Some(frames), "the track's length");
+                let ch = usize::from(slice.stream_info().channels);
+                let mut got = Vec::new();
+                loop {
+                    let n = slice.decode_into(&mut buf).expect("decode slice");
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                }
+                assert_eq!(got.len(), frames as usize * ch, "exactly the slice");
+                let from = start as usize * ch;
+                assert_eq!(
+                    got,
+                    all[from..from + got.len()],
+                    "the slice must be the file's own frames for that range"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("range thread panicked");
     }
 }

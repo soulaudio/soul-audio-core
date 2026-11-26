@@ -98,6 +98,35 @@ pub struct TrackRec {
     /// (a `MultiCatalog` re-packs the offset with the source, so an empty ref
     /// from source >= 1 has a non-zero `off`). (New in format v8.)
     pub disc_subtitle: StrRef,
+    /// For a **cue-sheet track**: the first audio frame of this track inside
+    /// `file_name`, which several tracks of a single-file album share. `0` for
+    /// an ordinary whole-file track. (New in format v9.)
+    pub cue_start_frames: u32,
+    /// For a **cue-sheet track**: the track's length in audio frames inside
+    /// `file_name`. **`0` means "not a cue track"** — play the whole file —
+    /// which is unambiguous because a zero-length track carries no audio.
+    /// (New in format v9.)
+    pub cue_frames: u32,
+}
+
+impl TrackRec {
+    /// This track's slice of its file, as `(start_frame, frames)` — `Some` only
+    /// for a cue-sheet track, `None` for an ordinary one (play the whole file).
+    ///
+    /// Feed it to `soul_audio_core::SubRange` and a single-file album plays as
+    /// separate, sample-accurate, gapless tracks.
+    #[must_use]
+    pub fn cue_range(&self) -> Option<(u64, u64)> {
+        (self.cue_frames != 0)
+            .then(|| (u64::from(self.cue_start_frames), u64::from(self.cue_frames)))
+    }
+
+    /// Whether this record is one track of a cue-sheet (single-file) album,
+    /// i.e. it shares its file with others.
+    #[must_use]
+    pub fn is_cue_track(&self) -> bool {
+        self.cue_frames != 0
+    }
 }
 
 /// Tier-1 folder record. `path` is the folder's location **relative to the card

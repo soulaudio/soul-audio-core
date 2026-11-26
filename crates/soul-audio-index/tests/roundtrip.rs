@@ -36,6 +36,7 @@ fn fixture() -> CatalogInput {
                 mbid: String::new(),
                 disc_subtitle: String::new(),
                 loudness: None,
+                cue_range: None,
             },
             TrackInput {
                 title: "Variatio 1".into(),
@@ -53,6 +54,7 @@ fn fixture() -> CatalogInput {
                 mbid: String::new(),
                 disc_subtitle: String::new(),
                 loudness: None,
+                cue_range: None,
             },
         ],
         artists: vec!["Kimiko Ishizaka".into()],
@@ -115,6 +117,7 @@ fn soulidx_resolves_locators_by_normalized_card_relative_key() {
         mbid: String::new(),
         disc_subtitle: String::new(),
         loudness: None,
+        cue_range: None,
     }); // id 2
     let bytes = write_index(&input);
     let rdr = IndexReader::new(SliceSource::new(&bytes));
@@ -261,6 +264,7 @@ fn baked_title_order_is_collation_sorted() {
             mbid: String::new(),
             disc_subtitle: String::new(),
             loudness: None,
+            cue_range: None,
         })
         .collect();
     let input = CatalogInput {
@@ -340,6 +344,7 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
                 mbid: String::new(),
                 disc_subtitle: String::new(),
                 loudness: None,
+                cue_range: None,
             },
             TrackInput {
                 title: "Uncovered Track".into(),
@@ -357,6 +362,7 @@ fn bakes_cover_art_into_blob_and_assigns_art_id() {
                 mbid: String::new(),
                 disc_subtitle: String::new(),
                 loudness: None,
+                cue_range: None,
             },
         ],
         artists: vec!["Artist".into()],
@@ -451,6 +457,7 @@ fn artist_album_track_orders_by_sort_name() {
                 mbid: String::new(),
                 disc_subtitle: String::new(),
                 loudness: None,
+                cue_range: None,
             },
             TrackInput {
                 title: "clapton_track".into(),
@@ -468,6 +475,7 @@ fn artist_album_track_orders_by_sort_name() {
                 mbid: String::new(),
                 disc_subtitle: String::new(),
                 loudness: None,
+                cue_range: None,
             },
         ],
         artists: vec!["Brian Eno".into(), "Eric Clapton".into()],
@@ -546,6 +554,7 @@ fn artist_sort_name_falls_back_to_display_when_untagged() {
             mbid: String::new(),
             disc_subtitle: String::new(),
             loudness: None,
+            cue_range: None,
         }],
         artists: vec!["Miles Davis".into()],
         artist_sorts: Vec::new(),
@@ -599,6 +608,7 @@ fn baked_genre_order_groups_by_genre_collation() {
             mbid: String::new(),
             disc_subtitle: String::new(),
             loudness: None,
+            cue_range: None,
         }
     }
     let input = CatalogInput {
@@ -676,8 +686,8 @@ fn loudness_fields_round_trip() {
 
     assert_eq!(
         soul_audio_index::FORMAT_VERSION,
-        8,
-        "v8: disc subtitle / disc count / MB release id appended"
+        9,
+        "v9: the cue-sheet track slice appended"
     );
     assert_eq!(
         rdr.track(0).unwrap().loudness,
@@ -748,20 +758,64 @@ fn v8_untagged_disc_fields_are_empty_and_disc_count_is_at_least_one() {
 /// The header's section offsets prove the v8 record strides: 91 B per track,
 /// 38 B per album.
 #[test]
-fn v8_record_strides() {
+fn v9_record_strides() {
     let bytes = write_index(&fixture()); // 2 tracks, 1 album
     let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize;
     let (records_off, albums_off, artists_off) = (u32_at(32), u32_at(36), u32_at(40));
-    assert_eq!(albums_off - records_off, 2 * 91, "TRACK RECORD is 91 B");
+    assert_eq!(albums_off - records_off, 2 * 99, "TRACK RECORD is 99 B");
     assert_eq!(artists_off - albums_off, 38, "ALBUM RECORD is 38 B");
 }
 
-/// The reader is exact-match on the version: a v7 file reads as an empty
-/// catalog (the desktop re-bakes), never as garbage.
+/// v9: a cue-sheet track's slice of its file round-trips, and an ordinary
+/// track reads back as "not a cue track" rather than as a zero-length slice.
+///
+/// Several cue tracks share one `file_name`; what tells them apart is this
+/// pair, so it has to survive the bake exactly — an off-by-one here splits an
+/// album in the wrong places.
 #[test]
-fn a_v7_file_reads_as_empty() {
+fn v9_cue_track_slices_round_trip() {
+    let mut input = fixture();
+    // Track 0 is the second track of a single-file album; track 1 is ordinary.
+    input.tracks[0].cue_range = Some((9 * 60 * 44_100, 8 * 60 * 44_100));
+    input.tracks[1].cue_range = None;
+    let bytes = write_index(&input);
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+
+    let t0 = rdr.track(0).unwrap();
+    assert_eq!(t0.cue_start_frames, 9 * 60 * 44_100);
+    assert_eq!(t0.cue_frames, 8 * 60 * 44_100);
+    assert!(t0.is_cue_track());
+    assert_eq!(
+        t0.cue_range(),
+        Some((9 * 60 * 44_100, 8 * 60 * 44_100)),
+        "the pair a SubRange decoder is built from"
+    );
+
+    let t1 = rdr.track(1).unwrap();
+    assert_eq!((t1.cue_start_frames, t1.cue_frames), (0, 0));
+    assert!(!t1.is_cue_track());
+    assert_eq!(
+        t1.cue_range(),
+        None,
+        "an ordinary track plays its whole file"
+    );
+
+    // A cue track at the very start of the file is still a cue track: the
+    // length is what distinguishes them, not the offset.
+    input.tracks[1].cue_range = Some((0, 1_000));
+    let bytes = write_index(&input);
+    let rdr = IndexReader::new(SliceSource::new(&bytes));
+    assert_eq!(rdr.track(1).unwrap().cue_range(), Some((0, 1_000)));
+}
+
+/// The reader is exact-match on the version: an older file reads as an empty
+/// catalog (the desktop re-bakes), never as garbage. v8 is the interesting one
+/// now — its records are 8 bytes shorter, so a lenient reader would walk off
+/// the stride and hand back scrambled tracks.
+#[test]
+fn an_older_file_reads_as_empty() {
     let mut bytes = write_index(&fixture());
-    bytes[4..6].copy_from_slice(&7u16.to_le_bytes());
+    bytes[4..6].copy_from_slice(&8u16.to_le_bytes());
     let rdr = IndexReader::new(SliceSource::new(&bytes));
     assert_eq!(rdr.track_count(), 0);
     assert_eq!(rdr.album_count(), 0);
