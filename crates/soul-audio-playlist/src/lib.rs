@@ -11,6 +11,11 @@
 //! caller-resolved entries; this crate never touches the filesystem or a live
 //! library itself.
 //!
+//! The [`cue`] module parses `.cue` sheets: a cue sheet is a playlist over one
+//! audio file, so it lives here, and its [`CueFile::ranges`](cue::CueFile::ranges)
+//! turns index points into the audio-frame ranges a sub-range decoder plays
+//! gaplessly.
+//!
 //! This crate is `no_std` + `alloc`. The optional `serde` feature derives
 //! (de)serialization for the locator/snapshot/playlist types (with `alloc`,
 //! no `std`), so a host can persist a playlist (e.g. to TOML) and the DAP can
@@ -22,6 +27,8 @@
 extern crate alloc;
 
 mod cover;
+/// `.cue` sheet parsing — a single-file album as sample-accurate tracks.
+pub mod cue;
 mod locator;
 mod model;
 mod resolve;
