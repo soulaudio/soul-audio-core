@@ -15,7 +15,6 @@ on:
       - "crates/soul-audio-desktop/**"
       - "crates/soul-audio-core/src/sink.rs"
       - "crates/soul-audio-core/src/convert.rs"
-      - "ci/hal-profile-device/**"
       - ".github/workflows/ci-macos-audio.yml"
       - "Cargo.lock"
   pull_request:
@@ -23,7 +22,6 @@ on:
       - "crates/soul-audio-desktop/**"
       - "crates/soul-audio-core/src/sink.rs"
       - "crates/soul-audio-core/src/convert.rs"
-      - "ci/hal-profile-device/**"
       - ".github/workflows/ci-macos-audio.yml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -189,7 +187,8 @@ jobs:
           --test coreaudio_exclusive_suite --
           --ignored --nocapture --test-threads=1
 
-  # SoulProfile: our own libASPL HAL plug-in (ci/hal-profile-device) impersonating device
+  # SoulProfile: our own libASPL HAL plug-in (crates/soul-audio-desktop/tests/fixtures/hal-profile-device)
+  # impersonating device
   # classes BlackHole can't — INTEGER physical formats (BlackHole is Float32-only, so the
   # HAL's float → int conversion on the exclusive path is otherwise never exercised) and a
   # fixed-rate sink. Each device loops its output back to an input stream, so the
@@ -210,7 +209,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.3
 
       - name: Build SoulProfile.driver (libASPL, ad-hoc signed)
-        run: ci/hal-profile-device/build.sh "$RUNNER_TEMP/profile"
+        run: crates/soul-audio-desktop/tests/fixtures/hal-profile-device/build.sh "$RUNNER_TEMP/profile"
 
       - name: Install it and restart coreaudiod
         run: |
