@@ -47,23 +47,30 @@
 //!
 //! # How a host runs it
 //!
-//! [`Convolver`] implements [`DspStage`], so it processes blocks exactly like
-//! the EQ and crossfeed stages — but it is **generic over its storage**, and
-//! [`Stage`](super::Stage) (the chain's slot enum) is not: a chain slot is an
-//! inline value, and this stage's filter is a megabyte that has to come from
-//! the caller. So today a host runs the convolver where it already runs
-//! block DSP that owns memory — as a sink decorator, reporting
-//! [`Sink::modifies_samples`](crate::sink::Sink::modifies_samples) while it is
-//! active so the bit-perfect claim
-//! ([`DecodeInfo::bit_perfect`](crate::deck::DecodeInfo::bit_perfect)) stays
-//! honest — with a `Vec<f32>` on the desktop and a `StaticCell` slice on the
-//! DAP.
+//! [`Convolver`] is a [`Stage::Convolver`](super::Stage::Convolver) like any
+//! other, so it is ordered against the EQ and crossfeed, bypassed with them,
+//! and reported in [`Chain::active_kinds`](super::Chain::active_kinds). Because
+//! its filter is caller memory, the chain — and therefore
+//! [`Deck`](crate::deck::Deck) — carries the storage type:
 //!
-//! Putting it *inside* [`Chain`](super::Chain) — so it can be reordered against
-//! the EQ and crossfeed — means giving the chain (and therefore [`Deck`](crate::deck::Deck))
-//! a storage type parameter. That is a deliberate API change to make on its
-//! own, not a side effect of landing the engine; [`StageKind::Convolver`]
-//! already exists so a signal path can name the stage either way.
+//! ```ignore
+//! // Desktop: a Vec backs the filter.
+//! let mut deck: Deck<CpalSink, OwnedDecoder, 1, Vec<f32>> = Deck::new(sink, Quality::Hq);
+//! let mut conv = Convolver::new(vec![0.0; storage_len(ir.len(), 2)]);
+//! conv.set_impulse_response(&ir, 2)?;
+//! deck.dsp_mut().push(Stage::Convolver(conv));
+//! ```
+//!
+//! The parameter **defaults to [`NoStorage`](super::NoStorage)**, so every deck
+//! that hosts no convolver is written exactly as before (`Deck<K, D, PRELOAD>`)
+//! and pays nothing. On that default storage
+//! [`set_impulse_response`](Convolver::set_impulse_response) declines with
+//! [`ConvolveError::StorageTooSmall`] rather than pretending to work — the
+//! stage stays inactive and the chain stays a passthrough.
+//!
+//! A host may equally run it as a sink decorator (reporting
+//! [`Sink::modifies_samples`](crate::sink::Sink::modifies_samples)); in the
+//! chain it additionally gets the ordering and the shared bypass.
 
 use super::{DspStage, StageKind};
 
@@ -235,6 +242,7 @@ enum Mode {
 /// regardless of how the caller chunks the stream, which is what makes the
 /// output independent of the block size; a host that cares (lip sync, an A/B
 /// against the unprocessed path) compensates by that many frames.
+#[derive(Clone, Debug)]
 pub struct Convolver<P> {
     storage: P,
     mode: Mode,
