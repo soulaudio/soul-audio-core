@@ -838,3 +838,40 @@ fn existing_destination_files_are_never_overwritten() {
         let _ = std::fs::remove_dir_all(&dest);
     }
 }
+
+/// `Disc CD 0N <subtitle>` folders (doubled prefix, CJK subtitles) are disc
+/// folders: one album, one destination folder — never "Album (2)".
+#[test]
+fn doubled_prefix_disc_folders_plan_into_one_album_folder() {
+    let src = unique_dir("cdcd-src");
+    let dest = unique_dir("cdcd-dest");
+    for (n, sub) in [
+        (1, "Sakura and Violet Thunder  稻光与雷樱的土地"),
+        (2, "Stories of the Floating World 浮世之枯荣"),
+        (3, "Battles of Inazuma 稻妻征战记"),
+    ] {
+        put(
+            &src,
+            &format!("Inazuma/Disc CD 0{n} {sub}/01 Song.flac"),
+            &track("Inazuma", &format!("Song {n}"), 1, Some(&format!("{n}/3"))),
+        );
+    }
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &Template::new(preset("artist-album").unwrap()),
+        Strategy::Copy,
+        &PlanOptions::new(&src),
+    );
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    let out = tree(&dest);
+    assert_eq!(out.len(), 3, "{out:?}");
+    assert!(
+        out.iter().all(|r| r.starts_with("HOYO-MiX/Inazuma/")),
+        "{out:?}"
+    );
+    assert!(!out.iter().any(|r| r.contains("(2)")), "{out:?}");
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dest);
+}
