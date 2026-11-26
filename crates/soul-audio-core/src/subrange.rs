@@ -118,6 +118,12 @@ impl<D: SeekableDecoder> Decoder for SubRange<D> {
     /// of stream (`Ok(0)`) even though the inner decoder has more audio — that
     /// is the whole point: the next cue track's samples belong to the next
     /// track.
+    ///
+    /// Only whole frames are emitted, so an `out` shorter than one frame yields
+    /// `Ok(0)` — the same thing every decoder in this crate does with a
+    /// sub-frame buffer, and indistinguishable from end-of-stream. Callers size
+    /// their buffers in frames (the deck's are `BLOCK · channels`); a caller
+    /// that does not would read the range as empty.
     fn decode_into(&mut self, out: &mut [i32]) -> Result<usize, DecodeError> {
         let channels = usize::from(self.stream_info().channels).max(1);
         let cap = match self.remaining() {
@@ -436,6 +442,72 @@ mod tests {
         );
     }
 
+    /// Randomized property check: for **any** split of a stream into
+    /// consecutive ranges, read back in **any** chunk sizes, the concatenation
+    /// is the stream — every frame once, in order. That is the whole contract a
+    /// cue album rests on, and it is the kind of thing a handful of fixed cases
+    /// can pass while an off-by-one in the length bookkeeping survives.
+    #[test]
+    fn random_splits_and_chunkings_always_tile_the_stream() {
+        // Deterministic xorshift64* (the house pattern — no dev-dependency).
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                if n == 0 { 0 } else { self.next() % n }
+            }
+        }
+        let mut rng = Rng(0x5542_5241_4E47_4501);
+
+        for case in 0..300 {
+            let total = 1 + rng.below(900);
+            let whole = drain(&mut Ramp::new(total));
+
+            // A random ascending set of cut points.
+            let cuts = rng.below(5) as usize;
+            let mut points: Vec<u64> = (0..cuts).map(|_| rng.below(total)).collect();
+            points.sort_unstable();
+            points.dedup();
+
+            let mut joined = Vec::new();
+            let mut start = 0u64;
+            for &end in points.iter().chain(core::iter::once(&total)) {
+                if end <= start {
+                    continue;
+                }
+                let len = end - start;
+                let mut r = SubRange::new(Ramp::new(total), start, Some(len)).expect("range");
+                assert_eq!(r.total_frames(), Some(len), "case {case}");
+                // Read it back in a random chunk size: at least one frame
+                // (below that, `decode_into` reports `Ok(0)` like every
+                // decoder here — see its docs), and deliberately including
+                // sizes that are neither a multiple of the frame nor of the
+                // range length, which is where trimming bugs live.
+                let chunk = 2 + rng.below(13) as usize;
+                let mut buf = vec![0i32; chunk];
+                loop {
+                    let n = r.decode_into(&mut buf).expect("decode");
+                    if n == 0 {
+                        break;
+                    }
+                    joined.extend_from_slice(&buf[..n]);
+                }
+                start = end;
+            }
+            assert_eq!(
+                joined, whole,
+                "case {case}: splits at {points:?} of {total} frames did not tile the stream"
+            );
+        }
+    }
+
     #[test]
     fn a_partial_frame_is_never_emitted() {
         // An odd-sized output buffer must not split a stereo frame.
@@ -444,5 +516,12 @@ mod tests {
         let n = r.decode_into(&mut buf).expect("decode");
         assert_eq!(n % 2, 0, "whole frames only, got {n}");
         assert_eq!(n, 6);
+        // And a buffer that cannot hold even one frame reports `Ok(0)` — the
+        // crate-wide convention, and the reason a caller sizes its buffers in
+        // frames (it is indistinguishable from end-of-stream).
+        let mut r = SubRange::new(Ramp::new(100), 0, Some(10)).expect("range");
+        assert_eq!(r.decode_into(&mut [0i32; 1]).expect("decode"), 0);
+        // The range is untouched by that: a proper buffer still reads it all.
+        assert_eq!(drain(&mut r).len(), 10 * 2);
     }
 }
