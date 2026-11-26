@@ -444,7 +444,11 @@ impl<S: Source> CafPcm<S> {
         let big_endian = desc.format_flags & LPCM_FLAG_LE == 0;
         let bits = desc.bits_per_channel as u8;
         let bps = (desc.bytes_per_packet / desc.channels) as usize;
-        if bps == 0 {
+        // `mBytesPerPacket` is a container field: a malformed `desc` can claim
+        // any width. Anything past the widest real sample is not a CAF we can
+        // decode, and must be refused here rather than reaching the shared
+        // converter (which would then convert nothing, silently).
+        if bps == 0 || bps > crate::formats::wav::MAX_BYTES_PER_SAMPLE {
             return Err(DecodeError::Unsupported);
         }
         let valid = if float {
@@ -546,11 +550,17 @@ impl<S: SeekSource> CafPcm<S> {
     /// [`DecodeError::Io`] if the underlying seek fails.
     fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
         let frame = self.total_frames.map_or(sample, |t| sample.min(t));
-        let byte = self.data_start + frame * self.block_align;
+        // Saturating: a `data` chunk of declared size −1 ("to end of file")
+        // leaves `total_frames` unknown, so `frame` is whatever the caller
+        // asked for — and `frame · block_align` overflowed on a malformed
+        // header with a huge packet size (found by fuzzing). A saturated
+        // offset seeks past the end, which the read then reports as EOF.
+        let offset = frame.saturating_mul(self.block_align);
+        let byte = self.data_start.saturating_add(offset);
         self.src
             .seek(SeekFrom::Start(byte))
             .map_err(|_| DecodeError::Io)?;
-        self.data_remaining = self.data_total.saturating_sub(frame * self.block_align);
+        self.data_remaining = self.data_total.saturating_sub(offset);
         Ok(frame)
     }
 }
@@ -1012,6 +1022,62 @@ mod tests {
             vec![0i32; crate::decoder_scratch_len()],
         );
         assert!(matches!(r, Err(DecodeError::Unsupported)));
+    }
+
+    /// A `desc` chunk whose `mBytesPerPacket` disagrees with its bit depth is
+    /// refused at construction.
+    ///
+    /// Found by fuzzing (a corrupted length field on the new `chan` seed): the
+    /// derived bytes-per-sample reached the shared PCM converter, whose
+    /// big-endian swap buffer holds 8 bytes, and an 18-byte "sample" panicked
+    /// there. A malformed header must be a clean `Unsupported` — this is a file
+    /// a user could have on disk, not a hypothetical.
+    #[test]
+    fn a_desc_whose_packet_size_is_not_a_sample_width_is_refused() {
+        // `caf_header` writes `mBytesPerPacket = channels * 2` for 16-bit, so
+        // build the header by hand to make the two disagree.
+        let caf = |bytes_per_packet: u32, channels: u32, bits: u32| {
+            let mut desc = Vec::new();
+            desc.extend_from_slice(&44_100f64.to_be_bytes());
+            desc.extend_from_slice(b"lpcm");
+            desc.extend_from_slice(&0u32.to_be_bytes());
+            desc.extend_from_slice(&bytes_per_packet.to_be_bytes());
+            desc.extend_from_slice(&1u32.to_be_bytes()); // frames/packet
+            desc.extend_from_slice(&channels.to_be_bytes());
+            desc.extend_from_slice(&bits.to_be_bytes());
+            let mut v = Vec::new();
+            v.extend_from_slice(b"caff");
+            v.extend_from_slice(&1u16.to_be_bytes());
+            v.extend_from_slice(&0u16.to_be_bytes());
+            let mut chunk = |ty: &[u8; 4], body: &[u8]| {
+                v.extend_from_slice(ty);
+                v.extend_from_slice(&(body.len() as i64).to_be_bytes());
+                v.extend_from_slice(body);
+            };
+            chunk(b"desc", &desc);
+            chunk(b"data", &[0u8; 64]);
+            v
+        };
+        let open = |bytes: &[u8]| {
+            CafDecoder::new_in(
+                crate::SliceSource::new(bytes),
+                vec![0i32; crate::decoder_scratch_len()],
+            )
+            .map(|_| ())
+        };
+
+        // 18 bytes per sample on one channel — the fuzzer's input.
+        assert_eq!(
+            open(&caf(18, 1, 24)).err(),
+            Some(DecodeError::Unsupported),
+            "a sample wider than any real PCM must be refused"
+        );
+        // And the boundary: 8 bytes (64-bit float's width) is still accepted,
+        // 9 is not.
+        assert!(open(&caf(8, 1, 32)).is_ok(), "8 bytes/sample is real");
+        assert_eq!(open(&caf(9, 1, 32)).err(), Some(DecodeError::Unsupported));
+        // A zero-width packet was already refused; keep it that way.
+        assert_eq!(open(&caf(0, 2, 16)).err(), Some(DecodeError::Unsupported));
     }
 
     /// An `lpcm` payload with no `chan` reports nothing — raw PCM in a CAF

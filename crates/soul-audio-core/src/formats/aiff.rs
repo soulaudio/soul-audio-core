@@ -62,7 +62,10 @@ impl<S: Source> AiffDecoder<S> {
             }
         }
         let bps = usize::from(demux.block_align()) / usize::from(info.channels);
-        if bps == 0 {
+        // `blockAlign` is a container field, so a malformed `COMM` can claim
+        // any sample width; refuse anything past the widest real one (the same
+        // guard CAF's `desc` gets, for the same reason).
+        if bps == 0 || bps > crate::formats::wav::MAX_BYTES_PER_SAMPLE {
             return Err(DecodeError::Unsupported);
         }
         let big_endian = demux.big_endian();

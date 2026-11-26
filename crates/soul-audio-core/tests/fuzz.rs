@@ -466,6 +466,98 @@ fn minimal_flac() -> Vec<u8> {
 /// stays fast; every container + codec the decode surface accepts is present.
 /// A truncated DSF prefix stands in for the (large) full `.dsf` so the DSF
 /// header/parse path is seeded without a 360 KiB fixture.
+/// A minimal multichannel `lpcm` CAF **carrying a `chan` chunk** — the
+/// `AudioChannelLayout` the downmix reads to place a surround file's channels.
+///
+/// Generated rather than committed because none of the real CAF fixtures have
+/// one (ffmpeg does not write it for the tone), and without such a seed the
+/// mutation strategies below would have to synthesize the literal `chan` bytes
+/// plus a plausible size to reach that parser at all — which they never will.
+/// `form` picks which of the three layout forms the chunk uses, since each is a
+/// different parse: `0` = per-channel descriptions (20 bytes each — the one with
+/// per-entry indexing), `1` = a channel bitmap, `2` = a layout-tag constant.
+fn minimal_caf_with_chan(form: u8) -> Vec<u8> {
+    const CH: u32 = 6;
+    let mut desc = Vec::new();
+    desc.extend_from_slice(&44_100f64.to_be_bytes()); // mSampleRate
+    desc.extend_from_slice(b"lpcm");
+    desc.extend_from_slice(&0u32.to_be_bytes()); // big-endian signed int
+    desc.extend_from_slice(&(CH * 3).to_be_bytes()); // mBytesPerPacket
+    desc.extend_from_slice(&1u32.to_be_bytes()); // mFramesPerPacket
+    desc.extend_from_slice(&CH.to_be_bytes());
+    desc.extend_from_slice(&24u32.to_be_bytes()); // mBitsPerChannel
+
+    let mut chan = Vec::new();
+    match form {
+        0 => {
+            chan.extend_from_slice(&0u32.to_be_bytes()); // UseChannelDescriptions
+            chan.extend_from_slice(&0u32.to_be_bytes()); // mChannelBitmap
+            chan.extend_from_slice(&CH.to_be_bytes()); // one description each
+            // L, R, C, LFE, Ls, Rs — `kAudioChannelLabel_*`.
+            for label in [1u32, 2, 3, 4, 5, 6] {
+                chan.extend_from_slice(&label.to_be_bytes()); // mChannelLabel
+                chan.extend_from_slice(&0u32.to_be_bytes()); // mChannelFlags
+                chan.extend_from_slice(&[0u8; 12]); // mCoordinates[3]
+            }
+        }
+        1 => {
+            chan.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // UseChannelBitmap
+            chan.extend_from_slice(&0x3Fu32.to_be_bytes()); // the 5.1 bits
+            chan.extend_from_slice(&0u32.to_be_bytes());
+        }
+        _ => {
+            chan.extend_from_slice(&(((121u32) << 16) | CH).to_be_bytes()); // MPEG_5_1_A
+            chan.extend_from_slice(&0u32.to_be_bytes());
+            chan.extend_from_slice(&0u32.to_be_bytes());
+        }
+    }
+
+    let mut data = Vec::new();
+    data.extend_from_slice(&0u32.to_be_bytes()); // mEditCount
+    for i in 0..(CH as usize * 4) {
+        // 24-bit big-endian samples.
+        data.extend_from_slice(&[(i as u8), 0x11, 0x22]);
+    }
+
+    let mut v = Vec::new();
+    v.extend_from_slice(b"caff");
+    v.extend_from_slice(&1u16.to_be_bytes()); // mFileVersion
+    v.extend_from_slice(&0u16.to_be_bytes()); // mFileFlags
+    for (ty, body) in [(b"desc", &desc), (b"chan", &chan), (b"data", &data)] {
+        v.extend_from_slice(ty);
+        v.extend_from_slice(&(body.len() as i64).to_be_bytes());
+        v.extend_from_slice(body);
+    }
+    v
+}
+
+/// The generated `chan` seeds must be **valid CAFs that actually carry a
+/// layout** — a seed the decoder rejects would leave the parser the mutations
+/// are meant to reach almost uncovered, and nothing else here would notice.
+#[test]
+fn the_generated_caf_chan_seeds_are_valid_and_carry_a_layout() {
+    use soul_audio_core::channels::{ChannelLayout, speaker::*};
+    for form in 0..3u8 {
+        let bytes = minimal_caf_with_chan(form);
+        let dec = open(
+            SliceSource::new(&bytes),
+            vec![0i32; soul_audio_core::decoder_scratch_len()],
+        )
+        .unwrap_or_else(|e| panic!("form {form}: the seed must open: {e:?}"));
+        assert_eq!(dec.stream_info().channels, 6, "form {form}");
+        let layout = dec
+            .channel_layout()
+            .unwrap_or_else(|| panic!("form {form}: the seed must carry a layout"));
+        // All three forms describe the same 5.1 layout, in WAVEFORMATEXTENSIBLE
+        // order — so a mutation that corrupts the chunk has something to break.
+        assert_eq!(
+            layout,
+            ChannelLayout::from_order(&[FL, FR, FC, LFE, BL, BR]).unwrap(),
+            "form {form}"
+        );
+    }
+}
+
 fn seeds() -> Vec<(&'static str, Vec<u8>)> {
     let dsf_full = include_bytes!("../../../testdata/tone.dsf");
     vec![
@@ -541,6 +633,11 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
             "caf-lpcm",
             include_bytes!("../../../testdata/tone-caf-le.caf").to_vec(),
         ),
+        // The `chan` (AudioChannelLayout) parser, in all three of its forms —
+        // see `minimal_caf_with_chan`. No committed CAF carries the chunk.
+        ("caf-chan-descriptions", minimal_caf_with_chan(0)),
+        ("caf-chan-bitmap", minimal_caf_with_chan(1)),
+        ("caf-chan-tag", minimal_caf_with_chan(2)),
         (
             "mkv-opus",
             include_bytes!("../../../testdata/tone-opus.webm").to_vec(),
