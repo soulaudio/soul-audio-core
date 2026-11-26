@@ -407,8 +407,8 @@ fn bit_perfect_loopback() {
 }
 
 /// Virtual devices whose input side plays back what was written to the output: BlackHole
-/// (Float32 physical) and the CI-only `SoulProfile` HAL plug-in (`ci/hal-profile-device`,
-/// integer physical formats).
+/// (Float32 physical) and the CI-only `SoulProfile` HAL plug-in
+/// (`tests/fixtures/hal-profile-device`, integer physical formats).
 fn is_loopback_device(name: &str) -> bool {
     name.starts_with("BlackHole") || name.starts_with("SoulProfile")
 }
