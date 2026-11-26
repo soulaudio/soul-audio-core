@@ -1,11 +1,11 @@
-<!-- Theme-aware Soul Audio mark: white-bodied on GitHub's dark theme, dark-bodied
-     on light. Uses GitHub's #gh-*-mode-only fragments, hidden/shown by CSS keyed on
-     GitHub's OWN theme (data-color-mode), rather than <picture>/prefers-color-scheme:
-     fingerprint-resistant browsers (LibreWolf, Tor) force prefers-color-scheme to
-     light, leaving the dark mark on a dark page. The shared mark lives in
-     soul-player-ng. -->
-<img alt="Soul Audio" src="https://raw.githubusercontent.com/soulaudio/soul-player-ng/main/app/icons/icon.png#gh-dark-mode-only" width="84" height="84">
-<img alt="Soul Audio" src="https://raw.githubusercontent.com/soulaudio/soul-player-ng/main/app/icons/icon-light.png#gh-light-mode-only" width="84" height="84">
+<!-- Theme-aware Soul Audio mark via GitHub's #gh-*-mode-only fragments on same-repo
+     (markdown) images: GitHub wraps each in an <a href="...#gh-*-mode-only"> and hides
+     the non-matching one with CSS keyed on its OWN theme (data-color-mode), so it also
+     works in fingerprint-resistant browsers (LibreWolf, Tor) that force
+     prefers-color-scheme to light. Same-repo images are proxied, so no muted tile. The
+     marks are pre-sized (markdown can't resize); the source lives in soul-player-ng. -->
+![Soul Audio](docs/soul-mark-dark.png#gh-dark-mode-only)
+![Soul Audio](docs/soul-mark-light.png#gh-light-mode-only)
 
 # soul-audio-core
 
