@@ -41,11 +41,28 @@ use alloc::vec::Vec;
 /// here is a CD sector: 588 stereo samples at 44.1 kHz).
 pub const CD_FRAMES_PER_SEC: u64 = 75;
 
+/// The largest timestamp [`CueTime::from_mm_ss_ff`] accepts, in CD frames —
+/// about 115 years of audio.
+///
+/// Not a limitation anyone meets: a day-long single file is 6.5 million
+/// frames, four orders of magnitude under this. It exists because a corrupt or
+/// hand-edited sheet can carry a 15-digit minute field, and a number that large
+/// is not a timestamp — refusing it (the sheet is then reported as malformed and
+/// the album imports as its plain file) is better than splitting the audio
+/// somewhere nobody meant.
+pub const MAX_CUE_FRAMES: u64 = 1 << 38;
+
 /// A cue timestamp, as a count of CD frames from the start of the file.
 ///
 /// `MM:SS:FF` with 75 frames per second. Minutes are not capped at 99: a
 /// sheet for a long single file legitimately runs past it, and clamping would
 /// silently mis-split the audio.
+///
+/// `frames` is public, so a value can also arrive from a caller or a
+/// deserialized profile rather than from the parser — every conversion below is
+/// therefore **total**, saturating rather than overflowing for any `u64`. An
+/// arithmetic panic in a library scan would take out someone's whole collection
+/// over one bad file.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CueTime {
@@ -57,15 +74,20 @@ impl CueTime {
     /// From `MM:SS:FF` components. `None` if seconds or frames are out of
     /// range (`SS > 59`, `FF > 74`) — that is a malformed sheet, not a long
     /// one, and accepting it would place the split somewhere else than the
-    /// ripper meant.
+    /// ripper meant — or if the total exceeds [`MAX_CUE_FRAMES`].
     #[must_use]
     pub fn from_mm_ss_ff(minutes: u64, seconds: u64, frames: u64) -> Option<Self> {
         if seconds > 59 || frames > CD_FRAMES_PER_SEC - 1 {
             return None;
         }
-        Some(Self {
-            frames: (minutes * 60 + seconds) * CD_FRAMES_PER_SEC + frames,
-        })
+        // Checked throughout: a corrupt sheet's 15-digit minute field must be
+        // refused, not wrapped into a plausible-looking offset.
+        let total = minutes
+            .checked_mul(60)?
+            .checked_add(seconds)?
+            .checked_mul(CD_FRAMES_PER_SEC)?
+            .checked_add(frames)?;
+        (total <= MAX_CUE_FRAMES).then_some(Self { frames: total })
     }
 
     /// The `(minutes, seconds, frames)` this timestamp displays as.
@@ -84,10 +106,14 @@ impl CueTime {
     /// nearest; see [`Self::divides_evenly`].
     #[must_use]
     pub fn to_frames(self, sample_rate: u32) -> u64 {
-        let num = self.frames * u64::from(sample_rate);
-        // Round to nearest so a non-multiple-of-75 rate cannot drift a whole
-        // sample per track.
-        (num + CD_FRAMES_PER_SEC / 2) / CD_FRAMES_PER_SEC
+        // `u128` intermediate: `frames` is a public field, so this has to be
+        // total for every `u64` — and the product of a large timestamp and a
+        // high rate leaves `u64` long before it stops being meaningful.
+        // Rounds to nearest, so a non-multiple-of-75 rate cannot drift a whole
+        // sample per track, and saturates rather than wrapping.
+        let num =
+            u128::from(self.frames) * u128::from(sample_rate) + u128::from(CD_FRAMES_PER_SEC) / 2;
+        u64::try_from(num / u128::from(CD_FRAMES_PER_SEC)).unwrap_or(u64::MAX)
     }
 
     /// Whether `sample_rate` divides evenly into CD frames, i.e. whether
@@ -100,7 +126,8 @@ impl CueTime {
     /// This timestamp in milliseconds (for a duration display).
     #[must_use]
     pub fn as_millis(self) -> u64 {
-        self.frames * 1000 / CD_FRAMES_PER_SEC
+        let ms = u128::from(self.frames) * 1000 / u128::from(CD_FRAMES_PER_SEC);
+        u64::try_from(ms).unwrap_or(u64::MAX)
     }
 }
 
@@ -565,6 +592,75 @@ mod tests {
         // Minutes past 99 are a long single file, not a malformed sheet.
         let long = CueTime::from_mm_ss_ff(123, 45, 67).unwrap();
         assert_eq!(long.mm_ss_ff(), (123, 45, 67));
+    }
+
+    /// A corrupt or hand-edited sheet can carry a minute field with fifteen
+    /// digits. That is not a timestamp, and the arithmetic that turns it into
+    /// a sample offset must not overflow: a panic here takes out the whole
+    /// library scan over one bad file.
+    #[test]
+    fn an_absurd_timestamp_is_refused_rather_than_overflowing() {
+        // Parses as a `u64` minute count, and its CD-frame total even fits —
+        // but it is past the sane ceiling, so it is refused.
+        assert_eq!(CueTime::from_mm_ss_ff(1_000_000_000_000_000, 0, 0), None);
+        // And one large enough to overflow the frame arithmetic itself.
+        assert_eq!(CueTime::from_mm_ss_ff(u64::MAX, 0, 0), None);
+        assert_eq!(CueTime::from_mm_ss_ff(u64::MAX / 60, 59, 74), None);
+        // Through the parser it reads as a malformed sheet, with its line.
+        assert!(matches!(
+            parse("FILE \"a.flac\" WAVE\nTRACK 01 AUDIO\nINDEX 01 1000000000000000:00:00\n"),
+            Err(CueError::BadTimestamp { line: 3 })
+        ));
+
+        // The ceiling is generous: a day-long single file is nowhere near it.
+        let day = CueTime::from_mm_ss_ff(24 * 60, 0, 0).expect("a day is a sane timestamp");
+        assert_eq!(day.to_frames(44_100), 24 * 3600 * 44_100);
+        assert_eq!(day.as_millis(), 24 * 3600 * 1000);
+        assert!(CueTime::from_mm_ss_ff(MAX_CUE_FRAMES / 75 / 60, 0, 0).is_some());
+
+        // `frames` is public, so a value can also arrive from a caller or a
+        // deserialized profile: every conversion stays total, saturating.
+        let absurd = CueTime { frames: u64::MAX };
+        assert_eq!(absurd.to_frames(768_000), u64::MAX);
+        assert_eq!(absurd.as_millis(), u64::MAX);
+        assert_eq!(absurd.to_frames(0), 0);
+        let (m, _, _) = absurd.mm_ss_ff();
+        assert!(m > 0, "the display form must not panic either");
+    }
+
+    /// And a file whose tracks carry such a value yields ranges rather than a
+    /// panic — the importer walks these for every sheet it finds.
+    #[test]
+    fn ranges_of_an_absurd_timestamp_do_not_panic() {
+        let file = CueFile {
+            name: String::from("a.flac"),
+            format: String::from("WAVE"),
+            tracks: vec![
+                CueTrack {
+                    number: 1,
+                    kind: String::from("AUDIO"),
+                    start: Some(CueTime { frames: 0 }),
+                    ..CueTrack::default()
+                },
+                CueTrack {
+                    number: 2,
+                    kind: String::from("AUDIO"),
+                    start: Some(CueTime { frames: u64::MAX }),
+                    ..CueTrack::default()
+                },
+            ],
+        };
+        // With and without a known file length.
+        for total in [Some(88_200u64), None] {
+            let ranges = file.ranges(192_000, total);
+            assert_eq!(ranges.len(), 2);
+            assert!(
+                ranges
+                    .iter()
+                    .all(|r| r.frames.unwrap_or(0) <= 88_200 || total.is_none()),
+                "{ranges:?}"
+            );
+        }
     }
 
     #[test]

@@ -185,7 +185,10 @@ impl<D: SeekableDecoder> SeekableDecoder for SubRange<D> {
             Some(f) => sample.min(f),
             None => sample,
         };
-        let landed = self.inner.seek_to(self.start + target)?;
+        // `saturating_add`: `start` is only clamped when the inner stream
+        // declares a length, so for a streaming source it is whatever the
+        // caller passed — and a seek must not be able to overflow it.
+        let landed = self.inner.seek_to(self.start.saturating_add(target))?;
         // Trust the inner decoder's landing point (a frame-granular format can
         // land earlier), but never outside the range.
         self.pos = landed.saturating_sub(self.start);
@@ -388,6 +391,49 @@ mod tests {
         assert_eq!(r.codec(), SourceCodec::Pcm);
         assert_eq!(r.channel_layout(), None);
         assert_eq!(r.inner().total_frames(), Some(100), "the file's own length");
+    }
+
+    /// A range of a **streaming** (length-unknown) source cannot have its start
+    /// clamped, so the seek arithmetic has to be total: a caller or a corrupt
+    /// index handing over an absurd offset must not overflow it. A panic here
+    /// would take out playback, not just the track.
+    #[test]
+    fn a_seek_on_an_unbounded_range_cannot_overflow() {
+        struct Unbounded;
+        impl Decoder for Unbounded {
+            fn stream_info(&self) -> StreamInfo {
+                StreamInfo {
+                    sample_rate: 44_100,
+                    channels: 2,
+                    format: SampleFormat::Int { bits: 24 },
+                }
+            }
+            fn decode_into(&mut self, _out: &mut [i32]) -> Result<usize, DecodeError> {
+                Ok(0)
+            }
+        }
+        impl SeekableDecoder for Unbounded {
+            fn seek_to(&mut self, s: u64) -> Result<u64, DecodeError> {
+                Ok(s)
+            }
+            fn total_frames(&self) -> Option<u64> {
+                None
+            }
+        }
+
+        let mut r = SubRange::new(Unbounded, u64::MAX - 10, None).expect("range");
+        // Saturates at the stream's own end rather than wrapping to the start.
+        assert_eq!(r.seek_to(1_000).expect("seek"), 10);
+        assert_eq!(r.seek_to(u64::MAX).expect("seek"), 10);
+        assert_eq!(r.decode_into(&mut [0i32; 4]).expect("decode"), 0);
+
+        // The same with a bounded range whose start is near the top.
+        let mut r = SubRange::new(Unbounded, u64::MAX - 10, Some(5)).expect("range");
+        assert_eq!(
+            r.seek_to(u64::MAX).expect("seek"),
+            5,
+            "clamped to the range"
+        );
     }
 
     #[test]
