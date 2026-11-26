@@ -66,6 +66,7 @@ exercises the hard codec paths. These demanding signals do.
 | `tone.dff`  | DSD64 (Philips DSDIFF, raw) — MSB-first/interleaved DFF + `DIIN` tags |
 | `dst-slice.dff` | DST (arithmetic-coded lossless DSD) — the FFmpeg FATE slice (real music, not a tone). Full-pipeline regression-locked; DST *correctness* is in `formats/dst.rs`'s arithmetic encode↔decode unit tests (no DST encoder / ffmpeg can't decode it → no external conformance ref) |
 | `tagged.flac` | native FLAC with ID3-style tags (title/artist/album) — used by the library-scan `Some(tag)` test |
+| `rva2-only.mp3` | `tone.mp3` with an ID3v2.4 tag whose only loudness frames are `RVA2` (track −7.89 dB + 16-bit peak, album −8.52 dB) and **no** `TXXX replaygain_*` — what mp3gain's ID3v2 mode / mutagen-based taggers leave. Read through `read_owned` and cross-checked against lofty's independent RVA2 parse (`crates/soul-audio-tags/tests/replaygain.rs`) |
 
 DSD is 1-bit at 2.8 MHz, so `tone.dsf` is deliberately shorter (0.5 s) to keep
 it small. The CLI decimates it to multi-bit PCM (DSD64 → 352.8 kHz) and the deck
@@ -140,6 +141,9 @@ PCM→DSD, so a 2nd-order sigma-delta modulator turns the tone into a 1-bit stre
 wrapped in a Sony DSF (`.dsf`, LSB-first/planar) or Philips DSDIFF (`.dff`,
 MSB-first/interleaved) container (ffmpeg *can* decode both, for cross-checking):
 `generate_dsd.py <out> [rate_hz] [dur_secs]` picks the container by extension.
+`rva2-only.mp3` is produced by `generate_rva2_mp3.py` (pure stdlib, no ffmpeg):
+ffmpeg has no mapping for relative-volume frames, so the ID3v2.4 `RVA2` tag is
+assembled byte-for-byte there and prepended to `tone.mp3`.
 `dst-slice.dff` is the committed DST FATE slice (`crates/soul-audio-core/testdata/
 dst-64fs44-2ch.slice.dff`), copied here for the CLI e2e. DST has no open encoder,
 so there is no tone/round-trip fixture for it.

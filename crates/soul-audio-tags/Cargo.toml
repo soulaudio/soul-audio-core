@@ -29,6 +29,12 @@ embedded-io-adapters = { workspace = true, features = ["std"] }
 name = "differential"
 required-features = ["std"]
 
+# `replaygain` reads a real MP3 fixture through `read_owned` and cross-checks it
+# against lofty — same two gates as `differential` above.
+[[test]]
+name = "replaygain"
+required-features = ["std"]
+
 # `dump` is a debug/verify tool that reads real files via `read_owned` (the
 # `alloc`/`std` surface), so it only builds with the feature — `cargo test`
 # without it (what `cargo xtask verify` runs) skips the example target.

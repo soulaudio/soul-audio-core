@@ -174,6 +174,13 @@ fn verify() -> Result<(), String> {
     // Run those host tests explicitly so the desktop bake path is actually gated.
     run(&["test", "-p", "soul-audio-index", "--features", "build"])?;
     run(&["test", "-p", "soul-audio-artbake", "--features", "build"])?;
+    // soul-audio-tags' real-file tests are `std`-gated the same way (the
+    // `differential` parity check vs lofty and the `replaygain` RVA2 acceptance
+    // test both need `read_owned` + `std::fs`, and their test targets are
+    // `required-features = ["std"]`). Without this line the default `cargo test`
+    // above compiles neither, so the lofty parity gate and the real-MP3
+    // ReplayGain gate were never actually run by anything.
+    run(&["test", "-p", "soul-audio-tags", "--features", "std"])?;
     // The STM32 discipline gates: the core, engine, and queue must build no_std
     // for the target, and the firmware must link for it.
     run(&[
