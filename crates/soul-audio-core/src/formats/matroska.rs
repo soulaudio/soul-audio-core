@@ -234,6 +234,24 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for MatroskaDecoder<S, P
             MatroskaDecoder::Aac(_) => crate::model::SourceCodec::Aac,
         }
     }
+
+    /// The channel layout of the **contained codec**. Matroska itself carries no
+    /// channel mask — `Audio` has only `Channels`, and `ChannelPositions` is
+    /// deprecated and absent in practice — but the codec inside it does fix an
+    /// order: FLAC's is spec-ordered like WAVEFORMATEXTENSIBLE, AAC's puts the
+    /// centre first. Forwarding the inner decoder's layout is therefore the only
+    /// correct answer here, and it is what lets a multichannel FLAC/AAC track in
+    /// an `.mka`/`.webm` fold to stereo in the ambiguous channel counts (4/5/7)
+    /// the deck will not guess at. Opus-in-Matroska is clamped to stereo
+    /// ([`MatroskaOpus::new_in`]), so there is no layout to report.
+    fn channel_layout(&self) -> Option<crate::channels::ChannelLayout> {
+        match self {
+            MatroskaDecoder::Opus(_) => None,
+            MatroskaDecoder::Flac(d) => d.channel_layout(),
+            #[cfg(feature = "aac")]
+            MatroskaDecoder::Aac(d) => d.channel_layout(),
+        }
+    }
 }
 
 /// Opus-in-Matroska: the shared [`OpusFrameDecoder`] core driven one
@@ -799,5 +817,221 @@ impl<S: Source> Read for MatroskaVorbisOgg<S> {
             }
         }
         Ok(w)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::SliceSource;
+
+    /// An EBML element ID as its big-endian bytes (the marker is already in the
+    /// constant). Mirrors the demuxer's own test writer in `demux::matroska`.
+    fn id_bytes(id: u32) -> Vec<u8> {
+        if id <= 0xFF {
+            vec![id as u8]
+        } else if id <= 0xFFFF {
+            id.to_be_bytes()[2..].to_vec()
+        } else if id <= 0xFF_FFFF {
+            id.to_be_bytes()[1..].to_vec()
+        } else {
+            id.to_be_bytes().to_vec()
+        }
+    }
+
+    /// An EBML size as a 1- or 2-byte vint, so bodies past 127 bytes (a FLAC
+    /// `CodecPrivate` plus a 4-channel frame) are expressible.
+    fn size_vint(n: usize) -> Vec<u8> {
+        if n < 0x7F {
+            vec![0x80 | n as u8]
+        } else {
+            assert!(n < 0x3FFF, "test element too large: {n}");
+            vec![0x40 | (n >> 8) as u8, (n & 0xFF) as u8]
+        }
+    }
+
+    fn elem(id: u32, body: &[u8]) -> Vec<u8> {
+        let mut v = id_bytes(id);
+        v.extend_from_slice(&size_vint(body.len()));
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// MSB-first bit writer, for hand-building the FLAC frame below.
+    struct BitWriter {
+        bytes: Vec<u8>,
+        cur: u8,
+        nbits: u8,
+    }
+
+    impl BitWriter {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                cur: 0,
+                nbits: 0,
+            }
+        }
+        fn bits(&mut self, val: u64, n: u32) {
+            for i in (0..n).rev() {
+                self.cur = (self.cur << 1) | ((val >> i) & 1) as u8;
+                self.nbits += 1;
+                if self.nbits == 8 {
+                    self.bytes.push(self.cur);
+                    self.cur = 0;
+                    self.nbits = 0;
+                }
+            }
+        }
+        fn signed(&mut self, val: i32, n: u32) {
+            let mask = if n >= 32 { u64::MAX } else { (1u64 << n) - 1 };
+            self.bits((val as i64 as u64) & mask, n);
+        }
+        fn align(&mut self) {
+            if self.nbits > 0 {
+                self.bits(0, u32::from(8 - self.nbits));
+            }
+        }
+        fn into_bytes(mut self) -> Vec<u8> {
+            self.align();
+            self.bytes
+        }
+    }
+
+    /// One FLAC frame of `block` frames × `channels` independent VERBATIM
+    /// subframes, `sample[ch][i] = ch * 100 + i`. CRCs are written as zero (the
+    /// decoder does not validate them), as in `formats::flac`'s own tests.
+    fn flac_verbatim_frame(block: usize, channels: u16) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        bw.bits(0b11_1111_1111_1110, 14); // sync
+        bw.bits(0, 1); // reserved
+        bw.bits(0, 1); // fixed block size
+        bw.bits(7, 4); // block size code 7 → explicit 16-bit below
+        bw.bits(0, 4); // sample rate from STREAMINFO
+        bw.bits(u64::from(channels) - 1, 4); // channel assignment = independent
+        bw.bits(0, 3); // sample size from STREAMINFO
+        bw.bits(0, 1); // reserved
+        bw.bits(0, 8); // UTF-8 frame number 0
+        bw.bits((block - 1) as u64, 16);
+        bw.bits(0, 8); // CRC-8 (unchecked)
+        for c in 0..i32::from(channels) {
+            bw.bits(0, 1); // subframe leading 0
+            bw.bits(1, 6); // VERBATIM
+            bw.bits(0, 1); // no wasted bits
+            for i in 0..block as i32 {
+                bw.signed(c * 100 + i, 16);
+            }
+        }
+        bw.align();
+        bw.bits(0, 16); // CRC-16 (unchecked)
+        bw.into_bytes()
+    }
+
+    /// A `fLaC` stream header (STREAMINFO only) for use as `CodecPrivate` — what
+    /// a real FLAC-in-Matroska track carries.
+    fn flac_codec_private(rate: u32, channels: u16, bits: u8, total: u64) -> Vec<u8> {
+        let mut si = [0u8; 34];
+        let v: u64 = (u64::from(rate) << 44)
+            | ((u64::from(channels) - 1) << 41)
+            | ((u64::from(bits) - 1) << 36)
+            | (total & 0xF_FFFF_FFFF);
+        si[10..18].copy_from_slice(&v.to_be_bytes());
+        let mut cp = Vec::new();
+        cp.extend_from_slice(b"fLaC");
+        cp.push(0x80); // last metadata block + STREAMINFO
+        cp.extend_from_slice(&[0, 0, 34]);
+        cp.extend_from_slice(&si);
+        cp
+    }
+
+    /// A minimal `A_FLAC` Matroska carrying one `SimpleBlock` = one FLAC frame.
+    fn flac_mkv(channels: u16, block: usize) -> Vec<u8> {
+        const ID_EBML_HEADER: u32 = 0x1A45_DFA3;
+        const ID_SEGMENT: u32 = 0x1853_8067;
+        const ID_TRACKS: u32 = 0x1654_AE6B;
+        const ID_TRACK_ENTRY: u32 = 0xAE;
+        const ID_TRACK_NUMBER: u32 = 0xD7;
+        const ID_TRACK_TYPE: u32 = 0x83;
+        const ID_CODEC_ID: u32 = 0x86;
+        const ID_CODEC_PRIVATE: u32 = 0x63A2;
+        const ID_AUDIO: u32 = 0xE1;
+        const ID_SAMPLING_FREQUENCY: u32 = 0xB5;
+        const ID_CHANNELS: u32 = 0x9F;
+        const ID_CLUSTER: u32 = 0x1F43_B675;
+        const ID_TIMESTAMP: u32 = 0xE7;
+        const ID_SIMPLE_BLOCK: u32 = 0xA3;
+
+        let mut audio = Vec::new();
+        audio.extend_from_slice(&elem(ID_SAMPLING_FREQUENCY, &96_000.0f32.to_be_bytes()));
+        audio.extend_from_slice(&elem(ID_CHANNELS, &[channels as u8]));
+
+        let mut te = Vec::new();
+        te.extend_from_slice(&elem(ID_TRACK_NUMBER, &[1]));
+        te.extend_from_slice(&elem(ID_TRACK_TYPE, &[2])); // audio
+        te.extend_from_slice(&elem(ID_CODEC_ID, b"A_FLAC"));
+        te.extend_from_slice(&elem(
+            ID_CODEC_PRIVATE,
+            &flac_codec_private(96_000, channels, 16, block as u64),
+        ));
+        te.extend_from_slice(&elem(ID_AUDIO, &audio));
+        let tracks = elem(ID_TRACKS, &elem(ID_TRACK_ENTRY, &te));
+
+        // SimpleBlock: track vint, int16 timestamp, flags, then the frame.
+        let mut sb = vec![0x81, 0x00, 0x00, 0x00];
+        sb.extend_from_slice(&flac_verbatim_frame(block, channels));
+        let mut cluster_body = elem(ID_TIMESTAMP, &[0]);
+        cluster_body.extend_from_slice(&elem(ID_SIMPLE_BLOCK, &sb));
+
+        let mut segment = tracks;
+        segment.extend_from_slice(&elem(ID_CLUSTER, &cluster_body));
+        let mut v = elem(ID_EBML_HEADER, b"\x42\x82\x84webm");
+        v.extend_from_slice(&elem(ID_SEGMENT, &segment));
+        v
+    }
+
+    /// Matroska carries no channel mask of its own, so a multichannel track can
+    /// only fold if the **contained codec**'s layout is forwarded. A 4-channel
+    /// FLAC track is the case that proves it: 4 channels is layout-ambiguous, so
+    /// the deck rejects it outright without a layout — and FLAC fixes 4ch as
+    /// quad. Desktop profile only (`embedded-profile` caps FLAC at stereo).
+    #[cfg(not(feature = "embedded-profile"))]
+    #[test]
+    fn multichannel_flac_in_matroska_reports_the_contained_codec_layout() {
+        let bytes = flac_mkv(4, 5);
+        let mut dec = MatroskaDecoder::new_in(
+            SliceSource::new(&bytes),
+            vec![0i32; crate::dispatch::decoder_scratch_len()],
+        )
+        .expect("open A_FLAC matroska");
+        assert_eq!(dec.stream_info().channels, 4);
+        assert_eq!(
+            dec.channel_layout(),
+            crate::channels::ChannelLayout::standard(4),
+            "the inner FLAC decoder's quad layout must reach the deck"
+        );
+        // And the stream really does decode — the layout is not reported for a
+        // track that would fail to play.
+        let mut out = [0i32; 64];
+        let n = dec.decode_into(&mut out).expect("decode");
+        assert_eq!(n, 5 * 4);
+        for i in 0..5 {
+            for c in 0..4 {
+                assert_eq!(out[i * 4 + c], (c as i32) * 100 + i as i32);
+            }
+        }
+    }
+
+    /// A stereo track is a passthrough, not a fold: FLAC reports no layout for
+    /// 1/2 channels, and that `None` must travel unchanged (the forwarding does
+    /// not invent a layout for stereo).
+    #[test]
+    fn stereo_flac_in_matroska_reports_no_layout() {
+        let bytes = flac_mkv(2, 5);
+        let dec = MatroskaDecoder::new_in(
+            SliceSource::new(&bytes),
+            vec![0i32; crate::dispatch::decoder_scratch_len()],
+        )
+        .expect("open A_FLAC matroska");
+        assert_eq!(dec.channel_layout(), None);
     }
 }

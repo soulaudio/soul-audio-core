@@ -358,3 +358,186 @@ fn real_wav_plain_4ch_without_a_mask_stays_rejected() {
     let dec = open(SliceSource::new(&wav), vec![0i32; decoder_scratch_len()]).expect("open");
     assert!(deck.load(dec).is_err(), "plain 4ch WAV must stay rejected");
 }
+
+// ===========================================================================
+// CAF: the layout lives in the `chan` (AudioChannelLayout) chunk, in any of its
+// three forms — a layout *tag* constant, a channel *bitmap*, or explicit
+// per-channel *descriptions*. Unlike WAV, CAF's tags also encode orders that
+// are NOT WAVEFORMATEXTENSIBLE (`MPEG_5_1_C` is `L C R Ls Rs LFE`), so these
+// tests use such an order deliberately: a decoder that ignored `chan` and fell
+// back to the count would fold the same 6 channels into visibly different
+// (Lo, Ro) values.
+// ===========================================================================
+
+/// `chan` chunk body using a CoreAudio layout-tag constant.
+fn chan_tag(tag: u32) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&tag.to_be_bytes()); // mChannelLayoutTag
+    b.extend_from_slice(&0u32.to_be_bytes()); // mChannelBitmap (unused)
+    b.extend_from_slice(&0u32.to_be_bytes()); // mNumberChannelDescriptions
+    b
+}
+
+/// `chan` chunk body using `kAudioChannelLayoutTag_UseChannelBitmap` — whose
+/// bits are the WAVEFORMATEXTENSIBLE speaker bits, in ascending-bit order.
+fn chan_bitmap(bitmap: u32) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // UseChannelBitmap
+    b.extend_from_slice(&bitmap.to_be_bytes());
+    b.extend_from_slice(&0u32.to_be_bytes());
+    b
+}
+
+/// `chan` chunk body using `kAudioChannelLayoutTag_UseChannelDescriptions`:
+/// one 20-byte `AudioChannelDescription` per channel, in stream order
+/// (`mChannelLabel`, `mChannelFlags`, then three float coordinates).
+fn chan_descriptions(labels: &[u32]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&0u32.to_be_bytes()); // UseChannelDescriptions
+    b.extend_from_slice(&0u32.to_be_bytes()); // mChannelBitmap (unused)
+    b.extend_from_slice(&(labels.len() as u32).to_be_bytes());
+    for &label in labels {
+        b.extend_from_slice(&label.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes()); // mChannelFlags
+        b.extend_from_slice(&[0u8; 12]); // mCoordinates[3]
+    }
+    b
+}
+
+/// Build a 24-bit big-endian `lpcm` CAF (24-bit ⇒ deck norm = 1, so the fold
+/// math stays exact), optionally carrying a `chan` chunk body. Each of `frames`
+/// frames carries `vals` (one 24-bit value per channel).
+fn caf_lpcm_24(ch: u16, chan: Option<Vec<u8>>, vals: &[i32], frames: usize) -> Vec<u8> {
+    assert_eq!(vals.len(), ch as usize);
+    let bytes_per_packet = u32::from(ch) * 3;
+
+    let mut desc = Vec::new();
+    desc.extend_from_slice(&48_000f64.to_be_bytes()); // mSampleRate
+    desc.extend_from_slice(b"lpcm"); // mFormatID
+    desc.extend_from_slice(&0u32.to_be_bytes()); // mFormatFlags: big-endian int
+    desc.extend_from_slice(&bytes_per_packet.to_be_bytes());
+    desc.extend_from_slice(&1u32.to_be_bytes()); // mFramesPerPacket
+    desc.extend_from_slice(&u32::from(ch).to_be_bytes());
+    desc.extend_from_slice(&24u32.to_be_bytes()); // mBitsPerChannel
+
+    let mut data = Vec::with_capacity(4 + frames * ch as usize * 3);
+    data.extend_from_slice(&0u32.to_be_bytes()); // mEditCount
+    for _ in 0..frames {
+        for &v in vals {
+            data.push(((v >> 16) & 0xFF) as u8); // big-endian 24-bit
+            data.push(((v >> 8) & 0xFF) as u8);
+            data.push((v & 0xFF) as u8);
+        }
+    }
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"caff");
+    bytes.extend_from_slice(&1u16.to_be_bytes()); // mFileVersion
+    bytes.extend_from_slice(&0u16.to_be_bytes()); // mFileFlags
+    let mut chunk = |ty: &[u8; 4], body: &[u8]| {
+        bytes.extend_from_slice(ty);
+        bytes.extend_from_slice(&(body.len() as i64).to_be_bytes());
+        bytes.extend_from_slice(body);
+    };
+    chunk(b"desc", &desc);
+    if let Some(c) = &chan {
+        chunk(b"chan", c);
+    }
+    chunk(b"data", &data);
+    bytes
+}
+
+/// As [`play_real_wav`], for a CAF built by [`caf_lpcm_24`].
+fn play_real_caf(bytes: &[u8]) -> (i32, i32) {
+    play_real_wav(bytes) // same public `open()` path; the sniffer picks CAF
+}
+
+/// `kAudioChannelLayoutTag_MPEG_5_1_C` = `(123 << 16) | 6`: `L C R Ls Rs LFE`.
+const MPEG_5_1_C: u32 = (123 << 16) | 6;
+/// `kAudioChannelLayoutTag_Quadraphonic` = `(108 << 16) | 4`: `L R Ls Rs`.
+const QUADRAPHONIC: u32 = (108 << 16) | 4;
+
+#[test]
+fn real_caf_5_1_folds_via_the_chan_layout_tag() {
+    // MPEG_5_1_C is NOT the WAVEFORMATEXTENSIBLE order: centre is channel 2 and the LFE
+    // is last. The huge value sits in the LFE slot of *that* order, so a decoder that fell
+    // back to the count (which would read channel 4 as the LFE) would leak it into the mix.
+    let vals = [1000, 3000, 2000, 5000, 6000, 4_000_000];
+    let caf = caf_lpcm_24(6, Some(chan_tag(MPEG_5_1_C)), &vals, 4_800);
+    let (lo, ro) = play_real_caf(&caf);
+    let exp_lo = (1000.0 + C * 3000.0 + C * 5000.0).round() as i32;
+    let exp_ro = (2000.0 + C * 3000.0 + C * 6000.0).round() as i32;
+    assert!((lo - exp_lo).abs() <= 2, "CAF 5.1 Lo {lo} != {exp_lo}");
+    assert!((ro - exp_ro).abs() <= 2, "CAF 5.1 Ro {ro} != {exp_ro}");
+}
+
+#[test]
+fn real_caf_quad_folds_via_the_chan_bitmap() {
+    // 4 channels is layout-ambiguous, so this folds only because `chan` resolves it —
+    // here through the bitmap form (WAVEFORMATEXTENSIBLE bits, ascending).
+    let bitmap = speaker::FL | speaker::FR | speaker::BL | speaker::BR;
+    let caf = caf_lpcm_24(
+        4,
+        Some(chan_bitmap(bitmap)),
+        &[1000, 2000, 5000, 6000],
+        4_800,
+    );
+    let (lo, ro) = play_real_caf(&caf);
+    let exp_lo = (1000.0 + C * 5000.0).round() as i32;
+    let exp_ro = (2000.0 + C * 6000.0).round() as i32;
+    assert!((lo - exp_lo).abs() <= 2, "CAF quad Lo {lo} != {exp_lo}");
+    assert!((ro - exp_ro).abs() <= 2, "CAF quad Ro {ro} != {exp_ro}");
+}
+
+#[test]
+fn real_caf_5_0_folds_via_chan_descriptions() {
+    // 5 channels is layout-ambiguous too. Descriptions in a deliberately non-canonical
+    // order — Left, Center, Right, LeftSurround, RightSurround (labels 1, 3, 2, 5, 6) —
+    // so the per-channel labels, not a count guess, decide where each channel lands.
+    let caf = caf_lpcm_24(
+        5,
+        Some(chan_descriptions(&[1, 3, 2, 5, 6])),
+        &[1000, 3000, 2000, 5000, 6000],
+        4_800,
+    );
+    let (lo, ro) = play_real_caf(&caf);
+    let exp_lo = (1000.0 + C * (3000.0 + 5000.0)).round() as i32;
+    let exp_ro = (2000.0 + C * (3000.0 + 6000.0)).round() as i32;
+    assert!((lo - exp_lo).abs() <= 2, "CAF 5.0 Lo {lo} != {exp_lo}");
+    assert!((ro - exp_ro).abs() <= 2, "CAF 5.0 Ro {ro} != {exp_ro}");
+}
+
+#[test]
+fn real_caf_quad_without_chan_stays_rejected() {
+    // No `chan`, ambiguous count → the deck still refuses to guess (same contract as a
+    // plain 4ch WAV). CAF's `chan` is the only layout it can carry.
+    let caf = caf_lpcm_24(4, None, &[1000, 2000, 5000, 6000], 100);
+    let mut deck: Deck<StereoCapture, AnyDecoder<SliceSource, Vec<i32>>, 0> = Deck::new(
+        StereoCapture {
+            written: Vec::new(),
+        },
+        Quality::Hq,
+    );
+    let dec = open(SliceSource::new(&caf), vec![0i32; decoder_scratch_len()]).expect("open caf");
+    assert!(
+        deck.load(dec).is_err(),
+        "4ch CAF without `chan` must stay rejected"
+    );
+}
+
+#[test]
+fn real_caf_quadraphonic_tag_folds_without_a_bitmap() {
+    // The non-MPEG tags matter too: `Quadraphonic` (L R Ls Rs) resolves the same ambiguous
+    // 4-channel count that the bitmap form did above.
+    let caf = caf_lpcm_24(
+        4,
+        Some(chan_tag(QUADRAPHONIC)),
+        &[1000, 2000, 5000, 6000],
+        4_800,
+    );
+    let (lo, ro) = play_real_caf(&caf);
+    let exp_lo = (1000.0 + C * 5000.0).round() as i32;
+    let exp_ro = (2000.0 + C * 6000.0).round() as i32;
+    assert!((lo - exp_lo).abs() <= 2, "CAF quad-tag Lo {lo} != {exp_lo}");
+    assert!((ro - exp_ro).abs() <= 2, "CAF quad-tag Ro {ro} != {exp_ro}");
+}
