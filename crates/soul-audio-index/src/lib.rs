@@ -730,7 +730,7 @@ pub mod build {
         pub tracks: Vec<TrackInput>,
         pub artists: Vec<String>,
         /// Per-artist sort-name ("Clapton, Eric"), aligned to `artists`
-        /// (index i = artists[i]). An empty entry — or a shorter/empty vec —
+        /// (index `i` = `artists[i]`). An empty entry — or a shorter/empty vec —
         /// falls back to the display name, so an untagged library orders by
         /// display name exactly as before.
         pub artist_sorts: Vec<String>,
@@ -741,8 +741,8 @@ pub mod build {
         pub albums: Vec<AlbumMeta>,
         pub folders: Vec<FolderInput>,
         pub playlists: Vec<PlaylistInput>,
-        /// Per-album cover source bytes, aligned to `albums` (index i =
-        /// albums[i]); `None` = no cover. Empty vec = no covers at all (the
+        /// Per-album cover source bytes, aligned to `albums` (index `i` =
+        /// `albums[i]`); `None` = no cover. Empty vec = no covers at all (the
         /// baker treats a missing index as `None`).
         pub covers: Vec<Option<Vec<u8>>>,
     }

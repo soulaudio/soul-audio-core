@@ -5,6 +5,9 @@
 //! ^(cd|disc|disk|dvd|side)[\s._-]*(\d{1,3}|[a-d])\b.*$
 //! ```
 //!
+//! A doubled prefix (`Disc CD 01 …`, `CD Disc 2`) is accepted: a second prefix
+//! followed by a separator or digit is skipped before the number.
+//!
 //! `a..d` count as discs `1..4` (vinyl sides). Whatever follows the number,
 //! trimmed of separators, is a **disc subtitle** fallback (`Disc 1 - Mondstadt`
 //! → `Mondstadt`). `\b` is an ASCII word boundary (`[A-Za-z0-9_]`), so a CJK
@@ -40,7 +43,20 @@ pub fn parse(name: &str) -> Option<DiscFolder<'_>> {
         .find(|p| bytes.len() >= p.len() && bytes[..p.len()].eq_ignore_ascii_case(p.as_bytes()))?
         .len();
     // The matched prefix is ASCII, so `plen` is a char boundary.
-    let rest = name[plen..].trim_start_matches(is_sep);
+    let mut rest = name[plen..].trim_start_matches(is_sep);
+    // A doubled prefix (`Disc CD 01 …`, `CD Disc 2`): skip a second prefix that
+    // is followed by a separator or a digit (so `Disc CDs` / `CD Disco 1` stay out).
+    let rbytes = rest.as_bytes();
+    if let Some(p2) = PREFIXES.iter().find(|p| {
+        rbytes.len() >= p.len()
+            && rbytes[..p.len()].eq_ignore_ascii_case(p.as_bytes())
+            && rest[p.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| is_sep(c) || c.is_ascii_digit())
+    }) {
+        rest = rest[p2.len()..].trim_start_matches(is_sep);
+    }
     let rb = rest.as_bytes();
     let (number, used) = if rb.first().is_some_and(u8::is_ascii_digit) {
         let n = rb.iter().take_while(|b| b.is_ascii_digit()).count();
@@ -100,6 +116,21 @@ mod tests {
     }
 
     #[test]
+    fn matches_doubled_prefixes() {
+        assert_eq!(
+            parse("Disc CD 01 Sakura and Violet Thunder  稻光与雷樱的土地"),
+            df(1, Some("Sakura and Violet Thunder  稻光与雷樱的土地"))
+        );
+        assert_eq!(
+            parse("Disc CD 03 Battles of Inazuma 稻妻征战记"),
+            df(3, Some("Battles of Inazuma 稻妻征战记"))
+        );
+        assert_eq!(parse("Disc CD1"), df(1, None));
+        assert_eq!(parse("CD Disc 2"), df(2, None));
+        assert_eq!(parse("disc-cd-02"), df(2, None));
+    }
+
+    #[test]
     fn rejects_non_disc_folders() {
         for name in [
             "Discography",
@@ -113,7 +144,12 @@ mod tests {
             "Sidewinder",
             "Disco 1",
             "Disc 2_Liyue", // `_` is a word char: no boundary after the number
-            " CD1",         // anchored at the start: no leading whitespace
+            "Disc CDs",
+            "Disc CD",
+            "Disc CD Collection",
+            "CD Disco 1",
+            "Disc CD1234",
+            " CD1", // anchored at the start: no leading whitespace
         ] {
             assert_eq!(parse(name), None, "{name:?} must not be a disc folder");
         }

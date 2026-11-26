@@ -509,6 +509,43 @@ fn disc_folder_subtitle_is_a_fallback_for_the_tag() {
 }
 
 #[test]
+fn doubled_prefix_disc_folders_fold_into_one_album() {
+    let root = fresh("md_cdcd");
+    for (n, sub) in [
+        (1, "Sakura and Violet Thunder  稻光与雷樱的土地"),
+        (2, "Stories of the Floating World 浮世之枯荣"),
+        (3, "Battles of Inazuma 稻妻征战记"),
+    ] {
+        put(
+            &root,
+            &format!("Inazuma/Disc CD 0{n} {sub}/01.flac"),
+            &["ALBUM=Inazuma", "TITLE=a", "TRACKNUMBER=1"],
+        );
+    }
+    let input = soul_audio_import::scan(&root).expect("scan");
+    assert_eq!(input.albums.len(), 1);
+    assert_eq!(input.albums[0].disc_count, 3);
+    assert_eq!(
+        input.folders[input.albums[0].folder as usize].path,
+        "Inazuma"
+    );
+    let subs: Vec<&str> = input
+        .tracks
+        .iter()
+        .map(|t| t.disc_subtitle.as_str())
+        .collect();
+    assert_eq!(
+        subs,
+        [
+            "Sakura and Violet Thunder  稻光与雷樱的土地",
+            "Stories of the Floating World 浮世之枯荣",
+            "Battles of Inazuma 稻妻征战记"
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn same_title_in_two_folders_is_two_albums() {
     let root = fresh("md_iso");
     put(&root, "A/01.flac", &["ALBUM=Greatest Hits", "TITLE=a"]);

@@ -61,15 +61,29 @@ fn main() {
 
 /// Run a cargo subcommand, returning an error string on non-zero exit.
 fn run(args: &[&str]) -> Result<(), String> {
-    println!("+ cargo {}", args.join(" "));
+    run_env(&[], args)
+}
+
+/// [`run`] with extra environment variables set for the child cargo.
+///
+/// `env` **replaces** any ambient value of the same variable, by design: the
+/// rustdoc gate passes `RUSTDOCFLAGS=-D warnings` so a developer's own
+/// `RUSTDOCFLAGS` can neither weaken nor change the gate.
+fn run_env(env: &[(&str, &str)], args: &[&str]) -> Result<(), String> {
+    let shown: String = env.iter().map(|(k, v)| format!("{k}={v:?} ")).collect();
+    println!("+ {shown}cargo {}", args.join(" "));
     let status = Command::new(env!("CARGO"))
+        .envs(env.iter().copied())
         .args(args)
         .status()
         .map_err(|e| format!("spawning cargo: {e}"))?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("`cargo {}` failed ({status})", args.join(" ")))
+        Err(format!(
+            "`{shown}cargo {}` failed ({status})",
+            args.join(" ")
+        ))
     }
 }
 
@@ -104,6 +118,23 @@ fn verify() -> Result<(), String> {
         "-D",
         "warnings",
     ])?;
+    // Rustdoc of the std adapters whose docs link into `build`-gated and
+    // private items: a broken or private intra-doc link is an error. Scoped to
+    // these crates (cheap: no codegen) rather than the whole workspace.
+    for args in [
+        &[
+            "doc",
+            "--no-deps",
+            "-p",
+            "soul-audio-index",
+            "--features",
+            "build",
+        ][..],
+        &["doc", "--no-deps", "-p", "soul-audio-import"][..],
+        &["doc", "--no-deps", "-p", "soul-audio-organize"][..],
+    ] {
+        run_env(&[("RUSTDOCFLAGS", "-D warnings")], args)?;
+    }
     // The checked-in generated tables must match their generators.
     resample_tables::check()?;
     filterbank_tables::check()?;

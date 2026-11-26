@@ -1,9 +1,9 @@
 //! Side files: the non-audio files that travel with an album — rip logs and cue
 //! sheets, covers, `Scans/`, lyrics, `.txt`/`.nfo`. Discovery walks the album
 //! root; placement decides each file's destination in the album's new folder.
-//! Side files are never opened or modified, only copied/moved (a `.log`'s
-//! checksum must stay valid). `.cue` `FILE` lines are NOT rewritten when tracks
-//! are renamed (documented limitation).
+//! Side files are only copied/moved, never modified (a `.log`'s checksum must
+//! stay valid) — except a `.cue` sheet, whose `FILE` lines the planner points
+//! at the renamed tracks (`crate::cue`).
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -51,6 +51,18 @@ struct Seen {
     foreign_audio: bool,
     /// One of the planner's inputs, directly in this folder.
     input: bool,
+    /// Set at depth 0 only: the album root itself, or one of its disc folders,
+    /// holds audio that is not an input — only part of the album was selected.
+    partial: bool,
+}
+
+/// An album root's side files, and whether its album was only partly selected.
+pub(crate) struct Collected {
+    /// Every side file under the root, sorted (see [`collect`]).
+    pub(crate) files: Vec<PathBuf>,
+    /// The album root, or a direct child named like a disc folder, holds audio
+    /// that is not an input.
+    pub(crate) partial: bool,
 }
 
 /// Every side file under `album_root`, recursively, sorted. Skips junk/hidden
@@ -59,18 +71,25 @@ struct Seen {
 /// directory (the destination root, when it sits inside a source album root).
 ///
 /// A sub-folder holding audio that is **not** an input — another album nested
-/// in this one, a disc the user did not select — is skipped whole: its files
-/// belong with that audio. The exception is one of this album's own disc
-/// folders: a direct child of the album root named like a disc folder
-/// ([`disc_folder::parse`]) that directly holds an input.
+/// in this one — is skipped whole: its files belong with that audio. The
+/// exception is one of this album's own disc folders: a direct child of the
+/// album root named like a disc folder ([`disc_folder::parse`]) that directly
+/// holds an input. Non-input audio in the album root itself or in **any** of
+/// its disc folders sets [`Collected::partial`] (the planner then moves no
+/// side file at all). That is conservative by design: audio that can never be
+/// an input (a format the importer does not decode, e.g. `.wma`/`.ape`), or a
+/// disc folder with none of its tracks selected, counts too.
 ///
 /// Non-UTF-8 names are side files like any other (never renamed lossily — see
 /// [`place`]).
-pub(crate) fn collect(album_root: &Path, skip: &Path, inputs: &HashSet<PathBuf>) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    walk(album_root, &paths::key(skip), inputs, 0, &mut out);
-    out.sort();
-    out
+pub(crate) fn collect(album_root: &Path, skip: &Path, inputs: &HashSet<PathBuf>) -> Collected {
+    let mut files = Vec::new();
+    let seen = walk(album_root, &paths::key(skip), inputs, 0, &mut files);
+    files.sort();
+    Collected {
+        files,
+        partial: seen.partial,
+    }
 }
 
 fn walk(
@@ -102,8 +121,9 @@ fn walk(
         if ft.is_dir() {
             let mark = out.len();
             let sub = walk(&path, skip, inputs, depth + 1, out);
-            let own_disc =
-                depth == 0 && sub.input && name.to_str().and_then(disc_folder::parse).is_some();
+            let disc = depth == 0 && name.to_str().and_then(disc_folder::parse).is_some();
+            seen.partial |= disc && sub.foreign_audio;
+            let own_disc = disc && sub.input;
             if sub.foreign_audio && !own_disc {
                 out.truncate(mark); // another album's folder: none of it is ours
                 seen.foreign_audio = true;
@@ -113,6 +133,7 @@ fn walk(
                 seen.input = true;
             } else if is_audio(&path) {
                 seen.foreign_audio = true;
+                seen.partial |= depth == 0;
             } else {
                 out.push(path);
             }

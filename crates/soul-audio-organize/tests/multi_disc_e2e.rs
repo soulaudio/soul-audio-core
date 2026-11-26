@@ -1,8 +1,10 @@
 //! The organize e2e matrix (multi-disc spec, "Testing"): three source layouts ×
 //! every preset (one-folder + `+disc-folders` album presets, and `flat`) ×
 //! Copy/Move. Each case asserts the exact destination tree (audio + side-file
-//! placement + collision prefixes), that nothing was modified, the source left
-//! intact (Copy) or pruned (Move), re-run idempotence, and finally that
+//! placement + collision prefixes), that nothing but a .cue's FILE lines was
+//! modified (the EAC cue names the renamed tracks, the log stays
+//! byte-identical), the source left intact (Copy) or pruned (Move), re-run
+//! idempotence, and finally that
 //! re-importing the destination yields the same albums (organize ∘ import).
 //!
 //! The matrix plans with a source root (`plan_with`), as the app does. Extra
@@ -19,7 +21,7 @@ use soul_audio_organize::{
     Action, EntryKind, PlanOptions, SideFilesLeft, Strategy, Template, apply, plan, plan_with,
     preset,
 };
-use support::{audio_files, flac, mp3, put, tree, unique_dir};
+use support::{at, audio_files, flac, mp3, put, rel, tree, unique_dir};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Layout {
@@ -56,6 +58,31 @@ fn track(album: &str, title: &str, n: u32, disc: Option<&str>) -> Vec<u8> {
     }
     let refs: Vec<&str> = c.iter().map(String::as_str).collect();
     flac(&refs)
+}
+
+/// An EAC-style CRLF cue for two tracks, `FILE "a"` and `FILE "b"`.
+fn eac_cue(a: &str, b: &str) -> Vec<u8> {
+    format!(
+        "REM GENRE Game\r\nREM COMMENT \"ExactAudioCopy v1.6\"\r\nPERFORMER \"HOYO-MiX\"\r\n\
+TITLE \"Box\"\r\nFILE \"{a}\" WAVE\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n\
+FILE \"{b}\" WAVE\r\n  TRACK 02 AUDIO\r\n    INDEX 01 00:00:00\r\n"
+    )
+    .into_bytes()
+}
+
+/// The Box cue's place inside the album folder and its rewritten bytes.
+fn expected_cue(layout: Layout, df: bool) -> (&'static str, Vec<u8>) {
+    match (layout, df) {
+        (_, false) => ("Box.cue", eac_cue("1-01 - Intro.flac", "1-02 - Theme.flac")),
+        (Layout::DiscSubfolders, true) => (
+            "Disc 1/Box.cue",
+            eac_cue("01 - Intro.flac", "02 - Theme.flac"),
+        ),
+        (_, true) => (
+            "Box.cue",
+            eac_cue("Disc 1/01 - Intro.flac", "Disc 1/02 - Theme.flac"),
+        ),
+    }
 }
 
 /// A single-disc MP3 album (exercises the ID3 path end to end).
@@ -95,7 +122,11 @@ fn flat_box(src: &Path) {
     );
     put(src, "Box/101 Intro.lrc", b"[00:00.00]Intro");
     put(src, "Box/Box.log", b"EAC log, checksum 1234");
-    put(src, "Box/Box.cue", b"FILE \"101 Intro.flac\" WAVE");
+    put(
+        src,
+        "Box/Box.cue",
+        &eac_cue("101 Intro.flac", "102 Theme.flac"),
+    );
     put(src, "Box/cover.jpg", b"jpg-bytes");
     put(src, "Box/Scans/Front.jpg", b"front-scan");
     put(src, "Box/info.txt", b"notes");
@@ -125,6 +156,11 @@ fn build_source(layout: Layout, src: &Path) {
             put(src, "Box/CD1/01 Intro.lrc", b"[00:00.00]Intro");
             put(src, "Box/CD1/Box.log", b"disc 1 log");
             put(src, "Box/CD2/Box.log", b"disc 2 log!");
+            put(
+                src,
+                "Box/CD1/Box.cue",
+                &eac_cue("01 Intro.flac", "02 Theme.flac"),
+            );
             put(src, "Box/cover.jpg", b"jpg-bytes");
             put(src, "Box/Scans/Front.jpg", b"front-scan");
             put(src, "Box/info.nfo", b"nfo");
@@ -173,6 +209,7 @@ fn album_files(layout: Layout, album: &str, df: bool) -> Vec<&'static str> {
             "1-01 - Intro.lrc",
             "Disc 1 - Box.log",
             "Disc 2 - Box.log",
+            "Box.cue",
             "cover.jpg",
             "Scans/Front.jpg",
             "info.nfo",
@@ -184,6 +221,7 @@ fn album_files(layout: Layout, album: &str, df: bool) -> Vec<&'static str> {
             "Disc 1/01 - Intro.lrc",
             "Disc 1/Box.log",
             "Disc 2/Box.log",
+            "Disc 1/Box.cue",
             "cover.jpg",
             "Scans/Front.jpg",
             "info.nfo",
@@ -307,6 +345,7 @@ fn run_case(layout: Layout, preset_name: &str, strategy: Strategy) {
     let files = audio_files(&src);
     let template = Template::new(preset(preset_name).expect("preset"));
     let opts = PlanOptions::new(&src);
+    let df = preset_name.ends_with("+disc-folders");
 
     // Plan: every entry is a fresh write.
     let p = plan_with(&files, &dest, &template, strategy, &opts);
@@ -357,11 +396,50 @@ fn run_case(layout: Layout, preset_name: &str, strategy: Strategy) {
             p.side_files_left
         );
     }
+    // What each destination must hold: the source bytes, or — a rewritten
+    // cue — the plan's rewritten bytes.
     let snapshot: Vec<(std::path::PathBuf, Vec<u8>)> = p
         .entries
         .iter()
-        .map(|e| (e.dst.clone(), std::fs::read(&e.src).unwrap()))
+        .map(|e| {
+            let bytes = match &e.rewritten {
+                Some(b) => b.clone(),
+                None => std::fs::read(&e.src).unwrap(),
+            };
+            (e.dst.clone(), bytes)
+        })
         .collect();
+
+    // Cue sheets: only the Box cue names tracks (the Suite cues name none),
+    // and it is rewritten; every .log stays a plain, byte-identical copy.
+    assert!(
+        p.cues_not_rewritten.is_empty(),
+        "{tag}: {:?}",
+        p.cues_not_rewritten
+    );
+    let rewritten: Vec<String> = p
+        .entries
+        .iter()
+        .filter(|e| e.rewritten.is_some())
+        .map(|e| rel(&dest, &e.dst))
+        .collect();
+    if preset_name == "flat" {
+        assert!(rewritten.is_empty(), "{tag}: {rewritten:?}");
+    } else {
+        let (cue_rel, _) = expected_cue(layout, df);
+        assert_eq!(
+            rewritten,
+            vec![format!("{}/{cue_rel}", album_dir(preset_name, "Box"))],
+            "{tag}"
+        );
+    }
+    assert!(
+        p.entries
+            .iter()
+            .filter(|e| e.src.extension().is_some_and(|x| x == "log"))
+            .all(|e| e.rewritten.is_none()),
+        "{tag}: logs are never modified"
+    );
 
     // Apply.
     let summary = apply(&p, |_| {}).expect("apply");
@@ -374,12 +452,23 @@ fn run_case(layout: Layout, preset_name: &str, strategy: Strategy) {
         expected_dest(layout, preset_name),
         "{tag}: destination tree"
     );
-    // 2. Nothing was modified on the way (side files and audio, byte for byte).
+    // 2. Nothing else was modified on the way (audio and side files byte for byte;
+    // a rewritten cue holds exactly the planned bytes).
     for (dst, bytes) in &snapshot {
         assert_eq!(
             &std::fs::read(dst).unwrap(),
             bytes,
             "{tag}: {dst:?} modified"
+        );
+    }
+    // 2b. The EAC cue names the renamed tracks, relative to its new folder.
+    if preset_name != "flat" {
+        let (cue_rel, cue_bytes) = expected_cue(layout, df);
+        let dir = album_dir(preset_name, "Box");
+        assert_eq!(
+            std::fs::read(at(&dest, &format!("{dir}/{cue_rel}"))).unwrap(),
+            cue_bytes,
+            "{tag}: rewritten cue"
         );
     }
     // 3. The source: untouched (Copy) / only what must stay (Move).
@@ -748,4 +837,41 @@ fn existing_destination_files_are_never_overwritten() {
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dest);
     }
+}
+
+/// `Disc CD 0N <subtitle>` folders (doubled prefix, CJK subtitles) are disc
+/// folders: one album, one destination folder — never "Album (2)".
+#[test]
+fn doubled_prefix_disc_folders_plan_into_one_album_folder() {
+    let src = unique_dir("cdcd-src");
+    let dest = unique_dir("cdcd-dest");
+    for (n, sub) in [
+        (1, "Sakura and Violet Thunder  稻光与雷樱的土地"),
+        (2, "Stories of the Floating World 浮世之枯荣"),
+        (3, "Battles of Inazuma 稻妻征战记"),
+    ] {
+        put(
+            &src,
+            &format!("Inazuma/Disc CD 0{n} {sub}/01 Song.flac"),
+            &track("Inazuma", &format!("Song {n}"), 1, Some(&format!("{n}/3"))),
+        );
+    }
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &Template::new(preset("artist-album").unwrap()),
+        Strategy::Copy,
+        &PlanOptions::new(&src),
+    );
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    let out = tree(&dest);
+    assert_eq!(out.len(), 3, "{out:?}");
+    assert!(
+        out.iter().all(|r| r.starts_with("HOYO-MiX/Inazuma/")),
+        "{out:?}"
+    );
+    assert!(!out.iter().any(|r| r.contains("(2)")), "{out:?}");
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dest);
 }

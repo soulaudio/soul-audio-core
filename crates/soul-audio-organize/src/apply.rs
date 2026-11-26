@@ -1,6 +1,9 @@
 //! Execution: the one mutating layer. [`apply`] walks an
 //! [`OrganizePlan`](crate::OrganizePlan), copying or moving each file into
-//! place, reporting [`Progress`] per entry and tallying a [`Summary`]. It is
+//! place — a rewritten `.cue` ([`PlanEntry::rewritten`](crate::PlanEntry::rewritten))
+//! is written from the plan's bytes instead, its source removed only after the
+//! write on a Move — reporting [`Progress`] per entry and tallying a
+//! [`Summary`]. It is
 //! **idempotent** — a destination that already exists is skipped, never
 //! overwritten — so re-running a plan is safe, and a per-file error never aborts
 //! the batch (it is recorded in [`Summary::failed`] and the walk continues).
@@ -9,8 +12,10 @@
 //! empty (bottom-up; a non-empty folder is never touched) — also on a resumed
 //! re-apply that had nothing left to move.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
+use crate::cue::SourceStamp;
 use crate::{Action, OrganizePlan, PlanEntry};
 
 /// Progress for one processed entry, delivered to the `on_progress` callback
@@ -56,6 +61,11 @@ pub struct Summary {
 /// is recorded in [`Summary::failed`] and the batch continues. The outer
 /// `io::Result` is reserved for a catastrophic failure; in practice this always
 /// returns `Ok(summary)`.
+///
+/// A Move renames. Only when the rename fails because the destination is on
+/// another volume does it copy instead (never over an existing file, synced
+/// and length-checked) and then remove the source; any other rename error is
+/// a failure and the source stays.
 pub fn apply(
     plan: &OrganizePlan,
     mut on_progress: impl FnMut(Progress),
@@ -86,10 +96,11 @@ pub fn apply(
 
 /// Apply a single entry, folding its outcome into `summary`.
 fn apply_one(entry: &PlanEntry, summary: &mut Summary) {
-    match entry.action {
-        Action::Copy => do_copy(entry, summary),
-        Action::Move => do_move(entry, summary),
-        Action::SkipDuplicate | Action::SkipConflict => summary.skipped += 1,
+    match (entry.action, &entry.rewritten) {
+        (Action::Copy | Action::Move, Some(bytes)) => do_write(entry, bytes, summary),
+        (Action::Copy, None) => do_copy(entry, summary),
+        (Action::Move, None) => do_move(entry, summary),
+        (Action::SkipDuplicate | Action::SkipConflict, _) => summary.skipped += 1,
     }
 }
 
@@ -121,6 +132,16 @@ fn do_copy(entry: &PlanEntry, summary: &mut Summary) {
 }
 
 fn do_move(entry: &PlanEntry, summary: &mut Summary) {
+    do_move_with(entry, summary, |src, dst| std::fs::rename(src, dst));
+}
+
+/// [`do_move`] with the rename injected (tests simulate a cross-device or a
+/// failing rename).
+fn do_move_with(
+    entry: &PlanEntry,
+    summary: &mut Summary,
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) {
     if !ensure_parent(entry, summary) {
         return;
     }
@@ -128,28 +149,189 @@ fn do_move(entry: &PlanEntry, summary: &mut Summary) {
         summary.skipped += 1;
         return;
     }
-    match std::fs::rename(&entry.src, &entry.dst) {
+    match rename(&entry.src, &entry.dst) {
         Ok(()) => summary.moved += 1,
-        // Source genuinely missing: a real failure, not a cross-device rename.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            summary.failed.push((entry.src.clone(), e.to_string()));
-        }
-        // Cross-device (or other) rename failure: fall back to copy + remove.
-        Err(_) => {
-            match std::fs::copy(&entry.src, &entry.dst)
-                .and_then(|_| std::fs::remove_file(&entry.src))
-            {
-                Ok(()) => summary.moved += 1,
+        // Another volume: copy, verify, and only then remove the source.
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            match copy_across(&entry.src, &entry.dst) {
+                Ok(()) => match std::fs::remove_file(&entry.src) {
+                    Ok(()) => summary.moved += 1,
+                    Err(e) => summary.failed.push((
+                        entry.src.clone(),
+                        format!(
+                            "copied to {} but could not remove the source: {e}",
+                            entry.dst.display()
+                        ),
+                    )),
+                },
                 Err(e) => summary.failed.push((entry.src.clone(), e.to_string())),
             }
         }
+        // Anything else (missing source, locked file, permissions, …) is a
+        // failure: the source stays where it is.
+        Err(e) => summary.failed.push((entry.src.clone(), e.to_string())),
     }
+}
+
+/// A cross-volume Move's copy: create `dst` (never over an existing file),
+/// stream `src` into it, flush it to disk and check its length against the
+/// source's. On any error the partial `dst` — only ever one this call created
+/// — is removed; the source is never touched here. Like `fs::copy`, the
+/// copy keeps the source's modification time and permissions (read-only
+/// flag); those are best-effort and never fail the move.
+fn copy_across(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut from = std::fs::File::open(src)?;
+    let src_meta = from.metadata()?;
+    let want = src_meta.len();
+    let mut to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)?;
+    let res = std::io::copy(&mut from, &mut to)
+        .and_then(|n| {
+            to.sync_all()?;
+            Ok(n)
+        })
+        .and_then(|n| {
+            let written = to.metadata()?.len();
+            if n == want && written == want {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!(
+                    "copied {written} of {want} bytes to {}",
+                    dst.display()
+                )))
+            }
+        });
+    if res.is_err() {
+        drop(to);
+        let _ = std::fs::remove_file(dst);
+        return res;
+    }
+    if let Ok(mtime) = src_meta.modified() {
+        let _ = to.set_modified(mtime);
+    }
+    drop(to);
+    let _ = std::fs::set_permissions(dst, src_meta.permissions());
+    res
+}
+
+/// A rewritten cue ([`PlanEntry::rewritten`]): write `bytes` at `dst` — never
+/// over an existing file — and, for a Move, remove the source only once the
+/// write succeeded.
+///
+/// The source is re-read first and must still match what was planned (its
+/// stamp: length + content hash): a cue edited, replaced or removed since
+/// planning is a failure — nothing is written, nothing removed — so an edit
+/// is never lost. A hand-built entry has no stamp: a Copy writes, a Move
+/// fails (it would delete a source nobody verified). A failed write leaves
+/// the source untouched (and no partial destination); a failed removal
+/// leaves both files and is recorded.
+///
+/// An existing `dst` is skipped — except on a Move whose `dst` already holds
+/// exactly `bytes` while the source is unchanged (a run stopped between the
+/// write and the removal): the removal is finished and the entry counts as
+/// moved.
+fn do_write(entry: &PlanEntry, bytes: &[u8], summary: &mut Summary) {
+    let is_move = entry.action == Action::Move;
+    if entry.dst.exists() {
+        // Length first: only a same-length destination is read in full.
+        let holds_bytes = std::fs::metadata(&entry.dst)
+            .is_ok_and(|m| m.is_file() && m.len() == bytes.len() as u64)
+            && std::fs::read(&entry.dst).is_ok_and(|d| d == bytes);
+        if is_move && holds_bytes && source_matches(entry) {
+            remove_source(entry, summary);
+        } else {
+            summary.skipped += 1;
+        }
+        return;
+    }
+    match entry.source_stamp {
+        Some(_) if !source_matches(entry) => {
+            summary.failed.push((
+                entry.src.clone(),
+                "the cue changed or vanished since it was planned; source kept — re-plan before moving this album, or move the cue by hand"
+                    .to_owned(),
+            ));
+            return;
+        }
+        None if is_move => {
+            summary.failed.push((
+                entry.src.clone(),
+                "a rewritten cue without a plan-time source check is never moved".to_owned(),
+            ));
+            return;
+        }
+        _ => {}
+    }
+    // Only now — a refused cue leaves no empty folder behind.
+    if !ensure_parent(entry, summary) {
+        return;
+    }
+    match write_new(&entry.dst, bytes) {
+        Ok(()) => {}
+        // Created by someone else since the check: still never overwritten.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            summary.skipped += 1;
+            return;
+        }
+        Err(e) => {
+            summary.failed.push((entry.src.clone(), e.to_string()));
+            return;
+        }
+    }
+    if is_move {
+        remove_source(entry, summary);
+    } else {
+        summary.copied += 1;
+    }
+}
+
+/// Whether `entry`'s source still matches its plan-time stamp (`false`
+/// without one, or when it cannot be read).
+fn source_matches(entry: &PlanEntry) -> bool {
+    let Some(stamp) = entry.source_stamp else {
+        return false;
+    };
+    // Cheap length check first: a grown file is never read whole.
+    std::fs::metadata(&entry.src).is_ok_and(|m| m.is_file() && m.len() == stamp.len())
+        && std::fs::read(&entry.src).is_ok_and(|b| SourceStamp::of(&b) == stamp)
+}
+
+/// The rewritten cue is in place: remove the (verified) source of a Move.
+fn remove_source(entry: &PlanEntry, summary: &mut Summary) {
+    match std::fs::remove_file(&entry.src) {
+        Ok(()) => summary.moved += 1,
+        Err(e) => summary.failed.push((
+            entry.src.clone(),
+            format!(
+                "wrote {} but could not remove the source: {e}",
+                entry.dst.display()
+            ),
+        )),
+    }
+}
+
+/// Create `dst` (failing if it exists) holding exactly `bytes`; on error the
+/// partial file is removed.
+fn write_new(dst: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)?;
+    let res = f.write_all(bytes).and_then(|()| f.sync_all());
+    if res.is_err() {
+        drop(f);
+        let _ = std::fs::remove_file(dst);
+    }
+    res
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Progress, apply};
-    use crate::{Strategy, Template, plan, presets};
+    use super::{Progress, Summary, apply, do_move_with};
+    use crate::cue::SourceStamp;
+    use crate::{Action, EntryKind, OrganizePlan, PlanEntry, Strategy, Template, plan, presets};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -351,5 +533,350 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// A one-entry plan writing `bytes` (a rewritten cue) for `src` → `dst`,
+    /// planned from a source holding `OLD` (as the planner stamps it).
+    fn cue_plan(src: &Path, dst: &Path, action: Action, bytes: &[u8]) -> OrganizePlan {
+        let mut p = hand_cue_plan(src, dst, action, bytes);
+        p.entries[0].source_stamp = Some(SourceStamp::of(OLD));
+        p
+    }
+
+    /// [`cue_plan`] without a source stamp (a hand-built entry).
+    fn hand_cue_plan(src: &Path, dst: &Path, action: Action, bytes: &[u8]) -> OrganizePlan {
+        let mut e = PlanEntry::new(src, dst, action, EntryKind::SideFile);
+        e.rewritten = Some(bytes.to_vec());
+        OrganizePlan {
+            entries: vec![e],
+            ..Default::default()
+        }
+    }
+
+    const OLD: &[u8] = b"FILE \"a.flac\" WAVE\r\n";
+    const NEW: &[u8] = b"FILE \"01 - A.flac\" WAVE\r\n";
+
+    #[test]
+    fn a_rewritten_cue_copy_writes_the_new_bytes_and_keeps_the_source() {
+        let dir = unique_dir("cue-copy");
+        let src = dir.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        let dst = join(&dir, &["out", "a.cue"]);
+        let s = apply(&cue_plan(&src, &dst, Action::Copy, NEW), |_| {}).unwrap();
+        assert_eq!((s.copied, s.moved, s.skipped), (1, 0, 0));
+        assert!(s.failed.is_empty(), "{:?}", s.failed);
+        assert_eq!(std::fs::read(&dst).unwrap(), NEW);
+        assert_eq!(std::fs::read(&src).unwrap(), OLD);
+        // A hand-built Copy (no stamp) writes too: the source is never touched.
+        let dst2 = join(&dir, &["out", "b.cue"]);
+        let s = apply(&hand_cue_plan(&src, &dst2, Action::Copy, NEW), |_| {}).unwrap();
+        assert_eq!((s.copied, s.failed.len()), (1, 0), "{:?}", s.failed);
+        assert_eq!(std::fs::read(&dst2).unwrap(), NEW);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rewritten_cue_move_writes_then_removes_the_source() {
+        let dir = unique_dir("cue-move");
+        let src = dir.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        let dst = join(&dir, &["out", "a.cue"]);
+        let p = cue_plan(&src, &dst, Action::Move, NEW);
+        let s = apply(&p, |_| {}).unwrap();
+        assert_eq!((s.copied, s.moved, s.skipped), (0, 1, 0));
+        assert_eq!(std::fs::read(&dst).unwrap(), NEW);
+        assert!(!src.exists());
+        // Re-applying the same plan is a no-op.
+        let again = apply(&p, |_| {}).unwrap();
+        assert_eq!((again.moved, again.skipped), (0, 1));
+        assert!(again.failed.is_empty(), "{:?}", again.failed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rewritten_cue_never_overwrites() {
+        let dir = unique_dir("cue-exists");
+        let src = dir.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        let dst = dir.join("b.cue");
+        std::fs::write(&dst, b"someone else's").unwrap();
+        let s = apply(&cue_plan(&src, &dst, Action::Move, NEW), |_| {}).unwrap();
+        assert_eq!((s.moved, s.skipped), (0, 1));
+        assert_eq!(std::fs::read(&dst).unwrap(), b"someone else's");
+        assert_eq!(std::fs::read(&src).unwrap(), OLD, "the source stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_cue_write_keeps_the_source() {
+        let dir = unique_dir("cue-fail");
+        let src = dir.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        // The destination's parent is a FILE: the write cannot happen.
+        std::fs::write(dir.join("blocker"), b"x").unwrap();
+        let dst = join(&dir, &["blocker", "a.cue"]);
+        let s = apply(&cue_plan(&src, &dst, Action::Move, NEW), |_| {}).unwrap();
+        assert_eq!((s.moved, s.failed.len()), (0, 1));
+        assert_eq!(std::fs::read(&src).unwrap(), OLD, "never both missing");
+        assert!(!dst.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cue_edited_after_planning_is_never_moved() {
+        // The user edits the cue between plan and apply: writing the planned
+        // bytes and deleting the source would lose the edit.
+        let dir = unique_dir("cue-edited");
+        let src = dir.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        let dst = join(&dir, &["out", "a.cue"]);
+        let p = cue_plan(&src, &dst, Action::Move, NEW);
+        let edited: &[u8] = b"REM EDITED
+FILE \"a.flac\" WAVE
+";
+        std::fs::write(&src, edited).unwrap();
+        let s = apply(&p, |_| {}).unwrap();
+        assert_eq!((s.moved, s.copied, s.skipped), (0, 0, 0));
+        assert_eq!(s.failed.len(), 1, "{:?}", s.failed);
+        assert_eq!(std::fs::read(&src).unwrap(), edited, "the edit survives");
+        assert!(!dst.exists(), "nothing written");
+        assert!(!dst.parent().unwrap().exists(), "not even its folder");
+        assert!(
+            s.failed[0].1.contains("source kept"),
+            "the message must not just say re-plan: {:?}",
+            s.failed
+        );
+        // Same length, different bytes: still caught (content hash).
+        let same_len: Vec<u8> = OLD.iter().map(|b| b.to_ascii_lowercase()).collect();
+        assert_eq!(same_len.len(), OLD.len());
+        std::fs::write(&src, &same_len).unwrap();
+        let s = apply(&p, |_| {}).unwrap();
+        assert_eq!((s.moved, s.failed.len()), (0, 1), "{:?}", s.failed);
+        assert_eq!(std::fs::read(&src).unwrap(), same_len);
+        assert!(!dst.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_vanished_cue_source_writes_nothing() {
+        for action in [Action::Move, Action::Copy] {
+            let dir = unique_dir("cue-vanished");
+            let src = dir.join("a.cue");
+            let dst = join(&dir, &["out", "a.cue"]);
+            // Planned from OLD, gone by apply time.
+            let s = apply(&cue_plan(&src, &dst, action, NEW), |_| {}).unwrap();
+            assert_eq!((s.moved, s.copied, s.failed.len()), (0, 0, 1), "{action:?}");
+            assert!(!dst.exists(), "{action:?}: nothing written");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_hand_built_rewritten_move_never_deletes_the_source() {
+        // No stamp: apply cannot tell whether the source changed since the
+        // bytes were made, so a Move fails safe.
+        let dir = unique_dir("cue-hand");
+        let src = dir.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        let dst = join(&dir, &["out", "a.cue"]);
+        let s = apply(&hand_cue_plan(&src, &dst, Action::Move, NEW), |_| {}).unwrap();
+        assert_eq!((s.moved, s.failed.len()), (0, 1), "{:?}", s.failed);
+        assert_eq!(std::fs::read(&src).unwrap(), OLD);
+        assert!(!dst.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_interrupted_cue_move_is_completed_on_reapply() {
+        // The rewritten cue was written but the source was not removed (the
+        // run stopped in between): re-applying finishes the Move.
+        let dir = unique_dir("cue-complete");
+        let src = dir.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        let dst = join(&dir, &["out", "a.cue"]);
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::write(&dst, NEW).unwrap();
+        let s = apply(&cue_plan(&src, &dst, Action::Move, NEW), |_| {}).unwrap();
+        assert!(s.failed.is_empty(), "{:?}", s.failed);
+        assert_eq!((s.moved, s.skipped), (1, 0));
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), NEW);
+
+        // ...but never when the source was edited, or dst is someone else's.
+        for (src_bytes, dst_bytes) in [(&b"edited"[..], NEW), (OLD, &b"other"[..])] {
+            std::fs::write(&src, src_bytes).unwrap();
+            std::fs::write(&dst, dst_bytes).unwrap();
+            let s = apply(&cue_plan(&src, &dst, Action::Move, NEW), |_| {}).unwrap();
+            assert_eq!((s.moved, s.skipped), (0, 1), "{:?}", s.failed);
+            assert_eq!(std::fs::read(&src).unwrap(), src_bytes, "source kept");
+            assert_eq!(std::fs::read(&dst).unwrap(), dst_bytes, "dst untouched");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A one-entry audio Move plan `src` → `dst` (both under `dir`).
+    fn move_entry(dir: &Path) -> (PathBuf, PathBuf, PlanEntry) {
+        let src = dir.join("a.flac");
+        std::fs::write(&src, b"audio bytes").unwrap();
+        let dst = join(dir, &["out", "01 - A.flac"]);
+        let e = PlanEntry::new(&src, &dst, Action::Move, EntryKind::Audio);
+        (src, dst, e)
+    }
+
+    #[test]
+    fn a_failed_rename_that_is_not_cross_device_keeps_the_source() {
+        let dir = unique_dir("mv-denied");
+        let (src, dst, e) = move_entry(&dir);
+        let mut s = Summary::default();
+        do_move_with(&e, &mut s, |_, _| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!((s.moved, s.failed.len()), (0, 1), "{:?}", s.failed);
+        assert_eq!(std::fs::read(&src).unwrap(), b"audio bytes");
+        assert!(!dst.exists(), "no copy fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cross_device_move_copies_verifies_then_removes() {
+        let dir = unique_dir("mv-xdev");
+        let (src, dst, e) = move_entry(&dir);
+        // An old modification time and the read-only flag, as fs::copy kept.
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let f = std::fs::OpenOptions::new().write(true).open(&src).unwrap();
+        f.set_modified(old).unwrap();
+        drop(f);
+        let mut perm = std::fs::metadata(&src).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&src, perm).unwrap();
+        let mut s = Summary::default();
+        do_move_with(&e, &mut s, |_, _| {
+            Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
+        });
+        assert!(s.failed.is_empty(), "{:?}", s.failed);
+        assert_eq!(s.moved, 1);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"audio bytes");
+        assert!(!src.exists());
+        let meta = std::fs::metadata(&dst).unwrap();
+        assert_eq!(meta.modified().unwrap(), old, "mtime preserved");
+        assert!(meta.permissions().readonly(), "read-only flag preserved");
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            let mut perm = meta.permissions();
+            perm.set_readonly(false);
+            std::fs::set_permissions(&dst, perm).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cross_device_move_never_overwrites_a_file_that_appeared() {
+        // Something creates dst between the exists-check and the copy.
+        let dir = unique_dir("mv-xdev-race");
+        let (src, dst, e) = move_entry(&dir);
+        let mut s = Summary::default();
+        do_move_with(&e, &mut s, |_, d| {
+            std::fs::write(d, b"someone else's").unwrap();
+            Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
+        });
+        assert_eq!((s.moved, s.failed.len()), (0, 1), "{:?}", s.failed);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"someone else's");
+        assert_eq!(std::fs::read(&src).unwrap(), b"audio bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_move_of_a_locked_source_fails_and_keeps_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = unique_dir("mv-locked");
+        let (src, dst, e) = move_entry(&dir);
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&src)
+            .unwrap();
+        let s = apply(
+            &OrganizePlan {
+                entries: vec![e],
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        drop(lock);
+        assert_eq!((s.moved, s.failed.len()), (0, 1), "{:?}", s.failed);
+        assert_eq!(std::fs::read(&src).unwrap(), b"audio bytes");
+        assert!(!dst.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cue Move whose source cannot be removed after the write: both files
+    /// stay and the failure is recorded (never both missing). `hold` makes
+    /// the source unremovable and returns its release.
+    fn assert_cue_kept_when_unremovable(
+        dir: &Path,
+        src: &Path,
+        hold: impl FnOnce() -> Box<dyn FnOnce()>,
+    ) {
+        let dst = join(dir, &["out", "a.cue"]);
+        let release = hold();
+        let s = apply(&cue_plan(src, &dst, Action::Move, NEW), |_| {}).unwrap();
+        release();
+        assert_eq!((s.moved, s.failed.len()), (0, 1), "{:?}", s.failed);
+        assert!(
+            s.failed[0].1.contains("could not remove the source"),
+            "{:?}",
+            s.failed
+        );
+        assert_eq!(std::fs::read(&dst).unwrap(), NEW);
+        assert_eq!(std::fs::read(src).unwrap(), OLD);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_cue_source_that_cannot_be_removed_is_kept_with_its_copy() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = unique_dir("cue-unremovable");
+        let src = dir.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        let held = src.clone();
+        assert_cue_kept_when_unremovable(&dir, &src, move || {
+            // Others may read it (the stamp check) but not delete it.
+            const FILE_SHARE_READ: u32 = 1;
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&held)
+                .unwrap();
+            Box::new(move || drop(f))
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cue_source_that_cannot_be_removed_is_kept_with_its_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_dir("cue-unremovable");
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let src = locked.join("a.cue");
+        std::fs::write(&src, OLD).unwrap();
+        let mode = |m: u32| std::fs::Permissions::from_mode(m);
+        std::fs::set_permissions(&locked, mode(0o555)).unwrap();
+        // root ignores directory permissions: nothing to test there.
+        let probe = locked.join("probe");
+        if std::fs::write(&probe, b"").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            std::fs::set_permissions(&locked, mode(0o755)).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let unlock = locked.clone();
+        assert_cue_kept_when_unremovable(&dir, &src, move || {
+            Box::new(move || std::fs::set_permissions(&unlock, mode(0o755)).unwrap())
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1366,3 +1366,361 @@ fn a_replan_after_apply_picks_the_same_side_file_names() {
         again.entries
     );
 }
+
+#[test]
+fn disc_dir_in_the_file_name_is_no_disc_folder_layout() {
+    // `{DiscDir}` only in the file name: every disc lands in one folder, so
+    // folder-inferred discs are reported and disc-folder side files go flat.
+    let (src, dest) = (unique_dir("dd-name-src"), unique_dir("dd-name-dest"));
+    put(
+        &src,
+        "Suite/Disc 1 - Mondstadt/01 Dawn.flac",
+        &track("Suite", "Dawn", 1, None),
+    );
+    put(
+        &src,
+        "Suite/Disc 2 - Liyue/01 Night.flac",
+        &track("Suite", "Night", 1, None),
+    );
+    put(&src, "Suite/Disc 2 - Liyue/notes.txt", b"notes");
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &Template::new("{AlbumArtist}/{Album}/{DiscDir} {TrackNo} - {Title}"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::Audio),
+        set(&[
+            "HOYO-MiX/Suite/Disc 1 01 - Dawn.flac",
+            "HOYO-MiX/Suite/Disc 2 01 - Night.flac",
+        ])
+    );
+    assert_eq!(p.folder_inferred_discs, vec![src.join("Suite")]);
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::SideFile),
+        set(&["HOYO-MiX/Suite/notes.txt"])
+    );
+}
+
+/// A dated `album` track (DATE=2020) whose bytes differ per `edition`.
+fn dated(album: &str, title: &str, n: u32, edition: &str) -> Vec<u8> {
+    let c = [
+        format!("ALBUM={album}"),
+        format!("TITLE={title}"),
+        "ARTIST=HOYO-MiX".to_owned(),
+        "ALBUMARTIST=HOYO-MiX".to_owned(),
+        "DATE=2020".to_owned(),
+        format!("TRACKNUMBER={n}"),
+        format!("COMMENT={edition}"),
+    ];
+    let refs: Vec<&str> = c.iter().map(String::as_str).collect();
+    flac(&refs)
+}
+
+#[test]
+fn the_numbered_suffix_goes_on_the_album_folder_not_a_folder_after_it() {
+    let (src, dest) = (unique_dir("albseg-src"), unique_dir("albseg-dest"));
+    put(&src, "A/01.flac", &dated("Box", "a", 1, "one"));
+    put(&src, "A/cover.jpg", b"a cover");
+    put(&src, "B/01.flac", &dated("Box", "a", 1, "two"));
+    put(&src, "B/cover.jpg", b"b cover!");
+    let p = plan_with(
+        &audio_files(&src),
+        &dest,
+        &Template::new("{AlbumArtist}/{Album}/{Year}/{TrackNo} - {Title}"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::Audio),
+        set(&[
+            "HOYO-MiX/Box/2020/01 - a.flac",
+            "HOYO-MiX/Box (2)/2020/01 - a.flac",
+        ])
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::SideFile),
+        set(&[
+            "HOYO-MiX/Box/2020/cover.jpg",
+            "HOYO-MiX/Box (2)/2020/cover.jpg",
+        ])
+    );
+    assert!(
+        p.entries.iter().all(|e| e.action == Action::Copy),
+        "{:#?}",
+        p.entries
+    );
+
+    // Re-plan after apply: the same numbered folders, everything already there.
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    let again = plan_with(
+        &audio_files(&src),
+        &dest,
+        &Template::new("{AlbumArtist}/{Album}/{Year}/{TrackNo} - {Title}"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    let pairs = |p: &OrganizePlan| -> Vec<(String, String)> {
+        p.entries
+            .iter()
+            .map(|e| (rel(&src, &e.src), rel(&dest, &e.dst)))
+            .collect()
+    };
+    assert_eq!(pairs(&again), pairs(&p));
+    assert!(
+        again
+            .entries
+            .iter()
+            .all(|e| e.action == Action::SkipDuplicate),
+        "{:#?}",
+        again.entries
+    );
+}
+
+#[test]
+fn a_partial_selection_leaves_the_album_side_files_in_place() {
+    // Select 3 of 10 tracks and Move them: the cover and the log stay with
+    // the 7 tracks left behind. Then select the rest: now they all go.
+    let (src, dest) = (unique_dir("partial-src"), unique_dir("partial-dest"));
+    let all: Vec<PathBuf> = (1..=10)
+        .map(|n| {
+            put(
+                &src,
+                &format!("Album/{n:02} t{n}.flac"),
+                &track("Album", &format!("t{n}"), n, None),
+            )
+        })
+        .collect();
+    put(&src, "Album/cover.jpg", b"cover");
+    put(&src, "Album/Album.log", b"EAC log");
+    let p = plan_with(
+        &all[..3],
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+        &opts(&src),
+    );
+    assert_eq!(dsts(&p, &dest, EntryKind::Audio).len(), 3);
+    assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty());
+    assert_eq!(
+        left(&p),
+        vec![(src.join("Album"), SideFilesLeft::PartialSelection, 2)]
+    );
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    assert!(at(&src, "Album/cover.jpg").exists());
+    assert!(at(&src, "Album/Album.log").exists());
+
+    // The rest of the album: a complete selection sweeps as before.
+    let rest = audio_files(&src);
+    assert_eq!(rest.len(), 7);
+    let p = plan_with(
+        &rest,
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Move,
+        &opts(&src),
+    );
+    assert!(p.side_files_left.is_empty(), "{:?}", p.side_files_left);
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::SideFile),
+        set(&["HOYO-MiX/Album/Album.log", "HOYO-MiX/Album/cover.jpg"])
+    );
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    assert!(!src.join("Album").exists(), "emptied album folder pruned");
+}
+
+#[test]
+fn unselected_audio_in_a_disc_folder_is_a_partial_selection() {
+    let (src, dest) = (unique_dir("partial-df-src"), unique_dir("partial-df-dest"));
+    let a = put(&src, "Box/CD1/01 a.flac", &track("Box", "a", 1, Some("1")));
+    let b = put(&src, "Box/CD1/02 b.flac", &track("Box", "b", 2, Some("1")));
+    let c = put(&src, "Box/CD2/01 c.flac", &track("Box", "c", 1, Some("2")));
+    put(&src, "Box/cover.jpg", b"cover");
+    put(&src, "Box/CD1/Box.log", b"disc 1 log");
+    for (inputs, why) in [
+        (vec![a.clone()], "a track of CD1 is missing"),
+        (vec![a.clone(), b.clone()], "all of CD2 is missing"),
+    ] {
+        let p = plan_with(
+            &inputs,
+            &dest,
+            &tpl("artist-album"),
+            Strategy::Copy,
+            &opts(&src),
+        );
+        assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty(), "{why}");
+        assert_eq!(
+            left(&p),
+            vec![(src.join("Box"), SideFilesLeft::PartialSelection, 2)],
+            "{why}"
+        );
+    }
+    // Every disc selected: swept.
+    let p = plan_with(
+        &[a, b, c],
+        &dest,
+        &tpl("artist-album"),
+        Strategy::Copy,
+        &opts(&src),
+    );
+    assert!(p.side_files_left.is_empty(), "{:?}", p.side_files_left);
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::SideFile),
+        set(&["HOYO-MiX/Box/Box.log", "HOYO-MiX/Box/cover.jpg"])
+    );
+}
+
+/// A `Box` track by H with `DATE=year`.
+fn yeared(title: &str, n: u32, year: &str) -> Vec<u8> {
+    let c = [
+        "ALBUM=Box".to_owned(),
+        format!("TITLE={title}"),
+        "ALBUMARTIST=H".to_owned(),
+        format!("TRACKNUMBER={n}"),
+        format!("DATE={year}"),
+    ];
+    let refs: Vec<&str> = c.iter().map(String::as_str).collect();
+    flac(&refs)
+}
+
+#[test]
+fn a_numbered_album_never_splits_across_numbers() {
+    // B shares A's `Box/2020` folder but its 2021 track has `Box/2021` to
+    // itself: still all of B goes to `Box (2)`, and so do its side files.
+    let (src, dest) = (unique_dir("yr-src"), unique_dir("yr-dest"));
+    put(&src, "A/1.flac", &yeared("a", 1, "2020"));
+    put(&src, "B/1.flac", &yeared("b", 1, "2020"));
+    put(&src, "B/2.flac", &yeared("c", 2, "2021"));
+    put(&src, "B/b.log", b"log");
+    let t = Template::new("{AlbumArtist}/{Album}/{Year}/{TrackNo} - {Title}");
+    let p = plan_with(&audio_files(&src), &dest, &t, Strategy::Copy, &opts(&src));
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::Audio),
+        set(&[
+            "H/Box/2020/01 - a.flac",
+            "H/Box (2)/2020/01 - b.flac",
+            "H/Box (2)/2021/02 - c.flac",
+        ])
+    );
+    assert_eq!(
+        dsts(&p, &dest, EntryKind::SideFile),
+        set(&["H/Box (2)/b.log"])
+    );
+    assert!(p.side_files_left.is_empty(), "{:?}", p.side_files_left);
+
+    // Re-plan after apply: the same names, everything already there.
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    let again = plan_with(&audio_files(&src), &dest, &t, Strategy::Copy, &opts(&src));
+    let pairs = |p: &OrganizePlan| -> Vec<(String, String)> {
+        p.entries
+            .iter()
+            .map(|e| (rel(&src, &e.src), rel(&dest, &e.dst)))
+            .collect()
+    };
+    assert_eq!(pairs(&again), pairs(&p));
+    assert!(
+        again
+            .entries
+            .iter()
+            .all(|e| e.action == Action::SkipDuplicate),
+        "{:#?}",
+        again.entries
+    );
+}
+
+#[test]
+fn an_album_split_over_album_folders_keeps_its_side_files() {
+    // `artist-year-album` with per-track dates: `2020 - Box` and `2021 - Box`.
+    // No one folder owns the log and the cue — they must not land in `H/`.
+    let (src, dest) = (unique_dir("split-src"), unique_dir("split-dest"));
+    put(&src, "B/1.flac", &yeared("b", 1, "2020"));
+    put(&src, "B/2.flac", &yeared("c", 2, "2021"));
+    put(&src, "B/b.log", b"log");
+    put(
+        &src,
+        "B/b.cue",
+        b"FILE \"1.flac\" WAVE\nFILE \"2.flac\" WAVE\n",
+    );
+    for strategy in [Strategy::Copy, Strategy::Move] {
+        let p = plan_with(
+            &audio_files(&src),
+            &dest,
+            &tpl("artist-year-album"),
+            strategy,
+            &opts(&src),
+        );
+        assert_eq!(
+            dsts(&p, &dest, EntryKind::Audio),
+            set(&["H/2020 - Box/01 - b.flac", "H/2021 - Box/02 - c.flac"])
+        );
+        assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty());
+        assert_eq!(
+            left(&p),
+            vec![(src.join("B"), SideFilesLeft::SplitAlbumFolders, 2)]
+        );
+        assert!(p.cues_not_rewritten.is_empty());
+    }
+}
+
+#[test]
+fn audio_that_is_never_an_input_makes_the_selection_partial() {
+    // `.wma`/`.ape` are audio this build never lists as an input: the album
+    // folder still holds part of the album, so its side files stay.
+    for other in ["Album/03 c.wma", "Album/04 d.APE"] {
+        let (src, dest) = (unique_dir("wma-src"), unique_dir("wma-dest"));
+        put(&src, "Album/01 a.flac", &track("Album", "a", 1, None));
+        put(&src, other, b"not decodable here");
+        put(&src, "Album/cover.jpg", b"cover");
+        let p = plan_with(
+            &audio_files(&src),
+            &dest,
+            &tpl("artist-album"),
+            Strategy::Move,
+            &opts(&src),
+        );
+        assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty(), "{other}");
+        assert_eq!(
+            left(&p),
+            vec![(src.join("Album"), SideFilesLeft::PartialSelection, 1)],
+            "{other}"
+        );
+        let s = apply(&p, |_| {}).unwrap();
+        assert!(s.failed.is_empty(), "{:?}", s.failed);
+        assert!(at(&src, other).exists() && at(&src, "Album/cover.jpg").exists());
+    }
+}
+
+#[test]
+fn moving_only_cd1_leaves_the_album_side_files_and_folder() {
+    let (src, dest) = (unique_dir("cd1-src"), unique_dir("cd1-dest"));
+    let a = put(&src, "Box/CD1/01 a.flac", &track("Box", "a", 1, Some("1")));
+    put(&src, "Box/CD2/01 c.flac", &track("Box", "c", 1, Some("2")));
+    put(&src, "Box/cover.jpg", b"cover");
+    put(&src, "Box/CD1/Box.log", b"disc 1 log");
+    let p = plan_with(
+        &[a],
+        &dest,
+        &tpl("artist-album+disc-folders"),
+        Strategy::Move,
+        &opts(&src),
+    );
+    assert!(dsts(&p, &dest, EntryKind::SideFile).is_empty());
+    assert_eq!(
+        left(&p),
+        vec![(src.join("Box"), SideFilesLeft::PartialSelection, 2)]
+    );
+    let s = apply(&p, |_| {}).unwrap();
+    assert!(s.failed.is_empty(), "{:?}", s.failed);
+    assert_eq!(s.moved, 1);
+    assert_eq!(
+        tree(&src),
+        set(&["Box/CD1/Box.log", "Box/CD2/01 c.flac", "Box/cover.jpg"]),
+        "the log, the cover and CD2 stay; Box/ and Box/CD1/ are not pruned"
+    );
+}

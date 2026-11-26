@@ -29,7 +29,8 @@ pub(crate) struct AlbumGroup {
     pub(crate) disc_count: u32,
     pub(crate) tracks: Vec<usize>,
     /// Some track's disc number came only from its disc-folder name (no disc
-    /// tag) — a layout without `{DiscDir}` loses it on re-import.
+    /// tag) — a layout without a `{DiscDir}` directory segment loses it on
+    /// re-import.
     pub(crate) disc_from_folder: bool,
 }
 
