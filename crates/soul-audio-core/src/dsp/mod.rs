@@ -28,6 +28,10 @@
 //! outside core (`soul-audio-eq`), exactly as it does for
 //! [`Equalizer`](crate::eq::Equalizer) itself.
 
+pub mod crossfeed;
+
+pub use crossfeed::CrossfeedStage;
+
 use crate::eq::Equalizer;
 
 /// How many stages one chain can hold. Four covers the planned set (EQ,
@@ -45,6 +49,8 @@ pub const EQ_BANDS: usize = 16;
 pub enum StageKind {
     /// Parametric EQ (a biquad band cascade).
     Eq,
+    /// Headphone crossfeed (see [`crossfeed`]).
+    Crossfeed,
 }
 
 /// One block-processing stage. Implemented by each concrete stage and forwarded
@@ -128,34 +134,50 @@ impl DspStage for EqStage {
 
 /// A chain slot: one concrete stage. An enum rather than a `dyn DspStage` so
 /// the chain needs neither allocation nor indirection.
+///
+/// The variants differ a lot in size — an EQ carries 16 bands' coefficients
+/// plus per-channel delay lines (~2.4 KiB), a crossfeed carries two filter
+/// states — and that is accepted deliberately: boxing the big one is exactly
+/// what a no-alloc crate cannot do, and the slot count is fixed and tiny
+/// ([`MAX_STAGES`]), so the worst case is a few kilobytes of inline storage
+/// sized for the largest stage. Same tradeoff (and the same `allow`) as
+/// [`AnyDecoder`](crate::dispatch::AnyDecoder) and
+/// [`MatroskaDecoder`](crate::formats::matroska::MatroskaDecoder).
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum Stage {
     /// Parametric EQ.
     Eq(EqStage),
+    /// Headphone crossfeed.
+    Crossfeed(CrossfeedStage),
 }
 
 impl DspStage for Stage {
     fn process(&mut self, buf: &mut [f32], channels: usize, sample_rate: u32) {
         match self {
             Stage::Eq(s) => s.process(buf, channels, sample_rate),
+            Stage::Crossfeed(s) => s.process(buf, channels, sample_rate),
         }
     }
 
     fn is_active(&self) -> bool {
         match self {
             Stage::Eq(s) => s.is_active(),
+            Stage::Crossfeed(s) => s.is_active(),
         }
     }
 
     fn reset(&mut self) {
         match self {
             Stage::Eq(s) => s.reset(),
+            Stage::Crossfeed(s) => s.reset(),
         }
     }
 
     fn kind(&self) -> StageKind {
         match self {
             Stage::Eq(s) => s.kind(),
+            Stage::Crossfeed(s) => s.kind(),
         }
     }
 }
@@ -417,6 +439,46 @@ mod tests {
 
         chain.clear();
         assert!(chain.is_empty() && !chain.is_active());
+    }
+
+    /// Two *different* stage kinds in one chain run in order and are reported
+    /// in order — the ordering the issue calls for (EQ-then-crossfeed and the
+    /// reverse are different sounds), and the chain's reason to exist.
+    #[test]
+    fn mixed_stage_kinds_run_and_report_in_chain_order() {
+        let mut crossfeed = crate::dsp::CrossfeedStage::new();
+        crossfeed.set_preset(crate::dsp::crossfeed::Preset::Moderate);
+        let mut chain = Chain::new();
+        assert!(chain.push(eq_stage(true)));
+        assert!(chain.push(Stage::Crossfeed(crossfeed)));
+        assert!(chain.is_active());
+
+        let mut kinds = [StageKind::Eq; MAX_STAGES];
+        assert_eq!(chain.active_kinds(&mut kinds), 2);
+        assert_eq!(kinds[..2], [StageKind::Eq, StageKind::Crossfeed]);
+
+        // Order matters: the same two stages swapped produce different audio
+        // (the EQ is non-linear-phase, the crossfeed is cross-channel).
+        let signal: Vec<f32> = (0..512)
+            .map(|i| if i % 2 == 0 { 0.5 } else { -0.25 })
+            .collect();
+        let mut forward = signal.clone();
+        chain.process(&mut forward, 2, 48_000);
+
+        let mut swapped = Chain::new();
+        swapped.push(Stage::Crossfeed(crossfeed));
+        swapped.push(eq_stage(true));
+        let mut reverse = signal.clone();
+        swapped.process(&mut reverse, 2, 48_000);
+        assert_ne!(forward, reverse, "stage order must affect the result");
+
+        // And the master bypass still hides both.
+        chain.set_bypass_all(true);
+        assert!(!chain.is_active());
+        assert_eq!(chain.active_kinds(&mut kinds), 0);
+        let mut untouched = signal.clone();
+        chain.process(&mut untouched, 2, 48_000);
+        assert_eq!(untouched, signal);
     }
 
     #[test]
