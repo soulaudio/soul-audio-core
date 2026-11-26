@@ -190,6 +190,16 @@ struct Track<D> {
     /// reaches `0` (full scale). `0` for a freshly loaded/preloaded track, so a
     /// normal play/gapless swap never fades — only an explicit seek does.
     fade_remaining: u32,
+    /// This track's ReplayGain, in dB (`0.0` = unity), as resolved at
+    /// load/preload time. Per *track*, not per deck, so a gapless album's
+    /// per-track gain switches at the swap rather than a block or more later
+    /// (or not at all until the driver notices). Clamped to
+    /// `[RG_MIN_DB, RG_MAX_DB]`.
+    rg_gain_db: f32,
+    /// Cached `10^(rg_gain_db/20)` for this track, so the dB→linear conversion
+    /// isn't recomputed per sample. Exactly `1.0` when `rg_gain_db == 0.0`,
+    /// which keeps an unnormalized track a bit-identical passthrough.
+    rg_linear: f32,
 }
 
 /// A streaming player of [`SeekableDecoder`] tracks into a [`Sink`], with a
@@ -212,12 +222,13 @@ pub struct Deck<K, D, const PRELOAD: usize> {
     /// The live output volume (0.0..=1.0), cached so a [`swap_sink`](Deck::swap_sink)
     /// can re-apply it — a fresh sink starts at unity and would otherwise jump.
     volume: f32,
-    /// Combined ReplayGain, in dB, applied to the deck's output (set by the
-    /// caller via [`set_replay_gain`](Deck::set_replay_gain)). `0.0` is unity.
+    /// The deck-wide ReplayGain, in dB — the gain a track loaded *without* an
+    /// explicit one inherits ([`load`](Deck::load)/[`preload`](Deck::preload)),
+    /// and what [`set_replay_gain`](Deck::set_replay_gain) sets. The gain
+    /// actually applied to audio lives on each [`Track`], so a gapless album
+    /// can switch it at the boundary; this is the fallback for a caller that
+    /// has one figure for everything. `0.0` is unity.
     rg_gain_db: f32,
-    /// Cached linear multiplier `10^(rg_gain_db/20)` so the dB→linear conversion
-    /// isn't recomputed per sample. `1.0` (exact) when `rg_gain_db == 0.0`.
-    rg_linear: f32,
     in_buf: [i32; IN_FIFO * MAX_CH],
     rs_buf: [i32; BLOCK * MAX_CH],
     out_buf: [i32; BLOCK * MAX_CH],
@@ -241,7 +252,6 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             fade_len: (FADE_MS * si.sample_rate + 500) / 1000,
             volume: 1.0,
             rg_gain_db: 0.0,
-            rg_linear: 1.0,
             in_buf: [0; IN_FIFO * MAX_CH],
             rs_buf: [0; BLOCK * MAX_CH],
             out_buf: [0; BLOCK * MAX_CH],
@@ -311,8 +321,19 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         Ok(Some(r))
     }
 
-    /// Build the per-track pipeline (channel map + resampler) for `decoder`.
-    fn build_track(&self, decoder: D) -> Result<Track<D>, DeckError> {
+    /// Resolve a requested gain in dB into the `(clamped dB, linear)` pair a
+    /// [`Track`] carries. `None` inherits the deck-wide gain. Unity is kept
+    /// exactly `1.0` so an unnormalized track is a bit-identical passthrough.
+    fn resolve_gain(&self, gain_db: Option<f32>) -> (f32, f32) {
+        let db = gain_db
+            .unwrap_or(self.rg_gain_db)
+            .clamp(RG_MIN_DB, RG_MAX_DB);
+        (db, if db == 0.0 { 1.0 } else { pow10_db(db) })
+    }
+
+    /// Build the per-track pipeline (channel map + resampler) for `decoder`,
+    /// with `gain_db` as its ReplayGain (`None` inherits the deck-wide one).
+    fn build_track(&self, decoder: D, gain_db: Option<f32>) -> Result<Track<D>, DeckError> {
         let si = decoder.stream_info();
         let ch = si.channels as usize;
         let channel_layout = decoder.channel_layout();
@@ -327,6 +348,7 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         // trailing padding too) or, when it doesn't declare one, everything left
         // after the delay. `total` (the reported duration) follows the same:
         // the playable length if known, else the delay-trimmed stream length.
+        let (gain, linear) = self.resolve_gain(gain_db);
         let encoder_delay = decoder.encoder_delay();
         let emit_cap = decoder.playable_frames();
         let total = emit_cap.or_else(|| {
@@ -349,15 +371,35 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             eof: false,
             drain: 0,
             fade_remaining: 0,
+            rg_gain_db: gain,
+            rg_linear: linear,
         })
     }
 
-    /// Play `decoder` immediately, discarding the current track and any preloads.
+    /// Play `decoder` immediately, discarding the current track and any
+    /// preloads. The track takes the deck-wide ReplayGain
+    /// ([`set_replay_gain`](Self::set_replay_gain)); use
+    /// [`load_with_gain`](Self::load_with_gain) to give it its own.
     ///
     /// # Errors
     /// [`DeckError::ChannelMismatch`] / [`DeckError::Resample`].
     pub fn load(&mut self, decoder: D) -> Result<(), DeckError> {
-        let track = self.build_track(decoder)?;
+        self.load_inner(decoder, None)
+    }
+
+    /// [`load`](Self::load) with this track's own ReplayGain, in dB (`0.0` =
+    /// unity, clamped to `[-60, 24]`). The caller computes it — track vs album
+    /// gain, preamp, reference-level reconciliation — per track, so each track
+    /// of a gapless album plays at its own level.
+    ///
+    /// # Errors
+    /// As [`load`](Self::load).
+    pub fn load_with_gain(&mut self, decoder: D, gain_db: f32) -> Result<(), DeckError> {
+        self.load_inner(decoder, Some(gain_db))
+    }
+
+    fn load_inner(&mut self, decoder: D, gain_db: Option<f32>) -> Result<(), DeckError> {
+        let track = self.build_track(decoder, gain_db)?;
         self.clear_preloads();
         self.current = Some(track);
         self.state = DeckState::Playing;
@@ -373,10 +415,25 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
     /// [`DeckError::ChannelMismatch`] / [`DeckError::Resample`] if the track is
     /// incompatible with the sink.
     pub fn preload(&mut self, decoder: D) -> Result<(), DeckError> {
+        self.preload_inner(decoder, None)
+    }
+
+    /// [`preload`](Self::preload) with this track's own ReplayGain, in dB. The
+    /// gain travels with the slot, so the gapless swap in [`pump`](Self::pump)
+    /// applies it from the swap's very first output frame — no block-late
+    /// smear, and no need for the driver to re-set anything at the boundary.
+    ///
+    /// # Errors
+    /// As [`preload`](Self::preload).
+    pub fn preload_with_gain(&mut self, decoder: D, gain_db: f32) -> Result<(), DeckError> {
+        self.preload_inner(decoder, Some(gain_db))
+    }
+
+    fn preload_inner(&mut self, decoder: D, gain_db: Option<f32>) -> Result<(), DeckError> {
         if self.preload_len >= PRELOAD {
             return Err(DeckError::Sink(SinkError::Unsupported));
         }
-        let track = self.build_track(decoder)?;
+        let track = self.build_track(decoder, gain_db)?;
         self.preloads[self.preload_len] = Some(track);
         self.preload_len += 1;
         Ok(())
@@ -537,26 +594,83 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         self.sink.set_volume(v);
     }
 
-    /// Set the combined ReplayGain, in dB, applied to the deck's output so
-    /// playback can be loudness-normalized. `0.0` is unity (an exact,
-    /// bit-identical passthrough). The caller (backend) is responsible for
-    /// computing this value — picking track vs album gain, adding any preamp,
-    /// reconciling the tag's reference level to a target — and setting it at a
-    /// track boundary; the deck just applies one constant gain, so there is no
-    /// per-sample ramp and no click to manage. `gain_db` is clamped to
-    /// `[-60, 24]` dB. A positive gain that pushes a sample past full scale is
-    /// still hard-clipped by the output clamp (peak-limited gains avoid it).
+    /// Set the ReplayGain, in dB, for **everything the deck is holding**: the
+    /// deck-wide default that later plain [`load`](Self::load)/
+    /// [`preload`](Self::preload) calls inherit, *and* the current track and
+    /// every staged preload, retargeted immediately. That is the
+    /// "mode/preamp changed and one figure covers the lot" path — it takes
+    /// effect live, not at the next boundary.
+    ///
+    /// `0.0` is unity (an exact, bit-identical passthrough) and `gain_db` is
+    /// clamped to `[-60, 24]` dB. The caller (backend) computes the value —
+    /// picking track vs album gain, adding any preamp, reconciling the tag's
+    /// reference level to a target. The deck applies one constant gain per
+    /// track, so there is no per-sample ramp and no click to manage. A
+    /// positive gain that pushes a sample past full scale is still
+    /// hard-clipped by the output clamp (peak-limited gains avoid it).
+    ///
+    /// For a gapless album whose tracks each have their own gain, give each
+    /// one its own at load time ([`load_with_gain`](Self::load_with_gain) /
+    /// [`preload_with_gain`](Self::preload_with_gain)) and update them
+    /// per-slot ([`set_current_replay_gain`](Self::set_current_replay_gain) /
+    /// [`set_preload_replay_gain`](Self::set_preload_replay_gain)) — this
+    /// method would flatten them all to one value.
     pub fn set_replay_gain(&mut self, gain_db: f32) {
-        let db = gain_db.clamp(RG_MIN_DB, RG_MAX_DB);
+        let (db, linear) = self.resolve_gain(Some(gain_db));
         self.rg_gain_db = db;
-        // Keep unity exact (1.0) so a 0 dB gain is a bit-identical passthrough.
-        self.rg_linear = if db == 0.0 { 1.0 } else { pow10_db(db) };
+        if let Some(t) = self.current.as_mut() {
+            t.rg_gain_db = db;
+            t.rg_linear = linear;
+        }
+        for slot in self.preloads.iter_mut().flatten() {
+            slot.rg_gain_db = db;
+            slot.rg_linear = linear;
+        }
     }
 
-    /// The currently-applied combined ReplayGain, in dB (`0.0` = unity).
+    /// Retarget just the **current** track's ReplayGain, in dB — the live
+    /// update for a mode/preamp change, where each track's figure differs
+    /// because its tags do. Staged preloads keep theirs (see
+    /// [`set_preload_replay_gain`](Self::set_preload_replay_gain)), and the
+    /// deck-wide default is left alone. A no-op when nothing is loaded.
+    pub fn set_current_replay_gain(&mut self, gain_db: f32) {
+        let (db, linear) = self.resolve_gain(Some(gain_db));
+        if let Some(t) = self.current.as_mut() {
+            t.rg_gain_db = db;
+            t.rg_linear = linear;
+        }
+    }
+
+    /// Retarget the ReplayGain of staged preload `slot` (`0` = the track that
+    /// swaps in next), in dB. Returns `false` if that slot is empty, so a
+    /// driver can walk slots without tracking how many it primed.
+    pub fn set_preload_replay_gain(&mut self, slot: usize, gain_db: f32) -> bool {
+        let (db, linear) = self.resolve_gain(Some(gain_db));
+        match self.preloads.get_mut(slot).and_then(|s| s.as_mut()) {
+            Some(t) => {
+                t.rg_gain_db = db;
+                t.rg_linear = linear;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The ReplayGain being applied right now, in dB (`0.0` = unity): the
+    /// current track's own gain, or — with nothing loaded — the deck-wide
+    /// default that the next plain [`load`](Self::load) would inherit.
     #[must_use]
     pub fn replay_gain_db(&self) -> f32 {
-        self.rg_gain_db
+        match self.current.as_ref() {
+            Some(t) => t.rg_gain_db,
+            None => self.rg_gain_db,
+        }
+    }
+
+    /// The ReplayGain staged for preload `slot`, in dB; `None` if empty.
+    #[must_use]
+    pub fn preload_replay_gain_db(&self, slot: usize) -> Option<f32> {
+        self.preloads.get(slot)?.as_ref().map(|t| t.rg_gain_db)
     }
 
     /// Seek the current track to per-channel `frame`.
@@ -738,13 +852,21 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
         // out so the per-frame decrement doesn't need a mutable track borrow here.
         let (src_ch, g, map, mut fade_remaining) = {
             let track = self.current.as_ref().unwrap();
-            (track.channels, track.norm, track.map, track.fade_remaining)
+            // Fold this TRACK's constant ReplayGain linear factor into its
+            // normalization scale once (constant within a track), so the
+            // per-sample output cost is unchanged. Reading it from the track —
+            // not the deck — is what makes the gain switch exactly at a
+            // gapless swap: `pump` promotes the preload, and the very next
+            // block already multiplies by the new track's factor. Applied
+            // BEFORE the existing output clamp, so a boost past full scale
+            // still hard-clips there.
+            (
+                track.channels,
+                track.norm * track.rg_linear,
+                track.map,
+                track.fade_remaining,
+            )
         };
-        // Fold the constant ReplayGain linear factor into the per-track
-        // normalization scale once (it's constant within a track), so the
-        // per-sample output cost is unchanged. Applied BEFORE the existing
-        // output clamp, so a boost past full scale still hard-clips there.
-        let g = g * self.rg_linear;
         let fade_len = self.fade_len;
         for f in 0..out_frames {
             // Seek de-click gain for this output frame: smoothstep `t*t*(3 - 2*t)`
@@ -2022,6 +2144,205 @@ mod tests {
         let c = run_rg(100, 100, Some(-1000.0));
         let d = run_rg(100, 100, Some(-60.0));
         assert_eq!(c, d, "attenuation clamps to -60 dB");
+    }
+
+    // --- per-track ReplayGain at the gapless boundary --------------------
+
+    /// A 1-channel 48 kHz deck (no resampling, so every output frame maps 1:1
+    /// to a source frame and the boundary index is exact) with PRELOAD = 1.
+    fn gapless_rg_deck() -> Deck<MockSink, ConstDecoder, 1> {
+        Deck::new(
+            MockSink {
+                rate: 48_000,
+                ch: 1,
+                written: Vec::new(),
+                last_volume: None,
+            },
+            Quality::Fast,
+        )
+    }
+
+    /// Two gapless tracks with **different** per-track gains must switch gain
+    /// exactly at the swap: the first track's samples all carry its own gain,
+    /// the second's all carry the second's, with no block-late smear in
+    /// between. Both tracks carry the same source value, so any difference in
+    /// the output is the gain and nothing else.
+    #[test]
+    fn per_track_replay_gain_switches_exactly_at_the_gapless_boundary() {
+        const FRAMES: u64 = 1_200;
+        let value = 10_000;
+        let base = value * 256; // 16-bit → canonical 24-bit
+        let mut deck = gapless_rg_deck();
+        // Track A at unity, track B at −6.0206 dB (×0.5).
+        deck.load_with_gain(const_dec(48_000, 1, value, FRAMES), 0.0)
+            .unwrap();
+        deck.preload_with_gain(const_dec(48_000, 1, value, FRAMES), -6.0206)
+            .unwrap();
+        let swaps = run(&mut deck);
+        assert_eq!(swaps, 1, "the preload must have swapped in");
+        let out = &deck.sink.written;
+        assert_eq!(out.len(), 2 * FRAMES as usize, "both tracks played in full");
+
+        let boundary = FRAMES as usize;
+        for (i, &s) in out[..boundary].iter().enumerate() {
+            assert_eq!(s, base, "track A must be unity at frame {i}");
+        }
+        for (i, &s) in out[boundary..].iter().enumerate() {
+            assert!(
+                (s - base / 2).abs() <= 3,
+                "track B must be halved at frame {i}: {s} vs {}",
+                base / 2
+            );
+        }
+    }
+
+    /// The inverse direction (attenuated → unity), so the test can't pass by
+    /// some gain merely decaying. Also proves the gain is not one block late:
+    /// the very first sample after the boundary is already at the new gain.
+    #[test]
+    fn per_track_replay_gain_switches_up_at_the_boundary_too() {
+        const FRAMES: u64 = 1_200;
+        let value = 10_000;
+        let base = value * 256;
+        let mut deck = gapless_rg_deck();
+        // Set the deck-wide gain to a third value first, so neither track's
+        // level can be reached by inheriting the default: if either explicit
+        // gain were dropped, the output would be at −20 dB instead.
+        deck.set_replay_gain(-20.0);
+        deck.load_with_gain(const_dec(48_000, 1, value, FRAMES), -6.0206)
+            .unwrap();
+        deck.preload_with_gain(const_dec(48_000, 1, value, FRAMES), 0.0)
+            .unwrap();
+        run(&mut deck);
+        let out = &deck.sink.written;
+        let boundary = FRAMES as usize;
+        assert!(
+            (out[boundary - 1] - base / 2).abs() <= 3,
+            "last sample of track A is still attenuated: {}",
+            out[boundary - 1]
+        );
+        assert_eq!(
+            out[boundary], base,
+            "first sample of track B is already at unity"
+        );
+    }
+
+    /// A per-track 0 dB gain stays a bit-identical passthrough — the gapless
+    /// concatenation of two unity tracks must be sample-for-sample what no
+    /// gain at all produces (an `rg_linear` of exactly 1.0, not 0.99999994).
+    #[test]
+    fn per_track_unity_gain_is_bit_identical_across_a_swap() {
+        let play = |with_gain: bool| {
+            let mut deck = gapless_rg_deck();
+            if with_gain {
+                deck.load_with_gain(const_dec(48_000, 1, 12_345, 600), 0.0)
+                    .unwrap();
+                deck.preload_with_gain(const_dec(48_000, 1, 12_345, 600), 0.0)
+                    .unwrap();
+            } else {
+                deck.load(const_dec(48_000, 1, 12_345, 600)).unwrap();
+                deck.preload(const_dec(48_000, 1, 12_345, 600)).unwrap();
+            }
+            run(&mut deck);
+            deck.sink.written
+        };
+        assert_eq!(play(true), play(false));
+        assert!(play(true).iter().all(|&s| s == 12_345 * 256));
+    }
+
+    /// `set_replay_gain` stays deck-wide, as it was before per-track gains:
+    /// it sets the gain for tracks loaded later **and** retargets the current
+    /// track and every staged preload — the "user changed mode/preamp and the
+    /// driver has no per-track figure" path, which must take effect live
+    /// rather than at the next boundary.
+    #[test]
+    fn set_replay_gain_retargets_the_current_track_and_preloads() {
+        const FRAMES: u64 = 1_200;
+        let value = 10_000;
+        let base = value * 256;
+        let mut deck = gapless_rg_deck();
+        deck.load_with_gain(const_dec(48_000, 1, value, FRAMES), 0.0)
+            .unwrap();
+        deck.preload_with_gain(const_dec(48_000, 1, value, FRAMES), 0.0)
+            .unwrap();
+        // Before any audio is produced, the user drops the preamp by 6 dB.
+        deck.set_replay_gain(-6.0206);
+        assert!((deck.replay_gain_db() - -6.0206).abs() < 1e-6);
+        run(&mut deck);
+        let out = &deck.sink.written;
+        assert_eq!(out.len(), 2 * FRAMES as usize);
+        for (i, &s) in out.iter().enumerate() {
+            assert!(
+                (s - base / 2).abs() <= 3,
+                "both tracks must take the deck-wide gain at frame {i}: {s}"
+            );
+        }
+    }
+
+    /// The per-slot live update: when the mode changes mid-track, the driver
+    /// recomputes each track's own gain (its tags differ), so it must be able
+    /// to retarget the current track and each preload *individually*.
+    #[test]
+    fn per_slot_replay_gain_can_be_updated_live() {
+        const FRAMES: u64 = 1_200;
+        let value = 10_000;
+        let base = value * 256;
+        let mut deck = gapless_rg_deck();
+        deck.load_with_gain(const_dec(48_000, 1, value, FRAMES), 0.0)
+            .unwrap();
+        deck.preload_with_gain(const_dec(48_000, 1, value, FRAMES), 0.0)
+            .unwrap();
+        // Album mode: this track −6.0206 dB, the next −20 dB.
+        deck.set_current_replay_gain(-6.0206);
+        assert!(deck.set_preload_replay_gain(0, -20.0));
+        // There is no second preload slot to retarget.
+        assert!(!deck.set_preload_replay_gain(1, -20.0));
+        run(&mut deck);
+        let out = &deck.sink.written;
+        let boundary = FRAMES as usize;
+        assert!(
+            (out[boundary - 1] - base / 2).abs() <= 3,
+            "current track took its new gain: {}",
+            out[boundary - 1]
+        );
+        assert!(
+            (out[boundary] - base / 10).abs() <= 3,
+            "the preload took its own new gain: {}",
+            out[boundary]
+        );
+    }
+
+    /// A plain `load`/`preload` (no explicit gain) inherits whatever
+    /// `set_replay_gain` last set — the pre-per-track behaviour every existing
+    /// caller relies on.
+    #[test]
+    fn load_without_a_gain_inherits_the_deck_gain() {
+        const FRAMES: u64 = 600;
+        let value = 10_000;
+        let base = value * 256;
+        let mut deck = gapless_rg_deck();
+        deck.set_replay_gain(-6.0206);
+        deck.load(const_dec(48_000, 1, value, FRAMES)).unwrap();
+        deck.preload(const_dec(48_000, 1, value, FRAMES)).unwrap();
+        run(&mut deck);
+        for &s in &deck.sink.written {
+            assert!((s - base / 2).abs() <= 3, "inherited deck gain: {s}");
+        }
+    }
+
+    /// Per-track gains are clamped like the deck-wide one, and reported back.
+    #[test]
+    fn per_track_gain_is_clamped_and_reported() {
+        let mut deck = gapless_rg_deck();
+        deck.load_with_gain(const_dec(48_000, 1, 100, 100), 1000.0)
+            .unwrap();
+        assert_eq!(deck.replay_gain_db(), RG_MAX_DB);
+        deck.set_current_replay_gain(-1000.0);
+        assert_eq!(deck.replay_gain_db(), RG_MIN_DB);
+        // With no track loaded, the reported gain falls back to the deck's own.
+        deck.stop();
+        deck.set_replay_gain(-3.0);
+        assert_eq!(deck.replay_gain_db(), -3.0);
     }
 
     #[test]

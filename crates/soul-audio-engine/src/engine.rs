@@ -118,15 +118,43 @@ impl<K: Sink, D: SeekableDecoder, S: Sequencer, const PRELOAD: usize> Engine<K, 
     }
 
     /// Hand an opened `decoder` (for `handle`) back. It becomes the current
-    /// track, a preload, or is discarded if the sequence moved on.
+    /// track, a preload, or is discarded if the sequence moved on. The track
+    /// takes the deck-wide ReplayGain; use
+    /// [`provide_with_gain`](Self::provide_with_gain) to give it its own.
     pub fn provide(&mut self, handle: S::Handle, decoder: D) -> Result<Provided, DeckError> {
+        self.provide_inner(handle, decoder, None)
+    }
+
+    /// [`provide`](Self::provide) with this track's own ReplayGain, in dB — the
+    /// figure the driver computed from *this* track's tags (× mode × preamp)
+    /// while it had the file open. It travels with the deck slot, so on a
+    /// gapless album the gain switches exactly at the swap instead of the next
+    /// track inheriting the previous one's level.
+    pub fn provide_with_gain(
+        &mut self,
+        handle: S::Handle,
+        decoder: D,
+        gain_db: f32,
+    ) -> Result<Provided, DeckError> {
+        self.provide_inner(handle, decoder, Some(gain_db))
+    }
+
+    fn provide_inner(
+        &mut self,
+        handle: S::Handle,
+        decoder: D,
+        gain_db: Option<f32>,
+    ) -> Result<Provided, DeckError> {
         if self.pending == Some(handle) {
             self.pending = None;
         }
         if self.wants_playback {
             if !self.have_current {
                 if Some(handle) == self.seq.current() {
-                    self.deck.load(decoder)?;
+                    match gain_db {
+                        Some(db) => self.deck.load_with_gain(decoder, db)?,
+                        None => self.deck.load(decoder)?,
+                    }
                     self.have_current = true;
                     self.current_handle = Some(handle);
                     return Ok(Provided::Loaded);
@@ -134,7 +162,10 @@ impl<K: Sink, D: SeekableDecoder, S: Sequencer, const PRELOAD: usize> Engine<K, 
             } else if self.deck.free_preload_slots() > 0 {
                 let primed = PRELOAD - self.deck.free_preload_slots();
                 if self.seq.upcoming(primed + 1) == Some(handle) {
-                    self.deck.preload(decoder)?;
+                    match gain_db {
+                        Some(db) => self.deck.preload_with_gain(decoder, db)?,
+                        None => self.deck.preload(decoder)?,
+                    }
                     self.primed[primed] = Some(handle);
                     return Ok(Provided::Preloaded);
                 }

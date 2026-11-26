@@ -436,3 +436,94 @@ fn underrun_still_reaches_every_track() {
         assert!(out.lock().unwrap().iter().any(|&s| s != 0));
     });
 }
+
+/// Per-track ReplayGain across a gapless boundary, through the real engine.
+///
+/// Both queue entries are the SAME fixture, so the two halves of the captured
+/// output would be sample-identical at one gain. Track 0 is provided at unity
+/// and track 1 at −6.0206 dB (×0.5), so:
+///   - the first half must be **bit-identical** to the unity solo render, and
+///   - the second half must be that same render halved, from its very first
+///     frame — the gain switching at the swap, not a block or more later.
+///
+/// Before per-slot gains the deck held one gain for everything, so the second
+/// track played at the first track's level until something re-set it deck-wide.
+#[test]
+fn per_track_replay_gain_switches_at_the_gapless_boundary() {
+    on_big_stack(|| {
+        // tone.wav is 44.1 kHz into a 48 kHz sink, so this also proves the gain
+        // is applied after the resampler, on the output frames.
+        let solo = render_solo("tone.wav");
+        let gains = [0.0f32, -6.0206];
+
+        let (mut e, out) = new_engine();
+        e.sequencer_mut().set_queue(2, 0);
+        e.rearm();
+
+        // Drive to the end, providing each track with its own gain.
+        let mut swaps = 0;
+        for _ in 0..1_000_000 {
+            while let Some(i) = e.poll_open() {
+                let d = open_fixture("tone.wav");
+                e.provide_with_gain(i, d, gains[i]).unwrap();
+            }
+            match e.pump().unwrap() {
+                Progress::TrackChanged => swaps += 1,
+                Progress::Ended => break,
+                _ => {}
+            }
+        }
+        assert_eq!(swaps, 1, "two-track queue swaps once");
+
+        let captured = out.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            2 * solo.len(),
+            "gapless concatenation of two renders of the same fixture"
+        );
+        assert_eq!(
+            &captured[..solo.len()],
+            &solo[..],
+            "the unity track must be bit-identical to the ungained render"
+        );
+        // ×0.5 of a 24-bit sample, with the deck's round-half-away-from-zero.
+        let mut checked_nonzero = 0usize;
+        for (i, (&got, &want)) in captured[solo.len()..].iter().zip(&solo).enumerate() {
+            let half = if want >= 0 {
+                (want as f64 * 0.5 + 0.5) as i32
+            } else {
+                (want as f64 * 0.5 - 0.5) as i32
+            };
+            assert!(
+                (got - half).abs() <= 3,
+                "frame {i} after the swap: {got} vs halved {half} (source {want})"
+            );
+            if want.abs() > 1000 {
+                checked_nonzero += 1;
+            }
+        }
+        assert!(
+            checked_nonzero > 1000,
+            "the halved half must contain real audio, not just silence ({checked_nonzero})"
+        );
+    });
+}
+
+/// The deck-wide setter still works through the engine and takes effect on
+/// everything it is holding — the "user moved the preamp" path, which must not
+/// wait for a track boundary.
+#[test]
+fn engine_wide_replay_gain_applies_to_current_and_primed() {
+    on_big_stack(|| {
+        let (mut e, _out) = new_engine();
+        e.sequencer_mut().set_queue(2, 0);
+        e.rearm();
+        let names = ["tone.wav", "tone.wav"];
+        service(&mut e, &names);
+        e.pump().unwrap(); // get a current track + a primed preload
+
+        e.deck_mut().set_replay_gain(-6.0);
+        assert!((e.deck().replay_gain_db() - -6.0).abs() < 1e-6);
+        assert_eq!(e.deck().preload_replay_gain_db(0), Some(-6.0));
+    });
+}
