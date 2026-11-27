@@ -365,6 +365,23 @@ impl<H: Hal> Sink for ExclusiveEngine<H> {
         true
     }
 
+    /// Exclusive mode bypasses the OS mixer, but **this sink's own software
+    /// volume is still in the path** ([`Renderer`] multiplies every sample by
+    /// the smoothed gain). At unity the multiply is exact — `cur_gain` starts at
+    /// `1.0`, the ramp keeps it there, and a canonical sample is an integer
+    /// inside an `f32`'s mantissa — so the stream reaches the device untouched.
+    /// Below unity it does not, and saying so is what keeps
+    /// [`DecodeInfo::bit_perfect`](soul_audio_core::deck::DecodeInfo::bit_perfect)
+    /// honest: the audio is being scaled no matter how exclusive the device is.
+    ///
+    /// It matters most for DSD-over-PCM, where the marker byte is the top byte
+    /// of every word: a volume of 0.99 does not make DoP quieter, it makes it
+    /// full-level noise. A host that wants bit-perfect DoP must hold the
+    /// software volume at unity and attenuate on the DAC.
+    fn modifies_samples(&self) -> bool {
+        f32::from_bits(self.volume.load(Ordering::Relaxed)) != 1.0
+    }
+
     /// Switch the hogged device to (the best match for) `rate` in place, keeping hog mode
     /// throughout so no other app can grab the device mid-switch. If the switch fails the
     /// previous rate is restored, so the sink is never left closed.

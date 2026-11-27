@@ -4,7 +4,10 @@
 //! - `render` runs the full gapless engine pipeline (decode → resample →
 //!   normalize → channel-map) over one or more files into a raw i32 LE PCM file —
 //!   the same pipeline `play` uses, but to a file, so it is testable without an
-//!   audio device.
+//!   audio device. `--dsd dop` renders a DSD file's own 1-bit stream in its
+//!   24-bit DoP carrier instead of decimating it, which is how the DoP framer
+//!   is verified end-to-end (markers intact through engine → deck → sink)
+//!   without a DAC.
 //! - `play` (built with `--features playback`) plays files **gaplessly** on the
 //!   default device via the cpal [`Sink`](soul_audio_core::Sink).
 //!
@@ -17,10 +20,11 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use soul_audio_core::demux::MatroskaDemuxer;
 use soul_audio_core::formats::matroska::{MatroskaDecoder, MatroskaVorbisOgg};
 use soul_audio_core::formats::vorbis::VorbisDecoder;
+use soul_audio_core::model::DsdMode;
 use soul_audio_core::{AnyDecoder, DecodeError, Decoder, Format, open, probe};
 
 #[derive(Parser)]
@@ -50,12 +54,17 @@ enum Cmd {
         /// Output .pcm path.
         #[arg(long)]
         out: PathBuf,
-        /// Output sample rate (Hz).
-        #[arg(long, default_value_t = 48_000)]
-        rate: u32,
-        /// Output channel count.
-        #[arg(long, default_value_t = 2)]
-        channels: u16,
+        /// Output sample rate (Hz) [default: 48000; with --dsd dop: the DSD
+        /// carrier rate].
+        #[arg(long)]
+        rate: Option<u32>,
+        /// Output channel count [default: 2; with --dsd dop: the DSD stream's
+        /// own channel count].
+        #[arg(long)]
+        channels: Option<u16>,
+        /// How to deliver a DSD (.dsf/.dff) input.
+        #[arg(long, value_enum, default_value_t = DsdDelivery::Decimate)]
+        dsd: DsdDelivery,
     },
     /// Play one or more audio files gaplessly on the default output device
     /// (needs `--features playback`).
@@ -64,6 +73,29 @@ enum Cmd {
         #[arg(required = true)]
         inputs: Vec<PathBuf>,
     },
+}
+
+/// How a DSD source is delivered downstream — the CLI's spelling of
+/// [`DsdMode`]. `Native` is deliberately absent: a native 1-bit stream is not
+/// PCM and does not go through this (or any) PCM sink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DsdDelivery {
+    /// Decimate to PCM (plays on any device). The default.
+    Decimate,
+    /// Pack the file's own 1-bit stream into a 24-bit DoP carrier at
+    /// `dsd_rate / 16`, for a DoP-capable DAC. The output must not be
+    /// resampled, remixed, gain-scaled or DSP'd — the marker byte lives in the
+    /// top byte of every word, so anything that touches a sample yields noise.
+    Dop,
+}
+
+impl From<DsdDelivery> for DsdMode {
+    fn from(d: DsdDelivery) -> Self {
+        match d {
+            DsdDelivery::Decimate => DsdMode::Decimate,
+            DsdDelivery::Dop => DsdMode::Dop,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -78,7 +110,8 @@ fn main() -> Result<()> {
             out,
             rate,
             channels,
-        } => Box::new(move || driver::render(&inputs, &out, rate, channels)),
+            dsd,
+        } => Box::new(move || driver::render(&inputs, &out, rate, channels, dsd.into())),
         Cmd::Play { inputs } => Box::new(move || play(&inputs)),
     };
     // Generous stack: the worker owns the engine/deck, which embed an

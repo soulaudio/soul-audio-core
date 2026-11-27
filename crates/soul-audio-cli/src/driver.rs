@@ -26,9 +26,9 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use soul_audio_core::model::SampleFormat;
-use soul_audio_core::{Deck, Progress, Quality, Sink, SinkError, StreamInfo};
-use soul_audio_desktop::{OwnedDecoder, open_track};
+use soul_audio_core::model::{DsdMode, SampleFormat};
+use soul_audio_core::{Deck, Decoder, Progress, Quality, Sink, SinkError, StreamInfo};
+use soul_audio_desktop::{OwnedDecoder, open_track_dsd};
 use soul_audio_engine::{Engine, LinearSequencer, Provided};
 
 #[cfg(feature = "playback")]
@@ -43,7 +43,13 @@ const PRELOAD: usize = 1;
 /// Generic over the sink so the same threads/engine drive a live device or a
 /// file render. A live sink paces the loop via backpressure; a file sink returns
 /// immediately, so it renders faster than real time.
-pub fn run<K: Sink>(sink: K, paths: &[PathBuf]) -> Result<()> {
+///
+/// `dsd` selects how a **DSD** source is delivered — see [`open_track_dsd`].
+/// Every non-DSD input ignores it. [`DsdMode::Dop`] only reaches a DAC intact if
+/// `sink` is opened at the carrier rate, exclusively, at ≥ 24 bits, with no
+/// gain, resampling or DSP; [`render`] enforces the rate/channel half of that,
+/// and [`play`] refuses the mode outright because a shared device cannot.
+pub fn run<K: Sink>(sink: K, paths: &[PathBuf], dsd: DsdMode) -> Result<()> {
     let info = sink.stream_info();
     println!(
         "output: {} Hz {}ch (canonical 24-bit) — {} track(s)",
@@ -75,7 +81,7 @@ pub fn run<K: Sink>(sink: K, paths: &[PathBuf]) -> Result<()> {
             .stack_size(64 * 1024 * 1024)
             .spawn_scoped(scope, move || {
                 for i in req_rx {
-                    let opened = open_track(&paths[i]).map(|d| (i, d));
+                    let opened = open_track_dsd(&paths[i], dsd).map(|d| (i, d));
                     if res_tx.send(opened).is_err() {
                         break; // pump thread gone
                     }
@@ -129,9 +135,17 @@ pub fn run<K: Sink>(sink: K, paths: &[PathBuf]) -> Result<()> {
 }
 
 /// Play `paths` gaplessly on the default output device, in order, then stop.
+///
+/// Always [`DsdMode::Decimate`]: this is cpal's **shared** device at its own
+/// default config (f32 or i16 — see `CpalSink::build`), so the OS mixer rescales
+/// every sample. DoP's marker byte is the top byte of the word, so a rescale
+/// turns the stream into full-level noise into someone's headphones. Delivering
+/// DoP needs an exclusive, ≥ 24-bit, no-DSP device path (`soul-audio-desktop`'s
+/// `alsa_exclusive`/`wasapi_exclusive`/`coreaudio_exclusive` engines); until
+/// this harness opens one, `render --dsd dop` is the way to verify the framer.
 #[cfg(feature = "playback")]
 pub fn play(paths: &[PathBuf]) -> Result<()> {
-    run(CpalSink::new()?, paths)
+    run(CpalSink::new()?, paths, DsdMode::Decimate)
 }
 
 /// A [`Sink`] that renders the pipeline's canonical 24-bit output to a file as
@@ -182,6 +196,100 @@ impl Sink for RenderSink {
 /// Render `paths` gaplessly to `out` (raw interleaved `i32` LE PCM) at
 /// `rate`/`channels`, resampling and channel-mapping through the same pipeline
 /// [`play`] uses. Runs without an audio device.
-pub fn render(paths: &[PathBuf], out: &Path, rate: u32, channels: u16) -> Result<()> {
-    run(RenderSink::new(out, rate, channels)?, paths)
+///
+/// `rate`/`channels` are `None` when the caller did not ask for a specific
+/// output format, which is what lets `--dsd dop` pick the carrier format the
+/// stream requires instead of silently resampling it (see [`dop_format`]).
+pub fn render(
+    paths: &[PathBuf],
+    out: &Path,
+    rate: Option<u32>,
+    channels: Option<u16>,
+    dsd: DsdMode,
+) -> Result<()> {
+    let (rate, channels) = match dsd {
+        DsdMode::Dop => dop_format(paths, rate, channels)?,
+        _ => (
+            rate.unwrap_or(DEFAULT_RENDER_RATE),
+            channels.unwrap_or(DEFAULT_RENDER_CHANNELS),
+        ),
+    };
+    run(RenderSink::new(out, rate, channels)?, paths, dsd)
+}
+
+/// Default render format when the caller names neither (`48 kHz` stereo).
+const DEFAULT_RENDER_RATE: u32 = 48_000;
+const DEFAULT_RENDER_CHANNELS: u16 = 2;
+
+/// Resolve the output format for a `--dsd dop` render.
+///
+/// DoP survives only if nothing touches the samples, and the deck's resampler
+/// and downmixer both do: a DoP stream rendered at any rate but its own
+/// `dsd_rate / 16` carrier — or to any channel count but its own — arrives as
+/// noise, every word's marker byte interpolated away. So the format is taken
+/// **from the stream**, and an explicit `--rate`/`--channels` that contradicts
+/// it is an error rather than a silently-ruined render.
+///
+/// Inputs that are not DSD (DoP is a no-op for them) do not constrain anything;
+/// if none of the inputs is DSD this is just [`render`]'s normal default. Two
+/// DSD inputs at different rates cannot both pass through one sink, so that is
+/// an error too — the second would be resampled.
+fn dop_format(
+    paths: &[PathBuf],
+    want_rate: Option<u32>,
+    want_channels: Option<u16>,
+) -> Result<(u32, u16)> {
+    let mut carrier: Option<(u32, u16, &Path)> = None;
+    for path in paths {
+        let decoder = open_track_dsd(path, DsdMode::Dop)?;
+        if !decoder.dsd_passthrough() {
+            continue; // not DSD: nothing to carry
+        }
+        let info = decoder.stream_info();
+        match carrier {
+            None => carrier = Some((info.sample_rate, info.channels, path)),
+            Some((rate, channels, first))
+                if (rate, channels) != (info.sample_rate, info.channels) =>
+            {
+                return Err(anyhow!(
+                    "cannot render these DSD files into one DoP stream: {} carries \
+                     {} Hz {}ch but {} carries {} Hz {}ch — one render has a single \
+                     output format, and resampling a DoP carrier destroys it",
+                    first.display(),
+                    rate,
+                    channels,
+                    path.display(),
+                    info.sample_rate,
+                    info.channels,
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    let Some((rate, channels, path)) = carrier else {
+        // No DSD input — `--dsd dop` changed nothing, so neither does the format.
+        return Ok((
+            want_rate.unwrap_or(DEFAULT_RENDER_RATE),
+            want_channels.unwrap_or(DEFAULT_RENDER_CHANNELS),
+        ));
+    };
+    if let Some(want) = want_rate.filter(|w| *w != rate) {
+        return Err(anyhow!(
+            "--rate {want} would resample {}'s DoP carrier ({rate} Hz) and destroy it; \
+             pass --rate {rate} or drop the flag",
+            path.display(),
+        ));
+    }
+    if let Some(want) = want_channels.filter(|w| *w != channels) {
+        return Err(anyhow!(
+            "--channels {want} would remix {}'s DoP carrier ({channels}ch) and destroy it; \
+             pass --channels {channels} or drop the flag",
+            path.display(),
+        ));
+    }
+    println!(
+        "DSD: DoP passthrough — carrier {rate} Hz {channels}ch, 24-bit. A device playing \
+         this must be exclusive, ≥24-bit, with no gain, resampling or DSP."
+    );
+    Ok((rate, channels))
 }

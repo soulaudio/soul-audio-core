@@ -603,7 +603,9 @@ mod tests {
         let n = dop.decode_into(&mut out).unwrap();
         assert_eq!(n, 2); // 4 DSD bytes → 2 DoP frames
         assert_eq!(out[0], 0x0005_AABB); // marker 0x05
-        assert_eq!(out[1], 0x00FA_CCDD); // marker 0xFA
+        // Sign-extended: a `0xFA` marker sets bit 23, so the canonical sample
+        // is negative (see `dsd::sign_extend_24`).
+        assert_eq!(out[1], 0xFFFA_CCDDu32 as i32); // marker 0xFA
     }
 
     /// A DST container with uncompressed (stored) `DSTF` frames must decode back

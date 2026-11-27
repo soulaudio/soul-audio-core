@@ -475,8 +475,19 @@ mod tests {
         for (f, frame) in buf[..n].chunks_exact(2).enumerate() {
             let want = if f % 2 == 0 { 0x05 } else { 0xFA };
             for (ch, &word) in frame.iter().enumerate() {
-                assert_eq!((word >> 16) & 0xFF, want, "frame {f} channel {ch}: marker");
-                assert_eq!(word & !0x00FF_FFFF, 0, "frame {f}: word must be 24-bit");
+                // The word is a canonical signed-24 sample carrying the DoP bit
+                // pattern in its low 24 bits (a `0xFA` marker sets bit 23, so
+                // the sample is negative) — read it as the pattern, and check
+                // it really is in range, because the deck clamps what is not.
+                assert_eq!(
+                    (word as u32 >> 16) & 0xFF,
+                    want,
+                    "frame {f} channel {ch}: marker"
+                );
+                assert!(
+                    (-(1 << 23)..1 << 23).contains(&word),
+                    "frame {f} channel {ch}: {word:#x} is outside canonical signed-24"
+                );
             }
         }
 

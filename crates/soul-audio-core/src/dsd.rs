@@ -23,14 +23,34 @@ const DOP_MARKER: [u8; 2] = [0x05, 0xFA];
 /// Maximum channels the DoP framer supports (group buffer = 2 bytes/channel).
 const MAX_DOP_CHANNELS: usize = 8;
 
+/// Reinterpret a 24-bit DoP word as the **canonical signed-24 sample** carrying
+/// that bit pattern (two's complement, bit 23 = sign).
+///
+/// This is not cosmetic. The pipeline's canonical domain is a signed 24-bit
+/// integer in `[-2^23, 2^23)`, and every stage downstream enforces it: the
+/// deck's output stage hard-clips to that range, and a 24-bit sink scales
+/// through `±1.0` floats. A `0xFA`-marked word has bit 23 set, so as an
+/// *unsigned* value (`0x00FA_xxxx` ≈ 16.4 M) it is twice full scale — the deck
+/// would clamp it to `0x7F_FFFF`, destroying the marker **and** the 16 DSD bits
+/// under it on every second frame, with the DAC emitting full-level noise. Sign
+/// extended, the same 24 bits are a legal sample that passes through untouched
+/// and arrives at the device as the exact DoP word.
+const fn sign_extend_24(word: u32) -> i32 {
+    ((word & 0x00FF_FFFF) as i32) << 8 >> 8
+}
+
 /// Wraps a [`DsdDecoder`] and presents it as a PCM [`Decoder`] using DoP.
 ///
 /// Each DoP frame packs 16 DSD bits **per channel** into a 24-bit word
 /// `marker<<16 | b_t0<<8 | b_t1` (earlier byte high), emitted as ordinary
 /// interleaved PCM frames (`L,R,…`) at `DSD_rate/16`. The `0x05`/`0xFA` marker
 /// toggles once per frame and is shared by all channels (phase `frame_index &
-/// 1`). The 24-bit word occupies the low 24 bits of each `i32`; a 32-bit
-/// transport shell must left-justify so the marker is the true MSByte.
+/// 1`). The 24-bit word occupies the low 24 bits of each `i32`, **sign-extended
+/// into the upper byte** so it is a legal canonical signed-24 sample rather than
+/// an out-of-range positive one (see [`sign_extend_24`] — getting this wrong
+/// clamps every `0xFA` frame at the deck's output stage). A consumer reads the
+/// DoP word as `sample as u32 & 0x00FF_FFFF`; a 32-bit transport shell must
+/// left-justify so the marker is the true MSByte.
 pub struct DopAdapter<D> {
     inner: D,
     channels: usize,
@@ -146,7 +166,8 @@ impl<D: DsdDecoder> Decoder for DopAdapter<D> {
             let marker = DOP_MARKER[(self.frame_index & 1) as usize];
             let b_t0 = self.group[self.ch_pos];
             let b_t1 = self.group[c + self.ch_pos];
-            out[w] = (i32::from(marker) << 16) | (i32::from(b_t0) << 8) | i32::from(b_t1);
+            let word = (u32::from(marker) << 16) | (u32::from(b_t0) << 8) | u32::from(b_t1);
+            out[w] = sign_extend_24(word);
             w += 1;
             self.ch_pos += 1;
             if self.ch_pos == c {
@@ -884,7 +905,9 @@ mod tests {
         let n = dop.decode_into(&mut out).unwrap();
         assert_eq!(n, 2); // 4 DSD bytes → 2 mono frames
         assert_eq!(out[0], 0x0005_AABB); // frame 0, marker 0x05
-        assert_eq!(out[1], 0x00FA_CCDD); // frame 1, marker 0xFA
+        // Sign-extended: bit 23 is set, so the canonical sample is negative and
+        // its low 24 bits are the DoP word (see `sign_extend_24`).
+        assert_eq!(out[1], 0xFFFA_CCDDu32 as i32); // frame 1, marker 0xFA
     }
 
     #[test]
@@ -904,8 +927,57 @@ mod tests {
         assert_eq!(out[0], 0x0005_A0A1); // L
         assert_eq!(out[1], 0x0005_B0B1); // R — SAME marker as L
         // Frame 1 (marker toggled to 0xFA, again shared by L and R).
-        assert_eq!(out[2], 0x00FA_C0C1); // L
-        assert_eq!(out[3], 0x00FA_D0D1); // R
+        assert_eq!(out[2], 0xFFFA_C0C1u32 as i32); // L
+        assert_eq!(out[3], 0xFFFA_D0D1u32 as i32); // R
+    }
+
+    /// **Every** DoP word must be a legal canonical sample — an integer in
+    /// `[-2^23, 2^23)` — because the deck's output stage hard-clips to that
+    /// range and a 24-bit sink scales through `±1.0` floats. Emitted as
+    /// unsigned patterns, half the frames (`0xFA`, bit 23 set) are twice full
+    /// scale and get clamped to `0x7F_FFFF`: marker and DSD payload both gone,
+    /// silently, on every second frame. The low 24 bits must still carry the
+    /// word, for both marker phases and every payload byte.
+    #[test]
+    fn every_dop_word_is_in_canonical_range_and_keeps_its_bits() {
+        // All 256 byte values, so both marker phases see payloads with and
+        // without the high bit set.
+        const BYTES: [u8; 256] = {
+            let mut a = [0u8; 256];
+            let mut i = 0;
+            while i < 256 {
+                a[i] = i as u8;
+                i += 1;
+            }
+            a
+        };
+        let fake = FakeDsd {
+            bytes: &BYTES,
+            pos: 0,
+            rate: DsdRate::Dsd64,
+            channels: 2,
+        };
+        let mut dop = DopAdapter::new(fake);
+        let mut out = [0i32; 256];
+        let n = dop.decode_into(&mut out).unwrap();
+        assert!(n > 0);
+        for (i, &s) in out[..n].iter().enumerate() {
+            assert!(
+                (-(1 << 23)..1 << 23).contains(&s),
+                "word {i} = {s:#x} is outside canonical signed-24 — the deck clamps it"
+            );
+            let marker = (s as u32 >> 16) & 0xFF;
+            assert!(
+                marker == 0x05 || marker == 0xFA,
+                "word {i}: marker lost ({marker:#04x})"
+            );
+            // The upper byte is pure sign extension, never payload.
+            assert_eq!(
+                s,
+                ((s as u32 & 0x00FF_FFFF) as i32) << 8 >> 8,
+                "word {i}: not a sign-extended 24-bit word"
+            );
+        }
     }
 
     #[test]
@@ -936,8 +1008,8 @@ mod tests {
         assert_eq!(dop.seek_to_frame(1).unwrap(), 1);
         let mut out = [0i32; 2];
         assert_eq!(dop.decode_into(&mut out).unwrap(), 2);
-        assert_eq!(out[0], 0x00FA_C0C1); // L, marker 0xFA (re-derived from index)
-        assert_eq!(out[1], 0x00FA_D0D1); // R, same marker
+        assert_eq!(out[0], 0xFFFA_C0C1u32 as i32); // L, marker 0xFA (re-derived)
+        assert_eq!(out[1], 0xFFFA_D0D1u32 as i32); // R, same marker
     }
 
     // ---- DecimateAdapter (DSD → PCM decimation FIR) ----
