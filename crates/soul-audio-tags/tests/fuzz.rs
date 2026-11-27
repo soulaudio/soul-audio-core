@@ -93,7 +93,18 @@ const VISIT_CAP: usize = 100_000;
 struct Rng(u64);
 impl Rng {
     fn new(seed: u64) -> Self {
-        Rng(seed | 1)
+        // SplitMix64 the caller's seed into the xorshift state. The usual
+        // `seed | 1` (which only dodged xorshift's zero fixed point) quietly
+        // made every even/odd pair the SAME corpus — seeds 2 and 3 explore
+        // identical inputs — and the weekly CI job seeds from the run number,
+        // so every other run would have re-explored the previous run's corpus.
+        // Mixing first means consecutive seeds are unrelated; the final `| 1`
+        // still avoids the zero state, costing one bit of a well-mixed value.
+        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        Rng(z | 1)
     }
     fn next(&mut self) -> u64 {
         let mut x = self.0;
@@ -765,4 +776,15 @@ fn generator_is_deterministic() {
     };
     assert_eq!(fingerprint(CI_SEED), fingerprint(CI_SEED));
     assert_ne!(fingerprint(CI_SEED), fingerprint(CI_SEED ^ 0xFFFF));
+    // Consecutive seeds must explore DIFFERENT corpora. They did not when the
+    // state was `seed | 1`: 2 and 3 were one corpus, which is precisely the
+    // pairing the weekly CI job hits, since it seeds from the run number.
+    for base in [CI_SEED, 0, 1, 2, 1000] {
+        assert_ne!(
+            fingerprint(base),
+            fingerprint(base + 1),
+            "seeds {base} and {} generate the same inputs",
+            base + 1
+        );
+    }
 }

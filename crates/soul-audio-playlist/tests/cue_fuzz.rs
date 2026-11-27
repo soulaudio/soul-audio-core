@@ -33,7 +33,18 @@ struct Rng(u64);
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        Rng(seed | 1)
+        // SplitMix64 the caller's seed into the xorshift state. The usual
+        // `seed | 1` (which only dodged xorshift's zero fixed point) quietly
+        // made every even/odd pair the SAME corpus — seeds 2 and 3 explore
+        // identical inputs — and the weekly CI job seeds from the run number,
+        // so every other run would have re-explored the previous run's corpus.
+        // Mixing first means consecutive seeds are unrelated; the final `| 1`
+        // still avoids the zero state, costing one bit of a well-mixed value.
+        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        Rng(z | 1)
     }
     fn next(&mut self) -> u64 {
         let mut x = self.0;
@@ -275,5 +286,35 @@ fn every_timestamp_value_converts_without_panicking() {
         let _ = t.as_millis();
         let (m, s, f) = t.mm_ss_ff();
         assert!(s < 60 && f < 75, "{frames} → {m}:{s}:{f}");
+    }
+}
+
+/// The generator must be reproducible — a reported failure is replayable from
+/// its seed — **and** consecutive seeds must explore different corpora. The
+/// latter did not hold while the PRNG state was `seed | 1`: seeds 2 and 3 were
+/// one corpus, which is exactly the pairing a run-number-seeded CI job hits.
+#[test]
+fn generator_is_deterministic_and_seeds_do_not_collide() {
+    let seeds_corpus = seeds();
+    let fingerprint = |seed: u64| -> Vec<(usize, u64)> {
+        let mut rng = Rng::new(seed);
+        (0..256)
+            .map(|_| {
+                let b = mutate(&mut rng, &seeds_corpus);
+                let h = b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| {
+                    (h ^ u64::from(x)).wrapping_mul(0x0000_0100_0000_01B3)
+                });
+                (b.len(), h)
+            })
+            .collect()
+    };
+    assert_eq!(fingerprint(7), fingerprint(7), "same seed → same inputs");
+    for base in [0u64, 1, 2, 1000, 0x5041_524B_4345_5545] {
+        assert_ne!(
+            fingerprint(base),
+            fingerprint(base + 1),
+            "seeds {base} and {} generate the same inputs",
+            base + 1
+        );
     }
 }
