@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use soul_audio_tags::Tags;
 
-use crate::sanitize::sanitize_segment;
+use crate::sanitize::{sanitize_extension, sanitize_segment};
 
 /// A destination path template, e.g. `{AlbumArtist}/{Album}/{TrackNo} - {Title}`.
 pub struct Template {
@@ -126,11 +126,32 @@ impl Template {
         }
         // Preserve the source extension (original case) by appending it to the
         // final component — `set_extension` would mis-handle a name with dots.
+        //
+        // Sanitized, unlike the segments above it: the extension is the only
+        // part of the path that comes from the source *file name* rather than
+        // from the template, so it is the only part no segment sanitizer has
+        // seen (see `sanitize_extension` for what a Linux-legal name can do to
+        // a FAT destination). A non-UTF-8 extension is appended verbatim — it
+        // cannot be inspected as text, and inventing a replacement would be a
+        // worse answer than preserving the bytes for a destination on the same
+        // filesystem.
         if let Some(ext) = src.extension() {
-            let mut os = path.into_os_string();
-            os.push(".");
-            os.push(ext);
-            path = PathBuf::from(os);
+            match ext.to_str() {
+                Some(text) => {
+                    if let Some(safe) = sanitize_extension(text) {
+                        let mut os = path.into_os_string();
+                        os.push(".");
+                        os.push(safe);
+                        path = PathBuf::from(os);
+                    }
+                }
+                None => {
+                    let mut os = path.into_os_string();
+                    os.push(".");
+                    os.push(ext);
+                    path = PathBuf::from(os);
+                }
+            }
         }
         path
     }
@@ -292,6 +313,199 @@ mod tests {
             p.push(s);
         }
         p
+    }
+
+    // ---- the destination-path invariants, over hostile input ---------------
+    //
+    // Tag text is untrusted: it comes from whatever files a user imported,
+    // including things a stranger wrote. Rendering turns that text into a path
+    // *under the destination root*, so three properties have to hold for ALL
+    // input, not just the cases someone thought to write a test for:
+    //
+    //   1. The path stays relative and has no `.`/`..` component — a tag must
+    //      never be able to place a file outside the destination root.
+    //   2. Every component is something NTFS and FAT can actually hold: no
+    //      separators, no `< > : " | ? *`, no ASCII control characters, no
+    //      trailing dot or space (Windows strips those, which would make the
+    //      planned path differ from the path that appears).
+    //   3. No component is empty.
+    //
+    // Driven by the house xorshift PRNG rather than a proptest dependency, so
+    // it matches the other fuzzers in this repo and stays reproducible.
+
+    /// Pieces chosen to attack each property: separators, traversal, reserved
+    /// device names, control characters, trailing dots/spaces, unicode
+    /// look-alikes, and the empty string.
+    const HOSTILE: &[&str] = &[
+        "..",
+        ".",
+        "../..",
+        "../../etc/passwd",
+        "/etc/passwd",
+        "C:\\Windows",
+        "\\\\server\\share",
+        "a/b",
+        "a\\b",
+        "CON",
+        "com1",
+        "LPT9",
+        "NUL.flac",
+        "trailing.",
+        "trailing ",
+        " leading",
+        "...",
+        "",
+        " ",
+        "\u{0}",
+        "a\u{1}b",
+        "\u{7f}",
+        "\u{feff}",
+        "Καληνύχτα",
+        "\u{2215}not-a-slash",
+        "name\u{a0}with nbsp",
+        "a name long enough to exercise the length fitting elsewhere in the crate",
+    ];
+
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+            &xs[(self.next() % xs.len() as u64) as usize]
+        }
+    }
+
+    /// Assert the invariants on one rendered relative path. `allow_empty` is
+    /// for the album-directory renders: a flat template (`{Title}`) gives an
+    /// album no folder of its own, and the empty relative path is how that is
+    /// expressed — it means "the destination root", not a malformed path.
+    fn assert_safe_relative(path: &Path, what: &str, allow_empty: bool) {
+        use std::path::Component;
+        assert!(
+            allow_empty || !path.as_os_str().is_empty(),
+            "{what}: rendered an empty path"
+        );
+        for c in path.components() {
+            match c {
+                Component::Normal(os) => {
+                    let s = os.to_str().unwrap_or_else(|| panic!("{what}: non-UTF-8"));
+                    assert!(!s.is_empty(), "{what}: empty component");
+                    assert!(
+                        !s.contains(['/', '\\', '<', '>', ':', '"', '|', '?', '*']),
+                        "{what}: component {s:?} holds a separator or an \
+                         NTFS-illegal character"
+                    );
+                    assert!(
+                        !s.chars().any(|c| matches!(c, '\u{0}'..='\u{1f}')),
+                        "{what}: component {s:?} holds a control character"
+                    );
+                    assert!(
+                        !s.ends_with('.') && !s.ends_with(' '),
+                        "{what}: component {s:?} ends with a dot or space, which \
+                         Windows strips — the planned path would not be the real one"
+                    );
+                }
+                other => panic!(
+                    "{what}: component {other:?} escapes the destination root \
+                     (the path must be relative, with no `.`/`..`)"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn no_tag_text_can_escape_the_destination_root_or_name_an_illegal_file() {
+        let mut rng = XorShift(0x0A5E_C0DE_0001u64);
+        let templates = [
+            "{AlbumArtist}/{Album}/{TrackNo} - {Title}",
+            "{Artist}/{Album} ({Year})/{DiscDir}{TrackNo}. {Title}",
+            "{Title}",
+            "{Genre}/{AlbumArtist}/{Album}/{Title}",
+        ];
+        // Source names whose *extension* is the attack (the one path component
+        // no segment sanitizer sees).
+        let srcs = [
+            "song.flac",
+            "song.FLAC",
+            "song",
+            "song.",
+            "song..",
+            "song.a:b",
+            "song.a/b",
+            "song.a\u{1}b",
+            "song. ",
+            "a.b.c",
+            ".hidden",
+            "song.CON",
+        ];
+
+        for i in 0..20_000 {
+            let tags = Tags {
+                title: Some((*rng.pick(HOSTILE)).to_owned()),
+                artist: Some((*rng.pick(HOSTILE)).to_owned()),
+                album: Some((*rng.pick(HOSTILE)).to_owned()),
+                album_artist: Some((*rng.pick(HOSTILE)).to_owned()),
+                genre: Some((*rng.pick(HOSTILE)).to_owned()),
+                date: Some((*rng.pick(HOSTILE)).to_owned()),
+                disc: Some(rng.next() as u32),
+                track: Some(rng.next() as u32),
+                ..Default::default()
+            };
+            let template = Template::new(*rng.pick(&templates));
+            let src = Path::new(*rng.pick(&srcs));
+
+            let what = format!("iter {i} src {src:?}");
+            // The track's own destination must always be a real path.
+            assert_safe_relative(&template.render(&tags, src), &what, false);
+            // The album-folder renders may legitimately be empty (a flat
+            // template has no album folder); their components must still be safe.
+            assert_safe_relative(
+                &template.render_album_dir(&tags, src),
+                &format!("{what} (album dir)"),
+                true,
+            );
+            if let Some(folder) = template.render_album_folder(&tags, src) {
+                assert_safe_relative(&folder, &format!("{what} (album folder)"), true);
+            }
+        }
+    }
+
+    /// The extension cases directly, so a failure names the rule rather than an
+    /// iteration number. Each of these is a file name that is legal on Linux.
+    #[test]
+    fn a_hostile_source_extension_is_sanitized_not_appended_verbatim() {
+        let tags = Tags {
+            title: Some("Title".into()),
+            ..Default::default()
+        };
+        let render = |src: &str| {
+            Template::new("{Title}")
+                .render(&tags, Path::new(src))
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        // Legitimate extensions are untouched, case preserved.
+        assert_eq!(render("x.flac"), "Title.flac");
+        assert_eq!(render("x.FLAC"), "Title.FLAC");
+        assert_eq!(render("x.m4a"), "Title.m4a");
+        // NTFS-illegal and control characters become `_`.
+        assert_eq!(render("x.a:b"), "Title.a_b");
+        assert_eq!(render("x.a\u{1}b"), "Title.a_b");
+        // An extension that collapses to nothing appends no dot at all — a
+        // trailing dot would be stripped by Windows, so the planned path and
+        // the real one would differ.
+        assert_eq!(render("x."), "Title");
+        assert_eq!(render("x.."), "Title");
+        assert_eq!(render("x. "), "Title");
+        // No extension at all is unchanged behaviour.
+        assert_eq!(render("x"), "Title");
     }
 
     #[test]

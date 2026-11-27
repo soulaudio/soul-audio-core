@@ -67,6 +67,42 @@ fn clean(s: &str) -> String {
     }
 }
 
+/// Sanitize a file **extension** taken from a source file name, returning
+/// `None` when nothing usable is left (so the caller appends no `.` at all).
+///
+/// The extension is the one part of a destination path that does **not** come
+/// from a template, so it is the one part the segment sanitizers never saw: it
+/// is whatever the source file happened to be called. A name that is perfectly
+/// legal on Linux — `track.a:b`, `track.a\x01b`, or `track.` (whose extension
+/// is the empty string) — would otherwise be appended verbatim and produce a
+/// destination component that NTFS or the DAP's FAT card cannot hold, which
+/// breaks this module's whole promise of one layout that works on every body.
+///
+/// `track.` is the sharper case: appending an empty extension leaves a trailing
+/// dot, which Windows silently strips — so the planned path and the path that
+/// actually appears on disk differ, and a collision the planner thought it had
+/// resolved can reappear. [`clean`] already trims trailing dots for exactly
+/// this reason; this keeps the append from putting one back.
+///
+/// Legitimate extensions (`flac`, `mp3`, `M4A`) pass through untouched, case
+/// preserved.
+pub(crate) fn sanitize_extension(ext: &str) -> Option<String> {
+    let replaced: String = ext
+        .chars()
+        .map(|c| {
+            if ILLEGAL.contains(&c) || matches!(c, '\u{0}'..='\u{1f}') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = replaced
+        .trim_start_matches(' ')
+        .trim_end_matches([' ', '.']);
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
 /// Make `s` safe to use as a single path segment on the host filesystem.
 pub(crate) fn sanitize_segment(s: &str) -> String {
     // Windows strips trailing dots/spaces; also drop surrounding spaces. Leading
