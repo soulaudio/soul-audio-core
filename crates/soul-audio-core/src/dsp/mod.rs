@@ -46,6 +46,37 @@ pub const MAX_STAGES: usize = 4;
 /// (core cannot depend on that crate — it depends on core).
 pub const EQ_BANDS: usize = 16;
 
+/// The default [`Chain`] storage: **none**.
+///
+/// A chain is parameterized by the storage its convolution stage needs
+/// ([`convolve::Convolver`]), because a measured impulse response is caller
+/// memory — a megabyte of it — and a chain slot is an inline value. Most decks
+/// never host a convolver, so the default is this zero-sized stand-in: it
+/// presents an empty slice, which means
+/// [`Convolver::set_impulse_response`](convolve::Convolver::set_impulse_response)
+/// on a default-storage chain declines with
+/// [`ConvolveError::StorageTooSmall`](convolve::ConvolveError::StorageTooSmall)
+/// rather than pretending to work.
+///
+/// A host that wants room correction names its storage instead —
+/// `Deck<Sink, Dec, PRELOAD, Vec<f32>>` on the desktop, a `StaticCell` slice on
+/// the DAP — and every existing `Deck<Sink, Dec, PRELOAD>` keeps compiling
+/// unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NoStorage;
+
+impl AsRef<[f32]> for NoStorage {
+    fn as_ref(&self) -> &[f32] {
+        &[]
+    }
+}
+
+impl AsMut<[f32]> for NoStorage {
+    fn as_mut(&mut self) -> &mut [f32] {
+        &mut []
+    }
+}
+
 /// What a stage *is*, for the signal-path UI — "which stages are active".
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StageKind {
@@ -153,18 +184,23 @@ impl DspStage for EqStage {
 /// [`MatroskaDecoder`](crate::formats::matroska::MatroskaDecoder).
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
-pub enum Stage {
+pub enum Stage<P = NoStorage> {
     /// Parametric EQ.
     Eq(EqStage),
     /// Headphone crossfeed.
     Crossfeed(CrossfeedStage),
+    /// Impulse-response convolution (room / headphone correction) over
+    /// caller-provided filter storage `P` — see [`NoStorage`] for why the
+    /// chain is parameterized by it.
+    Convolver(Convolver<P>),
 }
 
-impl DspStage for Stage {
+impl<P: AsRef<[f32]> + AsMut<[f32]>> DspStage for Stage<P> {
     fn process(&mut self, buf: &mut [f32], channels: usize, sample_rate: u32) {
         match self {
             Stage::Eq(s) => s.process(buf, channels, sample_rate),
             Stage::Crossfeed(s) => s.process(buf, channels, sample_rate),
+            Stage::Convolver(s) => s.process(buf, channels, sample_rate),
         }
     }
 
@@ -172,6 +208,7 @@ impl DspStage for Stage {
         match self {
             Stage::Eq(s) => s.is_active(),
             Stage::Crossfeed(s) => s.is_active(),
+            Stage::Convolver(s) => s.is_active(),
         }
     }
 
@@ -179,6 +216,7 @@ impl DspStage for Stage {
         match self {
             Stage::Eq(s) => s.reset(),
             Stage::Crossfeed(s) => s.reset(),
+            Stage::Convolver(s) => s.reset(),
         }
     }
 
@@ -186,6 +224,7 @@ impl DspStage for Stage {
         match self {
             Stage::Eq(s) => s.kind(),
             Stage::Crossfeed(s) => s.kind(),
+            Stage::Convolver(s) => s.kind(),
         }
     }
 }
@@ -201,23 +240,37 @@ impl DspStage for Stage {
 ///
 /// Default: empty, not bypassed — which is inactive, so a deck that never
 /// configures DSP behaves exactly as it did before the chain existed.
-#[derive(Clone, Debug, Default)]
-pub struct Chain {
-    stages: [Option<Stage>; MAX_STAGES],
+#[derive(Clone, Debug)]
+pub struct Chain<P = NoStorage> {
+    stages: [Option<Stage<P>>; MAX_STAGES],
     len: usize,
     bypass_all: bool,
 }
 
-impl Chain {
+impl<P> Default for Chain<P> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<P> Chain<P> {
     /// An empty chain.
+    ///
+    /// Deliberately not a `Default` bound on `P`: a DAP's storage is a
+    /// `&'static mut [f32]` carved from a `StaticCell`, which has no default,
+    /// and a deck must still be constructible before any filter is installed.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            stages: core::array::from_fn(|_| None),
+            len: 0,
+            bypass_all: false,
+        }
     }
 
     /// Append `stage`. Returns `false` (leaving the chain untouched) when full
     /// — no-alloc means a hard capacity, not a silent reallocation.
-    pub fn push(&mut self, stage: Stage) -> bool {
+    pub fn push(&mut self, stage: Stage<P>) -> bool {
         if self.len >= MAX_STAGES {
             return false;
         }
@@ -228,7 +281,7 @@ impl Chain {
 
     /// Remove the stage at `index`, shifting the rest down to keep the order
     /// contiguous. `None` if out of range.
-    pub fn remove(&mut self, index: usize) -> Option<Stage> {
+    pub fn remove(&mut self, index: usize) -> Option<Stage<P>> {
         if index >= self.len {
             return None;
         }
@@ -272,13 +325,13 @@ impl Chain {
 
     /// The stage at `index`, in chain order.
     #[must_use]
-    pub fn stage(&self, index: usize) -> Option<&Stage> {
+    pub fn stage(&self, index: usize) -> Option<&Stage<P>> {
         self.stages.get(index)?.as_ref()
     }
 
     /// The stage at `index`, mutably — how a caller configures it (set EQ
     /// bands, pick a crossfeed preset).
-    pub fn stage_mut(&mut self, index: usize) -> Option<&mut Stage> {
+    pub fn stage_mut(&mut self, index: usize) -> Option<&mut Stage<P>> {
         self.stages.get_mut(index)?.as_mut()
     }
 
@@ -295,6 +348,14 @@ impl Chain {
         self.bypass_all
     }
 
+    /// Whether the master bypass is engaged.
+    #[must_use]
+    pub fn is_bypassed_marker(&self) -> bool {
+        self.bypass_all
+    }
+}
+
+impl<P: AsRef<[f32]> + AsMut<[f32]>> Chain<P> {
     /// Whether the chain would change the samples: not master-bypassed, and at
     /// least one stage active. The deck skips the chain entirely when this is
     /// `false`, which is what keeps bypass bit-exact.
@@ -354,7 +415,8 @@ mod tests {
         Biquad::new(1.2, -0.4, 0.1, -0.3, 0.05)
     }
 
-    fn eq_stage(active: bool) -> Stage {
+    /// An EQ stage for a chain of any storage type (the EQ needs none).
+    fn eq_stage<P>(active: bool) -> Stage<P> {
         let mut s = EqStage::new();
         if active {
             s.equalizer_mut().set_band(0, non_flat());
@@ -364,7 +426,7 @@ mod tests {
 
     #[test]
     fn an_empty_or_flat_chain_is_inactive() {
-        let mut chain = Chain::new();
+        let mut chain: Chain = Chain::new();
         assert!(!chain.is_active(), "an empty chain is inactive");
         assert!(chain.is_empty());
 
@@ -382,7 +444,7 @@ mod tests {
 
     #[test]
     fn a_configured_stage_is_active_and_changes_the_block() {
-        let mut chain = Chain::new();
+        let mut chain: Chain = Chain::new();
         chain.push(eq_stage(true));
         assert!(chain.is_active());
         let mut buf = [1000.0f32, 1000.0, 1000.0, 1000.0];
@@ -395,7 +457,7 @@ mod tests {
 
     #[test]
     fn master_bypass_is_inactive_and_a_passthrough() {
-        let mut chain = Chain::new();
+        let mut chain: Chain = Chain::new();
         chain.push(eq_stage(true));
         chain.set_bypass_all(true);
         assert!(chain.is_bypassed());
@@ -411,7 +473,7 @@ mod tests {
 
     #[test]
     fn capacity_is_hard_and_refuses_rather_than_allocating() {
-        let mut chain = Chain::new();
+        let mut chain: Chain = Chain::new();
         for i in 0..MAX_STAGES {
             assert!(chain.push(eq_stage(false)), "stage {i} should fit");
         }
@@ -425,7 +487,7 @@ mod tests {
 
     #[test]
     fn stages_can_be_reordered_and_removed_keeping_the_order_contiguous() {
-        let mut chain = Chain::new();
+        let mut chain: Chain = Chain::new();
         // Three distinguishable stages: only the middle one is active.
         chain.push(eq_stage(false));
         chain.push(eq_stage(true));
@@ -456,7 +518,7 @@ mod tests {
     fn mixed_stage_kinds_run_and_report_in_chain_order() {
         let mut crossfeed = crate::dsp::CrossfeedStage::new();
         crossfeed.set_preset(crate::dsp::crossfeed::Preset::Moderate);
-        let mut chain = Chain::new();
+        let mut chain: Chain = Chain::new();
         assert!(chain.push(eq_stage(true)));
         assert!(chain.push(Stage::Crossfeed(crossfeed)));
         assert!(chain.is_active());
@@ -473,7 +535,7 @@ mod tests {
         let mut forward = signal.clone();
         chain.process(&mut forward, 2, 48_000);
 
-        let mut swapped = Chain::new();
+        let mut swapped: Chain = Chain::new();
         swapped.push(Stage::Crossfeed(crossfeed));
         swapped.push(eq_stage(true));
         let mut reverse = signal.clone();
@@ -489,9 +551,93 @@ mod tests {
         assert_eq!(untouched, signal);
     }
 
+    /// The convolver as a **chain stage**, over caller-provided storage: it
+    /// runs in order with the others, is reported in the active set, and its
+    /// bypass stays bit-exact. This is what the storage type parameter buys —
+    /// a `Deck<_, _, N, Vec<f32>>` can host room correction alongside the EQ
+    /// and reorder the two.
+    #[test]
+    fn a_convolver_runs_in_the_chain_over_caller_storage() {
+        use crate::dsp::convolve::{Convolver, storage_len};
+
+        // A short, non-trivial IR on the direct path (no latency), so the
+        // comparison is straightforward.
+        let ir = [0.5f32, 0.25, -0.125, 0.0625];
+        let mut conv = Convolver::new(vec![0.0f32; storage_len(ir.len(), 2)]);
+        conv.set_impulse_response(&ir, 2).expect("install IR");
+        assert!(conv.is_active());
+
+        let mut chain: Chain<Vec<f32>> = Chain::new();
+        assert!(chain.push(Stage::Convolver(conv.clone())));
+        assert!(
+            chain.is_active(),
+            "a loaded convolver makes the chain active"
+        );
+        let mut kinds = [StageKind::Eq; MAX_STAGES];
+        assert_eq!(chain.active_kinds(&mut kinds), 1);
+        assert_eq!(kinds[0], StageKind::Convolver);
+
+        let signal: Vec<f32> = (0..256).map(|i| ((i % 17) as f32 - 8.0) / 8.0).collect();
+        let mut convolved = signal.clone();
+        chain.process(&mut convolved, 2, 48_000);
+        assert_ne!(convolved, signal, "the convolver must process the block");
+
+        // Bypassing the chain restores the exact samples, as for every stage.
+        chain.set_bypass_all(true);
+        let mut bypassed = signal.clone();
+        chain.process(&mut bypassed, 2, 48_000);
+        assert_eq!(bypassed, signal, "a bypassed convolver is bit-exact");
+
+        // Order matters against the EQ, which is the point of having a chain:
+        // convolve-then-EQ differs from EQ-then-convolve.
+        let build = |convolver_first: bool| {
+            let mut c: Chain<Vec<f32>> = Chain::new();
+            if convolver_first {
+                c.push(Stage::Convolver(conv.clone()));
+                c.push(eq_stage(true));
+            } else {
+                c.push(eq_stage(true));
+                c.push(Stage::Convolver(conv.clone()));
+            }
+            let mut buf = signal.clone();
+            c.process(&mut buf, 2, 48_000);
+            buf
+        };
+        assert_ne!(
+            build(true),
+            build(false),
+            "stage order must change the result"
+        );
+    }
+
+    /// The default storage is honest about being none: a convolver on a
+    /// default-parameterized chain cannot take a filter, so it stays inactive
+    /// and the chain stays a passthrough — rather than silently truncating
+    /// someone's room correction.
+    #[test]
+    fn the_default_storage_declines_a_filter_instead_of_pretending() {
+        use crate::dsp::convolve::{ConvolveError, Convolver};
+
+        let mut conv: Convolver<NoStorage> = Convolver::new(NoStorage);
+        let ir = [0.5f32; 8];
+        assert!(matches!(
+            conv.set_impulse_response(&ir, 2),
+            Err(ConvolveError::StorageTooSmall { .. })
+        ));
+        assert!(!conv.is_active());
+
+        let mut chain: Chain = Chain::new();
+        assert!(chain.push(Stage::Convolver(conv)));
+        assert!(!chain.is_active(), "no filter, no processing");
+        let signal: Vec<f32> = (0..64).map(|i| i as f32).collect();
+        let mut buf = signal.clone();
+        chain.process(&mut buf, 2, 48_000);
+        assert_eq!(buf, signal);
+    }
+
     #[test]
     fn active_kinds_reports_only_the_active_stages_in_order() {
-        let mut chain = Chain::new();
+        let mut chain: Chain = Chain::new();
         chain.push(eq_stage(false));
         chain.push(eq_stage(true));
         let mut kinds = [StageKind::Eq; MAX_STAGES];
@@ -510,7 +656,7 @@ mod tests {
 
     #[test]
     fn reset_clears_filter_state_so_two_runs_match() {
-        let mut chain = Chain::new();
+        let mut chain: Chain = Chain::new();
         chain.push(eq_stage(true));
         let input = [1000.0f32, -1000.0, 500.0, 0.0, 250.0, 125.0];
         let mut first = input;

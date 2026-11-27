@@ -22,8 +22,12 @@ pub enum Provided {
 /// `PRELOAD` is the deck's gapless preload depth. The engine treats the
 /// sequencer as the single source of truth and reconciles the deck's current +
 /// primed preloads to `seq.current()` / `seq.upcoming(1..=PRELOAD)` each cycle.
-pub struct Engine<K, D, S: Sequencer, const PRELOAD: usize> {
-    deck: Deck<K, D, PRELOAD>,
+///
+/// `P` is the deck's DSP-chain convolution storage (see
+/// [`soul_audio_core::dsp::NoStorage`]); it defaults to none, so an engine that
+/// hosts no convolver is written exactly as before.
+pub struct Engine<K, D, S: Sequencer, const PRELOAD: usize, P = soul_audio_core::dsp::NoStorage> {
+    deck: Deck<K, D, PRELOAD, P>,
     seq: S,
     /// The deck's current slot holds `current_handle`.
     have_current: bool,
@@ -37,10 +41,17 @@ pub struct Engine<K, D, S: Sequencer, const PRELOAD: usize> {
     pending: Option<S::Handle>,
 }
 
-impl<K: Sink, D: SeekableDecoder, S: Sequencer, const PRELOAD: usize> Engine<K, D, S, PRELOAD> {
+impl<
+    K: Sink,
+    D: SeekableDecoder,
+    S: Sequencer,
+    const PRELOAD: usize,
+    P: AsRef<[f32]> + AsMut<[f32]>,
+> Engine<K, D, S, PRELOAD, P>
+{
     /// Wrap `deck` + `seq`. The sequencer starts wherever it is; call
     /// [`rearm`](Self::rearm) after configuring it to begin playback.
-    pub fn new(deck: Deck<K, D, PRELOAD>, seq: S) -> Self {
+    pub fn new(deck: Deck<K, D, PRELOAD, P>, seq: S) -> Self {
         Self {
             deck,
             seq,
@@ -96,12 +107,12 @@ impl<K: Sink, D: SeekableDecoder, S: Sequencer, const PRELOAD: usize> Engine<K, 
 
     /// Borrow the deck (position/duration/rate/sink queries).
     #[must_use]
-    pub fn deck(&self) -> &Deck<K, D, PRELOAD> {
+    pub fn deck(&self) -> &Deck<K, D, PRELOAD, P> {
         &self.deck
     }
 
     /// Mutably borrow the deck (deck-only controls / sink flush).
-    pub fn deck_mut(&mut self) -> &mut Deck<K, D, PRELOAD> {
+    pub fn deck_mut(&mut self) -> &mut Deck<K, D, PRELOAD, P> {
         &mut self.deck
     }
 

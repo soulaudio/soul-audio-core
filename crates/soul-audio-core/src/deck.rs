@@ -293,7 +293,13 @@ struct Track<D> {
 
 /// A streaming player of [`SeekableDecoder`] tracks into a [`Sink`], with a
 /// `PRELOAD`-deep gapless preload buffer.
-pub struct Deck<K, D, const PRELOAD: usize> {
+///
+/// `P` is the storage the chain's **convolution** stage carves its filter from
+/// (see [`dsp::NoStorage`](crate::dsp::NoStorage)). It defaults to no storage,
+/// so a deck that never hosts a convolver is written exactly as before —
+/// `Deck<Sink, Dec, PRELOAD>` — while a host doing room correction names it:
+/// `Deck<Sink, Dec, PRELOAD, Vec<f32>>`.
+pub struct Deck<K, D, const PRELOAD: usize, P = crate::dsp::NoStorage> {
     sink: K,
     sink_rate: u32,
     sink_channels: usize,
@@ -324,13 +330,15 @@ pub struct Deck<K, D, const PRELOAD: usize> {
     /// This output's DSP chain, run on each finished output block (see
     /// [`dsp`](crate::dsp)). Empty by default, and skipped entirely while
     /// inactive — which is what keeps a bypassed chain bit-exact.
-    dsp: Chain,
+    dsp: Chain<P>,
     /// `f32` working copy of one output block for the DSP chain. Only touched
     /// while the chain is active.
     dsp_buf: [f32; BLOCK * MAX_CH],
 }
 
-impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
+impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize, P: AsRef<[f32]> + AsMut<[f32]>>
+    Deck<K, D, PRELOAD, P>
+{
     /// Create a deck feeding `sink`. `quality` selects the resampler tier.
     pub fn new(sink: K, quality: Quality) -> Self {
         let si = sink.stream_info();
@@ -813,14 +821,14 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
     /// output block after decode/resample/downmix and before the sink. One
     /// chain per deck, i.e. per output.
     #[must_use]
-    pub fn dsp(&self) -> &Chain {
+    pub fn dsp(&self) -> &Chain<P> {
         &self.dsp
     }
 
     /// The DSP chain, mutably: add/remove/reorder stages, configure one, or
     /// bypass the lot. Changes take effect on the next block — stages are
     /// configuration, not audio, so there is nothing to synchronize.
-    pub fn dsp_mut(&mut self) -> &mut Chain {
+    pub fn dsp_mut(&mut self) -> &mut Chain<P> {
         &mut self.dsp
     }
 
@@ -1311,7 +1319,9 @@ mod tests {
     }
 
     /// Pump to `Ended`, returning (all output, count of TrackChanged events).
-    fn run<K: Sink, D: SeekableDecoder, const P: usize>(deck: &mut Deck<K, D, P>) -> usize {
+    fn run<K: Sink, D: SeekableDecoder, const N: usize, P: AsRef<[f32]> + AsMut<[f32]>>(
+        deck: &mut Deck<K, D, N, P>,
+    ) -> usize {
         let mut swaps = 0;
         for _ in 0..100_000 {
             match deck.pump().unwrap() {
@@ -2394,6 +2404,78 @@ mod tests {
         assert!(!di.dsp_active);
         assert!(di.bit_perfect(), "a bypassed chain is bit-perfect again");
         assert_eq!(deck.dsp().len(), 1, "the stage is still configured");
+    }
+
+    /// A **convolver in the deck's chain**, over caller-provided storage: room
+    /// correction running in the real output path. The storage type parameter
+    /// defaults to none, so this is also the test that a deck which *does* name
+    /// storage behaves like any other.
+    #[test]
+    fn a_deck_with_storage_can_host_a_convolver() {
+        use crate::dsp::convolve::{Convolver, storage_len};
+
+        let ir = [0.5f32, 0.25, -0.125, 0.0625];
+        let mut conv = Convolver::new(vec![0.0f32; storage_len(ir.len(), 2)]);
+        conv.set_impulse_response(&ir, 2).expect("install IR");
+
+        let play = |stage: Option<crate::dsp::Stage<Vec<f32>>>| {
+            let sink = MockSink {
+                rate: 48_000,
+                ch: 2,
+                written: Vec::new(),
+                last_volume: None,
+            };
+            // The fourth parameter is the chain's convolution storage; every
+            // other deck in this suite leaves it defaulted.
+            let mut deck: Deck<MockSink, ConstDecoder, 1, Vec<f32>> =
+                Deck::new(sink, Quality::Fast);
+            if let Some(stage) = stage {
+                assert!(deck.dsp_mut().push(stage));
+            }
+            deck.load(ConstDecoder {
+                rate: 48_000,
+                ch: 2,
+                bits: 24,
+                value: 100_000,
+                frames: 600,
+                pos: 0,
+            })
+            .unwrap();
+            run(&mut deck);
+            deck.sink.written
+        };
+
+        let plain = play(None);
+        let corrected = play(Some(crate::dsp::Stage::Convolver(conv.clone())));
+        assert_eq!(plain.len(), corrected.len(), "the chain must not resize");
+        assert_ne!(plain, corrected, "the convolver must process the output");
+        // A 0.5-gain-at-DC IR over a constant source settles below the input.
+        assert!(
+            corrected.iter().all(|&s| s.abs() <= 100_000 * 256),
+            "the corrected output must stay bounded"
+        );
+
+        // And it is declared: an active convolver is not a bit-perfect path.
+        let mut deck: Deck<BpSink, ConstDecoder, 1, Vec<f32>> = Deck::new(
+            BpSink {
+                rate: 44_100,
+                ch: 2,
+                format: INT24,
+                exclusive: true,
+                modifies: false,
+            },
+            Quality::Fast,
+        );
+        deck.load(bp_track(24, 44_100, 2)).unwrap();
+        assert!(deck.decode_info().unwrap().bit_perfect());
+        deck.dsp_mut()
+            .push(crate::dsp::Stage::Convolver(conv.clone()));
+        let di = deck.decode_info().unwrap();
+        assert!(di.dsp_active);
+        assert!(!di.bit_perfect(), "room correction is not bit-perfect");
+        let mut kinds = [crate::dsp::StageKind::Eq; crate::dsp::MAX_STAGES];
+        assert_eq!(deck.dsp().active_kinds(&mut kinds), 1);
+        assert_eq!(kinds[0], crate::dsp::StageKind::Convolver);
     }
 
     /// A seek clears the stages' filter state: the pre-seek tail must not ring
