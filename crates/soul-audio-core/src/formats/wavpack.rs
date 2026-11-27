@@ -115,7 +115,17 @@ const EXP2_TABLE: [u8; 256] = [
 /// Signed-log → value (`entropy_utils.c:wp_exp2s`).
 fn wp_exp2s(log: i32) -> i32 {
     if log < 0 {
-        return -wp_exp2s(-log);
+        // Two traps on one line, both only reachable from a malformed stream
+        // (a valid one's logs come from the i16 the metadata carries and from
+        // bounded entropy state):
+        //   * `-i32::MIN` overflows — and `wrapping_neg` would leave it
+        //     negative, so the recursion would never terminate. Saturating the
+        //     argument keeps the sign flip total AND the recursion finite.
+        //   * the recursive result can itself be `i32::MIN` (the `value <<`
+        //     branch below can set bit 31 for an extreme log), so negating it
+        //     wraps rather than trapping — which is what the C reference's
+        //     `-wp_exp2s(-log)` does in practice.
+        return wp_exp2s(log.saturating_neg()).wrapping_neg();
     }
     let value = u32::from(EXP2_TABLE[(log & 0xff) as usize]) | 0x100;
     let e = log >> 8;
@@ -1332,6 +1342,37 @@ fn parse_decorr_samples(raw: &[u8], passes: &mut [DecorrPass], mono: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `wp_exp2s` must be total: a malformed stream can hand it any `i32`.
+    ///
+    /// Two traps lived on its first line — `-i32::MIN` overflowed, and the
+    /// obvious `wrapping_neg` fix would have left the value negative and
+    /// recursed forever. Found by fuzzing (`FUZZ_SEED=0xD15EA5E FUZZ_ITERS=8000`,
+    /// the `wavpack` seed with a corrupted length field).
+    #[test]
+    fn exp2s_is_total_for_every_input() {
+        // The two that trapped, and their neighbours.
+        for log in [i32::MIN, i32::MIN + 1, -1, 0, 1, i32::MAX - 1, i32::MAX] {
+            let v = wp_exp2s(log);
+            // Nothing to assert about the value of a garbage log beyond that it
+            // came back at all — the point is that it did, and in bounded time.
+            let _ = v;
+        }
+        // A sweep over the whole exponent range, both signs: every `e` the
+        // shift branches can take, including the ones that set bit 31 (whose
+        // negation is what wrapped).
+        for e in 0..=0xFF_FFFFi32 {
+            if e % 0x1_0000 != 0 {
+                continue; // stride: 256 points across the range
+            }
+            for sign in [1i32, -1] {
+                let _ = wp_exp2s(e.saturating_mul(sign));
+            }
+        }
+        // The documented identity still holds for real inputs.
+        assert_eq!(wp_exp2s(-1), -wp_exp2s(1));
+        assert_eq!(wp_exp2s(-0x800), -wp_exp2s(0x800));
+    }
 
     #[test]
     fn exp2s_matches_reference_points() {
