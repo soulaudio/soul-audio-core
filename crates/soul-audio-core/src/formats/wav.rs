@@ -338,9 +338,45 @@ impl<S: Source> Decoder for WavDecoder<S> {
 /// `out[..samples]`, applying bit-width widening, IEEE-float scaling, or G.711
 /// companding. `big_endian` reverses each multi-byte sample to the little-endian
 /// order the widen/float helpers expect (AIFF and RIFX store samples big-endian;
-/// WAV `sowt`/canonical are little-endian). Shared by [`WavDecoder`] and
-/// [`crate::formats::aiff::AiffDecoder`] — the one place PCM sample bytes become
-/// `i32`. Returns the number of samples written.
+/// WAV `sowt`/canonical are little-endian). Shared by [`WavDecoder`],
+/// [`crate::formats::aiff::AiffDecoder`] and
+/// [`crate::formats::caf::CafPcm`](crate::formats::caf) — the one place PCM
+/// sample bytes become `i32`. Returns the number of samples written.
+///
+/// `bps` (bytes per sample) wider than [`MAX_BYTES_PER_SAMPLE`] converts
+/// **nothing** (returns `0`). `bps` comes from a container field for AIFF and
+/// CAF — `blockAlign / channels`, `mBytesPerPacket / mChannelsPerFrame` — so a
+/// malformed header can name any width at all, and the byte-swap buffer below
+/// is sized for the widest real sample. The callers reject such a file at
+/// construction; this guard is the backstop that keeps the shared converter
+/// itself total (it used to panic here on a 9-byte "sample").
+/// Widest `bps` (bytes per sample) [`convert_samples`] accepts — the size of
+/// its big-endian swap buffer, and well past any real PCM sample (64-bit float
+/// is 8).
+pub(crate) const MAX_BYTES_PER_SAMPLE: usize = 8;
+
+/// Bytes per sample the decode of `(bits, float, companding)` actually **reads**
+/// — [`widen`] and [`float_to_i32`] index a fixed number of bytes for each
+/// width, and a companded sample is one byte. A `bps` below this would index
+/// past the sample (the AIFF/CAF `bps` comes from a container field, so it can
+/// claim 2 bytes for a 24-bit sample); [`convert_samples`] refuses such a call
+/// instead.
+pub(crate) const fn bytes_needed(bits: u8, float: bool, companding: Option<Companding>) -> usize {
+    if companding.is_some() {
+        return 1;
+    }
+    if float {
+        return if bits == 64 { 8 } else { 4 };
+    }
+    match bits {
+        8 => 1,
+        16 => 2,
+        24 => 3,
+        // `widen`'s fallback arm reads four bytes for every other width.
+        _ => 4,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn convert_samples(
     buf: &[u8],
@@ -351,6 +387,9 @@ pub(crate) fn convert_samples(
     big_endian: bool,
     out: &mut [i32],
 ) -> usize {
+    if bps == 0 || bps > MAX_BYTES_PER_SAMPLE || bps < bytes_needed(bits, float, companding) {
+        return 0;
+    }
     let samples = (buf.len() / bps).min(out.len());
     for (i, slot) in out[..samples].iter_mut().enumerate() {
         let raw = &buf[i * bps..i * bps + bps];

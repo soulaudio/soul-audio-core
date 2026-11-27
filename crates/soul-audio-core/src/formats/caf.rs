@@ -6,10 +6,11 @@
 //! chunk, with the `ALACSpecificConfig` from the `kuki` magic cookie).
 //!
 //! A CAF file is a 8-byte `caff` header then a sequence of chunks
-//! (`[type:4][size:i64 BE][body]`). We read `desc` (the audio format) and, for
-//! ALAC, `kuki` (the cookie), then stream the `data` chunk. Other chunks
-//! (`chan`, `info`, `pakt`, …) are skipped. A `data` chunk may declare size −1
-//! ("to end of file"); we then read until EOF.
+//! (`[type:4][size:i64 BE][body]`). We read `desc` (the audio format), `chan`
+//! (the channel layout, for the multichannel → stereo fold) and, for ALAC,
+//! `kuki` (the cookie), then stream the `data` chunk. Other chunks (`info`,
+//! `pakt`, …) are skipped. A `data` chunk may declare size −1 ("to end of
+//! file"); we then read until EOF.
 
 use embedded_io::SeekFrom;
 
@@ -33,6 +34,66 @@ struct Desc {
     frames_per_packet: u32,
     channels: u32,
     bits_per_channel: u32,
+}
+
+/// `kAudioChannelLayoutTag_UseChannelDescriptions`.
+const LAYOUT_USE_DESCRIPTIONS: u32 = 0;
+/// `kAudioChannelLayoutTag_UseChannelBitmap`.
+const LAYOUT_USE_BITMAP: u32 = 1 << 16;
+/// Bytes of one `AudioChannelDescription`: label, flags, 3 × f32 coordinates.
+const CHANNEL_DESCRIPTION_LEN: usize = 20;
+/// Bytes of `chan` we read: the 12-byte `AudioChannelLayout` head plus
+/// descriptions for up to [`channels::MAX_CHANNELS`] channels.
+const CHAN_CAP: usize = 12 + CHANNEL_DESCRIPTION_LEN * crate::channels::MAX_CHANNELS;
+
+/// Parse a CAF `chan` (`AudioChannelLayout`) chunk body into an ordered layout
+/// for a `channels`-channel stream:
+/// `[mChannelLayoutTag:u32][mChannelBitmap:u32][mNumberChannelDescriptions:u32]`
+/// then that many 20-byte `AudioChannelDescription`s.
+///
+/// All three forms are honoured — descriptions (per-channel labels, in stream
+/// order), bitmap (WAVEFORMATEXTENSIBLE-compatible bits), and a layout-tag
+/// constant. `None` whenever the layout cannot be mapped *exactly*: an unknown
+/// tag, an unplaceable label or bit, a description count that disagrees with
+/// the stream, or a truncated body. The caller then reports no layout at all,
+/// so the deck falls back to its count heuristic instead of folding a guessed
+/// order — a wrong order is audible (the centre channel arriving in a
+/// surround), a missing one only costs the ambiguous counts their fold.
+fn parse_chan(body: &[u8], channels: u16) -> Option<crate::channels::ChannelLayout> {
+    use crate::channels::{
+        ChannelLayout, coreaudio_bitmap_layout, coreaudio_label_speaker, coreaudio_layout_tag,
+    };
+    if body.len() < 12 || channels == 0 {
+        return None;
+    }
+    let tag = be_u32(&body[0..4]);
+    let bitmap = be_u32(&body[4..8]);
+    let descriptions = be_u32(&body[8..12]);
+    match tag {
+        LAYOUT_USE_DESCRIPTIONS => {
+            // One description per channel, in the stream's own channel order.
+            if usize::from(channels) != descriptions as usize {
+                return None;
+            }
+            let mut order = [0u32; crate::channels::MAX_CHANNELS];
+            let n = usize::from(channels);
+            if n > order.len() {
+                return None;
+            }
+            for (i, slot) in order[..n].iter_mut().enumerate() {
+                let at = 12 + i * CHANNEL_DESCRIPTION_LEN;
+                let label = body.get(at..at + 4).map(be_u32)?;
+                *slot = coreaudio_label_speaker(label)?;
+            }
+            ChannelLayout::from_order(&order[..n])
+        }
+        LAYOUT_USE_BITMAP => coreaudio_bitmap_layout(bitmap, channels),
+        _ => {
+            let layout = coreaudio_layout_tag(tag)?;
+            // A tag names its own channel count; distrust one that disagrees with `desc`.
+            (layout.channels() == usize::from(channels)).then_some(layout)
+        }
+    }
 }
 
 /// Read a big-endian `u32`/`u64`/`i64` from a slice.
@@ -175,6 +236,10 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> CafDecoder<S, P> {
         let mut desc: Option<Desc> = None;
         let mut kuki = [0u8; 64];
         let mut kuki_len = 0usize;
+        // `chan` may precede or follow `desc`, so keep the raw body and parse it
+        // once the channel count is known (at `data`).
+        let mut chan = [0u8; CHAN_CAP];
+        let mut chan_len = 0usize;
         let mut pos: u64 = 8;
         loop {
             let mut ch = [0u8; 12];
@@ -201,6 +266,16 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> CafDecoder<S, P> {
                         bits_per_channel: be_u32(&d[28..32]),
                     });
                 }
+                b"chan" => {
+                    if size < 0 {
+                        return Err(DecodeError::Malformed);
+                    }
+                    let take = (size as usize).min(chan.len());
+                    read_exact(&mut src, &mut chan[..take])?;
+                    skip(&mut src, size as u64 - take as u64)?;
+                    pos += size as u64;
+                    chan_len = take;
+                }
                 b"kuki" => {
                     if size < 0 {
                         return Err(DecodeError::Malformed);
@@ -226,6 +301,7 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> CafDecoder<S, P> {
                         src,
                         desc,
                         &kuki[..kuki_len],
+                        &chan[..chan_len],
                         data_bytes,
                         data_start,
                         scratch,
@@ -246,16 +322,17 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> CafDecoder<S, P> {
         src: S,
         desc: Desc,
         kuki: &[u8],
+        chan: &[u8],
         data_bytes: u64,
         data_start: u64,
         scratch: P,
     ) -> Result<Self, DecodeError> {
         match &desc.format_id {
             b"lpcm" => Ok(CafDecoder::Pcm(CafPcm::new(
-                src, &desc, data_bytes, data_start,
+                src, &desc, chan, data_bytes, data_start,
             )?)),
             b"alac" => Ok(CafDecoder::Alac(CafAlac::new_in(
-                src, kuki, data_bytes, data_start, scratch,
+                src, kuki, chan, data_bytes, data_start, scratch,
             )?)),
             _ => Err(DecodeError::Unsupported),
         }
@@ -315,6 +392,21 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for CafDecoder<S, P> {
             CafDecoder::Alac(_) => crate::model::SourceCodec::Alac,
         }
     }
+
+    /// The channel layout from the `chan` (`AudioChannelLayout`) chunk — in any
+    /// of its three forms (see [`parse_chan`]) — so a multichannel CAF folds to
+    /// stereo in its own channel order. For an ALAC payload with no `chan`,
+    /// ALAC's default per-count order
+    /// ([`channels::alac_layout`](crate::channels::alac_layout)) stands in, the
+    /// same layout the M4A ALAC decoder reports. An `lpcm` payload with no
+    /// `chan` reports nothing: raw PCM in a CAF carries no order of its own, so
+    /// only the deck's count heuristic can speak for it.
+    fn channel_layout(&self) -> Option<crate::channels::ChannelLayout> {
+        match self {
+            CafDecoder::Pcm(d) => d.layout,
+            CafDecoder::Alac(d) => d.layout,
+        }
+    }
 }
 
 /// `lpcm` CAF: stream the `data` region, convert each frame to `i32`.
@@ -326,6 +418,8 @@ pub struct CafPcm<S> {
     bits: u8,
     float: bool,
     big_endian: bool,
+    /// The `chan`-chunk channel layout, if the file carried a mappable one.
+    layout: Option<crate::channels::ChannelLayout>,
     /// Interleaved-frame byte stride (`bytes_per_packet`), for the seek offset.
     block_align: u64,
     /// Absolute byte offset of the first sample, and the total sample-data size.
@@ -335,7 +429,13 @@ pub struct CafPcm<S> {
 }
 
 impl<S: Source> CafPcm<S> {
-    fn new(src: S, desc: &Desc, data_bytes: u64, data_start: u64) -> Result<Self, DecodeError> {
+    fn new(
+        src: S,
+        desc: &Desc,
+        chan: &[u8],
+        data_bytes: u64,
+        data_start: u64,
+    ) -> Result<Self, DecodeError> {
         if desc.channels == 0 || desc.frames_per_packet != 1 {
             return Err(DecodeError::Unsupported);
         }
@@ -344,7 +444,11 @@ impl<S: Source> CafPcm<S> {
         let big_endian = desc.format_flags & LPCM_FLAG_LE == 0;
         let bits = desc.bits_per_channel as u8;
         let bps = (desc.bytes_per_packet / desc.channels) as usize;
-        if bps == 0 {
+        // `mBytesPerPacket` is a container field: a malformed `desc` can claim
+        // any width. Anything past the widest real sample is not a CAF we can
+        // decode, and must be refused here rather than reaching the shared
+        // converter (which would then convert nothing, silently).
+        if bps == 0 || bps > crate::formats::wav::MAX_BYTES_PER_SAMPLE {
             return Err(DecodeError::Unsupported);
         }
         let valid = if float {
@@ -377,6 +481,7 @@ impl<S: Source> CafPcm<S> {
             bits,
             float,
             big_endian,
+            layout: parse_chan(chan, desc.channels as u16),
             block_align,
             data_start,
             data_total: if data_bytes == u64::MAX {
@@ -445,11 +550,17 @@ impl<S: SeekSource> CafPcm<S> {
     /// [`DecodeError::Io`] if the underlying seek fails.
     fn seek_to(&mut self, sample: u64) -> Result<u64, DecodeError> {
         let frame = self.total_frames.map_or(sample, |t| sample.min(t));
-        let byte = self.data_start + frame * self.block_align;
+        // Saturating: a `data` chunk of declared size −1 ("to end of file")
+        // leaves `total_frames` unknown, so `frame` is whatever the caller
+        // asked for — and `frame · block_align` overflowed on a malformed
+        // header with a huge packet size (found by fuzzing). A saturated
+        // offset seeks past the end, which the read then reports as EOF.
+        let offset = frame.saturating_mul(self.block_align);
+        let byte = self.data_start.saturating_add(offset);
         self.src
             .seek(SeekFrom::Start(byte))
             .map_err(|_| DecodeError::Io)?;
-        self.data_remaining = self.data_total.saturating_sub(frame * self.block_align);
+        self.data_remaining = self.data_total.saturating_sub(offset);
         Ok(frame)
     }
 }
@@ -478,12 +589,15 @@ pub struct CafAlac<S, P> {
     out_len: usize,
     out_pos: usize,
     eof: bool,
+    /// The `chan`-chunk layout, else ALAC's default order for the channel count.
+    layout: Option<crate::channels::ChannelLayout>,
 }
 
 impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> CafAlac<S, P> {
     fn new_in(
         src: S,
         kuki: &[u8],
+        chan: &[u8],
         data_bytes: u64,
         data_start: u64,
         scratch: P,
@@ -518,6 +632,10 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> CafAlac<S, P> {
             out_len: 0,
             out_pos: 0,
             eof: false,
+            // An explicit `chan` wins; without one, ALAC's own per-count order
+            // applies exactly as it does for ALAC in M4A.
+            layout: parse_chan(chan, cfg.channels as u16)
+                .or_else(|| crate::channels::alac_layout(cfg.channels as u16)),
         })
     }
 
@@ -757,5 +875,222 @@ mod tests {
         let (cfg2, rate2) = parse_alac_cookie(&wrapped).unwrap();
         assert_eq!(cfg2.frame_length, 4096);
         assert_eq!(rate2, 44_100);
+    }
+
+    /// A `chan` body in the layout-tag form.
+    fn chan_tag(tag: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&tag.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b
+    }
+
+    /// A `chan` body in the descriptions form, one 20-byte entry per label.
+    fn chan_descriptions(labels: &[u32]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&0u32.to_be_bytes()); // UseChannelDescriptions
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&(labels.len() as u32).to_be_bytes());
+        for &l in labels {
+            b.extend_from_slice(&l.to_be_bytes());
+            b.extend_from_slice(&0u32.to_be_bytes()); // flags
+            b.extend_from_slice(&[0u8; 12]); // coordinates
+        }
+        b
+    }
+
+    #[test]
+    fn chan_parses_all_three_forms() {
+        use crate::channels::speaker::*;
+        // Tag form: MPEG_5_1_C = (123 << 16) | 6 = L C R Ls Rs LFE.
+        let l = parse_chan(&chan_tag((123 << 16) | 6), 6).expect("tag layout");
+        assert_eq!(l.speakers(), &[FL, FC, FR, BL, BR, LFE]);
+
+        // Bitmap form.
+        let mut bitmap = Vec::new();
+        bitmap.extend_from_slice(&(1u32 << 16).to_be_bytes()); // UseChannelBitmap
+        bitmap.extend_from_slice(&(FL | FR | BL | BR).to_be_bytes());
+        bitmap.extend_from_slice(&0u32.to_be_bytes());
+        let l = parse_chan(&bitmap, 4).expect("bitmap layout");
+        assert_eq!(l.speakers(), &[FL, FR, BL, BR]);
+
+        // Descriptions form, in a deliberately non-canonical order.
+        let l = parse_chan(&chan_descriptions(&[1, 3, 2, 5, 6]), 5).expect("description layout");
+        assert_eq!(l.speakers(), &[FL, FC, FR, BL, BR]);
+    }
+
+    #[test]
+    fn chan_declines_rather_than_guesses() {
+        // Truncated head / empty body / zero channels.
+        assert_eq!(parse_chan(&[], 6), None);
+        assert_eq!(parse_chan(&chan_tag((123 << 16) | 6), 0), None);
+        assert_eq!(parse_chan(&[0u8; 11], 6), None);
+        // A tag whose count disagrees with `desc`, and an unknown tag.
+        assert_eq!(parse_chan(&chan_tag((123 << 16) | 6), 5), None);
+        assert_eq!(parse_chan(&chan_tag((9999 << 16) | 6), 6), None);
+        // Descriptions: count mismatch, an unplaceable label (13 = VerticalHeightLeft),
+        // and a body truncated mid-description.
+        assert_eq!(parse_chan(&chan_descriptions(&[1, 2, 3]), 5), None);
+        assert_eq!(parse_chan(&chan_descriptions(&[1, 2, 3, 13, 6]), 5), None);
+        let mut truncated = chan_descriptions(&[1, 2, 3, 5, 6]);
+        truncated.truncate(12 + 20 * 4 + 2);
+        assert_eq!(parse_chan(&truncated, 5), None);
+        // More channels than the deck can carry.
+        assert_eq!(parse_chan(&chan_descriptions(&[1; 9]), 9), None);
+    }
+
+    /// Assemble a CAF around the given `desc` payload bits, `chan` body, and
+    /// `kuki`, with an empty-but-present `data` chunk — enough to construct a
+    /// decoder and ask it for its layout.
+    fn caf_header(format: &[u8; 4], channels: u32, chan: Option<&[u8]>, kuki: &[u8]) -> Vec<u8> {
+        let mut desc = Vec::new();
+        desc.extend_from_slice(&44_100f64.to_be_bytes());
+        desc.extend_from_slice(format);
+        desc.extend_from_slice(&0u32.to_be_bytes()); // flags
+        desc.extend_from_slice(&(channels * 2).to_be_bytes()); // bytes/packet (16-bit)
+        desc.extend_from_slice(&1u32.to_be_bytes()); // frames/packet
+        desc.extend_from_slice(&channels.to_be_bytes());
+        desc.extend_from_slice(&16u32.to_be_bytes()); // bits/channel
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"caff");
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        let mut chunk = |ty: &[u8; 4], body: &[u8]| {
+            bytes.extend_from_slice(ty);
+            bytes.extend_from_slice(&(body.len() as i64).to_be_bytes());
+            bytes.extend_from_slice(body);
+        };
+        chunk(b"desc", &desc);
+        if let Some(c) = chan {
+            chunk(b"chan", c);
+        }
+        if !kuki.is_empty() {
+            chunk(b"kuki", kuki);
+        }
+        chunk(b"data", &0u32.to_be_bytes()); // edit count only: no samples
+        bytes
+    }
+
+    /// A bare 24-byte `ALACSpecificConfig` for `channels` channels.
+    fn alac_cookie(channels: u8) -> Vec<u8> {
+        let mut c = vec![0u8; 24];
+        c[0..4].copy_from_slice(&4096u32.to_be_bytes());
+        c[5] = 16; // bitDepth
+        c[8] = 14; // kb
+        c[9] = channels;
+        c[20..24].copy_from_slice(&44_100u32.to_be_bytes());
+        c
+    }
+
+    /// An ALAC payload with no `chan` still reports a layout: ALAC's own
+    /// per-count order, the same one ALAC-in-M4A reports — so a 5.1 Apple
+    /// Lossless CAF folds correctly even though the container said nothing. An
+    /// explicit `chan` overrides it. Desktop profile only: `embedded-profile`
+    /// caps ALAC at stereo ([`alac::MAX_CHANNELS`]), where a 5.1 stream is a
+    /// clean `Unsupported` instead — see the test below.
+    #[cfg(not(feature = "embedded-profile"))]
+    #[test]
+    fn alac_in_caf_falls_back_to_the_alac_order_and_chan_overrides_it() {
+        use crate::channels::{alac_layout, speaker::*};
+        let scratch = || vec![0i32; crate::decoder_scratch_len()];
+
+        let bytes = caf_header(b"alac", 6, None, &alac_cookie(6));
+        let dec = CafDecoder::new_in(crate::SliceSource::new(&bytes), scratch()).expect("open");
+        assert_eq!(dec.channel_layout(), alac_layout(6));
+
+        // MPEG_5_1_A order in an explicit `chan` wins over ALAC's centre-first default.
+        let chan = chan_tag((121 << 16) | 6);
+        let bytes = caf_header(b"alac", 6, Some(&chan), &alac_cookie(6));
+        let dec = CafDecoder::new_in(crate::SliceSource::new(&bytes), scratch()).expect("open");
+        assert_eq!(
+            dec.channel_layout().expect("chan layout").speakers(),
+            &[FL, FR, FC, LFE, BL, BR]
+        );
+    }
+
+    /// The inverse of the test above under `embedded-profile`: a 5.1 ALAC CAF
+    /// declines at construction rather than reporting a layout for a stream
+    /// that profile cannot decode.
+    #[cfg(feature = "embedded-profile")]
+    #[test]
+    fn multichannel_alac_in_caf_is_unsupported_on_the_embedded_profile() {
+        let bytes = caf_header(b"alac", 6, None, &alac_cookie(6));
+        let r = CafDecoder::new_in(
+            crate::SliceSource::new(&bytes),
+            vec![0i32; crate::decoder_scratch_len()],
+        );
+        assert!(matches!(r, Err(DecodeError::Unsupported)));
+    }
+
+    /// A `desc` chunk whose `mBytesPerPacket` disagrees with its bit depth is
+    /// refused at construction.
+    ///
+    /// Found by fuzzing (a corrupted length field on the new `chan` seed): the
+    /// derived bytes-per-sample reached the shared PCM converter, whose
+    /// big-endian swap buffer holds 8 bytes, and an 18-byte "sample" panicked
+    /// there. A malformed header must be a clean `Unsupported` — this is a file
+    /// a user could have on disk, not a hypothetical.
+    #[test]
+    fn a_desc_whose_packet_size_is_not_a_sample_width_is_refused() {
+        // `caf_header` writes `mBytesPerPacket = channels * 2` for 16-bit, so
+        // build the header by hand to make the two disagree.
+        let caf = |bytes_per_packet: u32, channels: u32, bits: u32| {
+            let mut desc = Vec::new();
+            desc.extend_from_slice(&44_100f64.to_be_bytes());
+            desc.extend_from_slice(b"lpcm");
+            desc.extend_from_slice(&0u32.to_be_bytes());
+            desc.extend_from_slice(&bytes_per_packet.to_be_bytes());
+            desc.extend_from_slice(&1u32.to_be_bytes()); // frames/packet
+            desc.extend_from_slice(&channels.to_be_bytes());
+            desc.extend_from_slice(&bits.to_be_bytes());
+            let mut v = Vec::new();
+            v.extend_from_slice(b"caff");
+            v.extend_from_slice(&1u16.to_be_bytes());
+            v.extend_from_slice(&0u16.to_be_bytes());
+            let mut chunk = |ty: &[u8; 4], body: &[u8]| {
+                v.extend_from_slice(ty);
+                v.extend_from_slice(&(body.len() as i64).to_be_bytes());
+                v.extend_from_slice(body);
+            };
+            chunk(b"desc", &desc);
+            chunk(b"data", &[0u8; 64]);
+            v
+        };
+        let open = |bytes: &[u8]| {
+            CafDecoder::new_in(
+                crate::SliceSource::new(bytes),
+                vec![0i32; crate::decoder_scratch_len()],
+            )
+            .map(|_| ())
+        };
+
+        // 18 bytes per sample on one channel — the fuzzer's input.
+        assert_eq!(
+            open(&caf(18, 1, 24)).err(),
+            Some(DecodeError::Unsupported),
+            "a sample wider than any real PCM must be refused"
+        );
+        // And the boundary: 8 bytes (64-bit float's width) is still accepted,
+        // 9 is not.
+        assert!(open(&caf(8, 1, 32)).is_ok(), "8 bytes/sample is real");
+        assert_eq!(open(&caf(9, 1, 32)).err(), Some(DecodeError::Unsupported));
+        // A zero-width packet was already refused; keep it that way.
+        assert_eq!(open(&caf(0, 2, 16)).err(), Some(DecodeError::Unsupported));
+    }
+
+    /// An `lpcm` payload with no `chan` reports nothing — raw PCM in a CAF
+    /// carries no order of its own, and the deck's count heuristic is the only
+    /// thing entitled to speak for it.
+    #[test]
+    fn lpcm_without_chan_reports_no_layout() {
+        let bytes = caf_header(b"lpcm", 6, None, &[]);
+        let dec = CafDecoder::new_in(
+            crate::SliceSource::new(&bytes),
+            vec![0i32; crate::decoder_scratch_len()],
+        )
+        .expect("open");
+        assert_eq!(dec.channel_layout(), None);
     }
 }

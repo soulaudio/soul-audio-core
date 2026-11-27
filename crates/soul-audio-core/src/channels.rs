@@ -168,6 +168,135 @@ pub fn alac_layout(channels: u16) -> Option<ChannelLayout> {
     ChannelLayout::from_order(order)
 }
 
+/// A CoreAudio `AudioChannelLayout` channel **label** (`kAudioChannelLabel_*`, the
+/// `mChannelLabel` of an `AudioChannelDescription`) as a WAVEFORMATEXTENSIBLE speaker bit.
+/// `None` for a label this downmix does not place — height/ambisonic/discrete channels and
+/// `Unknown`/`Unused` — so an unplaceable label makes the whole layout `None` rather than
+/// silently folding a height channel into the front plane.
+///
+/// The surround labels are the distinction worth getting right: `LeftSurround` (5) is the
+/// *rear* pair of a 5.1 layout while `LeftSurroundDirect` (10) is the *side* pair, which is
+/// how CoreAudio tells 7.1's two surround pairs apart (`RearSurroundLeft`, 33, is the other
+/// rear spelling). Matches ffmpeg's `mov_chan.c` mapping.
+#[must_use]
+pub fn coreaudio_label_speaker(label: u32) -> Option<u32> {
+    use speaker::*;
+    Some(match label {
+        1 => FL,   // Left
+        2 => FR,   // Right
+        3 => FC,   // Center
+        4 => LFE,  // LFEScreen
+        5 => BL,   // LeftSurround (rear)
+        6 => BR,   // RightSurround (rear)
+        7 => FLC,  // LeftCenter
+        8 => FRC,  // RightCenter
+        9 => BC,   // CenterSurround (rear centre)
+        10 => SL,  // LeftSurroundDirect (side)
+        11 => SR,  // RightSurroundDirect (side)
+        33 => BL,  // RearSurroundLeft
+        34 => BR,  // RearSurroundRight
+        35 => FLC, // LeftWide
+        36 => FRC, // RightWide
+        _ => return None,
+    })
+}
+
+/// A CoreAudio `AudioChannelLayout` **layout tag** (`kAudioChannelLayoutTag_*`: a constant
+/// in the high 16 bits, the channel count in the low 16) as an ordered layout. This is the
+/// CAF `chan` chunk's compact form, and unlike a channel mask it can express orders that
+/// are *not* WAVEFORMATEXTENSIBLE — `MPEG_5_1_B` is `L R Ls Rs C LFE`, `MPEG_5_1_D` is
+/// `C L R Ls Rs LFE` — which is exactly why the count alone cannot stand in for it.
+///
+/// Covers the tags that name a speaker layout our stereo fold can place: the MPEG/AAC/ITU
+/// families, `Quadraphonic`/`Pentagonal`/`Hexagonal`, and the DVD/AudioUnit aliases. `None`
+/// for mono/stereo (a fold does not apply), for the two "look elsewhere in the struct" tags
+/// (`UseChannelDescriptions` = 0, `UseChannelBitmap` = `1 << 16`), and for anything else —
+/// including `DiscreteInOrder`, ambisonics, `Cube`, and the height layouts — so an unknown
+/// tag falls back to the caller's count heuristic instead of a guessed order.
+#[must_use]
+pub fn coreaudio_layout_tag(tag: u32) -> Option<ChannelLayout> {
+    use speaker::*;
+    // Tag constants are `(id << 16) | channel_count`.
+    const fn t(id: u32, ch: u32) -> u32 {
+        (id << 16) | ch
+    }
+    let order: &[u32] = match tag {
+        // Quadraphonic (108): L R Ls Rs — also `AAC_Quadraphonic`.
+        x if x == t(108, 4) => &[FL, FR, BL, BR],
+        // Pentagonal (109): L R Ls Rs C.
+        x if x == t(109, 5) => &[FL, FR, BL, BR, FC],
+        // Hexagonal (110): L R Ls Rs C Cs — also `AAC_6_0`'s non-AAC sibling.
+        x if x == t(110, 6) => &[FL, FR, BL, BR, FC, BC],
+        // MPEG_3_0_A (113): L R C. MPEG_3_0_B (114) / AAC_3_0: C L R.
+        x if x == t(113, 3) => &[FL, FR, FC],
+        x if x == t(114, 3) => &[FC, FL, FR],
+        // MPEG_4_0_A (115): L R C Cs. MPEG_4_0_B (116) / AAC_4_0: C L R Cs.
+        x if x == t(115, 4) => &[FL, FR, FC, BC],
+        x if x == t(116, 4) => &[FC, FL, FR, BC],
+        // MPEG_5_0_A..D (117..120): the four 5.0 orders.
+        x if x == t(117, 5) => &[FL, FR, FC, BL, BR],
+        x if x == t(118, 5) => &[FL, FR, BL, BR, FC],
+        x if x == t(119, 5) => &[FL, FC, FR, BL, BR],
+        x if x == t(120, 5) => &[FC, FL, FR, BL, BR], // AAC_5_0
+        // MPEG_5_1_A..D (121..124): the four 5.1 orders. `A` is WAVEFORMATEXTENSIBLE's.
+        x if x == t(121, 6) => &[FL, FR, FC, LFE, BL, BR],
+        x if x == t(122, 6) => &[FL, FR, BL, BR, FC, LFE],
+        x if x == t(123, 6) => &[FL, FC, FR, BL, BR, LFE],
+        x if x == t(124, 6) => &[FC, FL, FR, BL, BR, LFE], // AAC_5_1
+        // MPEG_6_1_A (125): L R C LFE Ls Rs Cs.
+        x if x == t(125, 7) => &[FL, FR, FC, LFE, BL, BR, BC],
+        // MPEG_7_1_A (126): L R C LFE Ls Rs Lc Rc.
+        x if x == t(126, 8) => &[FL, FR, FC, LFE, BL, BR, FLC, FRC],
+        // MPEG_7_1_B (127) / AAC_7_1: C Lc Rc L R Ls Rs LFE.
+        x if x == t(127, 8) => &[FC, FLC, FRC, FL, FR, BL, BR, LFE],
+        // MPEG_7_1_C (128): L R C LFE Ls Rs Rls Rrs — the side pair, then the rear pair.
+        x if x == t(128, 8) => &[FL, FR, FC, LFE, SL, SR, BL, BR],
+        // Emagic_Default_7_1 (129): L R Ls Rs C LFE Lc Rc.
+        x if x == t(129, 8) => &[FL, FR, BL, BR, FC, LFE, FLC, FRC],
+        // AudioUnit_6_0 (139): L R Ls Rs C Cs. AudioUnit_7_0 (140): L R Ls Rs C Rls Rrs.
+        x if x == t(139, 6) => &[FL, FR, BL, BR, FC, BC],
+        x if x == t(140, 7) => &[FL, FR, SL, SR, FC, BL, BR],
+        // AAC_6_0 (141): C L R Ls Rs Cs. AAC_6_1 (142): C L R Ls Rs Cs LFE.
+        x if x == t(141, 6) => &[FC, FL, FR, BL, BR, BC],
+        x if x == t(142, 7) => &[FC, FL, FR, BL, BR, BC, LFE],
+        // AAC_7_0 (143): C L R Ls Rs Rls Rrs.
+        x if x == t(143, 7) => &[FC, FL, FR, SL, SR, BL, BR],
+        // AudioUnit_7_0_Front (148): L R Ls Rs C Lc Rc.
+        x if x == t(148, 7) => &[FL, FR, BL, BR, FC, FLC, FRC],
+        // Deliberately unmapped, and therefore `None` (the caller falls back rather than
+        // mis-routing): the `DVD_*`/`ITU_*` aliases (whose tag ids this does not claim to
+        // know by heart — a wrong id→order pairing with a matching channel count would
+        // silently send the centre to a surround), `SMPTE_DTV` (its trailing `Lt`/`Rt` are
+        // a matrix-stereo downmix, not speakers, so it must not fold like one),
+        // `DiscreteInOrder`, `Cube`, the ambisonic B-format, and every height layout.
+        // A file using one of those can still fold if it carries the descriptions or
+        // bitmap form, which name their channels outright.
+        _ => return None,
+    };
+    ChannelLayout::from_order(order)
+}
+
+/// A CoreAudio `mChannelBitmap` (`kAudioChannelBit_*`) as a layout. The first eleven bits
+/// are defined identically to the WAVEFORMATEXTENSIBLE speaker bits (`Left` = `1 << 0` …
+/// `RightSurroundDirect` = `1 << 10`), in the same ascending-bit channel order, so this is
+/// [`ChannelLayout::from_mask`] — but only once the higher (height / top-centre) bits are
+/// ruled out: those have no WAVEFORMATEXTENSIBLE counterpart, and treating them as one
+/// would mis-route a height channel into the front plane. `None` if any is set, or if the
+/// bit count doesn't match `channels`.
+#[must_use]
+pub fn coreaudio_bitmap_layout(bitmap: u32, channels: u16) -> Option<ChannelLayout> {
+    // Bits 0..=10 are the WAVEFORMATEXTENSIBLE speakers; 11+ (TopCenterSurround and the
+    // vertical-height set) are not.
+    const PLACEABLE: u32 = 0x7FF;
+    if bitmap == 0 || bitmap & !PLACEABLE != 0 {
+        return None;
+    }
+    if bitmap.count_ones() != u32::from(channels) {
+        return None; // the bitmap doesn't describe this stream
+    }
+    Some(ChannelLayout::from_mask(bitmap))
+}
+
 /// The `(Lo, Ro)` stereo downmix gain for one speaker (ITU-R BS.775): front-centre and the
 /// surrounds fold in at −3 dB (`1/√2`), the LFE is dropped, back-centre folds equally to
 /// both. `None` for a speaker this fold does not place (don't guess).
@@ -203,6 +332,105 @@ pub fn downmix_to_stereo_coeffs(layout: &ChannelLayout) -> Option<[(f32, f32); M
 mod tests {
     use super::*;
     const C: f32 = core::f32::consts::FRAC_1_SQRT_2;
+
+    /// A CoreAudio layout tag: constant id in the high 16 bits, channel count in the low.
+    const fn ca_tag(id: u32, ch: u32) -> u32 {
+        (id << 16) | ch
+    }
+
+    #[test]
+    fn coreaudio_tags_keep_their_own_channel_order() {
+        use speaker::*;
+        // The four 5.1 orders are the whole point: same six channels, four positions for
+        // the centre and the LFE. A count-based guess can only ever match one of them.
+        assert_eq!(
+            coreaudio_layout_tag(ca_tag(121, 6)).unwrap().speakers(), // MPEG_5_1_A
+            &[FL, FR, FC, LFE, BL, BR]
+        );
+        assert_eq!(
+            coreaudio_layout_tag(ca_tag(122, 6)).unwrap().speakers(), // MPEG_5_1_B
+            &[FL, FR, BL, BR, FC, LFE]
+        );
+        assert_eq!(
+            coreaudio_layout_tag(ca_tag(123, 6)).unwrap().speakers(), // MPEG_5_1_C
+            &[FL, FC, FR, BL, BR, LFE]
+        );
+        assert_eq!(
+            coreaudio_layout_tag(ca_tag(124, 6)).unwrap().speakers(), // MPEG_5_1_D / AAC_5_1
+            &[FC, FL, FR, BL, BR, LFE]
+        );
+        // MPEG_5_1_A is WAVEFORMATEXTENSIBLE's order — the one the count fallback assumes.
+        assert_eq!(
+            coreaudio_layout_tag(ca_tag(121, 6)).unwrap(),
+            ChannelLayout::standard(6).unwrap()
+        );
+        // Quadraphonic resolves an ambiguous count; every tag's layout folds.
+        assert_eq!(
+            coreaudio_layout_tag(ca_tag(108, 4)).unwrap().speakers(),
+            &[FL, FR, BL, BR]
+        );
+        for tag in [
+            108, 109, 110, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126,
+            127, 128, 129, 139, 140, 141, 142, 143, 148,
+        ] {
+            // The low 16 bits are each tag's own channel count, so sweep every plausible
+            // one and check the layouts we do claim are all foldable.
+            for ch in 3..=MAX_CHANNELS as u32 {
+                if let Some(l) = coreaudio_layout_tag(ca_tag(tag, ch)) {
+                    assert_eq!(l.channels(), ch as usize, "tag {tag} count {ch}");
+                    assert!(
+                        downmix_to_stereo_coeffs(&l).is_some(),
+                        "tag {tag} count {ch} has an unfoldable speaker"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unmappable_coreaudio_tags_and_labels_are_none() {
+        // The two "look elsewhere in the struct" tags are not layouts themselves.
+        assert_eq!(coreaudio_layout_tag(0), None); // UseChannelDescriptions
+        assert_eq!(coreaudio_layout_tag(1 << 16), None); // UseChannelBitmap
+        // Mono/stereo are not a downmix, and an unknown tag must not be guessed.
+        assert_eq!(coreaudio_layout_tag(ca_tag(100, 1)), None); // Mono
+        assert_eq!(coreaudio_layout_tag(ca_tag(101, 2)), None); // Stereo
+        assert_eq!(coreaudio_layout_tag(ca_tag(112, 8)), None); // Cube
+        assert_eq!(coreaudio_layout_tag(ca_tag(147, 6)), None); // DiscreteInOrder
+        assert_eq!(coreaudio_layout_tag(ca_tag(9999, 6)), None);
+        // A known tag id with the wrong channel count in its low bits is not that tag.
+        assert_eq!(coreaudio_layout_tag(ca_tag(121, 5)), None);
+
+        // Labels: the placeable set maps, everything else (height, ambisonic, Unknown,
+        // Unused, discrete) stays None so an unplaceable channel can't be folded blind.
+        use speaker::*;
+        assert_eq!(coreaudio_label_speaker(1), Some(FL));
+        assert_eq!(coreaudio_label_speaker(3), Some(FC));
+        assert_eq!(coreaudio_label_speaker(4), Some(LFE));
+        assert_eq!(coreaudio_label_speaker(5), Some(BL)); // LeftSurround = rear
+        assert_eq!(coreaudio_label_speaker(10), Some(SL)); // LeftSurroundDirect = side
+        assert_eq!(coreaudio_label_speaker(0), None); // Unknown
+        assert_eq!(coreaudio_label_speaker(12), None); // TopCenterSurround
+        assert_eq!(coreaudio_label_speaker(13), None); // VerticalHeightLeft
+        assert_eq!(coreaudio_label_speaker(0xFFFF_FFFF), None); // Unknown sentinel
+    }
+
+    #[test]
+    fn coreaudio_bitmap_matches_the_wave_mask_and_rejects_height_bits() {
+        use speaker::*;
+        // Bits 0..=10 are the WAVEFORMATEXTENSIBLE speakers, same ascending order.
+        let m = FL | FR | FC | LFE | BL | BR;
+        assert_eq!(
+            coreaudio_bitmap_layout(m, 6).unwrap(),
+            ChannelLayout::from_mask(m)
+        );
+        // A bit past the shared range (TopCenterSurround, 1 << 11) has no
+        // WAVEFORMATEXTENSIBLE counterpart — fold nothing rather than the wrong thing.
+        assert_eq!(coreaudio_bitmap_layout(m | (1 << 11), 7), None);
+        // A bitmap that doesn't describe this stream is not this stream's layout.
+        assert_eq!(coreaudio_bitmap_layout(m, 5), None);
+        assert_eq!(coreaudio_bitmap_layout(0, 6), None);
+    }
 
     #[test]
     fn standard_masks_have_the_right_channel_counts() {
