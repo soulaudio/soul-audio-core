@@ -33,10 +33,20 @@ use soul_audio_core::Biquad;
 pub const MAX_BANDS: usize = 16;
 
 /// Gain limit (± dB) for each band and the preamp — heads clamp to this.
+///
+/// This is **UI policy**, not a limit of the filter: it is the range a slider
+/// offers and a head enforces. [`coeffs`] deliberately realises more than this
+/// (see [`DESIGN_MAX_GAIN_DB`]), because a profile imported from a file was
+/// never near a slider — rejecting a legitimate 15 dB band from someone else's
+/// correction would be this crate overriding a choice that is not its own.
 pub const GAIN_LIMIT_DB: f32 = 12.0;
 
 /// Q (resonance / bandwidth) limits heads clamp to: very wide to surgical.
+///
+/// UI policy, like [`GAIN_LIMIT_DB`] — see [`DESIGN_MIN_Q`] for the far looser
+/// bound at which the design arithmetic itself gives out.
 pub const Q_MIN: f32 = 0.3;
+/// See [`Q_MIN`].
 pub const Q_MAX: f32 = 12.0;
 
 /// Displayed / draggable frequency range (Hz).
@@ -118,18 +128,29 @@ pub fn default_bands() -> [Band; 8] {
     })
 }
 
-/// Largest band gain magnitude, in dB, that [`coeffs`] will realise. Beyond
-/// this the RBJ design's `10^(gain/40)` amplitude term runs out of `f32` (and
-/// is meaningless long before it does). Published corrections stay within
-/// ±20 dB; this leaves two orders of magnitude of headroom over that.
-pub const MAX_GAIN_DB: f32 = 120.0;
+/// Largest band gain magnitude, in dB, that [`coeffs`] will **realise**.
+///
+/// This is the second of two tiers, and the distinction matters:
+/// [`GAIN_LIMIT_DB`] (±12 dB) is what a head's UI offers and enforces, while
+/// this is where the *arithmetic* gives out — the RBJ design's `10^(gain/40)`
+/// amplitude term runs out of `f32` near 1540 dB and is numerically useless
+/// long before that. A band between the two tiers (say 20 dB, which published
+/// corrections do use) is realised faithfully; a band past this one is not a
+/// filter at all and bypasses.
+///
+/// Both exist because a profile read from a file never passed through a
+/// slider. Enforcing the UI limit here would silently rewrite someone else's
+/// correction; enforcing nothing let a `Gain 3.4e38 dB` line design an
+/// infinity (see the module's `profile_fuzz` test).
+pub const DESIGN_MAX_GAIN_DB: f32 = 120.0;
 
-/// Narrowest and widest `q` [`coeffs`] will realise. `alpha = sin(w0) / (2q)`
-/// overflows for a denormal `q`, and a `q` of 1000 is already a filter no ear
-/// resolves. Real corrections live in 0.1–10.
-pub const MIN_Q: f32 = 1e-3;
-/// See [`MIN_Q`].
-pub const MAX_Q: f32 = 1e3;
+/// Narrowest and widest `q` [`coeffs`] will **realise** — the realizability
+/// tier, as [`DESIGN_MAX_GAIN_DB`] is for gain ([`Q_MIN`]/[`Q_MAX`] are the UI
+/// policy). `alpha = sin(w0) / (2q)` overflows for a denormal `q`, and a `q` of
+/// 1000 is already a filter no ear resolves.
+pub const DESIGN_MIN_Q: f32 = 1e-3;
+/// See [`DESIGN_MIN_Q`].
+pub const DESIGN_MAX_Q: f32 = 1e3;
 
 /// RBJ "Audio EQ Cookbook" biquad coefficients, already `a0`-normalised, as
 /// `[b0, b1, b2, a1, a2]` — or `None` (a flat passthrough) for a band that cannot
@@ -168,7 +189,7 @@ pub fn coeffs(kind: BandKind, f0: f32, gain_db: f32, q: f32, fs: f32) -> Option<
     // (published AutoEq profiles stay within ±20 dB and Q 0.1–10), so a value
     // beyond them is a broken profile, and a bypassed band is a better answer
     // than a filter with a million-fold gain.
-    if gain_db.abs() > MAX_GAIN_DB || !(MIN_Q..=MAX_Q).contains(&q) {
+    if gain_db.abs() > DESIGN_MAX_GAIN_DB || !(DESIGN_MIN_Q..=DESIGN_MAX_Q).contains(&q) {
         return None;
     }
     if kind.uses_gain() && gain_db.abs() < 1e-3 {
@@ -434,6 +455,43 @@ mod tests {
             q,
             enabled: true,
         }
+    }
+
+    /// The two limit tiers are deliberately different, and a reader picking the
+    /// wrong constant is the mistake this pins: a band **between** them — the
+    /// ±20 dB and Q 0.1 that real published corrections use — must be realised
+    /// faithfully, while only the realizability tier bypasses.
+    #[test]
+    fn the_ui_limit_is_policy_and_the_design_limit_is_arithmetic() {
+        // Compile-time: the UI tier must be strictly inside the realizability
+        // tier, or the two have been edited into contradiction.
+        const {
+            assert!(GAIN_LIMIT_DB < DESIGN_MAX_GAIN_DB);
+            assert!(DESIGN_MIN_Q < Q_MIN && Q_MAX < DESIGN_MAX_Q);
+        }
+
+        // Past the UI limit but realisable: designed, not dropped.
+        let loud = bell(1000.0, GAIN_LIMIT_DB + 8.0, 1.0);
+        assert_ne!(design(&loud, FS), Biquad::bypass());
+        assert!(
+            (band_magnitude_db(&loud, 1000.0, FS) - (GAIN_LIMIT_DB + 8.0)).abs() < 0.5,
+            "a 20 dB band must actually boost 20 dB"
+        );
+        let wide = bell(1000.0, 6.0, 0.1);
+        assert_ne!(design(&wide, FS), Biquad::bypass(), "Q 0.1 is realisable");
+
+        // Past the realizability limit: bypass, with finite coefficients by
+        // construction.
+        let absurd = bell(1000.0, DESIGN_MAX_GAIN_DB + 1.0, 1.0);
+        assert_eq!(design(&absurd, FS), Biquad::bypass());
+        assert_eq!(
+            design(&bell(1000.0, 6.0, DESIGN_MIN_Q / 2.0), FS),
+            Biquad::bypass()
+        );
+        assert_eq!(
+            design(&bell(1000.0, 6.0, DESIGN_MAX_Q * 2.0), FS),
+            Biquad::bypass()
+        );
     }
 
     #[test]
