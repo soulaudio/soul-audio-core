@@ -580,8 +580,16 @@ fn handle_rva2<S: embedded_io::Read>(
 /// integer→ASCII — `no_std`, no float, no `core::fmt`). Returns the written
 /// prefix as `&str`.
 fn fmt_db_512(adj: i16, out: &mut [u8; 16]) -> &str {
-    // Hundredths of a dB, truncated toward zero (display precision).
-    let centi = (i32::from(adj) * 100) / 512;
+    // Hundredths of a dB, rounded half away from zero — truncating would bias
+    // every value toward 0 dB by up to a hundredth (−4362 = −8.5195 dB reads
+    // as −8.51, not −8.52), and a consumer has no way to recover the lost bit.
+    // Integer round: (|adj| · 100 · 2 + 512) / 1024, sign reapplied.
+    let magnitude = (u32::from(adj.unsigned_abs()) * 200 + 512) / 1024;
+    let centi = if adj < 0 {
+        -(magnitude as i32)
+    } else {
+        magnitude as i32
+    };
     let mut n = 0;
     if centi < 0 {
         out[n] = b'-';
@@ -996,6 +1004,77 @@ mod tests {
             "non-master RVA2 yields no gain: {:?}",
             c.fields
         );
+    }
+
+    /// `RVA2` is a v2.4 frame, but taggers (mutagen, foobar2000) also write it
+    /// into v2.3 tags, and real MP3s in the wild carry it there — the frame
+    /// dispatch is version-independent, so it must still be read. The master
+    /// channel is also not required to come first: a frame that describes
+    /// front-right before master still yields the master adjustment.
+    #[test]
+    fn id3v23_rva2_and_master_after_other_channels() {
+        let mut scratch = [0u8; 256];
+        let tag = id3v23(&[rva2_frame("track", 0x01, -4040, 0)]);
+        let mut c = Collect::default();
+        read_id3v2(&mut SliceSource::new(&tag), &mut scratch, &mut c).unwrap();
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::ReplayGainTrackGain) && v == "-7.89 dB"),
+            "v2.3 RVA2 → track gain: {:?}",
+            c.fields
+        );
+
+        // front-right (0x02, 16-bit peak) first, then master (0x01).
+        let mut body = Vec::new();
+        body.push(0); // empty identification
+        body.extend_from_slice(&[0x02]);
+        body.extend_from_slice(&(-1024i16).to_be_bytes());
+        body.extend_from_slice(&[16, 0x80, 0x00]); // 16 peak bits, 2 peak bytes
+        body.extend_from_slice(&[0x01]);
+        body.extend_from_slice(&(-4040i16).to_be_bytes());
+        body.push(0);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"RVA2");
+        frame.extend_from_slice(&synchsafe(body.len() as u32));
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(&body);
+
+        let tag = id3v24(&[frame]);
+        let mut c = Collect::default();
+        read_id3v2(&mut SliceSource::new(&tag), &mut scratch, &mut c).unwrap();
+        assert!(
+            c.fields
+                .iter()
+                .any(|(f, _, v)| *f == Some(Field::ReplayGainTrackGain) && v == "-7.89 dB"),
+            "master channel after a peak-carrying one: {:?}",
+            c.fields
+        );
+    }
+
+    /// The 1/512-dB → hundredths conversion rounds to nearest, not toward
+    /// zero: a truncating one reads every adjustment as quieter-in-magnitude
+    /// than it is by up to 0.01 dB, in both signs.
+    #[test]
+    fn rva2_db_formatting_rounds_to_nearest() {
+        let f = |adj: i16| {
+            let mut buf = [0u8; 16];
+            // The formatter borrows `buf`, so copy the result out.
+            String::from(fmt_db_512(adj, &mut buf))
+        };
+        // −4362/512 = −8.519531… → −8.52 (truncation would give −8.51).
+        assert_eq!(f(-4362), "-8.52 dB");
+        assert_eq!(f(4362), "8.52 dB");
+        // Exact and already-short values are untouched.
+        assert_eq!(f(0), "0.00 dB");
+        assert_eq!(f(1536), "3.00 dB"); // +3 dB exactly
+        assert_eq!(f(-4040), "-7.89 dB"); // −7.890625 → −7.89 either way
+        // The extremes stay in range (±64 dB is all a 1/512-dB i16 can hold).
+        assert_eq!(f(i16::MIN), "-64.00 dB");
+        assert_eq!(f(i16::MAX), "64.00 dB");
+        // Half-way cases round away from zero: ±5/512 dB = ±0.009765625.
+        assert_eq!(f(5), "0.01 dB");
+        assert_eq!(f(-5), "-0.01 dB");
     }
 
     #[test]
