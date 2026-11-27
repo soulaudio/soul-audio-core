@@ -141,6 +141,12 @@ impl Sink for EqSink {
     fn exclusive(&self) -> bool {
         self.inner.exclusive()
     }
+    /// What the host's `DspSink` must report: an *enabled* EQ rewrites every
+    /// sample, so the path is no longer bit-perfect however exclusive the
+    /// device is. Bypassed, it is a bit-exact passthrough and reports `false`.
+    fn modifies_samples(&self) -> bool {
+        self.enabled
+    }
     fn write(&mut self, frames: &[i32]) -> Result<(), SinkError> {
         if !self.enabled {
             return self.inner.write(frames);
@@ -325,10 +331,58 @@ fn exclusive_output_reopens_to_native_rate_bit_perfect() {
             TONE_RATE,
             "exclusive device should have reopened to the native rate"
         );
+        // The signal-path verdict the UI shows must agree: exclusive device,
+        // at the track's own rate, unity gain, no mapping, no sink DSP.
+        let di = deck.decode_info().expect("decode info");
+        assert!(
+            di.bit_perfect(),
+            "exclusive output at the native rate must report bit-perfect: {di:?}"
+        );
         pump_to_end(&mut deck);
         deck.sink().written.clone()
     });
     assert_two_tone("exclusive@44.1k(bit-perfect)", &out, TONE_RATE);
+}
+
+/// The inverse of the above through the same real pipeline: a shared device at
+/// a different rate is resampled by the OS-facing path, and must NOT be
+/// reported as bit-perfect — on two independent counts (shared mode and
+/// resampling).
+#[test]
+fn shared_output_is_not_reported_bit_perfect() {
+    on_big_stack(|| {
+        let dec = open_track(&testdata("tone.flac")).expect("open_track");
+        let mut deck: Deck<CaptureSink, OwnedDecoder, 0> =
+            Deck::new(CaptureSink::shared(48_000), Quality::Hq);
+        deck.load(dec).expect("load");
+        let di = deck.decode_info().expect("decode info");
+        assert!(!di.bit_perfect(), "shared + resampled is not bit-perfect");
+        assert!(di.resampling);
+        assert!(!di.exclusive);
+    });
+}
+
+/// An **active DSP stage** costs bit-perfection even on an exclusive device at
+/// the native rate — and bypassing it restores the claim. The deck cannot see
+/// past its sink, so this is the decorator reporting on itself
+/// (`Sink::modifies_samples`), exactly as the host's `DspSink` must.
+#[test]
+fn an_enabled_dsp_sink_is_not_bit_perfect_but_a_bypassed_one_is() {
+    on_big_stack(|| {
+        for (enabled, want) in [(true, false), (false, true)] {
+            let dec = open_track(&testdata("tone.flac")).expect("open_track");
+            let bands = soul_audio_eq::default_bands().to_vec();
+            let sink = EqSink::new(CaptureSink::exclusive(TONE_RATE), bands, enabled);
+            let mut deck: Deck<EqSink, OwnedDecoder, 0> = Deck::new(sink, Quality::Hq);
+            deck.load(dec).expect("load");
+            let di = deck.decode_info().expect("decode info");
+            assert_eq!(
+                di.bit_perfect(),
+                want,
+                "EQ enabled={enabled} should report bit_perfect={want}: {di:?}"
+            );
+        }
+    });
 }
 
 /// EQ ON: a +12 dB peaking band centred on the LEFT tone (440 Hz) must visibly boost

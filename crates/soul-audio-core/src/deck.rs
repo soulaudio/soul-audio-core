@@ -42,6 +42,79 @@ pub struct DecodeInfo {
     pub resampling: bool,
     /// Whether the sink drives the device in exclusive (bit-perfect) mode.
     pub exclusive: bool,
+    /// Whether the deck applies any gain of its own: a ReplayGain other than
+    /// 0 dB, or a volume below unity (which the sink applies at its output
+    /// stage). Either one rescales every sample.
+    pub gain_applied: bool,
+    /// Whether the deck remaps channels — a multichannel fold or a mono upmix
+    /// — rather than passing the decoded channels straight through.
+    pub channel_mapped: bool,
+    /// Whether the sink itself alters the samples
+    /// ([`Sink::modifies_samples`](crate::sink::Sink::modifies_samples)) — an
+    /// active DSP decorator the deck cannot see past.
+    pub sink_modifies: bool,
+}
+
+impl DecodeInfo {
+    /// The **bit-perfect verdict** for a signal-path display: `true` only when
+    /// the decoded samples reach the device untouched save for an exact
+    /// scaling. That means all of:
+    ///
+    /// - the sink is **exclusive** (no OS mixer in the path),
+    /// - no **resampling** — the device runs at the track's own rate,
+    /// - no **gain**: ReplayGain at 0 dB and volume at unity,
+    /// - no **channel mapping** (no fold, no mono upmix),
+    /// - the **sink** applies no DSP of its own, and
+    /// - no **depth reduction**: every decoded bit survives both the deck's
+    ///   canonical 24-bit pipeline and the device's own format. A shallower
+    ///   source into a deeper device *is* bit-perfect (the normalization is an
+    ///   exact left shift); a source deeper than 24 bits is not, because the
+    ///   canonical pipeline scales it down before the sink ever sees it.
+    ///
+    /// A **DSD** source is never bit-perfect here: it reaches the deck already
+    /// decimated to PCM. True DSD passthrough (DoP / native) is a separate
+    /// output path, not this one.
+    ///
+    /// The transient seek de-click fade is deliberately **not** a term: it is
+    /// a few milliseconds after an explicit seek, and flickering the flag for
+    /// it would be noise rather than information about the configured path.
+    #[must_use]
+    pub fn bit_perfect(&self) -> bool {
+        // DSD arrives decimated — the samples the device gets are not the ones
+        // in the file, however pristine the rest of the chain is.
+        if matches!(self.source, SampleFormat::Dsd { .. }) {
+            return false;
+        }
+        if !self.exclusive
+            || self.resampling
+            || self.gain_applied
+            || self.channel_mapped
+            || self.sink_modifies
+        {
+            return false;
+        }
+        // Effective depth the path preserves: the device's own, capped by the
+        // deck's canonical 24-bit processing format. A float device is not a
+        // reduction for anything the canonical pipeline can carry — an f32
+        // mantissa holds exactly 24 bits.
+        let device_bits = match self.output_format {
+            SampleFormat::Int { bits } => u32::from(bits),
+            SampleFormat::Float { bits } => {
+                if bits >= 64 {
+                    53
+                } else {
+                    24
+                }
+            }
+            // A DSD *device* is not fed by this PCM path.
+            SampleFormat::Dsd { .. } => return false,
+        };
+        let decoded_bits = match self.decoded.format {
+            SampleFormat::Int { bits } | SampleFormat::Float { bits } => u32::from(bits),
+            SampleFormat::Dsd { .. } => return false,
+        };
+        decoded_bits <= device_bits.min(CANONICAL_BITS as u32)
+    }
 }
 
 /// Canonical output scale: samples are normalized to signed 24-bit (`±2^23`),
@@ -749,6 +822,9 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize> Deck<K, D, PRELOAD> {
             output_format: self.sink.stream_info().format,
             resampling: t.resampler.is_some(),
             exclusive: self.sink.exclusive(),
+            gain_applied: t.rg_linear != 1.0 || self.volume != 1.0,
+            channel_mapped: !matches!(t.map, Map::Passthrough),
+            sink_modifies: self.sink.modifies_samples(),
         })
     }
 
@@ -2144,6 +2220,164 @@ mod tests {
         let c = run_rg(100, 100, Some(-1000.0));
         let d = run_rg(100, 100, Some(-60.0));
         assert_eq!(c, d, "attenuation clamps to -60 dB");
+    }
+
+    // --- the bit-perfect verdict -----------------------------------------
+
+    /// A sink whose exclusivity, format and sample-modifying behaviour are all
+    /// configurable — the three device-side terms of the bit-perfect verdict.
+    struct BpSink {
+        rate: u32,
+        ch: usize,
+        format: SampleFormat,
+        exclusive: bool,
+        modifies: bool,
+    }
+    impl Sink for BpSink {
+        fn stream_info(&self) -> StreamInfo {
+            StreamInfo {
+                sample_rate: self.rate,
+                channels: self.ch as u16,
+                format: self.format,
+            }
+        }
+        fn exclusive(&self) -> bool {
+            self.exclusive
+        }
+        fn modifies_samples(&self) -> bool {
+            self.modifies
+        }
+        fn write(&mut self, _frames: &[i32]) -> Result<(), SinkError> {
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), SinkError> {
+            Ok(())
+        }
+    }
+
+    /// A deck on an exclusive 24-bit sink at `rate`, playing a `bits`-deep,
+    /// `ch`-channel track at `track_rate` — the shape every term below perturbs
+    /// exactly one part of.
+    fn bp_deck(
+        rate: u32,
+        ch: usize,
+        format: SampleFormat,
+        exclusive: bool,
+        modifies: bool,
+    ) -> Deck<BpSink, ConstDecoder, 1> {
+        Deck::new(
+            BpSink {
+                rate,
+                ch,
+                format,
+                exclusive,
+                modifies,
+            },
+            Quality::Fast,
+        )
+    }
+
+    const INT24: SampleFormat = SampleFormat::Int { bits: 24 };
+
+    fn bp_track(bits: u8, rate: u32, ch: usize) -> ConstDecoder {
+        ConstDecoder {
+            rate,
+            ch,
+            bits,
+            value: 1000,
+            frames: 100,
+            pos: 0,
+        }
+    }
+
+    /// The headline case: an exclusive device at the track's own rate, unity
+    /// gain, no channel mapping, no sink-side DSP — bit-perfect.
+    #[test]
+    fn bit_perfect_when_exclusive_native_rate_and_untouched() {
+        let mut deck = bp_deck(44_100, 2, INT24, true, false);
+        deck.load(bp_track(24, 44_100, 2)).unwrap();
+        let di = deck.decode_info().unwrap();
+        assert!(di.bit_perfect(), "{di:?}");
+        // A shallower source into a deeper device is still bit-perfect: the
+        // deck's canonical-24 normalization is an exact left shift.
+        deck.load(bp_track(16, 44_100, 2)).unwrap();
+        assert!(deck.decode_info().unwrap().bit_perfect());
+    }
+
+    /// Each term, perturbed one at a time. Every one of these is a real way to
+    /// stop being bit-perfect, and a UI that claims otherwise is lying to the
+    /// listener about their signal path.
+    #[test]
+    fn bit_perfect_is_false_for_every_thing_that_touches_the_samples() {
+        // Shared mode: the OS mixer is in the path.
+        let mut deck = bp_deck(44_100, 2, INT24, false, false);
+        deck.load(bp_track(24, 44_100, 2)).unwrap();
+        assert!(!deck.decode_info().unwrap().bit_perfect(), "shared mode");
+
+        // Resampling (device rate ≠ track rate).
+        let mut deck = bp_deck(48_000, 2, INT24, true, false);
+        deck.load(bp_track(24, 44_100, 2)).unwrap();
+        assert!(!deck.decode_info().unwrap().bit_perfect(), "resampled");
+
+        // ReplayGain.
+        let mut deck = bp_deck(44_100, 2, INT24, true, false);
+        deck.load_with_gain(bp_track(24, 44_100, 2), -6.0).unwrap();
+        assert!(!deck.decode_info().unwrap().bit_perfect(), "replaygain");
+
+        // Volume below unity (applied at the sink's output stage).
+        let mut deck = bp_deck(44_100, 2, INT24, true, false);
+        deck.load(bp_track(24, 44_100, 2)).unwrap();
+        deck.set_volume(0.5);
+        assert!(!deck.decode_info().unwrap().bit_perfect(), "volume");
+        deck.set_volume(1.0);
+        assert!(deck.decode_info().unwrap().bit_perfect(), "back to unity");
+
+        // Channel mapping: a 5.1 source folded to the stereo device, and a mono
+        // source upmixed to it.
+        let mut deck = bp_deck(44_100, 2, INT24, true, false);
+        deck.load(bp_track(24, 44_100, 6)).unwrap();
+        assert!(!deck.decode_info().unwrap().bit_perfect(), "downmixed");
+        let mut deck = bp_deck(44_100, 2, INT24, true, false);
+        deck.load(bp_track(24, 44_100, 1)).unwrap();
+        assert!(!deck.decode_info().unwrap().bit_perfect(), "mono upmix");
+
+        // A sink-side DSP decorator (the host's EQ sink) says so itself.
+        let mut deck = bp_deck(44_100, 2, INT24, true, true);
+        deck.load(bp_track(24, 44_100, 2)).unwrap();
+        assert!(!deck.decode_info().unwrap().bit_perfect(), "sink DSP");
+
+        // A device narrower than the source: the sink truncates.
+        let mut deck = bp_deck(44_100, 2, SampleFormat::Int { bits: 16 }, true, false);
+        deck.load(bp_track(24, 44_100, 2)).unwrap();
+        assert!(!deck.decode_info().unwrap().bit_perfect(), "16-bit device");
+
+        // A source deeper than the canonical 24-bit pipeline: the deck itself
+        // scales it down, so even a 32-bit device cannot be handed it intact.
+        let mut deck = bp_deck(44_100, 2, SampleFormat::Int { bits: 32 }, true, false);
+        deck.load(bp_track(32, 44_100, 2)).unwrap();
+        assert!(
+            !deck.decode_info().unwrap().bit_perfect(),
+            "32-bit source through a 24-bit canonical pipeline"
+        );
+
+        // Nothing loaded: there is no signal path to call bit-perfect.
+        let deck = bp_deck(44_100, 2, INT24, true, false);
+        assert!(deck.decode_info().is_none());
+    }
+
+    /// A float device is not a reduction: a 24-bit integer sample is exact in
+    /// f32 (its mantissa holds 24 bits), so an exclusive float device is still
+    /// bit-perfect — but a 32-bit source is not exact in f32.
+    #[test]
+    fn bit_perfect_accounts_for_float_device_formats() {
+        let mut deck = bp_deck(44_100, 2, SampleFormat::Float { bits: 32 }, true, false);
+        deck.load(bp_track(24, 44_100, 2)).unwrap();
+        assert!(deck.decode_info().unwrap().bit_perfect(), "24-bit into f32");
+        deck.load(bp_track(32, 44_100, 2)).unwrap();
+        assert!(
+            !deck.decode_info().unwrap().bit_perfect(),
+            "32-bit source is not exact in f32 (nor in canonical 24)"
+        );
     }
 
     // --- per-track ReplayGain at the gapless boundary --------------------

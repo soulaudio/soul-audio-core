@@ -48,6 +48,22 @@ pub trait Sink {
     fn exclusive(&self) -> bool {
         false
     }
+    /// Whether this sink **alters the samples** it is handed before they reach
+    /// the device — a DSP decorator (EQ, crossfeed, convolution) wrapping
+    /// another sink, as the desktop host's does. Default `false`: a plain
+    /// device sink passes the deck's block through untouched.
+    ///
+    /// The deck cannot see past its sink, so a decorator that is processing has
+    /// to say so itself; this is the term
+    /// [`DecodeInfo::bit_perfect`](crate::deck::DecodeInfo::bit_perfect) uses
+    /// to avoid claiming a bit-perfect path through an active DSP stage. A
+    /// decorator that is *bypassed* (a bit-exact passthrough) should report
+    /// `false` — the claim is about what it does to the audio, not about
+    /// whether it is in the chain.
+    fn modifies_samples(&self) -> bool {
+        false
+    }
+
     /// Write **all** of `frames` (interleaved `i32`, length = frame count ×
     /// channels), blocking as needed for buffer space. Returns on completion.
     ///
