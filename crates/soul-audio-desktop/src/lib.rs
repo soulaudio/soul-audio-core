@@ -42,8 +42,8 @@ pub use coreaudio_exclusive::{
     nominal_rate, physical_format_ladder,
 };
 pub use decoder::{
-    OwnedDecoder, ReadSeek, Src, open_seekable_src, open_track, open_track_range, vorbis_arena,
-    wavpack_pcm,
+    OwnedDecoder, ReadSeek, Src, open_seekable_src, open_track, open_track_dsd, open_track_range,
+    vorbis_arena, wavpack_pcm,
 };
 #[cfg(feature = "playback")]
 pub use sink::{CpalSink, default_output_config, default_output_device_name, output_device_names};

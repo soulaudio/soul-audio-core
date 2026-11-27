@@ -233,6 +233,74 @@ fn output_is_bit_exact_at_unity_volume() {
     );
 }
 
+/// A **DoP** stream is the strictest thing this path can carry: the `0x05`/`0xFA`
+/// marker is the top byte of every 24-bit word, so any scaling at all turns the
+/// stream into full-level noise rather than quieter music.
+///
+/// Two claims, because a host needs both: at unity volume the words arrive
+/// untouched (the Float32 round-trip and the smoothed gain are exact), and when
+/// the volume is *not* unity the sink says `modifies_samples` — which is the
+/// term that stops
+/// [`DecodeInfo::bit_perfect`](soul_audio_core::deck::DecodeInfo::bit_perfect)
+/// from claiming a bit-perfect path through a software attenuator.
+#[test]
+fn dop_words_survive_the_exclusive_path_only_at_unity_volume() {
+    /// A 24-bit DoP word as the framer emits it: the canonical signed sample
+    /// carrying that bit pattern (a `0xFA` marker sets bit 23 → negative).
+    fn word(w: u32) -> i32 {
+        ((w & 0x00FF_FFFF) as i32) << 8 >> 8
+    }
+
+    let (hal, name) = world(fixture("usb-uac2-dac-384k"));
+    // DSD64's carrier rate — the rate a DoP stream actually runs at.
+    let mut sink = open(&hal, &name, 176_400).unwrap();
+    assert!(
+        !sink.modifies_samples(),
+        "an exclusive sink at unity volume alters nothing"
+    );
+
+    // Alternating marker phases, stereo, with payloads on both sides of the
+    // sign bit of the payload bytes.
+    let mut dop = Vec::new();
+    let mut x: u32 = 0x5041_5243;
+    while dop.len() < 4096 {
+        let marker = if (dop.len() / 2) % 2 == 0 { 0x05 } else { 0xFA };
+        for _ in 0..2 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            dop.push(word((marker << 16) | (x & 0xFFFF)));
+        }
+    }
+    sink.write(&dop).unwrap();
+    let got = rendered_canonical(&hal, dop.len() / 2);
+    assert_eq!(
+        got, dop,
+        "the exclusive path altered DoP words at unity volume — a DAC gets noise"
+    );
+    for (i, &s) in got.iter().enumerate() {
+        let marker = (s as u32 >> 16) & 0xFF;
+        assert!(
+            marker == 0x05 || marker == 0xFA,
+            "word {i}: marker {marker:#04x} did not survive"
+        );
+    }
+
+    // Software attenuation scales the words — markers included — so the sink
+    // must stop claiming an untouched path.
+    sink.set_volume(0.99);
+    assert!(
+        sink.modifies_samples(),
+        "a sink attenuating in software must not be reported as bit-perfect"
+    );
+    sink.write(&dop).unwrap();
+    assert_ne!(
+        rendered_canonical(&hal, dop.len() / 2),
+        dop,
+        "0.99 volume should be observable in the output"
+    );
+}
+
 #[test]
 fn underrun_plays_silence_not_garbage() {
     let (hal, name) = world(fixture("macbook-pro-speakers"));
