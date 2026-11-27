@@ -28,8 +28,10 @@
 //! outside core (`soul-audio-eq`), exactly as it does for
 //! [`Equalizer`](crate::eq::Equalizer) itself.
 
+pub mod convolve;
 pub mod crossfeed;
 
+pub use convolve::Convolver;
 pub use crossfeed::CrossfeedStage;
 
 use crate::eq::Equalizer;
@@ -51,6 +53,12 @@ pub enum StageKind {
     Eq,
     /// Headphone crossfeed (see [`crossfeed`]).
     Crossfeed,
+    /// Impulse-response convolution — room / headphone correction (see
+    /// [`convolve`]). [`Convolver`] is generic over its (caller-provided)
+    /// filter storage, so it is not a [`Stage`] variant yet — see that
+    /// module's "How a host runs it". The kind exists so a signal path can
+    /// name the stage wherever it runs.
+    Convolver,
 }
 
 /// One block-processing stage. Implemented by each concrete stage and forwarded

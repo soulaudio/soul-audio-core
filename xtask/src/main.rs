@@ -8,6 +8,7 @@ use std::path::Path;
 use std::process::{Command, exit};
 
 mod commit_msg;
+mod convolve_tables;
 mod filterbank_tables;
 mod gate;
 mod opus_tables;
@@ -17,7 +18,7 @@ mod sbr_tables;
 mod silk_tables;
 mod vorbis_tables;
 
-const USAGE: &str = "usage: cargo xtask <verify|ci|precommit|qa-audio|check-commit-msg <file>|gen-resample-tables|gen-filterbank-tables|gen-sbr-tables|gen-ps-tables|gen-vorbis-tables|gen-opus-tables|gen-silk-tables>";
+const USAGE: &str = "usage: cargo xtask <verify|ci|precommit|qa-audio|check-commit-msg <file>|gen-resample-tables|gen-convolve-tables|gen-filterbank-tables|gen-sbr-tables|gen-ps-tables|gen-vorbis-tables|gen-opus-tables|gen-silk-tables>";
 
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
@@ -31,6 +32,8 @@ fn main() {
         "check-commit-msg" => commit_msg::check(std::env::args().nth(2)),
         "gen-resample-tables" => resample_tables::run(),
         "check-resample-tables" => resample_tables::check(),
+        "gen-convolve-tables" => convolve_tables::run(),
+        "check-convolve-tables" => convolve_tables::check(),
         "gen-filterbank-tables" => filterbank_tables::run(),
         "check-filterbank-tables" => filterbank_tables::check(),
         "gen-sbr-tables" => sbr_tables::run(),
@@ -137,6 +140,7 @@ fn verify() -> Result<(), String> {
     }
     // The checked-in generated tables must match their generators.
     resample_tables::check()?;
+    convolve_tables::check()?;
     filterbank_tables::check()?;
     sbr_tables::check()?;
     ps_tables::check()?;
