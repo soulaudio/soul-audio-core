@@ -660,7 +660,13 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> FlacDecoder<S, P> {
             0 => {}
             1 => {
                 for i in 1..block {
-                    plane[i] += plane[i - 1];
+                    // Widen then truncate, exactly as orders 2..4 below do.
+                    // For a valid stream the restored sample fits the declared
+                    // bit depth and no truncation happens; a malformed one can
+                    // drive the running sum past `i32`, and this arm used to be
+                    // the only one that trapped on that (found by fuzzing — see
+                    // the regression test). The reference decoder wraps.
+                    plane[i] = (i64::from(plane[i]) + i64::from(plane[i - 1])) as i32;
                 }
             }
             2 => {
@@ -1180,6 +1186,41 @@ mod tests {
         v.extend_from_slice(&streaminfo(rate, channels, bits, total));
         v.extend_from_slice(audio);
         v
+    }
+
+    /// `restore_fixed` must be total on every order: a malformed stream's
+    /// residuals can drive the running sum past `i32`.
+    ///
+    /// Order 1 was the only arm that trapped there — orders 2..4 already widen
+    /// to `i64` and truncate on store, and now it does the same. Found by
+    /// fuzzing (`FUZZ_SEED=0x1234 FUZZ_ITERS=8000`, the `flac` seed with a
+    /// zeroed run).
+    #[test]
+    fn restore_fixed_is_total_at_every_order() {
+        type Dec = FlacDecoder<SliceSource<'static>, Vec<i32>>;
+        for order in 0..=4usize {
+            // A plane engineered to overflow: the predictor accumulates toward
+            // i32::MAX and then past it.
+            let mut plane = vec![i32::MAX; 16];
+            Dec::restore_fixed(&mut plane, order, 16);
+            assert!(plane.iter().all(|s| *s == *s), "order {order}");
+
+            let mut plane = vec![i32::MIN; 16];
+            Dec::restore_fixed(&mut plane, order, 16);
+
+            // Alternating extremes, which overflow in both directions.
+            let mut plane: Vec<i32> = (0..16)
+                .map(|i| if i % 2 == 0 { i32::MAX } else { i32::MIN })
+                .collect();
+            Dec::restore_fixed(&mut plane, order, 16);
+        }
+
+        // And the arithmetic is unchanged for ordinary values: order 1 is the
+        // running sum of the residuals.
+        let mut plane = vec![0i32; 8];
+        plane[..5].copy_from_slice(&[10, 1, 2, 3, 4]);
+        Dec::restore_fixed(&mut plane, 1, 5);
+        assert_eq!(&plane[..5], &[10, 11, 13, 16, 20]);
     }
 
     // -- CONSTANT -------------------------------------------------------------
