@@ -59,6 +59,19 @@ impl Biquad {
         *self == Self::bypass()
     }
 
+    /// Whether every coefficient is finite — i.e. whether this section can be
+    /// run at all. A NaN or infinity here poisons the delay line permanently
+    /// (see [`Equalizer::set_band`]), so the filter refuses such a section
+    /// rather than playing it once.
+    #[must_use]
+    pub fn is_finite(&self) -> bool {
+        self.b0.is_finite()
+            && self.b1.is_finite()
+            && self.b2.is_finite()
+            && self.a1.is_finite()
+            && self.a2.is_finite()
+    }
+
     /// Advance one sample through this section, updating `s` (the per-channel
     /// delay line for THIS section).
     #[inline]
@@ -114,9 +127,23 @@ impl<const BANDS: usize> Equalizer<BANDS> {
 
     /// Set band `i`'s coefficients (ignored if `i >= BANDS`). Does not touch the
     /// delay lines, so a live coefficient change doesn't click.
+    ///
+    /// A section with any **non-finite** coefficient is installed as
+    /// [`Biquad::bypass`] instead. This is the door, and it has to be shut
+    /// here: a NaN that reaches the filter multiplies into the delay line, and
+    /// the delay line is then NaN for *every later sample* — the audio does not
+    /// come back when the host fixes the coefficients, only when someone calls
+    /// [`reset`](Self::reset). One bad value would silence playback until
+    /// restart. A host that designs its own coefficients (rather than going
+    /// through `soul-audio-eq`, which refuses non-finite inputs at the
+    /// designer) gets the same protection.
     pub fn set_band(&mut self, i: usize, band: Biquad) {
         if let Some(slot) = self.bands.get_mut(i) {
-            *slot = band;
+            *slot = if band.is_finite() {
+                band
+            } else {
+                Biquad::bypass()
+            };
         }
     }
 
