@@ -88,6 +88,7 @@ struct BiquadState {
 /// `no_std` / no-alloc: the band coefficients and the per-channel delay lines are
 /// fixed-size arrays. Processing is in `f32`; the deck converts to/from its `i32`
 /// canonical samples at the call site (and clamps on the way back).
+#[derive(Clone, Copy, Debug)]
 pub struct Equalizer<const BANDS: usize> {
     bands: [Biquad; BANDS],
     state: [[BiquadState; BANDS]; MAX_CHANNELS],

@@ -19,6 +19,7 @@
 //!
 //! `OwnedDecoder` is large by value, so the pipeline runs on a big-stack thread.
 
+use soul_audio_core::dsp::{EqStage, Stage};
 use soul_audio_core::{
     Deck, Decoder, Equalizer, Progress, Quality, SampleFormat, Sink, SinkError, StreamInfo,
 };
@@ -360,6 +361,110 @@ fn shared_output_is_not_reported_bit_perfect() {
         assert!(di.resampling);
         assert!(!di.exclusive);
     });
+}
+
+/// The DSP chain **inside the deck** (not the host's sink decorator): the same
+/// +12 dB peaking band at 440 Hz, designed by `soul-audio-eq` and set on the
+/// deck's EQ stage, must boost the on-target LEFT tone through the real
+/// decode → resample → chain → sink path — and leave the off-centre RIGHT tone
+/// alone.
+#[test]
+fn deck_dsp_chain_eq_boosts_the_target_band() {
+    let band = Band {
+        kind: BandKind::Peaking,
+        freq: 440.0,
+        gain_db: 12.0,
+        q: 4.0,
+        enabled: true,
+    };
+    let render = |with_eq: bool| {
+        on_big_stack(move || {
+            let dec = open_track(&testdata("tone.flac")).expect("open_track");
+            let mut deck: Deck<CaptureSink, OwnedDecoder, 0> =
+                Deck::new(CaptureSink::shared(TONE_RATE), Quality::Hq);
+            if with_eq {
+                let mut stage = EqStage::new();
+                // Designed for the SINK rate — stages run post-resample.
+                stage
+                    .equalizer_mut()
+                    .set_band(0, design(&band, TONE_RATE as f32));
+                assert!(deck.dsp_mut().push(Stage::Eq(stage)));
+                assert!(deck.dsp().is_active());
+            }
+            deck.load(dec).expect("load");
+            pump_to_end(&mut deck);
+            deck.sink().written.clone()
+        })
+    };
+
+    let flat = render(false);
+    let eqd = render(true);
+    assert_eq!(flat.len(), eqd.len(), "the chain must not change length");
+
+    let sr = f64::from(TONE_RATE);
+    let l_flat = goertzel_power(&deinterleave(&flat, 2, 0), sr, LEFT_HZ);
+    let l_eqd = goertzel_power(&deinterleave(&eqd, 2, 0), sr, LEFT_HZ);
+    let r_flat = goertzel_power(&deinterleave(&flat, 2, 1), sr, RIGHT_HZ);
+    let r_eqd = goertzel_power(&deinterleave(&eqd, 2, 1), sr, RIGHT_HZ);
+    assert!(
+        l_eqd > l_flat * 3.0,
+        "the deck chain's +12 dB @ 440 Hz must boost the LEFT tone: flat={l_flat:.2e} eq={l_eqd:.2e}"
+    );
+    let (l_boost, r_boost) = (l_eqd / l_flat.max(1.0), r_eqd / r_flat.max(1.0));
+    assert!(
+        l_boost > r_boost * 3.0,
+        "the boost must be frequency-selective: 440 x{l_boost:.1} vs 659 x{r_boost:.1}"
+    );
+}
+
+/// A deck DSP chain that is **empty, flat, or master-bypassed** must be a
+/// bit-exact passthrough through the whole real pipeline — identical, sample
+/// for sample, to a deck with no chain configured at all. This is the property
+/// the bit-perfect claim rests on, asserted here on real decoded audio rather
+/// than a synthetic block.
+#[test]
+fn a_bypassed_deck_dsp_chain_is_bit_identical_on_real_audio() {
+    let band = Band {
+        kind: BandKind::Peaking,
+        freq: 440.0,
+        gain_db: 12.0,
+        q: 4.0,
+        enabled: true,
+    };
+    let render = move |configure: fn(&mut Deck<CaptureSink, OwnedDecoder, 0>, &Band)| {
+        on_big_stack(move || {
+            let dec = open_track(&testdata("tone.flac")).expect("open_track");
+            let mut deck: Deck<CaptureSink, OwnedDecoder, 0> =
+                Deck::new(CaptureSink::shared(TONE_RATE), Quality::Hq);
+            configure(&mut deck, &band);
+            deck.load(dec).expect("load");
+            pump_to_end(&mut deck);
+            deck.sink().written.clone()
+        })
+    };
+
+    let plain = render(|_, _| {});
+    assert!(!plain.is_empty());
+    // A stage present but flat.
+    let flat_stage = render(|deck, _| {
+        deck.dsp_mut().push(Stage::Eq(EqStage::new()));
+        assert!(!deck.dsp().is_active());
+    });
+    assert_eq!(plain, flat_stage, "a flat stage must be bit-identical");
+    // A configured, boosting stage with the master bypass engaged.
+    let bypassed = render(|deck, band| {
+        let mut stage = EqStage::new();
+        stage
+            .equalizer_mut()
+            .set_band(0, design(band, TONE_RATE as f32));
+        deck.dsp_mut().push(Stage::Eq(stage));
+        deck.dsp_mut().set_bypass_all(true);
+        assert!(!deck.dsp().is_active());
+    });
+    assert_eq!(
+        plain, bypassed,
+        "a master-bypassed chain must be bit-identical"
+    );
 }
 
 /// An **active DSP stage** costs bit-perfection even on an exclusive device at
