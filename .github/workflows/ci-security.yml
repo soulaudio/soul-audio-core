@@ -7,6 +7,14 @@ on:
   schedule:
     # Weekly, so newly-disclosed advisories are caught even without a push.
     - cron: '27 6 * * 1'
+  # Lets the long fuzz run (below) be kicked off on demand, e.g. after touching
+  # a parser, without waiting for the weekly tick.
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: 'Per-surface fuzz budget in seconds'
+        required: false
+        default: '420'
 
 permissions:
   contents: read
@@ -38,6 +46,42 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2.1.1
         with:
           command: check bans licenses sources
+
+  # Long-mode fuzzing of every untrusted-byte surface. NOT on pull_request: the
+  # per-PR gate already runs each fuzzer's bounded CI mode (a fixed seed, a few
+  # thousand inputs), which is a regression check, not a search. Finding *new*
+  # bugs needs volume and a fresh corpus, and that belongs on a schedule rather
+  # than in everyone's PR latency.
+  #
+  # The seed is the run number, so each run explores different inputs and any
+  # failure is exactly reproducible from the log (`FUZZ_SEED=<n>` locally).
+  # Debug build on purpose: these harnesses hunt arithmetic-overflow panics,
+  # which release builds silently wrap instead of catching.
+  fuzz:
+    name: long fuzz (decode, tags, cue)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SEED: ${{ github.run_number }}
+      BUDGET: ${{ github.event.inputs.fuzz_seconds || '420' }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Decode surface (containers + codecs + DSD + Vorbis)
+        run: cargo test -p soul-audio-core --test fuzz -- --nocapture
+        env:
+          FUZZ_SEED: ${{ env.SEED }}
+          FUZZ_SECONDS: ${{ env.BUDGET }}
+      - name: Tag surface (every container's metadata reader)
+        run: cargo test -p soul-audio-tags --test fuzz -- --nocapture
+        env:
+          TAG_FUZZ_SEED: ${{ env.SEED }}
+          TAG_FUZZ_SECONDS: ${{ env.BUDGET }}
+      - name: Cue sheets (parse + ranges + sub-range seek)
+        run: cargo test -p soul-audio-playlist --test cue_fuzz -- --nocapture
+        env:
+          CUE_FUZZ_SEED: ${{ env.SEED }}
+          CUE_FUZZ_ITERS: '4000000'
 
   sbom:
     name: SBOM (CycloneDX)

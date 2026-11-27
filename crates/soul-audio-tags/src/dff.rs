@@ -51,7 +51,14 @@ pub fn read_dff<S: SeekSource>(
             }
             b"DSD " => {
                 if channels > 0 {
-                    facts.total_frames = Some(size / channels * 8);
+                    // `size` is the chunk length as the *file* declares it, so
+                    // `× 8` overflowed `u64` for a declared size above
+                    // `u64::MAX / 8` — a panic (and on the DAP, a dead
+                    // firmware) on a file a scan merely looked at. Saturating
+                    // keeps the fact nonsense-but-bounded, which the deck
+                    // already handles: a length longer than the data just means
+                    // decode ends early.
+                    facts.total_frames = Some((size / channels).saturating_mul(8));
                 }
             }
             b"DST " => {

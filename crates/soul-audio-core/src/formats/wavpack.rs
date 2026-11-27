@@ -891,7 +891,15 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> WavpackDecoder<S, P> {
                         read_exact(&mut self.src, &mut raw[..cnt])?;
                         skip(&mut self.src, payload - cnt as u64 + pad)?;
                         let per = if decode_mono { 1 } else { 2 };
-                        let weights = cnt / per;
+                        // Bound by the terms actually declared. A block may
+                        // carry a `DECORR_WEIGHTS` sub-block with more weights
+                        // than `DECORR_TERMS` had terms — or no terms metadata
+                        // at all (`num_terms == 0`), which a reordered or
+                        // corrupt block gives you — and `num_terms - 1 - j`
+                        // then underflowed. A weight with no term to attach to
+                        // is meaningless, so the excess is dropped (the
+                        // remaining `raw` bytes are simply not consumed).
+                        let weights = (cnt / per).min(num_terms);
                         let mut idx = 0usize;
                         for j in 0..weights {
                             let p = &mut passes[num_terms - 1 - j];

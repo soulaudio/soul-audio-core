@@ -1152,11 +1152,22 @@ fn stsc_locate<S: crate::io::SeekSource>(
             let run_chunks = first_chunk.saturating_sub(last_first);
             let run_samples = run_chunks.saturating_mul(last_spc);
             if last_spc != 0 && sample < samples_before.saturating_add(run_samples) {
-                let into = sample - samples_before;
+                // Every term below is file-controlled: `first_chunk` is a `u32`
+                // straight out of `stsc`, and the spec's "chunk numbers are
+                // 1-based" is a promise a corrupt (or hostile) file does not
+                // keep. `last_first == 0` underflowed `last_first - 1`, and a
+                // large `chunk_in_run`/`last_spc` overflowed the sample count —
+                // both panics in a debug build, which on the DAP means the
+                // firmware dies on a bad file instead of skipping it.
+                // `samples_before` cannot exceed `sample` here (a run that
+                // passed it would have returned in its own iteration), but the
+                // saturating form costs nothing and removes the need to
+                // re-derive that every time this is read.
+                let into = sample.saturating_sub(samples_before);
                 let chunk_in_run = into / last_spc;
                 return Ok((
-                    (last_first - 1) + chunk_in_run,
-                    samples_before + chunk_in_run * last_spc,
+                    last_first.saturating_sub(1).saturating_add(chunk_in_run),
+                    samples_before.saturating_add(chunk_in_run.saturating_mul(last_spc)),
                     last_spc,
                 ));
             }
@@ -1166,8 +1177,9 @@ fn stsc_locate<S: crate::io::SeekSource>(
         last_spc = spc;
         have = true;
     }
-    // Final run spans [last_first, total_chunks].
-    let run_chunks = (total_chunks + 1).saturating_sub(last_first);
+    // Final run spans [last_first, total_chunks]. `total_chunks` comes from
+    // `stco`'s entry count, so `total_chunks + 1` overflowed at `u32::MAX`.
+    let run_chunks = total_chunks.saturating_add(1).saturating_sub(last_first);
     let into = sample.saturating_sub(samples_before);
     let chunk_in_run = if last_spc == 0 {
         0
@@ -1175,8 +1187,8 @@ fn stsc_locate<S: crate::io::SeekSource>(
         (into / last_spc).min(run_chunks.saturating_sub(1))
     };
     Ok((
-        (last_first - 1) + chunk_in_run,
-        samples_before + chunk_in_run * last_spc,
+        last_first.saturating_sub(1).saturating_add(chunk_in_run),
+        samples_before.saturating_add(chunk_in_run.saturating_mul(last_spc)),
         last_spc,
     ))
 }
@@ -1451,5 +1463,55 @@ mod tests {
         assert_eq!(c.sample_rate, 44_100);
         assert_eq!(r.total_samples(), 13_230);
         assert_eq!(r.mdat_remaining(), 17_411);
+    }
+    /// `stsc_locate` reads **file-controlled** `u32`s and does chunk/sample
+    /// arithmetic on them. The spec says chunk numbers are 1-based and that
+    /// entries ascend; a corrupt or hostile file says whatever it likes, and
+    /// three of those lies used to panic a debug build (and so kill the DAP
+    /// firmware on a bad file rather than skipping the track):
+    ///
+    ///   * `first_chunk == 0` → `last_first - 1` underflowed,
+    ///   * `total_chunks == u32::MAX` → `total_chunks + 1` overflowed,
+    ///   * a huge `samples_per_chunk` → the sample count overflowed.
+    ///
+    /// Found by `tests/fuzz.rs` (length-field mutation of the ALAC fixture).
+    /// The requirement is total-ness, not a particular mapping: any `Ok`/`Err`
+    /// is fine for a nonsense table, a panic is not.
+    #[test]
+    fn stsc_locate_is_total_for_hostile_tables() {
+        /// Build a `stsc` payload: version/flags, entry count, then
+        /// `(first_chunk, samples_per_chunk, sample_desc_index)` triples.
+        fn stsc(entries: &[(u32, u32)]) -> Vec<u8> {
+            let mut v = Vec::new();
+            v.extend_from_slice(&0u32.to_be_bytes()); // version + flags
+            v.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            for &(first, spc) in entries {
+                v.extend_from_slice(&first.to_be_bytes());
+                v.extend_from_slice(&spc.to_be_bytes());
+                v.extend_from_slice(&1u32.to_be_bytes());
+            }
+            v
+        }
+
+        let tables: &[&[(u32, u32)]] = &[
+            &[(0, 1)], // first_chunk = 0 (the underflow)
+            &[(0, 0)],
+            &[(0, u32::MAX)],
+            &[(1, u32::MAX), (2, u32::MAX)], // sample-count overflow
+            &[(u32::MAX, u32::MAX)],
+            &[(5, 1), (2, 1)], // descending (not allowed by spec)
+            &[(1, 0), (1, 0)], // zero samples-per-chunk
+            &[],               // no entries at all
+        ];
+        for t in tables {
+            let payload = stsc(t);
+            for &total_chunks in &[0u32, 1, u32::MAX] {
+                for &sample in &[0u32, 1, 1000, u32::MAX] {
+                    let mut src = SliceSource::new(&payload);
+                    // `stsc` is (offset, size) of the payload within the file.
+                    let _ = stsc_locate(&mut src, (0, payload.len() as u64), total_chunks, sample);
+                }
+            }
+        }
     }
 }
