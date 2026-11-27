@@ -353,6 +353,29 @@ impl<S: SeekSource> IndexReader<S> {
         self.src.into_inner()
     }
 
+    /// Byte offset of entry `index` in a table of `stride`-byte records based
+    /// at `base` — **checked**, because every term is a `u32` the *index file*
+    /// chose.
+    ///
+    /// The per-accessor `id >= count` guards do not make this arithmetic safe:
+    /// the `count` they compare against comes out of the same header, so a
+    /// declared `track_count` of `u32::MAX` lets a perfectly "in-range" id
+    /// overflow `id × RECORD_SIZE`, and a section offset near `u32::MAX`
+    /// overflows the add. An index is a file on a removable card — a
+    /// half-written bake, FAT corruption, or anything a stranger wrote — so
+    /// `Corrupt` is the honest answer, and it is one the browse UI already
+    /// handles (the entry simply does not render).
+    ///
+    /// Saturating would be wrong here, not merely less tidy: it would turn a
+    /// nonsense offset into a *plausible* one and read an unrelated record.
+    /// (Found by `tests/fuzz.rs`.)
+    fn table_off(base: u32, index: u32, stride: usize) -> Result<u32, CatalogError> {
+        index
+            .checked_mul(stride as u32)
+            .and_then(|delta| base.checked_add(delta))
+            .ok_or(CatalogError::Corrupt)
+    }
+
     /// Seek to `off` and fill `buf` exactly. Maps any I/O error to `Io`.
     fn read_at(&self, off: u32, buf: &mut [u8]) -> Result<(), CatalogError> {
         let mut src = self.src.borrow_mut();
@@ -373,7 +396,7 @@ impl<S: SeekSource> IndexReader<S> {
         if p >= self.header.playlist_count {
             return Err(CatalogError::OutOfRange);
         }
-        let off = self.header.playlists_off + p * PLAYLIST_DIR_ENTRY as u32;
+        let off = Self::table_off(self.header.playlists_off, p, PLAYLIST_DIR_ENTRY)?;
         let mut b = [0u8; PLAYLIST_DIR_ENTRY];
         self.read_at(off, &mut b)?;
         let name = StrRef {
@@ -404,7 +427,10 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
             return Err(CatalogError::OutOfRange);
         }
         let mut b = [0u8; GENRE_REF_SIZE];
-        self.read_at(self.header.genres_off + id * GENRE_REF_SIZE as u32, &mut b)?;
+        self.read_at(
+            Self::table_off(self.header.genres_off, id, GENRE_REF_SIZE)?,
+            &mut b,
+        )?;
         let name = StrRef {
             off: le_u32(&b, 0),
             len: le_u16(&b, 4),
@@ -418,7 +444,7 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
         }
         let mut b = [0u8; ARTIST_REF_SIZE];
         self.read_at(
-            self.header.artists_off + id * ARTIST_REF_SIZE as u32,
+            Self::table_off(self.header.artists_off, id, ARTIST_REF_SIZE)?,
             &mut b,
         )?;
         let name = StrRef {
@@ -434,9 +460,13 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
         }
         // The sort-name table sits immediately after the artist name table
         // (artist_count StrRefs), so no header slot is spent on its offset.
-        let sorts_off = self.header.artists_off + self.header.artist_count * ARTIST_REF_SIZE as u32;
+        let sorts_off = Self::table_off(
+            self.header.artists_off,
+            self.header.artist_count,
+            ARTIST_REF_SIZE,
+        )?;
         let mut b = [0u8; ARTIST_REF_SIZE];
-        self.read_at(sorts_off + id * ARTIST_REF_SIZE as u32, &mut b)?;
+        self.read_at(Self::table_off(sorts_off, id, ARTIST_REF_SIZE)?, &mut b)?;
         let sort = StrRef {
             off: le_u32(&b, 0),
             len: le_u16(&b, 4),
@@ -448,7 +478,7 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
         if id >= self.header.track_count {
             return Err(CatalogError::OutOfRange);
         }
-        let off = self.header.records_off + id * RECORD_SIZE as u32;
+        let off = Self::table_off(self.header.records_off, id, RECORD_SIZE)?;
         let mut r = [0u8; RECORD_SIZE];
         self.read_at(off, &mut r)?;
         Ok(TrackRec {
@@ -498,7 +528,7 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
         if id >= self.header.album_count {
             return Err(CatalogError::OutOfRange);
         }
-        let off = self.header.albums_off + id * ALBUM_RECORD_SIZE as u32;
+        let off = Self::table_off(self.header.albums_off, id, ALBUM_RECORD_SIZE)?;
         let mut r = [0u8; ALBUM_RECORD_SIZE];
         self.read_at(off, &mut r)?;
         Ok(AlbumRec {
@@ -530,7 +560,12 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
         if u64::from(s.off) + len as u64 > u64::from(self.header.string_heap_len) {
             return Err(CatalogError::Corrupt);
         }
-        self.read_at(self.header.string_heap_off + s.off, &mut buf[..len])?;
+        let at = self
+            .header
+            .string_heap_off
+            .checked_add(s.off)
+            .ok_or(CatalogError::Corrupt)?;
+        self.read_at(at, &mut buf[..len])?;
         Ok(len)
     }
 
@@ -543,8 +578,13 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
         if i >= self.header.track_count {
             return Err(CatalogError::OutOfRange);
         }
-        let slot = axis_index(axis) * self.header.track_count + i;
-        self.read_u32_at(self.header.order_tables_off + slot * 4)
+        // `axis × track_count + i`, then `× 4`: all three steps are over
+        // header-chosen values, so all three are checked.
+        let slot = axis_index(axis)
+            .checked_mul(self.header.track_count)
+            .and_then(|base| base.checked_add(i))
+            .ok_or(CatalogError::Corrupt)?;
+        self.read_u32_at(Self::table_off(self.header.order_tables_off, slot, 4)?)
     }
 
     fn resolve_locator(&self, key: &str) -> Option<TrackId> {
@@ -555,7 +595,7 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
             let mid = lo + (hi - lo) / 2;
             // The id at probe `mid` of the locator-key-sorted order.
             let id = self
-                .read_u32_at(self.header.locator_order_off + mid * 4)
+                .read_u32_at(Self::table_off(self.header.locator_order_off, mid, 4).ok()?)
                 .ok()?;
             let t = self.track(id).ok()?;
             // Reconstruct the probe's key pieces into stack buffers (no alloc); a
@@ -585,7 +625,7 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
         }
         let mut dir = [0u8; ALBUM_DIR_ENTRY];
         self.read_at(
-            self.header.album_tracks_off + album * ALBUM_DIR_ENTRY as u32,
+            Self::table_off(self.header.album_tracks_off, album, ALBUM_DIR_ENTRY)?,
             &mut dir,
         )?;
         let count = le_u32(&dir, 0);
@@ -593,7 +633,7 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
         if i >= count {
             return Err(CatalogError::OutOfRange);
         }
-        self.read_u32_at(run_off + i * 4)
+        self.read_u32_at(Self::table_off(run_off, i, 4)?)
     }
 
     fn album_track_count(&self, album: AlbumId) -> u32 {
@@ -601,13 +641,10 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
             return 0;
         }
         let mut dir = [0u8; ALBUM_DIR_ENTRY];
-        if self
-            .read_at(
-                self.header.album_tracks_off + album * ALBUM_DIR_ENTRY as u32,
-                &mut dir,
-            )
-            .is_err()
-        {
+        let Ok(at) = Self::table_off(self.header.album_tracks_off, album, ALBUM_DIR_ENTRY) else {
+            return 0;
+        };
+        if self.read_at(at, &mut dir).is_err() {
             return 0;
         }
         le_u32(&dir, 0)
@@ -623,7 +660,7 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
         }
         let mut b = [0u8; FOLDER_RECORD_SIZE];
         self.read_at(
-            self.header.folders_off + id * FOLDER_RECORD_SIZE as u32,
+            Self::table_off(self.header.folders_off, id, FOLDER_RECORD_SIZE)?,
             &mut b,
         )?;
         Ok(FolderRec {
@@ -659,7 +696,7 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
         if i >= count {
             return Err(CatalogError::OutOfRange);
         }
-        self.read_u32_at(run_off + i * 4)
+        self.read_u32_at(Self::table_off(run_off, i, 4)?)
     }
 }
 

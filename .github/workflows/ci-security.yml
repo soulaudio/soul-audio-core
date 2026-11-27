@@ -58,7 +58,7 @@ jobs:
   # Debug build on purpose: these harnesses hunt arithmetic-overflow panics,
   # which release builds silently wrap instead of catching.
   fuzz:
-    name: long fuzz (decode, tags, cue)
+    name: long fuzz (decode, tags, index, cue)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -77,6 +77,13 @@ jobs:
         env:
           TAG_FUZZ_SEED: ${{ env.SEED }}
           TAG_FUZZ_SECONDS: ${{ env.BUDGET }}
+      - name: Index reader (.soulidx off an SD card)
+        run: cargo test -p soul-audio-index --features build --test fuzz -- --nocapture
+        env:
+          IDX_FUZZ_SEED: ${{ env.SEED }}
+          # Iteration-bounded (no time knob): ~30k inputs/s in a debug build, so
+          # this is a couple of minutes.
+          IDX_FUZZ_ITERS: '4000000'
       - name: Cue sheets (parse + ranges + sub-range seek)
         run: cargo test -p soul-audio-playlist --test cue_fuzz -- --nocapture
         env:
