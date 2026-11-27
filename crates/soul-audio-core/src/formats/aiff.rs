@@ -101,7 +101,17 @@ impl<S: SeekSource> AiffDecoder<S> {
     /// [`DecodeError::Io`] if the seek fails.
     pub fn seek_to(&mut self, frame: u64) -> Result<u64, DecodeError> {
         let landed = self.demux.seek_to(frame)?;
-        self.sample_pos = landed * u64::from(self.channels);
+        // Saturating for the same reason WAV's position multiply is (see
+        // `WavDecoder::seek_to`, where a stream of unknown length let the
+        // caller's own frame reach this multiply and overflow `u64`).
+        //
+        // It is **not** reachable here today: AIFF always ends up with a known
+        // frame count — `COMM.numSampleFrames` or the `SSND` size over the
+        // block align, both `u32`-derived — so `seek_to` clamps `landed` to at
+        // most `u32::MAX`, and `u32::MAX × u16::MAX` is nowhere near `u64::MAX`.
+        // Kept saturating so this line's correctness is local, rather than
+        // resting on a two-hop argument about bounds set in another module.
+        self.sample_pos = landed.saturating_mul(u64::from(self.channels));
         Ok(landed)
     }
 
