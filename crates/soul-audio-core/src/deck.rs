@@ -694,7 +694,22 @@ impl<K: Sink, D: SeekableDecoder, const PRELOAD: usize, P: AsRef<[f32]> + AsMut<
 
     /// Forward the target volume to the sink (0.0..=1.0), where it is applied at
     /// the output stage so the change is heard immediately.
+    ///
+    /// A **NaN** request is ignored and the current volume kept; an infinity is
+    /// an ordinary out-of-range value and still clamps (`+inf` → 1.0, `-inf` →
+    /// 0.0, which is unambiguous). `f32::clamp` returns `NaN` for a `NaN` input
+    /// — it bounds a range, it does not validate one — so a NaN used to flow
+    /// straight through to the sink,
+    /// where it multiplies every sample. In a host whose gain is smoothed (the
+    /// desktop sinks ramp toward the target per sample) the smoother's state
+    /// becomes NaN and **stays** NaN: setting a sane volume afterwards does not
+    /// bring the audio back, because `cur += (target - cur) * k` is NaN forever
+    /// once `cur` is. A volume that cannot be interpreted must not be able to
+    /// silence the player, so it is refused rather than clamped.
     pub fn set_volume(&mut self, volume: f32) {
+        if volume.is_nan() {
+            return;
+        }
         let v = volume.clamp(0.0, 1.0);
         self.volume = v;
         self.sink.set_volume(v);
@@ -1889,6 +1904,46 @@ mod tests {
         assert_eq!(deck.sink().last_volume, Some(1.0), "clamped to 1.0");
         deck.set_volume(-0.5);
         assert_eq!(deck.sink().last_volume, Some(0.0), "clamped to 0.0");
+
+        // A NaN request is REFUSED, not clamped: `f32::clamp` returns NaN for
+        // a NaN (it bounds a range, it does not validate one), and a NaN gain
+        // reaching a smoothed output stage sticks for the life of the stream —
+        // see `set_volume`. The sink must not even be told. An infinity, by
+        // contrast, is an ordinary out-of-range value and still clamps.
+        deck.set_volume(f32::NAN);
+        assert_eq!(
+            deck.sink().last_volume,
+            Some(0.0),
+            "a NaN volume must leave the sink's volume untouched"
+        );
+        // Infinities are ordinary out-of-range values: clamp handles those.
+        deck.set_volume(f32::INFINITY);
+        assert_eq!(deck.sink().last_volume, Some(1.0), "+inf clamps to 1.0");
+        deck.set_volume(f32::NEG_INFINITY);
+        assert_eq!(deck.sink().last_volume, Some(0.0), "-inf clamps to 0.0");
+        // A sane value still works after a refused one.
+        deck.set_volume(0.75);
+        assert_eq!(deck.sink().last_volume, Some(0.75));
+    }
+
+    /// Why the refusal matters: the desktop sinks ramp toward the target
+    /// (`cur += (target - cur) * k`) so a volume change is heard without a
+    /// click. That recurrence has no way back from a NaN — this pins the
+    /// arithmetic the guard exists for, so the reasoning cannot quietly rot
+    /// even though the smoother itself lives in `soul-audio-desktop`.
+    #[test]
+    fn a_smoothed_gain_never_recovers_from_a_nan_target() {
+        let step = |cur: f32, target: f32| cur + (target - cur) * 0.01;
+        let mut cur = 1.0f32;
+        cur = step(cur, f32::NAN);
+        assert!(cur.is_nan(), "one NaN target poisons the smoother");
+        for _ in 0..100_000 {
+            cur = step(cur, 1.0);
+        }
+        assert!(
+            cur.is_nan(),
+            "and it stays poisoned forever, so the audio cannot come back"
+        );
     }
 
     #[test]

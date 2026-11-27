@@ -301,6 +301,49 @@ fn dop_words_survive_the_exclusive_path_only_at_unity_volume() {
     );
 }
 
+/// A `NaN` volume must never reach the renderer. Its gain is smoothed per
+/// sample (`cur += (target - cur) * k`) so a change is heard without a click,
+/// and that recurrence cannot recover from a NaN: the gain stays NaN for the
+/// life of the stream, so every later sample is NaN — silence that a sane
+/// volume cannot undo. `clamp` does not catch it (it returns NaN for NaN), so
+/// the sink refuses it outright.
+#[test]
+fn a_nan_volume_is_refused_and_the_output_stays_finite() {
+    let (hal, name) = world(fixture("usb-uac2-dac-384k"));
+    let mut sink = open(&hal, &name, 48_000).unwrap();
+
+    sink.set_volume(0.5);
+    sink.set_volume(f32::NAN);
+    // The refused request must not even be recorded: a sink reporting a NaN
+    // volume would also make `modifies_samples()` nonsense (NaN != 1.0), so a
+    // bit-perfect claim would flip on a value that was never applied.
+    assert!(
+        sink.modifies_samples(),
+        "the volume is still the 0.5 set before the refused NaN"
+    );
+
+    let pattern: Vec<i32> = (0..2048)
+        .map(|n| if n % 64 == 0 { 1 << 22 } else { -(1 << 20) })
+        .collect();
+    sink.write(&pattern).unwrap();
+    let got = hal.render(pattern.len() / 2);
+    assert!(
+        got.iter().all(|s| s.is_finite()),
+        "a NaN volume poisoned the renderer's gain"
+    );
+    assert!(
+        got.iter().any(|&s| s != 0.0),
+        "output went silent, which is what a poisoned gain looks like"
+    );
+
+    // Infinities are ordinary out-of-range values and still clamp, so the
+    // stream keeps playing (at full scale) rather than being refused.
+    sink.set_volume(f32::INFINITY);
+    sink.write(&pattern).unwrap();
+    let got = hal.render(pattern.len() / 2);
+    assert!(got.iter().all(|s| s.is_finite()));
+}
+
 #[test]
 fn underrun_plays_silence_not_garbage() {
     let (hal, name) = world(fixture("macbook-pro-speakers"));
