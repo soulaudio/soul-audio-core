@@ -99,6 +99,66 @@ pub fn supported_rates(formats: &[PhysFormat], channels: u32) -> Vec<u32> {
     rates
 }
 
+/// What a device can carry for **DSD-over-PCM**, derived from the formats it
+/// actually advertises — the bridge from a real device to
+/// [`soul_audio_core::dop::plan`].
+///
+/// Everything except one field comes from the hardware: the widest integer
+/// word it accepts for `channels` (DoP needs ≥ 24 bits — the marker is the top
+/// byte), and the highest rate it will take at that width (the DoP carrier is
+/// `dsd_rate / 16`, so DSD64 needs 176.4 kHz). `exclusive` is whether the
+/// engine actually holds the device (hog mode taken, no mixer in the path).
+///
+/// `dop_declared` is the one thing hardware cannot tell us. **No OS API reports
+/// whether a DAC understands DoP**: a DoP stream is ordinary 24-bit PCM, and a
+/// DAC that does not recognise the markers reproduces it as full-level noise.
+/// It is therefore a *setting* — the user's, or a device-specific profile — and
+/// modelling it as one is the honest option. Passing `false` means "never send
+/// DoP to this device", which is the safe default for unknown hardware.
+///
+/// Native DSD is reported as unavailable: neither CoreAudio nor WASAPI has a
+/// native-DSD path (ASIO does, and the DAP drives its DAC over SAI) — both are
+/// separate output paths, not this PCM one.
+#[must_use]
+pub fn dop_capabilities(
+    formats: &[PhysFormat],
+    channels: u32,
+    exclusive: bool,
+    dop_declared: bool,
+) -> soul_audio_core::dop::DeviceCapabilities {
+    // Only integer formats at least 24 bits wide can carry a DoP word intact.
+    // A float format could hold the bits exactly too, but a DoP stream is only
+    // meaningful as the integer pattern the DAC pattern-matches, and no DAC
+    // documents accepting it as float — so this stays conservative.
+    let carriers = || {
+        formats
+            .iter()
+            .filter(|f| f.channels >= channels && !f.float && f.bits >= 24)
+    };
+    let bits = carriers().map(|f| f.bits).max().unwrap_or(0);
+    // The highest standard rate any such format supports (a ranged format
+    // advertises a span, so walk the ladder rather than trusting `rate_max`,
+    // which may not be a real rate).
+    let max_pcm_rate = carriers()
+        .flat_map(|f| {
+            STANDARD_RATES
+                .iter()
+                .copied()
+                .filter(move |&r| f.supports_rate(r))
+        })
+        .max()
+        .unwrap_or(0);
+    soul_audio_core::dop::DeviceCapabilities {
+        exclusive,
+        dop: dop_declared,
+        native_dsd: false,
+        max_pcm_rate,
+        // `bits` is `u32` here (CoreAudio's `mBitsPerChannel`) and `u8` there;
+        // saturate rather than wrapping a nonsense value into range.
+        bits: u8::try_from(bits).unwrap_or(u8::MAX),
+    }
+}
+
 /// The standard PCM sample-rate ladder (both the 44.1 k and 48 k families).
 pub const STANDARD_RATES: [u32; 13] = [
     8_000, 11_025, 16_000, 22_050, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000,
@@ -266,6 +326,134 @@ mod tests {
                 8_000, 11_025, 16_000, 22_050, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400,
                 192_000
             ]
+        );
+    }
+
+    /// A real **USB DAC** profile: 24-bit integer up to 384 kHz, which is what
+    /// a DoP-capable DAC looks like through CoreAudio.
+    fn usb_dac_384k() -> Vec<PhysFormat> {
+        [
+            384_000, 352_800, 192_000, 176_400, 96_000, 88_200, 48_000, 44_100,
+        ]
+        .into_iter()
+        .map(|r| int(r, 24, 2))
+        .collect()
+    }
+
+    /// DoP capability, derived from the formats devices actually advertise and
+    /// fed through core's policy. Each case is a device class this project will
+    /// meet, and the point is that the *rate ceiling* — not a vendor list —
+    /// decides what a device can carry.
+    #[test]
+    fn dop_capability_is_derived_from_the_formats_a_device_advertises() {
+        use soul_audio_core::model::{DsdMode, DsdRate};
+
+        // A DoP-capable USB DAC, held exclusively, with the user's DoP setting
+        // on: DSD64/128/256 ride the carrier, DSD512 (1411.2 kHz) does not.
+        let caps = dop_capabilities(&usb_dac_384k(), 2, true, true);
+        assert_eq!(caps.bits, 24);
+        assert_eq!(caps.max_pcm_rate, 384_000);
+        assert!(caps.exclusive && caps.dop && !caps.native_dsd);
+        for (rate, want) in [
+            (DsdRate::Dsd64, DsdMode::Dop),
+            (DsdRate::Dsd128, DsdMode::Dop),
+            (DsdRate::Dsd256, DsdMode::Decimate), // 705.6 kHz > 384 kHz
+            (DsdRate::Dsd512, DsdMode::Decimate),
+        ] {
+            let plan = soul_audio_core::dop::plan(rate, &caps, DsdMode::Dop);
+            assert_eq!(plan.mode, want, "{rate:?}");
+        }
+
+        // The MacBook's own speakers advertise Float32 only: no DoP carrier at
+        // all, whatever the user sets.
+        let caps = dop_capabilities(&macbook_speakers(), 2, true, true);
+        assert_eq!(caps.bits, 0, "float-only is not a DoP carrier");
+        assert_eq!(caps.max_pcm_rate, 0);
+        assert_eq!(
+            soul_audio_core::dop::plan(DsdRate::Dsd64, &caps, DsdMode::Dop).mode,
+            DsdMode::Decimate
+        );
+
+        // A DisplayPort monitor: 24-bit, but it tops out at 48 kHz.
+        let caps = dop_capabilities(&displayport_monitor(), 2, true, true);
+        assert_eq!((caps.bits, caps.max_pcm_rate), (24, 48_000));
+        assert_eq!(
+            soul_audio_core::dop::plan(DsdRate::Dsd64, &caps, DsdMode::Dop).mode,
+            DsdMode::Decimate
+        );
+
+        // The two things that are settings, not hardware: holding the device,
+        // and the user declaring the DAC understands DoP. Either one off means
+        // no DoP, because the failure mode is full-level noise.
+        for (exclusive, declared) in [(false, true), (true, false), (false, false)] {
+            let caps = dop_capabilities(&usb_dac_384k(), 2, exclusive, declared);
+            assert_eq!(
+                soul_audio_core::dop::plan(DsdRate::Dsd64, &caps, DsdMode::Dop).mode,
+                DsdMode::Decimate,
+                "exclusive={exclusive} declared={declared}"
+            );
+        }
+
+        // A multichannel request against a stereo-only device finds no carrier.
+        let caps = dop_capabilities(&usb_dac_384k(), 6, true, true);
+        assert_eq!((caps.bits, caps.max_pcm_rate), (0, 0));
+    }
+
+    /// The two halves meet with no new engine code: a DoP decoder reports the
+    /// **carrier** rate as its stream rate (176.4 kHz for DSD64), so the
+    /// existing per-track native-rate switch asks the device for exactly that,
+    /// and the format picker lands on an integer word wide enough to carry the
+    /// marker. If either of those stopped holding, DoP would reach the DAC
+    /// resampled or as float — i.e. as noise.
+    #[test]
+    fn the_native_rate_switch_lands_a_dop_carrier_untouched() {
+        let fmts = usb_dac_384k();
+        let rates = supported_rates(&fmts, 2);
+        for carrier in [176_400u32, 352_800] {
+            assert_eq!(
+                choose_rate(&rates, carrier),
+                Some(carrier),
+                "the DoP carrier must be taken natively, never resampled"
+            );
+            let picked = pick_physical_format(&fmts, carrier, 2).expect("a format at the carrier");
+            assert!(
+                !picked.float && picked.bits >= 24,
+                "a DoP word needs an integer format at least 24 bits wide, got {picked:?}"
+            );
+        }
+        // DSD512's carrier is past this device: `choose_rate` would land
+        // somewhere else, which is exactly why `dop::plan` refuses it upstream
+        // rather than letting the rate switch silently resample DoP.
+        assert_ne!(choose_rate(&rates, 1_411_200), Some(1_411_200));
+    }
+
+    /// A ranged format (one descriptor spanning a span of rates, as some
+    /// drivers report) must be walked against the real rate ladder rather than
+    /// trusting its `rate_max`, which need not be a rate the device accepts.
+    #[test]
+    fn dop_capability_walks_a_ranged_format() {
+        let ranged = PhysFormat {
+            rate_min: 44_100,
+            rate_max: 200_000, // not a standard rate
+            float: false,
+            bits: 32,
+            channels: 2,
+        };
+        let caps = dop_capabilities(&[ranged], 2, true, true);
+        assert_eq!(caps.bits, 32);
+        assert_eq!(
+            caps.max_pcm_rate, 192_000,
+            "the ceiling must be a rate the ladder actually contains"
+        );
+        // 176.4 kHz fits under it, so DSD64 rides DoP.
+        assert_eq!(
+            soul_audio_core::dop::plan(
+                soul_audio_core::model::DsdRate::Dsd64,
+                &caps,
+                soul_audio_core::model::DsdMode::Dop
+            )
+            .mode,
+            soul_audio_core::model::DsdMode::Dop
         );
     }
 
