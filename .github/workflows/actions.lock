@@ -25,7 +25,7 @@ workflows:
         - 'actions/checkout@v7.0.1'
         - 'anchore/sbom-action@v0.24.3'
         - 'embarkstudios/cargo-deny-action@v2.1.1'
-        - 'taiki-e/install-action@v2.90.4'
+        - 'taiki-e/install-action@v2.90.8'
     '.github/workflows/codeql.yml':
         - 'actions/checkout@v7.0.1'
         - 'github/codeql-action@52cf1852265d99e9bea071b03366fc777a602909'
@@ -78,8 +78,8 @@ dependencies:
         commit: 'sha1-d1527c8f67ef9af357290475d4af4b0fab8f12e0'
         owner_id: 580492
         repo_id: 298565987
-    'taiki-e/install-action@v2.90.4':
-        ref: 'v2.90.4'
-        commit: 'sha1-4a76afe23f9e08d2d9550fb56e556444e8611d21'
+    'taiki-e/install-action@v2.90.8':
+        ref: 'v2.90.8'
+        commit: 'sha1-fe3acb53a98b62c772db35de75ce0e4595e7ca8c'
         owner_id: 43724913
         repo_id: 442947557
