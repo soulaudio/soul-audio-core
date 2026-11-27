@@ -14,8 +14,9 @@ use soul_audio_core::formats::dff::DffDecoder;
 use soul_audio_core::formats::dsf::DsfDecoder;
 use soul_audio_core::formats::matroska::{MatroskaDecoder, MatroskaVorbisOgg};
 use soul_audio_core::formats::vorbis::VorbisDecoder;
+use soul_audio_core::model::DsdMode;
 use soul_audio_core::{
-    AnyDecoder, DecodeError, Decoder, Format, PlaybackDecimateAdapter, SampleFormat,
+    AnyDecoder, DecodeError, Decoder, DopAdapter, Format, PlaybackDecimateAdapter, SampleFormat,
     SeekableDecoder, SourceCodec, StreamInfo, open_seekable, probe,
 };
 
@@ -98,6 +99,13 @@ pub enum OwnedDecoder {
     MatroskaVorbis(VorbisDecoder<MatroskaVorbisOgg<Src>, Box<[u8]>>),
     Dsf(PlaybackDecimateAdapter<DsfDecoder<Src>>),
     Dff(PlaybackDecimateAdapter<DffDecoder<Src>>),
+    /// DSF delivered as **DoP** — the file's 1-bit stream packed into a 24-bit
+    /// PCM carrier at `dsd_rate / 16`, for a DoP-capable DAC on an exclusive
+    /// output. Built by [`open_track_dsd`] with [`DsdMode::Dop`]; see
+    /// [`soul_audio_core::dop`] for what the device must satisfy.
+    DsfDop(DopAdapter<DsfDecoder<Src>>),
+    /// DFF delivered as DoP (as [`OwnedDecoder::DsfDop`]).
+    DffDop(DopAdapter<DffDecoder<Src>>),
 }
 
 impl Decoder for OwnedDecoder {
@@ -107,6 +115,8 @@ impl Decoder for OwnedDecoder {
             OwnedDecoder::Vorbis(d) => d.stream_info(),
             OwnedDecoder::MatroskaVorbis(d) => d.stream_info(),
             OwnedDecoder::Dsf(d) => d.stream_info(),
+            OwnedDecoder::DsfDop(d) => d.stream_info(),
+            OwnedDecoder::DffDop(d) => d.stream_info(),
             OwnedDecoder::Dff(d) => d.stream_info(),
         }
     }
@@ -116,6 +126,8 @@ impl Decoder for OwnedDecoder {
             OwnedDecoder::Vorbis(d) => d.decode_into(out),
             OwnedDecoder::MatroskaVorbis(d) => d.decode_into(out),
             OwnedDecoder::Dsf(d) => d.decode_into(out),
+            OwnedDecoder::DsfDop(d) => d.decode_into(out),
+            OwnedDecoder::DffDop(d) => d.decode_into(out),
             OwnedDecoder::Dff(d) => d.decode_into(out),
         }
     }
@@ -127,6 +139,8 @@ impl Decoder for OwnedDecoder {
             OwnedDecoder::Vorbis(d) => d.source_format(),
             OwnedDecoder::MatroskaVorbis(d) => d.source_format(),
             OwnedDecoder::Dsf(d) => d.source_format(),
+            OwnedDecoder::DsfDop(d) => d.source_format(),
+            OwnedDecoder::DffDop(d) => d.source_format(),
             OwnedDecoder::Dff(d) => d.source_format(),
         }
     }
@@ -137,13 +151,23 @@ impl Decoder for OwnedDecoder {
         match self {
             OwnedDecoder::Pcm(d) => d.codec(),
             OwnedDecoder::Vorbis(_) | OwnedDecoder::MatroskaVorbis(_) => SourceCodec::Vorbis,
-            OwnedDecoder::Dsf(_) | OwnedDecoder::Dff(_) => SourceCodec::Dsd,
+            OwnedDecoder::Dsf(_)
+            | OwnedDecoder::Dff(_)
+            | OwnedDecoder::DsfDop(_)
+            | OwnedDecoder::DffDop(_) => SourceCodec::Dsd,
         }
     }
     /// Forward the source channel layout so a decoder's layout (e.g. WAV `dwChannelMask`,
     /// FLAC per-count canonical, Vorbis/Opus per-count order) reaches the deck through this
     /// wrapper instead of the `None` default — the app's real playback path builds
     /// `OwnedDecoder`, so the multichannel fold depends on this forward.
+    /// Only the DoP variants hand the device the file's DSD bits untouched;
+    /// the decimators produce PCM (a conversion), and every other variant is
+    /// PCM to begin with.
+    fn dsd_passthrough(&self) -> bool {
+        matches!(self, OwnedDecoder::DsfDop(_) | OwnedDecoder::DffDop(_))
+    }
+
     fn channel_layout(&self) -> Option<soul_audio_core::channels::ChannelLayout> {
         match self {
             OwnedDecoder::Pcm(d) => d.channel_layout(),
@@ -151,6 +175,9 @@ impl Decoder for OwnedDecoder {
             OwnedDecoder::MatroskaVorbis(d) => d.channel_layout(),
             OwnedDecoder::Dsf(d) => d.channel_layout(),
             OwnedDecoder::Dff(d) => d.channel_layout(),
+            // DoP carries the stream's own channels in their own order; there
+            // is no layout to fold (a DoP word is not a PCM sample).
+            OwnedDecoder::DsfDop(_) | OwnedDecoder::DffDop(_) => None,
         }
     }
 }
@@ -168,6 +195,8 @@ impl SeekableDecoder for OwnedDecoder {
             // `seek_to_frame`.
             OwnedDecoder::Dsf(d) => d.seek_to_frame(sample),
             OwnedDecoder::Dff(d) => d.seek_to_frame(sample),
+            OwnedDecoder::DsfDop(d) => d.seek_to_frame(sample),
+            OwnedDecoder::DffDop(d) => d.seek_to_frame(sample),
         }
     }
     fn total_frames(&self) -> Option<u64> {
@@ -179,6 +208,9 @@ impl SeekableDecoder for OwnedDecoder {
             // container's declared DSD sample count (`None` if not declared).
             OwnedDecoder::Dsf(d) => d.total_frames(),
             OwnedDecoder::Dff(d) => d.total_frames(),
+            // DoP frames, i.e. DSD samples / 16 per channel.
+            OwnedDecoder::DsfDop(d) => d.total_frames(),
+            OwnedDecoder::DffDop(d) => d.total_frames(),
         }
     }
 }
@@ -190,6 +222,35 @@ pub fn open_track(path: &Path) -> Result<OwnedDecoder> {
     let file = File::open(path).map_err(|e| anyhow!("opening {}: {e}", path.display()))?;
     let boxed: Box<dyn ReadSeek + Send> = Box::new(file);
     build_owned_decoder(boxed, &path.display().to_string())
+}
+
+/// Open `path` into an owned decoder with an explicit **DSD delivery mode** —
+/// the entry point a host uses once it has a plan from
+/// [`soul_audio_core::dop::plan`].
+///
+/// - [`DsdMode::Decimate`] is [`open_track`]: DSD becomes PCM that plays
+///   anywhere. The default, because it always works.
+/// - [`DsdMode::Dop`] wraps the DSD decoder in the DoP framer instead, so the
+///   file's own 1-bit stream reaches a DoP-capable DAC untouched, carried in
+///   24-bit PCM words at `dsd_rate / 16`. **The device must be opened at that
+///   carrier rate, exclusively, at ≥ 24 bits, with no gain, no resampling and
+///   no DSP** — the marker byte is the top byte of every word, so anything
+///   that touches the samples turns the stream into full-level noise. Ask
+///   `dop::plan` rather than deciding here.
+/// - [`DsdMode::Native`] is not an `OwnedDecoder`: a native 1-bit stream is not
+///   PCM and does not go through the PCM deck at all (it is the DAP's SAI
+///   path), so this returns an error rather than quietly handing back
+///   something else.
+///
+/// A non-DSD file ignores the mode entirely — there is nothing to deliver
+/// differently.
+///
+/// # Errors
+/// As [`open_track`], plus [`DsdMode::Native`] (not a PCM decoder).
+pub fn open_track_dsd(path: &Path, mode: DsdMode) -> Result<OwnedDecoder> {
+    let file = File::open(path).map_err(|e| anyhow!("opening {}: {e}", path.display()))?;
+    let boxed: Box<dyn ReadSeek + Send> = Box::new(file);
+    build_owned_decoder_with(boxed, &path.display().to_string(), mode)
 }
 
 /// Open any `Read + Seek` byte source into an owned decoder — the same
@@ -237,6 +298,16 @@ pub fn open_track_range(
 /// only used to name the source in error messages (a path for the former, a
 /// generic "stream" for the latter).
 fn build_owned_decoder(reader: Box<dyn ReadSeek + Send>, label: &str) -> Result<OwnedDecoder> {
+    build_owned_decoder_with(reader, label, DsdMode::Decimate)
+}
+
+/// [`build_owned_decoder`] with an explicit DSD delivery mode (see
+/// [`open_track_dsd`]).
+fn build_owned_decoder_with(
+    reader: Box<dyn ReadSeek + Send>,
+    label: &str,
+    dsd_mode: DsdMode,
+) -> Result<OwnedDecoder> {
     // 64 KiB of std buffering; the decoder reads through it via embedded-io.
     let mut src = FromStd::new(IoBufReader::with_capacity(64 * 1024, reader));
     let format = probe(&mut src).map_err(|e| anyhow!("probing {label}: {e:?}"))?;
@@ -246,12 +317,26 @@ fn build_owned_decoder(reader: Box<dyn ReadSeek + Send>, label: &str) -> Result<
         // cheap enough to sustain real-time — single-stage 352.8 kHz resampling runs at
         // ~0.5× real-time even in release and starves the audio callback (stutter heard
         // as slowed/stretched playback). See `PlaybackDecimateAdapter`.
-        Format::Dsf => Ok(OwnedDecoder::Dsf(PlaybackDecimateAdapter::new(
-            DsfDecoder::new(src).map_err(|e| anyhow!("DSF {label}: {e:?}"))?,
-        ))),
-        Format::Dff => Ok(OwnedDecoder::Dff(PlaybackDecimateAdapter::new(
-            DffDecoder::new(src).map_err(|e| anyhow!("DFF {label}: {e:?}"))?,
-        ))),
+        Format::Dsf => {
+            let inner = DsfDecoder::new(src).map_err(|e| anyhow!("DSF {label}: {e:?}"))?;
+            match dsd_mode {
+                DsdMode::Dop => Ok(OwnedDecoder::DsfDop(DopAdapter::new(inner))),
+                DsdMode::Decimate => Ok(OwnedDecoder::Dsf(PlaybackDecimateAdapter::new(inner))),
+                DsdMode::Native => Err(anyhow!(
+                    "native DSD is not a PCM decoder (use the DSD decoder directly): {label}"
+                )),
+            }
+        }
+        Format::Dff => {
+            let inner = DffDecoder::new(src).map_err(|e| anyhow!("DFF {label}: {e:?}"))?;
+            match dsd_mode {
+                DsdMode::Dop => Ok(OwnedDecoder::DffDop(DopAdapter::new(inner))),
+                DsdMode::Decimate => Ok(OwnedDecoder::Dff(PlaybackDecimateAdapter::new(inner))),
+                DsdMode::Native => Err(anyhow!(
+                    "native DSD is not a PCM decoder (use the DSD decoder directly): {label}"
+                )),
+            }
+        }
         // Vorbis needs a caller-provided arena (`VorbisDecoder<S, A>`), so it
         // is not an `AnyDecoder` variant `open` can build — special-cased
         // here, same as the DSF/DFF split above, ahead of the `open` catch-all
@@ -335,6 +420,78 @@ mod tests {
             .expect("spawn decode thread")
             .join()
             .expect("decode thread panicked");
+    }
+
+    /// A real DSF fixture opened in **DoP** mode: the file's own 1-bit stream,
+    /// packed into a 24-bit PCM carrier for a DoP DAC rather than decimated.
+    ///
+    /// Three things have to be right or a DAC plays noise, and all three are
+    /// checked against the same fixture's decimated open: the carrier rate is
+    /// the DSD rate over 16 (not the DSD rate, and not the decimated rate), the
+    /// stream is still reported as DSD at source, and every word carries the
+    /// `0x05`/`0xFA` marker in its top byte, alternating once per frame and
+    /// shared by both channels.
+    #[test]
+    fn open_track_dsd_delivers_dop_frames_at_the_carrier_rate() {
+        // `OwnedDecoder` is large by value (the Vorbis variant dominates it),
+        // so build it on a big stack like the sibling tests do.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(dop_open_body)
+            .expect("spawn")
+            .join()
+            .expect("DoP open thread panicked");
+    }
+
+    fn dop_open_body() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tone.dsf");
+        let mut dop = open_track_dsd(&path, DsdMode::Dop).expect("open DSF as DoP");
+        let decimated = open_track(&path).expect("open DSF decimated");
+
+        // The source is DSD64 either way; only the delivery differs.
+        let rate = match dop.source_format() {
+            SampleFormat::Dsd { rate } => rate,
+            other => panic!("DoP must still report a DSD source, got {other:?}"),
+        };
+        assert_eq!(dop.codec(), SourceCodec::Dsd);
+        assert_eq!(
+            dop.stream_info().sample_rate,
+            soul_audio_core::dop::dop_carrier_rate(rate),
+            "DoP must be delivered at the dsd_rate/16 carrier"
+        );
+        assert_eq!(dop.stream_info().sample_rate, 176_400, "DSD64 → 176.4 kHz");
+        assert_eq!(dop.stream_info().format, SampleFormat::Int { bits: 24 });
+        assert_eq!(
+            decimated.stream_info().sample_rate,
+            44_100,
+            "the decimated path is unchanged"
+        );
+        assert_eq!(dop.stream_info().channels, 2);
+
+        // Every word's top byte is the marker, alternating per frame.
+        let mut buf = [0i32; 2 * 64];
+        let n = dop.decode_into(&mut buf).expect("decode DoP");
+        assert!(n > 0, "no DoP frames decoded");
+        for (f, frame) in buf[..n].chunks_exact(2).enumerate() {
+            let want = if f % 2 == 0 { 0x05 } else { 0xFA };
+            for (ch, &word) in frame.iter().enumerate() {
+                assert_eq!((word >> 16) & 0xFF, want, "frame {f} channel {ch}: marker");
+                assert_eq!(word & !0x00FF_FFFF, 0, "frame {f}: word must be 24-bit");
+            }
+        }
+
+        // A DoP track still reports a duration (DSD samples / 16), so the deck
+        // can trim and the UI can show a position.
+        assert!(dop.total_frames().is_some(), "DoP must report its length");
+
+        // Native DSD is not a PCM decoder and says so rather than silently
+        // handing back something else.
+        assert!(open_track_dsd(&path, DsdMode::Native).is_err());
+        // A non-DSD file ignores the mode entirely.
+        let flac =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tone.flac");
+        let a = open_track_dsd(&flac, DsdMode::Dop).expect("FLAC ignores the DSD mode");
+        assert_eq!(a.stream_info().sample_rate, 44_100);
     }
 
     /// Vorbis-in-Matroska through `open_track` — guards the consumer-dispatch

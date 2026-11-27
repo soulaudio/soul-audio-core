@@ -95,6 +95,22 @@ pub trait Decoder {
         crate::model::SourceCodec::Pcm
     }
 
+    /// Whether this decoder hands the device the source's **DSD bits
+    /// untouched** — i.e. it is a DoP framer
+    /// ([`DopAdapter`](crate::dsd::DopAdapter)), which repacks the 1-bit stream
+    /// into 24-bit PCM carrier words without altering a single DSD sample.
+    ///
+    /// Only meaningful when [`source_format`](Self::source_format) is
+    /// [`SampleFormat::Dsd`](crate::model::SampleFormat::Dsd); `false` (the
+    /// default) for every PCM decoder and for the DSD **decimators**, whose
+    /// output is a conversion — correct, but not the file's bits. This is what
+    /// lets [`DecodeInfo::bit_perfect`](crate::deck::DecodeInfo::bit_perfect)
+    /// report a DoP path as bit-perfect (it is) while never reporting a
+    /// decimated one as such (it isn't).
+    fn dsd_passthrough(&self) -> bool {
+        false
+    }
+
     /// The source channel **layout** — which speaker each source channel drives, in stream
     /// order — when the format carries or implies one (WAV/CAF explicitly; FLAC per count;
     /// Vorbis/Opus per their own fixed order, which puts the centre channel second). `None`

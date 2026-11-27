@@ -240,6 +240,13 @@ impl<S: crate::io::Source, P: AsRef<[i32]> + AsMut<[i32]>> Decoder for AnyDecode
     /// Forward the source channel layout per variant, so a layout a decoder reports (e.g. the
     /// WAV `dwChannelMask` or the FLAC/Vorbis/Opus per-count order) reaches the deck through
     /// this dispatch wrapper rather than being masked by the trait's `None` default.
+    /// No `AnyDecoder` variant is a DSD path: DSD needs a caller-chosen
+    /// adapter (DoP or decimate), which the shell builds itself
+    /// (`soul-audio-desktop`'s `OwnedDecoder`). Always `false` here.
+    fn dsd_passthrough(&self) -> bool {
+        false
+    }
+
     fn channel_layout(&self) -> Option<crate::channels::ChannelLayout> {
         match self {
             AnyDecoder::Wav(d) => d.channel_layout(),
