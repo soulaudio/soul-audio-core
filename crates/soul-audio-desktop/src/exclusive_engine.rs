@@ -446,7 +446,14 @@ impl<H: Hal> Sink for ExclusiveEngine<H> {
         Ok(())
     }
 
+    /// A `NaN` request is ignored: `clamp` passes a `NaN` through, and the
+    /// renderer's smoothed gain keeps a `NaN` for the life of the stream (see
+    /// the `Sink::set_volume` contract), so one bad value would mute output
+    /// until the device is reopened. An infinity still clamps.
     fn set_volume(&mut self, volume: f32) {
+        if volume.is_nan() {
+            return;
+        }
         self.volume
             .store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }

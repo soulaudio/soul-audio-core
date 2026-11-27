@@ -94,6 +94,15 @@ pub trait Sink {
     /// Set output volume 0.0..=1.0. A sink that applies gain at its output stage
     /// (e.g. a device callback) overrides this so changes are heard immediately;
     /// the default is a no-op for sinks without an output-side gain.
+    ///
+    /// An implementation **must ignore a `NaN`** (an infinity is fine to clamp:
+    /// `+inf` → 1.0 is unambiguous). `f32::clamp` does not help for the NaN —
+    /// it returns `NaN` for a `NaN` input — and a NaN gain is not a transient
+    /// glitch: a smoothed gain (`cur += (target - cur) * k`) stays
+    /// NaN for the life of the stream once it has seen one, so a later sane
+    /// volume cannot recover the audio. [`Deck::set_volume`](crate::Deck::set_volume)
+    /// already refuses such a request, so this is the guard for a host that
+    /// drives a sink directly.
     fn set_volume(&mut self, volume: f32) {
         let _ = volume;
     }
