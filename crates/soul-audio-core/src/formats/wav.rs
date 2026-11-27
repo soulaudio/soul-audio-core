@@ -252,7 +252,15 @@ impl<S: SeekSource> WavDecoder<S> {
     /// [`DecodeError::Io`] if the seek fails.
     pub fn seek_to(&mut self, frame: u64) -> Result<u64, DecodeError> {
         let landed = self.demux.seek_to(frame)?;
-        self.sample_pos = landed * u64::from(self.channels);
+        // A `data` chunk of unknown size (`frames_total == None`) means the
+        // demuxer deliberately does NOT clamp the requested frame — see
+        // `WavDemuxer::seek_to` — so `landed` is the caller's own target, and
+        // `× channels` overflowed `u64` for an extreme seek on a stream whose
+        // header declared no length. The position is derived from a lie
+        // either way, so saturating keeps it nonsense-but-bounded (which
+        // `position()` divides back down) instead of panicking on a file the
+        // player merely seeked in. Found by `tests/fuzz.rs`.
+        self.sample_pos = landed.saturating_mul(u64::from(self.channels));
         Ok(landed)
     }
 
@@ -497,6 +505,45 @@ mod tests {
     }
 
     /// Build a mono IEEE-float WAV (`bits` = 32 or 64, format tag 3).
+    /// An extreme seek on a stream whose `data` size is **unknown** must not
+    /// panic. A `data` size of 0 (or RF64's `0xFFFFFFFF` with no `ds64`) means
+    /// "streamed, length unknown", so the demuxer deliberately does **not**
+    /// clamp the target frame — and the decoder then multiplied it by the
+    /// channel count to track its position, overflowing `u64`.
+    ///
+    /// Found by `tests/fuzz.rs` (a length-field mutation of a minimal WAV):
+    /// a player seeking in a stream whose header lies is an ordinary event,
+    /// and on the DAP the panic is fatal. Mono could never trigger it — the
+    /// multiply needs `channels >= 2`, which is why this test is stereo.
+    #[test]
+    fn an_extreme_seek_on_an_unknown_length_stream_cannot_overflow() {
+        // Stereo 16-bit, `data` size 0 → `frames_total == None` (streamed).
+        let mut v = wav(16, &[0u8; 8]);
+        v[22..24].copy_from_slice(&2u16.to_le_bytes()); // channels = 2
+        v[32..34].copy_from_slice(&4u16.to_le_bytes()); // block_align = 2 * 2
+        let data_size = v.len() - 44;
+        assert_eq!(&v[36..40], b"data");
+        v[40..44].copy_from_slice(&0u32.to_le_bytes()); // size 0 = unknown
+        let _ = data_size;
+
+        let mut d = WavDecoder::new(SliceSource::new(&v)).expect("open stereo wav");
+        assert_eq!(d.stream_info().channels, 2);
+        assert_eq!(d.total_frames(), None, "an unknown data size has no length");
+
+        for frame in [u64::MAX, u64::MAX / 2, u64::MAX / 4 + 1, 1 << 62] {
+            let landed = d.seek_to(frame).expect("seek must not fail");
+            // The position is derived from a header that lied, so the only
+            // requirement is that it stays bounded and consistent.
+            let pos = d.position();
+            assert!(pos <= landed, "position {pos} exceeds the frame landed on");
+        }
+        // A sane seek still works, and still reads.
+        assert_eq!(d.seek_to(1).expect("seek to 1"), 1);
+        assert_eq!(d.position(), 1);
+        let mut out = [0i32; 4];
+        let _ = d.decode_into(&mut out).expect("decode after seek");
+    }
+
     fn wav_float(bits: u16, data: &[u8]) -> Vec<u8> {
         let channels = 1u16;
         let block_align = channels * (bits / 8);
