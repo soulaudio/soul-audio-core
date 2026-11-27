@@ -58,7 +58,7 @@ jobs:
   # Debug build on purpose: these harnesses hunt arithmetic-overflow panics,
   # which release builds silently wrap instead of catching.
   fuzz:
-    name: long fuzz (decode, tags, index, art, cue)
+    name: long fuzz (decode, tags, index, art, eq, cue)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -89,6 +89,13 @@ jobs:
         env:
           ART_FUZZ_SEED: ${{ env.SEED }}
           ART_FUZZ_ITERS: '4000000'
+      - name: EQ profiles (AutoEq text → biquads → audio)
+        run: cargo test -p soul-audio-eq --test profile_fuzz -- --nocapture
+        env:
+          EQ_FUZZ_SEED: ${{ env.SEED }}
+          # ~5k profiles/s in a debug build (each designs every band at five
+          # device rates and runs a block of audio), so this is ~2 minutes.
+          EQ_FUZZ_ITERS: '600000'
       - name: Cue sheets (parse + ranges + sub-range seek)
         run: cargo test -p soul-audio-playlist --test cue_fuzz -- --nocapture
         env:

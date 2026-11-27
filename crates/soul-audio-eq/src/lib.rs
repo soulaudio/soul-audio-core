@@ -118,6 +118,19 @@ pub fn default_bands() -> [Band; 8] {
     })
 }
 
+/// Largest band gain magnitude, in dB, that [`coeffs`] will realise. Beyond
+/// this the RBJ design's `10^(gain/40)` amplitude term runs out of `f32` (and
+/// is meaningless long before it does). Published corrections stay within
+/// ±20 dB; this leaves two orders of magnitude of headroom over that.
+pub const MAX_GAIN_DB: f32 = 120.0;
+
+/// Narrowest and widest `q` [`coeffs`] will realise. `alpha = sin(w0) / (2q)`
+/// overflows for a denormal `q`, and a `q` of 1000 is already a filter no ear
+/// resolves. Real corrections live in 0.1–10.
+pub const MIN_Q: f32 = 1e-3;
+/// See [`MIN_Q`].
+pub const MAX_Q: f32 = 1e3;
+
 /// RBJ "Audio EQ Cookbook" biquad coefficients, already `a0`-normalised, as
 /// `[b0, b1, b2, a1, a2]` — or `None` (a flat passthrough) for a band that cannot
 /// or should not filter: out of range, non-positive Q, or a gain shape at ~0 dB.
@@ -128,7 +141,34 @@ pub fn default_bands() -> [Band; 8] {
 /// coefficients) and [`band_magnitude_db`] (which evaluates them).
 #[must_use]
 pub fn coeffs(kind: BandKind, f0: f32, gain_db: f32, q: f32, fs: f32) -> Option<[f32; 5]> {
+    // Non-finite first: EVERY comparison below is false for a NaN, so a NaN
+    // `f0`/`q` sailed straight through the range checks and produced a biquad
+    // of five NaNs. An AutoEq profile is downloaded text, and Rust's float
+    // parser accepts "NaN" and "inf" happily, so this is reachable from a file
+    // a user pasted in — and a NaN that reaches the filter is not merely a bad
+    // sound: the biquad's delay line becomes NaN and *stays* NaN for every
+    // later sample, so playback does not recover when the profile is fixed.
+    if !f0.is_finite() || !gain_db.is_finite() || !q.is_finite() || !fs.is_finite() {
+        return None;
+    }
     if f0 <= 0.0 || f0 >= fs / 2.0 || q <= 0.0 {
+        return None;
+    }
+    // Finite is not enough: the design is exponential in the gain and inverse
+    // in `q`, so *finite but absurd* values still overflow `f32`.
+    //
+    //   * `a = 10^(gain_db / 40)` overflows above roughly 1540 dB, and is
+    //     already numerically useless long before that.
+    //   * `alpha = sin(w0) / (2q)` overflows for a denormal `q` (`1e-45`
+    //     yields infinity).
+    //
+    // Both are reachable from profile text (`Gain 3.4e38 dB`, `Q 1e-45`), and
+    // an infinity in a coefficient is as fatal as a NaN — same poisoned delay
+    // line. The bounds are far outside anything a real correction uses
+    // (published AutoEq profiles stay within ±20 dB and Q 0.1–10), so a value
+    // beyond them is a broken profile, and a bypassed band is a better answer
+    // than a filter with a million-fold gain.
+    if gain_db.abs() > MAX_GAIN_DB || !(MIN_Q..=MAX_Q).contains(&q) {
         return None;
     }
     if kind.uses_gain() && gain_db.abs() < 1e-3 {
@@ -299,6 +339,11 @@ fn value_after(tokens: &[&str], key: &str) -> Option<f32> {
         .position(|&t| t == key)
         .and_then(|i| tokens.get(i + 1))
         .and_then(|t| t.parse::<f32>().ok())
+        // `"NaN"`, `"inf"` and `"1e40"` all parse successfully, and a profile
+        // carrying one is malformed in the sense this module already documents
+        // — so the value is treated as absent (the band falls back to its
+        // default, which is flat) rather than carried into the design.
+        .filter(|v: &f32| v.is_finite())
 }
 
 /// Parse an AutoEQ / Equalizer-APO ParametricEQ profile into `(preamp_db, bands)`.
@@ -311,7 +356,12 @@ pub fn parse_autoeq(text: &str) -> (f32, Vec<Band>) {
     for line in text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("Preamp:") {
-            if let Some(v) = rest.split_whitespace().next().and_then(|t| t.parse().ok()) {
+            if let Some(v) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|t| t.parse::<f32>().ok())
+                .filter(|v| v.is_finite())
+            {
                 preamp = v;
             }
         } else if line.starts_with("Filter") {
