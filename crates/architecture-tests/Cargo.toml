@@ -11,8 +11,11 @@ publish = false
 [dev-dependencies]
 soul-audio-core = { path = "../soul-audio-core" }
 soul-audio-catalog = { path = "../soul-audio-catalog" }
-# Default features = the no-alloc reader (no `build` baker).
-soul-audio-index = { path = "../soul-audio-index" }
+# The no-alloc gate measures the READER, but it needs a real baked index to
+# read — an empty/foreign-version header makes every accessor return before it
+# touches the source, which is how that test used to measure nothing. The
+# `build` baker is host-side std and runs OUTSIDE the measured region.
+soul-audio-index = { path = "../soul-audio-index", features = ["build"] }
 # signal_integrity.rs: the audiophile fitness functions need the DSP chain model
 # (shared with soul-player-ng and the DAP) and the equalizer it applies through.
 soul-audio-dsp = { path = "../soul-audio-dsp", features = ["serde"] }
