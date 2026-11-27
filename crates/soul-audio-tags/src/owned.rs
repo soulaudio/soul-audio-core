@@ -203,9 +203,26 @@ pub fn read_owned<S: SeekSource>(src: &mut S) -> Result<(Tags, StreamFacts), Tag
 ///   is the picture *ordinal*, not a byte offset — re-walk the Ogg stream,
 ///   base64-decode the Nth picture comment (reassembled across pages), and
 ///   return the embedded FLAC PICTURE block's image bytes.
+///
+/// # Errors
+/// [`TagError::Malformed`] if the descriptor does not fit inside `src` —
+/// checked **before** allocating, which is the point. `data_len` is a `u32` the
+/// *file* chose (a FLAC `PICTURE` block states it verbatim, and nothing upstream
+/// can cross-check it against the real stream length), so a 12-byte edit to any
+/// file in a library would otherwise make a scan allocate up to 4 GiB of zeroed
+/// memory per cover before `read_exact` discovered the file was 3 MB. That is a
+/// memory-exhaustion DoS from untrusted input, not a decode bug; validating the
+/// range here covers every container at once (FLAC `PICTURE`, ID3v2 `APIC`,
+/// MP4 `covr`) rather than once per parser.
 pub fn read_picture_bytes<S: SeekSource>(src: &mut S, p: &Picture) -> Result<Vec<u8>, TagError> {
     match p.encoding {
         DataEncoding::Raw => {
+            let end = src.seek(SeekFrom::End(0)).map_err(|_| TagError::Io)?;
+            // `end - offset` only after the offset is known to be inside, so
+            // this cannot underflow on a descriptor pointing past EOF.
+            if p.data_offset > end || u64::from(p.data_len) > end - p.data_offset {
+                return Err(TagError::Malformed);
+            }
             src.seek(SeekFrom::Start(p.data_offset))
                 .map_err(|_| TagError::Io)?;
             let mut buf = alloc::vec![0u8; p.data_len as usize];
@@ -300,6 +317,62 @@ mod tests {
         let mut src2 = SliceSource::new(&bytes);
         let pic_bytes = read_picture_bytes(&mut src2, &tags.pictures[0]).unwrap();
         assert_eq!(pic_bytes, b"\xFF\xD8\xFF\xEE");
+    }
+
+    /// A picture descriptor whose declared length does not fit in the file must
+    /// be **refused before anything is allocated**.
+    ///
+    /// `data_len` comes verbatim from a FLAC `PICTURE` block, so flipping four
+    /// bytes in any file in a library turns one cover read into a request for
+    /// up to 4 GiB of zeroed memory — on a scan that walks thousands of files,
+    /// that is a memory-exhaustion DoS from untrusted input, and it used to
+    /// happen before `read_exact` ever noticed the file was kilobytes long.
+    ///
+    /// This test cannot *observe* an allocation, so it pins the behaviour that
+    /// prevents it: the range check rejects the descriptor (`Malformed`, not
+    /// `Io` — the file lied, it did not end early). If the check is removed
+    /// this still fails, because a 4 GiB read from a 200-byte slice errors —
+    /// after trying to allocate 4 GiB, which is what the guard avoids.
+    #[test]
+    fn a_picture_longer_than_the_file_is_refused_before_allocating() {
+        let bytes = flac_fixture(&["TITLE=Fuzz"]);
+        let mut src = SliceSource::new(&bytes);
+        let (tags, _) = read_owned(&mut src).unwrap();
+        let real = tags.pictures[0];
+        assert_eq!(real.data_len, 4, "fixture's cover is the 4-byte stub");
+
+        for &liar in &[u32::MAX, u32::MAX / 2, bytes.len() as u32 + 1, 5] {
+            let mut p = real;
+            p.data_len = liar;
+            let mut s = SliceSource::new(&bytes);
+            assert_eq!(
+                read_picture_bytes(&mut s, &p),
+                Err(TagError::Malformed),
+                "data_len={liar} claims more than the file holds"
+            );
+        }
+
+        // An offset past the end is the same lie from the other direction, and
+        // must not underflow the length arithmetic.
+        for &off in &[bytes.len() as u64, bytes.len() as u64 + 1, u64::MAX] {
+            let mut p = real;
+            p.data_offset = off;
+            p.data_len = 1;
+            let mut s = SliceSource::new(&bytes);
+            assert_eq!(read_picture_bytes(&mut s, &p), Err(TagError::Malformed));
+        }
+
+        // The honest descriptor still works, and a zero-length one is empty,
+        // not an error.
+        let mut s = SliceSource::new(&bytes);
+        assert_eq!(
+            read_picture_bytes(&mut s, &real).unwrap(),
+            b"\xFF\xD8\xFF\xEE"
+        );
+        let mut empty = real;
+        empty.data_len = 0;
+        let mut s = SliceSource::new(&bytes);
+        assert!(read_picture_bytes(&mut s, &empty).unwrap().is_empty());
     }
 
     #[test]

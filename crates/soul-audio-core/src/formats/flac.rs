@@ -800,8 +800,21 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> FlacDecoder<S, P> {
             let emit_pc = (self.block_total / self.channels.max(1) as usize) as u64;
             let frame_start = self.decoded_per_ch.saturating_sub(emit_pc);
             if target < self.decoded_per_ch {
-                self.emit_i = ((target - frame_start) as usize) * self.channels as usize;
-                return Ok(target);
+                // `target` can land *before* this frame: `decoded_per_ch` is
+                // anchored from a frame header on the FLAC-in-Ogg/Matroska path
+                // (and from the SEEKTABLE otherwise), and a corrupt header can
+                // anchor it past the target — which underflowed
+                // `target - frame_start`. The earliest sample we can still emit
+                // is the frame's own start, so land there and say so rather
+                // than claiming a position this frame does not contain.
+                let landed = target.max(frame_start);
+                let into = (landed - frame_start) as usize;
+                // Also clamp the emit cursor: the multiply is `usize` (32-bit
+                // on the DAP) and `emit_i` indexes the decoded block.
+                self.emit_i = into
+                    .saturating_mul(self.channels.max(1) as usize)
+                    .min(self.block_total);
+                return Ok(landed);
             }
             self.emit_i = self.block_total; // discard the whole frame
         }

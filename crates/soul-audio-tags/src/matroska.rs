@@ -68,17 +68,26 @@ fn read_header<S: SeekSource>(
     }
 
     let body_start = src.seek(SeekFrom::Current(0)).map_err(|_| TagError::Io)?;
+    // The range must never invert. `parent_end` is derived from the *parent's*
+    // declared size, so a child whose header starts past it — which a corrupt
+    // or hostile EBML tree gives you — made `body_end < body_start`, and every
+    // consumer below computes `end - start`: four underflow panics from one bad
+    // var-int (found by `tests/fuzz.rs`). Clamping here fixes them at the
+    // source: an element that starts past its parent's end is simply empty.
     let body_end = if all_ones {
-        parent_end // unknown size: runs to the parent's end
+        parent_end.max(body_start) // unknown size: runs to the parent's end
     } else {
-        body_start.saturating_add(size).min(parent_end)
+        body_start
+            .saturating_add(size)
+            .min(parent_end)
+            .max(body_start)
     };
     Ok(Some((id, body_start, body_end, all_ones)))
 }
 
 /// Read up to 8 big-endian bytes as a `u64` (for TimecodeScale).
 fn read_uint<S: SeekSource>(src: &mut S, start: u64, end: u64) -> Result<u64, TagError> {
-    let len = (end - start).min(8) as usize;
+    let len = end.saturating_sub(start).min(8) as usize;
     let mut buf = [0u8; 8];
     read_exact(src, &mut buf[..len])?;
     let mut v = 0u64;
@@ -90,7 +99,7 @@ fn read_uint<S: SeekSource>(src: &mut S, start: u64, end: u64) -> Result<u64, Ta
 
 /// Read a 4- or 8-byte big-endian IEEE float (for Duration).
 fn read_float<S: SeekSource>(src: &mut S, start: u64, end: u64) -> Result<f64, TagError> {
-    let len = (end - start) as usize;
+    let len = end.saturating_sub(start) as usize;
     if len == 4 {
         let mut b = [0u8; 4];
         read_exact(src, &mut b)?;
@@ -244,7 +253,7 @@ fn walk_simple_tag<S: SeekSource>(
 
     while let Some((id, body_start, body_end, _)) = read_header(src, end)? {
         if id == TAG_NAME {
-            let len = (body_end - body_start).min(name.len() as u64) as usize;
+            let len = body_end.saturating_sub(body_start).min(name.len() as u64) as usize;
             read_exact(src, &mut name[..len])?;
             name_len = len;
             name_present = true;
@@ -269,7 +278,7 @@ fn emit_string<S: SeekSource>(
     scratch: &mut [u8],
     sink: &mut impl TagSink,
 ) -> Result<(), TagError> {
-    let want = (end - start).min(scratch.len() as u64) as usize;
+    let want = end.saturating_sub(start).min(scratch.len() as u64) as usize;
     read_exact(src, &mut scratch[..want])?;
     if let Ok(s) = core::str::from_utf8(&scratch[..want]) {
         let s = s.trim_end_matches('\0').trim();
