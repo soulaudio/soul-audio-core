@@ -22,6 +22,7 @@ pub mod model;
 pub mod probe;
 pub mod resample;
 pub mod sink;
+pub mod subrange;
 
 pub use deck::{Deck, DeckError, DeckState, DecodeInfo, Progress};
 pub use decoder::{DecodeError, Decoder, DsdDecoder, DsdSeek, SeekableDecoder};
@@ -34,6 +35,7 @@ pub use model::{DsdMode, DsdRate, Format, SampleFormat, SourceCodec, StreamInfo}
 pub use probe::probe;
 pub use resample::{Quality, ResampleError, Resampler};
 pub use sink::{Sink, SinkError};
+pub use subrange::SubRange;
 
 /// Whether the patented AAC decoder is compiled in. MUST stay `false` in all
 /// shipped soul products (DAP firmware + desktop player) — AAC is a Via LA

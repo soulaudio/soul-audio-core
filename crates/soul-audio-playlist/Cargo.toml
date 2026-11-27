@@ -27,3 +27,10 @@ features = ["derive", "alloc"]
 # (the desktop's choice). `toml` is not no_std so it stays out of the crate's
 # own dependency surface.
 serde_json = "1"
+# Test-only: `tests/cue_playback.rs` plays a real single-file album (a committed
+# FLAC + a cue sheet) through the real decoder/`SubRange`/`Deck` path, which is
+# the only way to show the cue arithmetic is sample-accurate and its boundaries
+# gapless. A dev-dependency only — this crate's own surface stays standalone,
+# and the dependency points the same way the layering does (higher-level crate
+# -> core), not the other way.
+soul-audio-core = { path = "../soul-audio-core" }
