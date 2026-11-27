@@ -142,6 +142,7 @@ fn track_input(t: &TrackData) -> TrackInput {
         mbid: String::new(),
         disc_subtitle: String::new(),
         loudness: None,
+        cue_range: None,
     }
 }
 
@@ -447,6 +448,7 @@ fn merge_orders_albums_chronologically_across_sources() {
                 mbid: String::new(),
                 disc_subtitle: String::new(),
                 loudness: None,
+                cue_range: None,
             }],
             artists: vec![artist.into()],
             artist_sorts: Vec::new(),
@@ -518,6 +520,7 @@ fn merge_orders_artists_by_sort_name_across_sources() {
                 mbid: String::new(),
                 disc_subtitle: String::new(),
                 loudness: None,
+                cue_range: None,
             }],
             artists: vec![artist.into()],
             artist_sorts: vec![sort.into()],
@@ -599,6 +602,7 @@ fn merge_orders_tracks_by_genre_across_sources() {
                 mbid: String::new(),
                 disc_subtitle: String::new(),
                 loudness: None,
+                cue_range: None,
             }],
             artists: vec!["Artist".into()],
             artist_sorts: Vec::new(),
@@ -1252,6 +1256,7 @@ fn multi_disc_v8_fields_route_per_source() {
             file_name: format!("{disc}-{track}.flac"),
             disc_subtitle: sub.into(),
             loudness: None,
+            cue_range: None,
         };
         CatalogInput {
             // Deliberately out of (disc, track) order.

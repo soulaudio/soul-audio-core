@@ -53,6 +53,8 @@ pub enum SkipReason {
     UnsupportedFormat,
 }
 
+mod cue;
+
 /// Files the scan passed over, grouped by extension: "12 .aac files, because the
 /// decoder is disabled". Grouped rather than listed because a real library
 /// yields thousands of paths and a user only needs the shape of the problem.
@@ -140,9 +142,17 @@ fn is_hidden(path: &Path) -> bool {
 /// Robust like the desktop service scan: symlink cycles terminate (canonical
 /// visited-set), an unreadable subdir is skipped with a warning, and only the
 /// root's own failure propagates.
+/// Whether `path` is a `.cue` sheet (the index of a single-file album).
+fn is_cue_sheet(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cue"))
+}
+
 fn walk(
     dir: &Path,
     out: &mut Vec<PathBuf>,
+    cues: &mut Vec<PathBuf>,
     visited: &mut HashSet<PathBuf>,
     skips: &mut Skips,
     depth: usize,
@@ -164,11 +174,15 @@ fn walk(
             continue;
         }
         if path.is_dir() {
-            if let Err(e) = walk(&path, out, visited, skips, depth + 1) {
+            if let Err(e) = walk(&path, out, cues, visited, skips, depth + 1) {
                 eprintln!("import: skipping unreadable dir {path:?}: {e}");
             }
         } else if is_supported(&path) {
             out.push(path);
+        } else if is_cue_sheet(&path) {
+            // Not audio itself: the index of a single-file album, expanded
+            // into tracks after extraction (`cue::expand`).
+            cues.push(path);
         } else {
             // Not imported — tell the caller why, so the app can say so rather
             // than leaving the user to wonder where their files went.
@@ -450,6 +464,14 @@ pub struct RawTrack {
     /// MusicBrainz recording MBID from the tags (empty when untagged) — baked into
     /// the index (v4) as the enrichment join key.
     mbid: String,
+    /// The container's own per-channel frame count, when it declares one. Used
+    /// to end the last track of a cue sheet exactly at the file's end (the
+    /// duration in ms would round).
+    total_frames: Option<u64>,
+    /// For a **cue-sheet track**: `(start_frame, frames)` — this entry's slice
+    /// of the file it shares with its siblings. `None` for an ordinary
+    /// whole-file track. Set by [`cue::expand`], baked into the index (v9).
+    cue_range: Option<(u32, u32)>,
 }
 
 /// Read + derive one file's [`RawTrack`] — the single file-opening step. Pure
@@ -486,6 +508,10 @@ fn extract_raw(path: &Path) -> RawTrack {
         .to_owned();
     RawTrack {
         path: path.to_path_buf(),
+        total_frames: facts.total_frames,
+        // A plain file is its own whole track; `cue::expand` rewrites this for
+        // the entries a cue sheet replaces it with.
+        cue_range: None,
         title,
         artist_name,
         album_artist_name,
@@ -598,6 +624,7 @@ fn build_catalog(raw: &[RawTrack], root: &Path) -> CatalogInput {
             channels: r.channels,
             file_name: r.file_name.clone(),
             mbid: r.mbid.clone(),
+            cue_range: r.cue_range,
             disc_subtitle,
             // Loudness is a deferred Tier-2 analysis pass (full decode), not the metadata scan.
             loudness: None,
@@ -628,11 +655,13 @@ fn build_catalog(raw: &[RawTrack], root: &Path) -> CatalogInput {
 /// prefer [`scan_incremental`].
 pub fn scan(root: &Path) -> std::io::Result<CatalogInput> {
     let mut paths = Vec::new();
+    let mut cues = Vec::new();
     let mut visited = HashSet::new();
     // `bake` has nowhere to put a report; the incremental scan carries one.
     let mut skips = Skips::default();
-    walk(root, &mut paths, &mut visited, &mut skips, 0)?;
+    walk(root, &mut paths, &mut cues, &mut visited, &mut skips, 0)?;
     let raw: Vec<RawTrack> = paths.iter().map(|p| extract_raw(p)).collect();
+    let raw = cue::expand(&cues, raw);
     Ok(build_catalog(&raw, root))
 }
 
@@ -895,9 +924,10 @@ fn scan_incremental_inner(
 ) -> std::io::Result<ScanOutcome> {
     // 1. Discovery: walk (sorted, deterministic) + stat each file.
     let mut paths = Vec::new();
+    let mut cues = Vec::new();
     let mut visited = HashSet::new();
     let mut skips = Skips::default();
-    walk(root, &mut paths, &mut visited, &mut skips, 0)?;
+    walk(root, &mut paths, &mut cues, &mut visited, &mut skips, 0)?;
     let total = paths.len();
     let mut current: Vec<(PathBuf, FileStamp)> = Vec::with_capacity(total);
     for (i, p) in paths.iter().enumerate() {
@@ -963,6 +993,11 @@ fn scan_incremental_inner(
         cache.entries.insert(p.clone(), (*stamp, rt.clone()));
         raw.push(rt);
     }
+    // Expand cue sheets AFTER the cache: the cache is keyed by audio-file path
+    // (one entry per file, as before), and a sheet is kilobytes to re-read, so
+    // an edited cue re-splits the album on the next scan without invalidating
+    // the expensive per-file tag extraction.
+    let raw = cue::expand(&cues, raw);
     let input = build_catalog(&raw, root);
 
     Ok(ScanOutcome {

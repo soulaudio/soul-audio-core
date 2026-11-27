@@ -61,10 +61,13 @@
 //!   53 file_name.off u32 · 57 file_name.len u16 · 59 mbid.off u32 ·
 //!   63 mbid.len u16 · 65 loudness: integrated_lufs f32 · 69 lra f32 ·
 //!   73 true_peak_dbtp f32 · 77 plr f32 · 81 dr f32 ·
-//!   85 disc_subtitle.off u32 · 89 disc_subtitle.len u16
+//!   85 disc_subtitle.off u32 · 89 disc_subtitle.len u16 ·
+//!   91 cue_start_frames u32 · 95 cue_frames u32
 //!   (mbid new in v4; loudness new in v6, valid iff flags & FLAG_HAS_LOUDNESS;
 //!    disc_subtitle new in v8 — appended, `(0,0)` = none, one heap string per
-//!    distinct value)
+//!    distinct value; cue_start_frames/cue_frames new in v9 — appended, a
+//!    cue-sheet track's slice of the file several tracks share, with
+//!    `cue_frames == 0` meaning "not a cue track, play the whole file")
 //!
 //! ALBUM RECORD (38 B, fixed; indexed by dense album id):
 //!    0 id u32 · 4 title.off u32 · 8 title.len u16 · 10 album_artist u32 ·
@@ -100,6 +103,10 @@
 //!   NORMALIZED card-relative path key (folder path + `/` + file name, per
 //!   `norm_locator_byte`). Lets `resolve_locator` binary-search a durable locator
 //!   to its id in O(log n) off SD instead of scanning the whole catalog.
+//!   NOTE (v9): the tracks of a **cue-sheet album** all share one file, hence
+//!   one locator key. `resolve_locator` returns one of them (which one is not
+//!   specified); a durable reference to a *particular* cue track needs the
+//!   track's `cue_start_frames` as well, which a locator does not carry.
 //!
 //! ALBUM→TRACKS: a directory of album_count × (count u32, run_abs_off u32),
 //!   then the concatenated u32 track-id runs.
@@ -134,7 +141,7 @@ use soul_audio_core::SeekSource;
 /// Magic at the head of `index.sidx` — `"SIDX"`.
 pub const MAGIC: [u8; 4] = *b"SIDX";
 /// Format version in the header.
-pub const FORMAT_VERSION: u16 = 8;
+pub const FORMAT_VERSION: u16 = 9;
 
 const HEADER_SIZE: usize = 76; // +4 for the v7 locator_order_off
 
@@ -191,7 +198,7 @@ fn cmp_locator_key(query: &[u8], folder_path: &[u8], file_name: &[u8]) -> core::
         Ordering::Equal
     }
 }
-const RECORD_SIZE: usize = 91; // 65 (v5) + 5×f32 loudness (v6) + disc_subtitle StrRef (v8)
+const RECORD_SIZE: usize = 99; // 91 (v8) + cue_start_frames + cue_frames (v9)
 const ALBUM_RECORD_SIZE: usize = 38; // 30 (v5) + disc_count u16 + mb_album_id StrRef (v8)
 /// v8 appended-field offsets. The compile-time checks pin them to the record
 /// ends, so an append that forgets to grow a record (or an insert that shifts
@@ -199,7 +206,12 @@ const ALBUM_RECORD_SIZE: usize = 38; // 30 (v5) + disc_count u16 + mb_album_id S
 const TRACK_DISC_SUBTITLE_OFF: usize = 85;
 const ALBUM_DISC_COUNT_OFF: usize = 30;
 const ALBUM_MB_ID_OFF: usize = 32;
-const _: () = assert!(TRACK_DISC_SUBTITLE_OFF + 6 == RECORD_SIZE);
+/// v9 appended-field offsets: a cue-sheet track's slice of its file.
+const TRACK_CUE_START_OFF: usize = 91;
+const TRACK_CUE_FRAMES_OFF: usize = 95;
+const _: () = assert!(TRACK_DISC_SUBTITLE_OFF + 6 == TRACK_CUE_START_OFF);
+const _: () = assert!(TRACK_CUE_START_OFF + 4 == TRACK_CUE_FRAMES_OFF);
+const _: () = assert!(TRACK_CUE_FRAMES_OFF + 4 == RECORD_SIZE);
 const _: () = assert!(ALBUM_DISC_COUNT_OFF + 2 == ALBUM_MB_ID_OFF);
 const _: () = assert!(ALBUM_MB_ID_OFF + 6 == ALBUM_RECORD_SIZE);
 const ARTIST_REF_SIZE: usize = 6; // StrRef (off u32, len u16) per artist
@@ -473,6 +485,8 @@ impl<S: SeekSource> Catalog for IndexReader<S> {
                 plr: le_f32(&r, 77),
                 dr: le_f32(&r, 81),
             }),
+            cue_start_frames: le_u32(&r, TRACK_CUE_START_OFF),
+            cue_frames: le_u32(&r, TRACK_CUE_FRAMES_OFF),
             disc_subtitle: StrRef {
                 off: le_u32(&r, TRACK_DISC_SUBTITLE_OFF),
                 len: le_u16(&r, TRACK_DISC_SUBTITLE_OFF + 4),
@@ -686,6 +700,10 @@ pub mod build {
         pub disc_subtitle: String,
         /// Baked R128 loudness, `Some` iff this track has been analyzed. (v6)
         pub loudness: Option<soul_audio_catalog::LoudnessRec>,
+        /// For a **cue-sheet track**: `(start_frame, frames)` — this track's
+        /// slice of `file_name`, which its sibling tracks share. `None` for an
+        /// ordinary whole-file track. (v9)
+        pub cue_range: Option<(u32, u32)>,
     }
 
     /// One folder to bake into the folder table. `path` is relative to the card
@@ -1118,6 +1136,11 @@ pub mod build {
             let (soff, slen) = track_subtitles[i];
             out.extend_from_slice(&soff.to_le_bytes()); // disc_subtitle.off @85 (v8)
             out.extend_from_slice(&slen.to_le_bytes()); // disc_subtitle.len @89 (v8)
+            // Cue slice (v9): zeroes for an ordinary track, which is what
+            // `cue_frames == 0` means on the way back out.
+            let (cue_start, cue_frames) = t.cue_range.unwrap_or((0, 0));
+            out.extend_from_slice(&cue_start.to_le_bytes()); // cue_start_frames @91
+            out.extend_from_slice(&cue_frames.to_le_bytes()); // cue_frames @95
             debug_assert_eq!(out.len() - rec_start, RECORD_SIZE);
         }
         debug_assert_eq!(out.len(), albums_off);
