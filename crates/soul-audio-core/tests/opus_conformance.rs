@@ -467,10 +467,18 @@ fn committed_vectors_match_enc_final_range() {
 ///
 /// Each vector must pass at BOTH mono and stereo (the `run_vectors.sh` criterion).
 #[test]
-#[ignore]
+#[ignore = "needs the RFC test vectors; set OPUS_VECTORS_DIR and run with --ignored"]
 fn full_corpus() {
-    let dir = std::env::var("OPUS_VECTORS_DIR")
-        .expect("set OPUS_VECTORS_DIR to the extracted opus_newvectors directory");
+    // Skip (not fail) when the corpus is absent, matching the convention the
+    // other corpus-gated tests use (`corpus_conforms_to_reference`,
+    // `corpus_vorbis_conforms_to_reference`). A bare `expect` here turned a
+    // `cargo test -- --include-ignored` sweep red for a *missing input*, which
+    // buries any real failure in the same run — and the bare `#[ignore]` gave
+    // no hint what was missing.
+    let Ok(dir) = std::env::var("OPUS_VECTORS_DIR") else {
+        println!("SKIP: set OPUS_VECTORS_DIR to the extracted opus_newvectors directory");
+        return;
+    };
     let mut failures = Vec::new();
     for n in 1..=12 {
         let name = format!("testvector{n:02}");

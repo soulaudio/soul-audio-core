@@ -128,6 +128,44 @@ raw-DSD DSDIFF (`tone.dff`) are covered end-to-end in the CLI render suite
 (`crates/soul-audio-cli/tests/e2e.rs`). HE-AAC/SBR (`tone-sbr.m4a`) renders pitch-only through
 the CLI e2e, like the other lossy AAC fixtures.
 
+## Reference-differential runs (local-only, last verified 2026-11-28)
+
+These suites compare our decoders against independent references and **cannot
+run on CI** — the reference binaries are not there. So the useful record is when
+they last passed and against what, which is this table. Re-run it after
+touching a decoder; the invocation is in each suite's module doc.
+
+| Suite | Result | Reference |
+|---|---|---|
+| `soul-audio-core` `reference_differential::committed_fixtures_conform_to_reference` | FLAC 3/3, WavPack 8/8, ALAC 5/5 **bit-exact** | flac 1.5.0, wvunpack 5.9.0, ffmpeg 8.1.2 |
+| `soul-audio-core` `downmix_conformance` (5 tests, `--features aac`) | 5/5 — 5.1→stereo matches ffmpeg's `ac2`; Opus family-1, AAC config-order and ALAC centre folds all symmetric | ffmpeg 8.1.2 |
+| `soul-audio-desktop` `vorbis_conformance::committed_vorbis_conforms_to_reference` | 4/4, SNR 68–92 dB (bar ≥ 50) | ffmpeg 8.1.2 |
+| `soul-audio-cli` `pipeline_e2e::pipeline_matches_ffmpeg_decode` | **bit-identical** through the whole pipeline (SNR = ∞) | ffmpeg 8.1.2 |
+
+Two things that run were found not to:
+
+- The **WavPack** half of the core suite had never executed. `wvunpack -y -q
+  <in> <out>` passes the output path as a *second input*, so wvunpack failed on
+  it and the assert fired — the fix is `-o <out>`, which `ref_flac` beside it
+  always used. All 8 fixtures are bit-exact once it runs.
+
+  Worse than inert: with no output flag, wvunpack decoded to its **default**
+  path — the `.wav` beside the input, *in this directory* — and `-y` forced the
+  overwrite. Running that suite silently rewrote the committed
+  `antiphase.wav`, which is the very reference `antiphase.flac` and
+  `antiphase.wv` are asserted bit-exact against. If you ran it before this fix,
+  check `git status` here.
+- The **AAC** downmix test cannot open its fixture without `--features aac`
+  (patent-gated off by default), so it failed partway through an otherwise
+  green `--ignored` run. It is now `#[cfg(feature = "aac")]`.
+
+Still not run anywhere, for want of inputs rather than tooling:
+`opus_conformance::full_corpus` (needs the RFC `opus_newvectors`,
+`OPUS_VECTORS_DIR`), the `CONFORMANCE_CORPUS_DIR` corpus sweeps, and
+`soul-audio-tags`' `corpus_parity_report` (`SOUL_TAGS_CORPUS`). Each now
+**skips with a message** instead of failing, so a `--include-ignored` sweep
+stays readable.
+
 ## Regenerating
 
 ```sh
