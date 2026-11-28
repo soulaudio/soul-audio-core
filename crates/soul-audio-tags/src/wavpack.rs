@@ -110,8 +110,14 @@ fn read_apev2<S: SeekSource>(
             if read_exact(src, &mut scratch[..want]).is_ok()
                 && let Ok(s) = core::str::from_utf8(&scratch[..want])
             {
-                let s = s.trim_end_matches('\0').trim();
-                if !s.is_empty() {
+                // Strip the NUL padding an APEv2 value may carry, but not
+                // whitespace: that is content, and the length-prefixed readers
+                // (and `lofty`) keep it. The extra `.trim()` here was the
+                // fourth instance of the same asymmetry — `riff`, `aiff` and
+                // `caf` had it too — and it was invisible until the corpus
+                // sweep's extension list learned about `.wv`.
+                let s = s.trim_end_matches('\0');
+                if !s.trim().is_empty() {
                     let raw = core::str::from_utf8(&key_buf[..nul]).unwrap_or("");
                     crate::util::emit_text(sink, Some(field), raw, s);
                 }

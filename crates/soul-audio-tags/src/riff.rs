@@ -134,8 +134,15 @@ fn read_info_list<S: SeekSource>(
         read_exact(src, &mut scratch[..want])?;
         let end = scratch[..want].iter().position(|&b| b == 0).unwrap_or(want);
         if let Ok(s) = core::str::from_utf8(&scratch[..end]) {
-            let s = s.trim();
-            if !s.is_empty() {
+            // The NUL scan above already removed the chunk's zero padding, so a
+            // `trim()` here would strip *intentional* whitespace — which every
+            // length-prefixed reader in this crate preserves (Vorbis comments,
+            // ID3 frames, MP4 `ilst`), and which `lofty` preserves too. Trimming
+            // only here made the same tag text read differently depending on the
+            // container it sat in. Emit it as written; a value that is *only*
+            // whitespace is still skipped, since that is an empty tag rather
+            // than a tag made of spaces.
+            if !s.trim().is_empty() {
                 let raw = core::str::from_utf8(&id).unwrap_or("");
                 sink.text(map_info_field(&id), raw, s);
             }
@@ -280,6 +287,42 @@ mod tests {
             c.fields
                 .iter()
                 .any(|(f, _, v)| *f == Some(Field::Title) && v == "Song X")
+        );
+    }
+
+    /// A `LIST`/`INFO` value's **whitespace is content**, not padding: the NUL
+    /// scan already removes the chunk's zero padding, so trimming on top of it
+    /// altered the value — and only in the chunk-based readers, so the same tag
+    /// text read differently in a `.wav` than in a `.flac`. Found by a corpus
+    /// parity sweep against `lofty`, which preserves it (and which showed the
+    /// identical bug in `aiff`, `caf` and `wavpack`).
+    ///
+    /// A value that is *only* whitespace is still dropped: that is an empty tag
+    /// rather than a tag made of spaces.
+    #[test]
+    fn wav_info_values_keep_their_whitespace() {
+        let bytes = wav_with_info("  leading and trailing  ", " Spaced Artist ", "   ");
+        let mut src = SliceSource::new(&bytes);
+        let mut scratch = [0u8; 256];
+        let mut c = Collect::default();
+        super::read_wav(&mut src, &mut scratch, &mut c).unwrap();
+
+        let got = |f: Field| {
+            c.fields
+                .iter()
+                .find(|(got, _, _)| *got == Some(f))
+                .map(|(_, _, v)| v.clone())
+        };
+        assert_eq!(
+            got(Field::Title).as_deref(),
+            Some("  leading and trailing  "),
+            "leading/trailing spaces in a title must survive"
+        );
+        assert_eq!(got(Field::Artist).as_deref(), Some(" Spaced Artist "));
+        assert_eq!(
+            got(Field::Album),
+            None,
+            "a whitespace-only value is an empty tag, not a tag of spaces"
         );
     }
 
