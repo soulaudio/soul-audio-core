@@ -144,6 +144,16 @@ touching a decoder; the invocation is in each suite's module doc.
 | `soul-audio-core` `mp3_conformance` | **10/10** ISO vectors (Layer I, II, III incl. the MPEG-2 LSF set) | ISO/IEC reference `.pcm` |
 | `soul-audio-core` `opus_conformance::full_corpus` | **24/24** — all 12 RFC 8251 vectors at *both* mono and stereo, Q 95.5–100 % on the `opus_compare` criterion | IETF RFC 8251 vectors |
 
+A **generated** corpus (`CONFORMANCE_CORPUS_DIR`) across 6 sample rates × 3
+channel counts × 2 depths then found a real decode gap: every 96 kHz and
+192 kHz FLAC failed with `Unsupported`, because the decoder's block ceiling was
+the subset's ≤48 kHz value (4608) at *every* rate, while the subset allows
+16384 above 48 kHz — and ffmpeg uses it (8192 at 96 kHz, 16384 at 192 kHz). The
+planes are now sized from each stream's declared block size, so all twelve
+hi-res files decode bit-exact and a CD-rate file reserves *less* scratch than
+before. Generating a corpus is worth it: the committed fixtures are all
+≤48 kHz, so nothing in-tree could have caught this.
+
 Two things that run were found not to:
 
 - The **WavPack** half of the core suite had never executed. `wvunpack -y -q

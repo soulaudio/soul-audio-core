@@ -22,10 +22,28 @@ use crate::formats::scratch::ScratchCursor;
 use crate::io::{SeekSource, Source};
 use crate::model::{SampleFormat, StreamInfo};
 
-/// Maximum decoded block size (samples per channel) the inline buffer supports.
-/// 4608 covers every standard-block-size encoder (the subset limit at ≤48 kHz);
-/// larger blocks are declined with [`DecodeError::Unsupported`].
-const MAX_BLOCK: usize = 4608;
+/// Largest block size (samples per channel) this decoder will plan for: the
+/// FLAC **subset** ceiling for streams above 48 kHz.
+///
+/// The subset allows 4608 at ≤48 kHz and **16384 above it**, and encoders use
+/// that headroom — ffmpeg picks 8192 at 96 kHz and 16384 at 192 kHz. This
+/// constant was 4608 for every rate, with the comment "the subset limit at
+/// ≤48 kHz", so a perfectly compliant hi-res FLAC opened (reporting correct
+/// stream info) and then failed at the first frame with `Unsupported`: a track
+/// that looked playable and produced nothing. Hi-res FLAC is the whole point of
+/// the device, so the ceiling now matches the format.
+///
+/// A stream declaring more than this is still declined — it is outside the
+/// subset, and planning for 65535-sample blocks would cost 2 MiB of scratch per
+/// 8 channels for files that essentially do not exist.
+const MAX_BLOCK: usize = 16_384;
+
+/// The subset ceiling at ≤48 kHz, kept as documentation of where 4608 comes
+/// from: it is what a CD-rate encoder emits, and therefore what the planes cost
+/// for the common case (the stride is now per-stream, so a 44.1 kHz file still
+/// only reserves `channels × 4608`).
+#[allow(dead_code)]
+const SUBSET_BLOCK_AT_48K: usize = 4608;
 /// Maximum channels the decode buffer supports (up to 7.1 surround on
 /// the desktop profile). FLAC's inter-channel decorrelation is stereo-only,
 /// so anything past 2 channels is always coded independently and decodes
@@ -90,6 +108,11 @@ pub struct FlacDecoder<S, P> {
     /// Stream bit depth (from STREAMINFO); the frame's declared depth normally
     /// matches this and is used when the frame header defers to STREAMINFO.
     bits: u8,
+    /// Per-plane stride in [`Self::scratch`]: **this stream's** declared max
+    /// block size, not a global constant. 4608 for a CD-rate file, up to
+    /// [`MAX_BLOCK`] for hi-res — which is what lets a 192 kHz stream decode
+    /// while a 44.1 kHz one reserves a third of the scratch it used to.
+    block_cap: usize,
     /// STREAMINFO max block size (the constant per-frame block for a
     /// fixed-blocksize stream); maps a fixed-blocking frame number to its absolute
     /// first sample (`frame_number × stream_block`), correct even for the short
@@ -199,14 +222,39 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> FlacDecoder<S, P> {
         if info.channels == 0 || info.channels as usize > MAX_CHANNELS || bits == 0 || bits > 32 {
             return Err(DecodeError::Unsupported);
         }
+        // Plan the planes from what THIS stream declares, not from the global
+        // worst case: `STREAMINFO.max_blocksize` and the channels actually
+        // present. A 44.1 kHz stereo file now reserves 2 × 4608 slots where it
+        // used to reserve 8 × 4608, and a 192 kHz stereo file can reserve
+        // 2 × 16384 — which is how hi-res becomes decodable without raising
+        // anyone's scratch budget. An undersized scratch is refused here, at
+        // construction, instead of failing on the first frame.
+        let channels = usize::from(info.channels);
+        let block_cap = match demux.max_block() as usize {
+            // STREAMINFO may leave the block size **undeclared** (`0`) — a
+            // streamed or container-embedded FLAC, which this decoder already
+            // accommodates elsewhere (`stream_block`'s "0 if the container did
+            // not declare it"). Nothing says how big a frame will be, so plan
+            // for as much as the caller's scratch affords, up to the subset
+            // ceiling; a frame beyond that still declines per-frame.
+            0 => (scratch.as_ref().len() / channels.max(1)).min(MAX_BLOCK),
+            // Declared: reserve exactly that. Beyond the subset ceiling is
+            // refused rather than planned for (see `MAX_BLOCK`).
+            declared if declared <= MAX_BLOCK => declared,
+            _ => return Err(DecodeError::Unsupported),
+        };
+        if block_cap == 0 {
+            return Err(DecodeError::Unsupported); // scratch too small for even one sample
+        }
         let mut cursor = ScratchCursor::new(scratch.as_ref().len());
-        let planes_off = cursor.alloc(MAX_CHANNELS * MAX_BLOCK)?;
+        let planes_off = cursor.alloc(channels * block_cap)?;
         let total_samples = demux.total_samples();
         let stream_block = u64::from(demux.max_block());
         Ok(Self {
             demux,
             channels: info.channels,
             bits,
+            block_cap,
             stream_block,
             total_samples,
             decoded_per_ch: 0,
@@ -226,10 +274,10 @@ impl<S: Source, P: AsRef<[i32]> + AsMut<[i32]>> FlacDecoder<S, P> {
         })
     }
 
-    /// The i32-slot offset of channel `ci`'s `MAX_BLOCK`-sample plane within
-    /// [`Self::scratch`].
+    /// The i32-slot offset of channel `ci`'s plane within [`Self::scratch`].
+    /// The stride is this stream's own `block_cap`, not the global ceiling.
     fn plane_off(&self, ci: usize) -> usize {
-        self.planes_off + ci * MAX_BLOCK
+        self.planes_off + ci * self.block_cap
     }
 
     /// Read-only view of channel `ci`'s plane.
@@ -1177,6 +1225,103 @@ mod tests {
     fn write_footer(bw: &mut BitWriter) {
         bw.align();
         bw.bits(0, 16); // CRC-16 (unchecked)
+    }
+
+    /// A STREAMINFO body that also declares min/max **blocksize** (bytes 0..4),
+    /// which [`streaminfo`] leaves at zero ("undeclared"). The block size is
+    /// what decides how much scratch a stream needs, so the hi-res tests have
+    /// to state it.
+    fn streaminfo_with_block(
+        rate: u32,
+        channels: u16,
+        bits: u8,
+        total: u64,
+        block: u16,
+    ) -> [u8; 34] {
+        let mut si = streaminfo(rate, channels, bits, total);
+        si[0..2].copy_from_slice(&block.to_be_bytes());
+        si[2..4].copy_from_slice(&block.to_be_bytes());
+        si
+    }
+
+    /// [`flac_file`] with an explicit declared block size.
+    fn flac_file_with_block(
+        rate: u32,
+        channels: u16,
+        bits: u8,
+        total: u64,
+        block: u16,
+        audio: &[u8],
+    ) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"fLaC");
+        v.push(0x80);
+        v.extend_from_slice(&[0, 0, 34]);
+        v.extend_from_slice(&streaminfo_with_block(rate, channels, bits, total, block));
+        v.extend_from_slice(audio);
+        v
+    }
+
+    /// A **hi-res** stream's blocks are bigger than a CD-rate stream's: the FLAC
+    /// subset allows 4608 at ≤48 kHz and **16384 above it**, and encoders use
+    /// that headroom (ffmpeg picks 8192 at 96 kHz, 16384 at 192 kHz). The block
+    /// ceiling here was 4608 for every rate, so such a file opened — reporting
+    /// correct stream info — and then failed on its first frame with
+    /// `Unsupported`: a track that looked playable and produced silence. Found
+    /// by running the `CONFORMANCE_CORPUS_DIR` sweep over a generated corpus of
+    /// rates; all twelve 96/192 kHz files failed, and now decode bit-exact
+    /// against libFLAC.
+    #[test]
+    fn a_hi_res_sized_block_decodes() {
+        const BLOCK: usize = 16_384; // the subset ceiling above 48 kHz
+        let k = 4_321i32;
+        let mut bw = BitWriter::new();
+        write_header(&mut bw, BLOCK, 0);
+        bw.bits(0, 1);
+        bw.bits(0, 6); // CONSTANT
+        bw.bits(0, 1);
+        bw.signed(k, 16);
+        write_footer(&mut bw);
+
+        let bytes =
+            flac_file_with_block(192_000, 1, 16, BLOCK as u64, BLOCK as u16, &bw.into_bytes());
+        let mut dec = FlacDecoder::new_in(SliceSource::new(&bytes), scratch())
+            .expect("a 192 kHz stream declaring a 16384 block must construct");
+        let mut out = vec![0i32; BLOCK];
+        let n = dec
+            .decode_into(&mut out)
+            .expect("16384-sample block must decode");
+        assert_eq!(n, BLOCK, "the whole block must come out");
+        assert!(out[..n].iter().all(|&s| s == k));
+    }
+
+    /// Past the subset ceiling is still refused — and **at construction**, so a
+    /// host finds out before it starts playing rather than on the first frame.
+    #[test]
+    fn a_block_past_the_subset_ceiling_is_refused_at_construction() {
+        let bytes = flac_file_with_block(192_000, 2, 16, 0, (MAX_BLOCK + 1) as u16, &[]);
+        assert!(
+            FlacDecoder::new_in(SliceSource::new(&bytes), scratch()).is_err(),
+            "a declared block past the ceiling must not construct"
+        );
+    }
+
+    /// The planes are planned from the stream's own declared size and channel
+    /// count, so a CD-rate stereo file now needs `2 × 4608` slots where it used
+    /// to need `MAX_CHANNELS × 4608` — a third of the scratch. This asserts the
+    /// improvement directly: construction succeeds with a scratch sized exactly
+    /// for what the file declares.
+    #[test]
+    fn a_cd_rate_stream_only_reserves_what_it_declares() {
+        let bytes = flac_file_with_block(44_100, 2, 16, 0, 4608, &[]);
+        let exact = vec![0i32; 2 * 4608];
+        assert!(
+            FlacDecoder::new_in(SliceSource::new(&bytes), exact).is_ok(),
+            "2 × 4608 slots must suffice for a 44.1 kHz stereo stream"
+        );
+        // One slot short must refuse, not panic or silently misindex.
+        let short = vec![0i32; 2 * 4608 - 1];
+        assert!(FlacDecoder::new_in(SliceSource::new(&bytes), short).is_err());
     }
 
     /// Build a 34-byte STREAMINFO body carrying the given parameters.
