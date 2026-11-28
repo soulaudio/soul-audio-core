@@ -141,6 +141,8 @@ touching a decoder; the invocation is in each suite's module doc.
 | `soul-audio-core` `downmix_conformance` (5 tests, `--features aac`) | 5/5 — 5.1→stereo matches ffmpeg's `ac2`; Opus family-1, AAC config-order and ALAC centre folds all symmetric | ffmpeg 8.1.2 |
 | `soul-audio-desktop` `vorbis_conformance::committed_vorbis_conforms_to_reference` | 4/4, SNR 68–92 dB (bar ≥ 50) | ffmpeg 8.1.2 |
 | `soul-audio-cli` `pipeline_e2e::pipeline_matches_ffmpeg_decode` | **bit-identical** through the whole pipeline (SNR = ∞) | ffmpeg 8.1.2 |
+| `soul-audio-core` `mp3_conformance` | **10/10** ISO vectors (Layer I, II, III incl. the MPEG-2 LSF set) | ISO/IEC reference `.pcm` |
+| `soul-audio-core` `opus_conformance::full_corpus` | **24/24** — all 12 RFC 8251 vectors at *both* mono and stereo, Q 95.5–100 % on the `opus_compare` criterion | IETF RFC 8251 vectors |
 
 Two things that run were found not to:
 
@@ -159,12 +161,28 @@ Two things that run were found not to:
   (patent-gated off by default), so it failed partway through an otherwise
   green `--ignored` run. It is now `#[cfg(feature = "aac")]`.
 
-Still not run anywhere, for want of inputs rather than tooling:
-`opus_conformance::full_corpus` (needs the RFC `opus_newvectors`,
-`OPUS_VECTORS_DIR`), the `CONFORMANCE_CORPUS_DIR` corpus sweeps, and
-`soul-audio-tags`' `corpus_parity_report` (`SOUL_TAGS_CORPUS`). Each now
-**skips with a message** instead of failing, so a `--include-ignored` sweep
-stays readable.
+The two **conformance corpora are fetchable**, so neither is a one-off any
+more — each is a script away, and each suite then finds its vectors with no
+environment variable:
+
+```sh
+bash testdata/fetch-mp3-conformance.sh    # ISO MPEG, ~1 MB
+cargo test -p soul-audio-core --test mp3_conformance
+
+bash testdata/fetch-opus-conformance.sh   # IETF RFC 8251, ~75 MB
+cargo test -p soul-audio-core --release --test opus_conformance \
+    full_corpus -- --ignored --nocapture   # ~4 min in release
+```
+
+Both corpora are gitignored (ISO copyright for the first; sheer size for the
+second). Run the Opus one in **release** — a debug build takes minutes per
+vector rather than seconds.
+
+Still not run anywhere, for want of inputs that cannot simply be downloaded:
+the `CONFORMANCE_CORPUS_DIR` corpus sweeps and `soul-audio-tags`'
+`corpus_parity_report` (`SOUL_TAGS_CORPUS`) both want a personal music
+library. Each **skips with a message** instead of failing, so a
+`--include-ignored` sweep stays readable.
 
 ## Regenerating
 

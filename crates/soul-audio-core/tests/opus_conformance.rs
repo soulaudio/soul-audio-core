@@ -475,9 +475,22 @@ fn full_corpus() {
     // `cargo test -- --include-ignored` sweep red for a *missing input*, which
     // buries any real failure in the same run — and the bare `#[ignore]` gave
     // no hint what was missing.
-    let Ok(dir) = std::env::var("OPUS_VECTORS_DIR") else {
-        println!("SKIP: set OPUS_VECTORS_DIR to the extracted opus_newvectors directory");
-        return;
+    // `testdata/opus-conformance-local/` (what `fetch-opus-conformance.sh`
+    // populates) by default, or `OPUS_VECTORS_DIR` for vectors kept elsewhere
+    // — the same fetch-then-run shape `mp3_conformance` uses, so the corpus
+    // does not need an env var to be remembered.
+    let local = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/opus-conformance-local");
+    let dir = match std::env::var("OPUS_VECTORS_DIR") {
+        Ok(d) => d,
+        Err(_) if local.join("testvector01.bit").is_file() => local.display().to_string(),
+        Err(_) => {
+            println!(
+                "SKIP: no vectors — run `bash testdata/fetch-opus-conformance.sh` \
+                 (or set OPUS_VECTORS_DIR)"
+            );
+            return;
+        }
     };
     let mut failures = Vec::new();
     for n in 1..=12 {

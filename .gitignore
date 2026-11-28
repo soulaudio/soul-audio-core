@@ -15,3 +15,8 @@
 # conformance verification only (tests/mp3_conformance.rs skips when absent),
 # NEVER committed. Fetch with testdata/fetch-mp3-conformance.sh.
 /testdata/mp3-conformance-local/
+# IETF Opus test vectors (RFC 8251) — freely redistributable but ~300 MB
+# extracted, used for LOCAL conformance verification only
+# (tests/opus_conformance.rs's full_corpus skips when absent), never committed.
+# Fetch with testdata/fetch-opus-conformance.sh.
+/testdata/opus-conformance-local/
