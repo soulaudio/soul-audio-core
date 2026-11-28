@@ -17,9 +17,10 @@
 //! hide a broken invariant instead of reporting it). So the gate pins the
 //! audited count and makes any increase deliberate.
 //!
-//! Six of the eight crates below are at **zero**, and that is the valuable part:
+//! Eleven of the thirteen crates below are at **zero** — including
+//! `soul-audio-firmware`, the device binary — and that is the valuable part:
 //! for them this is not a budget but an absolute, and a single new `unwrap` in
-//! the catalog reader or the engine fails CI.
+//! the firmware, the engine or the catalog reader fails CI.
 //!
 //! `todo!`/`unimplemented!` are **banned everywhere**, with no budget: an
 //! unfinished branch in a shipping decoder is not an invariant, it is a hole.
@@ -44,6 +45,20 @@ use std::path::{Path, PathBuf};
 /// Per-crate ceilings for `unwrap`/`expect`/`panic!`/`unreachable!` in
 /// production code, audited at the commit that introduced this file.
 ///
+/// # Scope: what "runs on the DAP" means here
+///
+/// The list is the set `cargo xtask verify` cross-builds for
+/// `thumbv7em-none-eabihf` — which is the only authoritative answer, since that
+/// build is what must link for the device — plus the `no_std` libraries those
+/// crates pull in (`soul-audio-catalog` and `soul-audio-index` are dependencies
+/// of the firmware binary; `soul-audio-eq` is a dependency of
+/// `soul-audio-dsp`). A crate absent from both is desktop-only and deliberately
+/// not gated: `soul-audio-multicatalog`, for instance, carries two
+/// mutex-poisoning `expect`s that are perfectly reasonable on a host and cannot
+/// reach a player.
+///
+/// # The numbers
+///
 /// `soul-audio-core`'s 46 break down as: deck invariants where a caller has
 /// already established the state (11), `dff`'s DST-substream accessors behind
 /// an `Option` the construction guarantees (8), AAC dispatch `unreachable!`s
@@ -51,16 +66,28 @@ use std::path::{Path, PathBuf};
 /// constant-width slices of fixed-size arrays in the Ogg/Vorbis/DST readers
 /// (15), and five more of the same two shapes. `soul-audio-tags`'s 1 is
 /// `comm[8..18]` on a `[u8; 18]` local — infallible.
+///
+/// **Everything else is zero, including the firmware binary itself.** That is
+/// the part of this gate with teeth: eleven of thirteen crates have no
+/// panicking construct at all, so for them this is an absolute and a single
+/// new `unwrap` fails CI.
 const BUDGET: &[(&str, usize)] = &[
+    // Cross-built for thumbv7em by `xtask verify`.
     ("soul-audio-core", 46),
     ("soul-audio-tags", 1),
-    // The rest are at zero and must stay there.
+    ("soul-audio-artbake", 0),
+    ("soul-audio-control", 0),
+    ("soul-audio-dsp", 0),
+    ("soul-audio-engine", 0),
+    ("soul-audio-firmware", 0),
+    ("soul-audio-loudness", 0),
+    ("soul-audio-playlist", 0),
+    ("soul-audio-queue", 0),
+    // `no_std` libraries the above link: catalog + index are firmware
+    // dependencies, eq is a `soul-audio-dsp` dependency.
     ("soul-audio-catalog", 0),
     ("soul-audio-index", 0),
-    ("soul-audio-artbake", 0),
-    ("soul-audio-engine", 0),
     ("soul-audio-eq", 0),
-    ("soul-audio-playlist", 0),
 ];
 
 /// Matches the attribute that opens a test module, in either spelling used in
