@@ -338,7 +338,13 @@ fn opus_surround_folds_centre_by_family1_order() {
 /// we mis-read the order (centre taken as front-left/right), the centre would skew to one
 /// side. End to end through the real `open()` -> AAC -> deck path.
 #[test]
-#[ignore = "requires ffmpeg (FFMPEG_BIN or on PATH)"]
+// AAC decode is patent-gated off by default, so without the feature this test
+// cannot open its own fixture — it used to die with a bare `open: Unsupported`
+// partway through an otherwise-green `--ignored` run, which reads as a decoder
+// bug rather than a missing feature. Run it with
+// `--features aac --test downmix_conformance -- --ignored`.
+#[cfg(feature = "aac")]
+#[ignore = "requires ffmpeg (FFMPEG_BIN or on PATH) and --features aac"]
 fn aac_surround_folds_centre_by_config_order() {
     let Some(bin) = ffmpeg_bin() else {
         eprintln!("skip: no ffmpeg");

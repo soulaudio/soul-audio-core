@@ -7,6 +7,12 @@
 //! does not). We decode a file through our `open()` path and through the
 //! reference (into a temp WAV, parsed to interleaved `i32`), and compare.
 //!
+//! Vorbis entries report `SKIP` here and that is not a coverage gap: core's
+//! `open_seekable` cannot build a Vorbis decoder (it needs a caller-provided
+//! arena), so Vorbis is differentially tested in
+//! `soul-audio-desktop/tests/vorbis_conformance.rs`, through `open_track`,
+//! against ffmpeg.
+//!
 //! `#[ignore]`d: the reference binaries are not on CI. Point each format at its
 //! reference via an env var (or put it on PATH):
 //!
@@ -111,6 +117,15 @@ const FORMATS: &[Fmt] = &[
     },
 ];
 
+/// **Every reference invocation must write only to `out`.** The rule is here
+/// because breaking it is silent and destructive, not merely wrong: without an
+/// explicit output flag, `wvunpack` decoded to its *default* path — the `.wav`
+/// beside the input, inside `testdata/` — and `-y` forced the overwrite. So
+/// running this suite rewrote the committed `antiphase.wav`, which is the
+/// reference `antiphase.flac` and `antiphase.wv` are asserted bit-exact
+/// against. A reference tool pointed at a fixture directory will happily
+/// clobber a fixture.
+///
 fn ref_flac(bin: &str, inp: &Path, out: &Path) {
     let st = Command::new(bin)
         .args(["-d", "-f", "-s", "-o"])
@@ -122,10 +137,16 @@ fn ref_flac(bin: &str, inp: &Path, out: &Path) {
 }
 
 fn ref_wvunpack(bin: &str, inp: &Path, out: &Path) {
+    // `-o <out>` is required, not optional sugar: a bare trailing path is
+    // another *input* to wvunpack, so `wvunpack -y -q in.wv out.wav` asks it to
+    // decode two files, fails to open the second, and writes no output at all
+    // ("errors occurred in 1 of 2 files"). That is how this half of the suite
+    // was written, so the WavPack differential had never actually run —
+    // `ref_flac` above always passed `-o` and did.
     let st = Command::new(bin)
-        .args(["-y", "-q"])
-        .arg(inp)
+        .args(["-y", "-q", "-o"])
         .arg(out)
+        .arg(inp)
         .status()
         .expect("spawn reference wvunpack");
     assert!(
