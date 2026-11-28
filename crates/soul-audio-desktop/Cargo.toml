@@ -68,7 +68,7 @@ optional = true
 # links on Linux so the graph keeps one copy. Its wrappers are SAFE, so this crate stays
 # `forbid(unsafe_code)`; libasound is already a build dependency of the cpal backend.
 [target.'cfg(target_os = "linux")'.dependencies.alsa]
-version = "0.9"
+version = "0.10"
 optional = true
 
 # The D-Bus device-reservation client (Linux only, MIT). `zbus` is pure Rust — no
