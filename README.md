@@ -32,7 +32,7 @@ allows, and the whole decode + seek surface is fuzzed for panic/hang safety.
 | Container / codec | Details |
 |---|---|
 | **WAV** | PCM integer (8/16/24/32), IEEE float (32/64), G.711 A-law/µ-law, IMA/DVI-ADPCM, RF64/BW64 (>4 GiB), RIFX (big-endian), up to 8 channels |
-| **FLAC** | Full decode, optional CRC-8/16 verification, up to 8 channels, sample-accurate seeking, **FLAC-in-Ogg** (also sample-accurate seeking) |
+| **FLAC** | Full decode, optional CRC-8/16 verification, up to 8 channels, sample-accurate seeking, **FLAC-in-Ogg** (also sample-accurate seeking). Hi-res included: the subset's larger blocks above 48 kHz (8192 at 96 kHz, 16384 at 192 kHz) decode bit-exact, with the decode planes sized from the stream's own declared block size |
 | **MP3** | MPEG-1/2/2.5 **Layers I, II, and III**, VBR (Xing/Info/VBRI), frame-granular + time seeking |
 | **AAC** *(opt-in)* | **AAC-LC** (mono … 7.1, incl. 5.1 multichannel), **HE-AAC** (SBR), **HE-AACv2** (Parametric Stereo); MP4/M4A and raw ADTS (`.aac`); sample-accurate seeking. **Behind the `aac` feature and off by default** — AAC is patent-encumbered (Via LA), and a clean-room implementation does not clear it, so a default build declines an AAC stream as `Unsupported` |
 | **ALAC** | Apple Lossless, MP4/M4A container, sample-accurate seeking |
