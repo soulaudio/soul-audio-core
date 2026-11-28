@@ -85,7 +85,7 @@ features = ["blocking-api"]
 # copy. Its `macos_helpers` expose hog mode / nominal-rate / physical-format control as
 # SAFE functions, so this crate stays `forbid(unsafe_code)`.
 [target.'cfg(target_os = "macos")'.dependencies.coreaudio-rs]
-version = "0.11"
+version = "0.14"
 optional = true
 default-features = false
 features = ["audio_unit", "core_audio"]
