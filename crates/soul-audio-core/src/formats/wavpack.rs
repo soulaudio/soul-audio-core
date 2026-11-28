@@ -1,12 +1,24 @@
 //! From-scratch WavPack (`.wv`) **lossless** decoder (dbry/WavPack format).
 //!
-//! Scope (v1): pure lossless, mono + stereo, 8/16/24-bit integer PCM, joint
-//! stereo, and the full decorrelation term set (including the negative
-//! cross-channel terms). Hybrid (lossy), float, DSD, >2-channel block
-//! stitching, and the `wvc`/`wvx` correction/extension streams are out of scope
-//! and decline as [`DecodeError::Unsupported`]. Seeking rewinds and
-//! decode-discards forward (a block-index scan would make it O(log n) — a
-//! follow-up); `total_frames` comes from the stream header.
+//! Scope: pure lossless, 8/16/24-bit integer PCM, joint stereo, the full
+//! decorrelation term set (including the negative cross-channel terms), and
+//! **multichannel** — a 5.0/5.1 frame is a run of ≤2-channel sub-blocks
+//! (`INITIAL_BLOCK`…`FINAL_BLOCK`) interleaved at their channel offsets, with
+//! the stream's WAVEFORMATEXTENSIBLE mask giving the layout
+//! (`tests/wavpack_multichannel.rs` holds it bit-exact against ffmpeg,
+//! including the odd-channel case where the final sub-block is mono).
+//!
+//! Hybrid (lossy), float, DSD, and the `wvc`/`wvx` correction/extension streams
+//! are out of scope and decline as [`DecodeError::Unsupported`]. Note the
+//! distinction: a single *block* carries at most 2 channels and
+//! [`WavpackDecoder::decode_block`] declines more, which is the format's own
+//! structure — it is not a limit on the file's channel count. (This paragraph
+//! said "mono + stereo … >2-channel block stitching out of scope" long after
+//! the stitching landed; the header is the first thing a reader believes, so it
+//! is worth keeping true.)
+//!
+//! Seeking rewinds and decode-discards forward (a block-index scan would make
+//! it O(log n) — a follow-up); `total_frames` comes from the stream header.
 //!
 //! A WavPack file is a sequence of blocks; each block carries a 32-byte header,
 //! a run of metadata sub-blocks (decorrelation terms/weights/samples, entropy

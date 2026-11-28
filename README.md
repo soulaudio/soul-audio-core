@@ -34,19 +34,24 @@ allows, and the whole decode + seek surface is fuzzed for panic/hang safety.
 | **WAV** | PCM integer (8/16/24/32), IEEE float (32/64), G.711 A-law/µ-law, IMA/DVI-ADPCM, RF64/BW64 (>4 GiB), RIFX (big-endian), up to 8 channels |
 | **FLAC** | Full decode, optional CRC-8/16 verification, up to 8 channels, sample-accurate seeking, **FLAC-in-Ogg** (also sample-accurate seeking) |
 | **MP3** | MPEG-1/2/2.5 **Layers I, II, and III**, VBR (Xing/Info/VBRI), frame-granular + time seeking |
-| **AAC** | **AAC-LC** (mono … 7.1, incl. 5.1 multichannel), **HE-AAC** (SBR), **HE-AACv2** (Parametric Stereo); MP4/M4A and raw ADTS (`.aac`); sample-accurate seeking |
+| **AAC** *(opt-in)* | **AAC-LC** (mono … 7.1, incl. 5.1 multichannel), **HE-AAC** (SBR), **HE-AACv2** (Parametric Stereo); MP4/M4A and raw ADTS (`.aac`); sample-accurate seeking. **Behind the `aac` feature and off by default** — AAC is patent-encumbered (Via LA), and a clean-room implementation does not clear it, so a default build declines an AAC stream as `Unsupported` |
 | **ALAC** | Apple Lossless, MP4/M4A container, sample-accurate seeking |
 | **Vorbis** | Ogg Vorbis, full decode (floor 1), up to 8 channels (5.1/7.1), page-granular seeking |
 | **Opus** | From-scratch RFC 6716 decoder — SILK, CELT, and hybrid modes; Ogg-encapsulated (RFC 7845), RFC 8251-conformant; mono/stereo sample-accurate seeking, plus multichannel surround (5.1/7.1, mapping family 1/255; decode-only) |
 | **DSD** | DSF and DFF/DSDIFF, DoP passthrough, decimation to PCM, DST decompression |
+| **AIFF / AIFF-C** | Big-endian integer PCM (8/16/24/32, true depth preserved) and the `sowt` little-endian variant, IEEE float (32/64), G.711 A-law/µ-law — the same conversion path WAV uses |
+| **WavPack** | **Lossless** `.wv`: 8/16/24-bit integer, joint stereo, the full decorrelation term set, and **multichannel** (5.0/5.1 — a frame is a run of ≤2-channel sub-blocks stitched at their channel offsets, with the stream's WAVEFORMATEXTENSIBLE mask giving the layout; verified bit-exact against ffmpeg). Hybrid/lossy, float, DSD and the `wvc`/`wvx` streams decline as `Unsupported` |
+| **CAF** | Apple Core Audio Format: `lpcm` (integer 8/16/24/32, big- **or** little-endian, and IEEE float) and `alac`; reads the `chan` channel layout, and handles a `data` chunk declared "to end of file" |
+| **Matroska / WebM** | `.mka`/`.webm` audio: **Opus**, **FLAC**, and **AAC** (opt-in, as above) through `open`; **Vorbis** decodes too but is constructed by hand (it needs the arena). Seeking uses the container Cues index — frame-granular at its ms resolution, sample-exact for FLAC, with a linear fallback when a file has no Cues |
 
 Output is interleaved `i32` in the source's sample range (16/24/32-bit), matching
 across every format.
 
-`open` handles WAV, FLAC, Ogg-FLAC, MP3, AAC (MP4 + ADTS), ALAC, and Opus
-directly. **DSD** and **Ogg Vorbis** are constructed by hand instead of through
-`open` — DSD needs an explicit output mode (native / DoP / decimate) and Vorbis
-needs a caller-provided decode arena (see the DSD section below).
+`open` handles WAV, AIFF/AIFF-C, FLAC, Ogg-FLAC, MP3, ALAC, Opus, WavPack, CAF,
+and Matroska/WebM directly — plus AAC (MP4 + ADTS) when the `aac` feature is on.
+**DSD** and **Ogg Vorbis** are constructed by hand instead of through `open` —
+DSD needs an explicit output mode (native / DoP / decimate) and Vorbis needs a
+caller-provided decode arena (see the DSD section below).
 
 ---
 
