@@ -53,7 +53,7 @@
 //!   68  string_heap_len         u32
 //!   72  locator_order_off       u32   (abs)  (v7)
 //!
-//! TRACK RECORD (91 B, fixed; `record[i]` at records_off + i*91):
+//! TRACK RECORD (99 B, fixed; `record[i]` at records_off + i*99):
 //!    0 id u32 · 4 title.off u32 · 8 title.len u16 · 10 artist u32 ·
 //!   14 album u32 · 18 album_artist u32 · 22 genre u32 · 26 folder u32 ·
 //!   30 track_no u16 · 32 disc_no u16 · 34 duration_ms u32 · 38 sample_rate u32 ·
@@ -1293,5 +1293,90 @@ pub mod build {
         // --- String heap ---
         out.extend_from_slice(&heap);
         out
+    }
+}
+
+/// The module doc above **is** the on-disk spec: `docs/ARCHITECTURE.md` names it
+/// as canonical, and anything else that reads a card — the desktop baker, a
+/// sync server, a future tool in another language — is written from it. A record
+/// size that drifts from the constant is therefore not a typo, it is a wrong
+/// specification, and the drift is silent because nothing in a normal build
+/// reads prose.
+///
+/// It drifted exactly that way: v9 appended the two cue fields, `RECORD_SIZE`
+/// became 99, the field list below gained offsets 91 and 95 — and the headline
+/// still said `(91 B, fixed; record[i] at records_off + i*91)`, which is the
+/// stride a second implementation would have used.
+///
+/// So the prose is parsed and compared to the constants.
+#[cfg(test)]
+mod spec_doc {
+    use super::{ALBUM_RECORD_SIZE, FOLDER_RECORD_SIZE, HEADER_SIZE, RECORD_SIZE};
+
+    /// The module doc of this very file, as text.
+    const SRC: &str = include_str!("lib.rs");
+
+    /// The `N` in a `//! <LABEL> (N B, fixed…` line.
+    fn documented_size(label: &str) -> usize {
+        let needle = format!("//! {label} (");
+        let line = SRC
+            .lines()
+            .find(|l| l.starts_with(&needle))
+            .unwrap_or_else(|| {
+                panic!("the spec no longer documents a {label} — rename or restore it")
+            });
+        let rest = &line[needle.len()..];
+        let (num, tail) = rest
+            .split_once(" B,")
+            .unwrap_or_else(|| panic!("{label} line is not `(N B, …)`: {line}"));
+        assert!(
+            tail.contains("fixed"),
+            "{label} is documented as variable-width; this check assumes fixed: {line}"
+        );
+        num.parse()
+            .unwrap_or_else(|_| panic!("{label} size is not a number: {line}"))
+    }
+
+    #[test]
+    fn the_documented_record_sizes_match_the_constants() {
+        assert_eq!(
+            documented_size("TRACK RECORD"),
+            RECORD_SIZE,
+            "the spec's TRACK RECORD size has drifted from RECORD_SIZE"
+        );
+        assert_eq!(
+            documented_size("ALBUM RECORD"),
+            ALBUM_RECORD_SIZE,
+            "the spec's ALBUM RECORD size has drifted from ALBUM_RECORD_SIZE"
+        );
+        assert_eq!(
+            documented_size("FOLDER RECORD"),
+            FOLDER_RECORD_SIZE,
+            "the spec's FOLDER RECORD size has drifted from FOLDER_RECORD_SIZE"
+        );
+        assert_eq!(
+            documented_size("HEADER"),
+            HEADER_SIZE,
+            "the spec's HEADER size has drifted from HEADER_SIZE"
+        );
+    }
+
+    /// The stride in the TRACK RECORD headline (`record[i] at records_off + i*N`)
+    /// must match too — it is the number a reader multiplies by, and the one
+    /// that was wrong.
+    #[test]
+    fn the_documented_track_stride_matches_the_record_size() {
+        let marker = "records_off + i*";
+        let line = SRC
+            .lines()
+            .find(|l| l.contains(marker))
+            .expect("the spec no longer states the track stride");
+        let after = &line[line.find(marker).unwrap() + marker.len()..];
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        assert_eq!(
+            digits.parse::<usize>().expect("stride is not a number"),
+            RECORD_SIZE,
+            "the spec's track stride has drifted from RECORD_SIZE: {line}"
+        );
     }
 }

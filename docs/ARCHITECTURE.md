@@ -34,13 +34,15 @@ These are settled. Each is enforced by docs + (where mechanizable) tests.
 3. **One on-disk format, `.soulidx`**, for desktop cache, DAP SD card, and
    server. Fixed-width records → O(1) seek; desktop-baked pre-sorted order
    tables → zero on-device sort; string heap; in-index playlists; `extended.blob`
-   (Tier-2/3) and `art.blob` (1-bit e-ink). The current format is **v8**; the
+   (Tier-2/3) and `art.blob` (1-bit e-ink). The current format is **v9**; the
    canonical byte layout is the `soul-audio-index` module doc
    (`crates/soul-audio-index/src/lib.rs`), and the reader is exact-match on the
    version (any other version reads as an empty catalog; the desktop re-bakes,
    a remote server and its clients must match). Records only ever grow by
    **appending** fields so existing offsets never move (v8 appended a per-track
-   `disc_subtitle` and a per-album `disc_count` + MusicBrainz release id).
+   `disc_subtitle` and a per-album `disc_count` + MusicBrainz release id; v9
+   appended a per-track `cue_start_frames`/`cue_frames`, the slice of a shared
+   audio file that a cue-sheet track plays).
    **Album identity** is `(album root folder, title, MusicBrainz release id)`:
    the album root is a track's folder, or its parent when that folder is a disc
    folder (`CD1`, `Disc 2 - Liyue`, …) below the scan root — one rule,

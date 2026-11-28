@@ -232,6 +232,12 @@ let n = pcm.decode_into(&mut buf)?;               // via the Decoder trait
 ```
 
 `DopAdapter` instead wraps the 1-bit stream in DoP frames for a DoP-capable DAC.
+Each frame is a 24-bit word — `0x05`/`0xFA` marker byte, then 16 DSD bits —
+delivered as a **canonical signed-24 sample**: the word's bit pattern
+sign-extended, so a `0xFA`-marked word is a negative `i32`. Read the word back
+as `sample as u32 & 0x00FF_FFFF`; the device must run at `dsd_rate / 16`,
+exclusively, with no gain, resampling or DSP, since anything that touches a
+sample destroys the marker.
 
 ---
 
