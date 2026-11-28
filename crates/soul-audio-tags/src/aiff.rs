@@ -95,8 +95,15 @@ fn read_text_chunk<S: SeekSource>(
     read_exact(src, &mut scratch[..want])?;
     let end = scratch[..want].iter().position(|&b| b == 0).unwrap_or(want);
     if let Ok(s) = core::str::from_utf8(&scratch[..end]) {
-        let s = s.trim();
-        if !s.is_empty() {
+        // The NUL scan above already removed the chunk's zero padding, so a
+        // `trim()` here would strip *intentional* whitespace — which every
+        // length-prefixed reader in this crate preserves (Vorbis comments,
+        // ID3 frames, MP4 `ilst`), and which `lofty` preserves too. Trimming
+        // only here made the same tag text read differently depending on the
+        // container it sat in. Emit it as written; a value that is *only*
+        // whitespace is still skipped, since that is an empty tag rather
+        // than a tag made of spaces.
+        if !s.trim().is_empty() {
             let field = match id {
                 b"NAME" => Some(Field::Title),
                 b"AUTH" => Some(Field::Artist),

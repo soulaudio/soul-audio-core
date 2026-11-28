@@ -111,8 +111,12 @@ fn read_info<S: SeekSource>(
                 core::str::from_utf8(&scratch[..vlen]),
             )
         {
-            let v = v.trim();
-            if !v.is_empty() {
+            // As in `riff`/`aiff`: `vlen` is already the exact value length
+            // (the `info` chunk is NUL-separated key/value pairs), so a
+            // `trim()` would strip intentional whitespace that the
+            // length-prefixed readers preserve. Only-whitespace is still an
+            // empty tag.
+            if !v.trim().is_empty() {
                 sink.text(Some(field), k, v);
             }
         }

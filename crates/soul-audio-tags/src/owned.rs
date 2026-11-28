@@ -189,7 +189,20 @@ impl TagSink for OwnedTags {
 /// Read tags + facts from `src`, collecting into an owned [`Tags`] (a 256-byte
 /// scratch buffer backs the underlying streaming [`read`]).
 pub fn read_owned<S: SeekSource>(src: &mut S) -> Result<(Tags, StreamFacts), TagError> {
-    let mut scratch = [0u8; 256];
+    // The no-alloc readers write one value at a time into the caller's buffer
+    // and **truncate** anything longer — that is the embedded contract, where
+    // the buffer is the budget. This is the owned/`alloc` path, though, and a
+    // 256-byte buffer silently clipped real values: a classical work title
+    // ("Symphony No. 9 in D minor, Op. 125 'Choral': IV. Presto — Allegro
+    // assai…") or a compilation's artist list passes 256 bytes easily, and a
+    // corpus sweep against `lofty` showed ours cut to ~250 characters where
+    // lofty returned all 300. Since this path already allocates the `String`s
+    // it returns, the buffer should not be the thing that limits them.
+    //
+    // 8 KiB covers any plausible title/artist/album; beyond it the core's
+    // truncation still applies, which is why this is a heap buffer rather than
+    // a bigger stack array (the embedded callers of `read` pick their own).
+    let mut scratch = alloc::vec![0u8; 8192];
     let mut sink = OwnedTags::default();
     let facts = read(src, &mut scratch, &mut sink)?;
     Ok((sink.tags, facts))
@@ -317,6 +330,28 @@ mod tests {
         let mut src2 = SliceSource::new(&bytes);
         let pic_bytes = read_picture_bytes(&mut src2, &tags.pictures[0]).unwrap();
         assert_eq!(pic_bytes, b"\xFF\xD8\xFF\xEE");
+    }
+
+    /// A long value must survive `read_owned` intact. The no-alloc `read`
+    /// truncates to the caller's buffer by design — that is the embedded
+    /// contract — but this is the owned path, and its 256-byte buffer silently
+    /// clipped real metadata: a classical work title or a compilation's artist
+    /// list passes 256 bytes easily. A corpus sweep against `lofty` showed ours
+    /// cut to ~250 characters where lofty returned all 300.
+    #[test]
+    fn read_owned_does_not_truncate_a_long_value() {
+        // 900 bytes of title — past the old 256-byte buffer by 3.5x, and past
+        // any single-line value a tagger writes.
+        let long: String = core::iter::repeat_n('T', 900).collect();
+        let bytes = flac_fixture(&[&alloc::format!("TITLE={long}"), "ARTIST=A"]);
+        let mut src = SliceSource::new(&bytes);
+        let (tags, _) = read_owned(&mut src).unwrap();
+        assert_eq!(
+            tags.title.as_deref(),
+            Some(long.as_str()),
+            "a 900-byte title came back truncated"
+        );
+        assert_eq!(tags.artist.as_deref(), Some("A"), "short values unaffected");
     }
 
     /// A picture descriptor whose declared length does not fit in the file must

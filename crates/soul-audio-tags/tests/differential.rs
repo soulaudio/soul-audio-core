@@ -151,8 +151,15 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Extensions the sweep walks. This must track every container
+/// [`soul_audio_tags::read`] dispatches to, or the sweep quietly under-covers:
+/// `aiff`, `wv`, `caf` and `mka` were missing, which is why a corpus run never
+/// looked at four supported containers — including the two (`aiff`, `caf`) that
+/// turned out to share the RIFF whitespace-trimming bug with `wav`, found by
+/// reading rather than by this sweep.
 const AUDIO_EXTENSIONS: &[&str] = &[
-    "flac", "mp3", "dsf", "dff", "wav", "ogg", "opus", "m4a", "aac",
+    "flac", "mp3", "dsf", "dff", "wav", "ogg", "oga", "opus", "m4a", "mp4", "aac", "aiff", "aifc",
+    "aif", "wv", "caf", "mka", "mkv", "webm",
 ];
 
 /// Local-library parity sweep. Not run by default (needs a real music
@@ -188,6 +195,7 @@ fn corpus_parity_report() {
     let mut scanned = 0usize;
     let mut matched = 0usize;
     let mut matched_with_tags = 0usize;
+    let mut reference_cannot_read = 0usize;
     let mut mismatches: Vec<String> = Vec::new();
 
     for path in &all {
@@ -209,6 +217,13 @@ fn corpus_parity_report() {
             if lof != (None, None, None) {
                 matched_with_tags += 1;
             }
+        } else if lof == (None, None, None) {
+            // lofty read nothing while we read something. That is not a parity
+            // failure: the sweep now walks containers lofty does not support
+            // (CAF, Matroska), and "the reference cannot read this at all" is
+            // outside what a *comparison* can judge. Counted separately so the
+            // tally stays honest rather than quietly scoring these as matches.
+            reference_cannot_read += 1;
         } else {
             mismatches.push(format!(
                 "{}: lofty={:?} ours={:?}",
@@ -221,7 +236,8 @@ fn corpus_parity_report() {
 
     println!(
         "corpus parity: {scanned} audio files scanned, {matched} matched \
-         ({matched_with_tags} with real tag values), {} mismatched",
+         ({matched_with_tags} with real tag values), {} mismatched, \
+         {reference_cannot_read} readable only by us (lofty found no tags)",
         mismatches.len()
     );
     let sample_n = 50;
